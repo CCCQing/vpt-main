@@ -39,17 +39,21 @@ class PromptedTransformer(Transformer):
         # 该实现的假设：只支持“prepend”与“random”初始化；不支持 deep-shared/局部层数选择
         assert prompt_config.LOCATION == "prepend"  # 只支持前置提示（插在 CLS 后、patch 前）
         assert prompt_config.INITIATION == "random" # 提示向量随机初始化（Xavier 风格区间）
+
+        # 不支持你在 12 层里只挑“第 3、7、11 层”插入的那种部分层 deep-prompt
+        # 支持的 deep 版本是：第 0 层用“前置 prompt”，从第 1 层到第 L-1 层“每层都用一份 deep-prompt”
         assert prompt_config.NUM_DEEP_LAYERS is None
+
+        # 不支持所有层共用同一组提示向量（共享参数）,支持的是每一层都有自己的提示参数
         assert not prompt_config.DEEP_SHARED
 
         # 初始化父类（会构建 embeddings、encoder 等）
         super(PromptedTransformer, self).__init__(
             config, img_size, vis)
-        
         self.prompt_config = prompt_config
         self.vit_config = config
 
-        # 统一将尺寸转成二元组（H, W）
+        # 规范输入尺寸 & 取出 patch 大小，统一将尺寸转成二元组（H, W）
         img_size = _pair(img_size)
         patch_size = _pair(config.patches["size"])
 
@@ -60,8 +64,9 @@ class PromptedTransformer(Transformer):
         # 对提示 token 可选的 dropout（训练期随机丢弃，增强鲁棒性）
         self.prompt_dropout = Dropout(self.prompt_config.DROPOUT)
 
+        # （可选）把“低维 prompt”线性投影到 ViT 的隐藏维 D
         # if project the prompt embeddings .PROJECT 指定提示向量（prompt token）在参数里存储的维度 d
-        # 若 PROJECT = -1则不投影，若 PROJECT >-1，则先将 prompt 的低维嵌入线性 投影到 ViT 的 hidden_size
+        # （可选）若 PROJECT = -1则不投影，若 PROJECT >-1，则先将 prompt 的低维嵌入线性 投影到 ViT 的 hidden_size
         # 若有一套预训练的低维 prompt、“同一套低维 prompt”跨不同隐藏维的 ViT 重用等需求时，可设置PROJECT =具体的d
         if self.prompt_config.PROJECT > -1:
             # only for prepend / add # 仅在 prepend/add 场景有意义
@@ -77,6 +82,7 @@ class PromptedTransformer(Transformer):
         # ====== 初始化提示 token 参数 ====== 让Prompt的数值尺度和“图像 patch 的嵌入”同量级,做一个上下界
         if self.prompt_config.INITIATION == "random":
             # Xavier-uniform 风格的上下界，根据输入维度与 prompt_dim 计算 val = sqrt( 6 / ( fan_in + fan_out ) )
+            # 目的：让随机初始化的提示向量和 patch 嵌入的量纲相近，便于两者在同一序列里被注意力网络一起处理
             # fan_in 近似为：每个 patch 的原始输入维度 = 3 * patch_h * patch_w（RGB 三通道 × patch 像素数）
             # fan_out 近似为：prompt_dim（提示向量的维度）
             # eg:patch_size = 16×16 = 256，3 * 256 = 768；设 prompt_dim = 192，则 val = sqrt(6/(768+192)) = sqrt(6/960) ≈ 0.079；
@@ -190,7 +196,7 @@ class PromptedTransformer(Transformer):
           - 若开启 deep prompt，则逐层替换；否则直接一次性送入 encoder
           - 返回编码后的序列与可选的注意力权重（由 vis 决定）
         """
-        # 1) prepend prompt
+        # 1) prepend prompt 并入前置提示
         # this is the default version:
         embedding_output = self.incorporate_prompt(x)
         # 2) deep prompt（可选）
@@ -206,7 +212,8 @@ class PromptedTransformer(Transformer):
 class PromptedVisionTransformer(VisionTransformer):
     """
     在标准 VisionTransformer 外壳下，用 PromptedTransformer 替换其内部的 transformer，
-    从而保留 ViT 的分类头/接口，但编码阶段具备 Prompt 功能。
+    - 复用原有 forward 接口/分类头写法（取 CLS 后线性分类）；
+    - 仅改变编码阶段（加入提示 token），其余训练/评测流程不受影响。
     """
     def __init__(self, prompt_cfg, model_type,img_size=224, num_classes=21843, vis=False):
         # 当前实现只支持原生的 CLS 池化方式（original）
@@ -217,8 +224,10 @@ class PromptedVisionTransformer(VisionTransformer):
         if prompt_cfg is None:
             raise ValueError("prompt_cfg cannot be None if using PromptedVisionTransformer")
         self.prompt_cfg = prompt_cfg
+
+        # 取出结构规格（如 hidden_size、层数、patch 大小等）
         vit_cfg = CONFIGS[model_type]
-        # 将内部 transformer 替换为带 Prompt 的版本
+        # 核心替换：把内部的 transformer 用“带 Prompt 的”版本替换
         self.transformer = PromptedTransformer(prompt_cfg, vit_cfg, img_size, vis)
 
     def forward(self, x, vis=False):

@@ -1,4 +1,7 @@
 # tools/tsne_vis.py
+"""
+t-SNE 特征可视化工具
+"""
 import os
 from collections import defaultdict
 import numpy as np

@@ -35,6 +35,7 @@ def setup(args):
     # setup dist
     # cfg.DIST_INIT_PATH = "tcp://{}:12399".format(os.environ["SLURMD_NODENAME"])
     # 8.21日修改os.environ访问环境变量在本地/非 SLURM 环境下这个变量不存在
+
     # -------------------- 分布式初始化地址设置 --------------------
     # 原始实现：在 SLURM 环境下从环境变量取节点名并组装 tcp://<node>:12399
     # 但在本地/非 SLURM 环境下不存在该变量，会触发 KeyError。
@@ -47,6 +48,7 @@ def setup(args):
 
     # setup output dir
     # output_dir / data_name / feature_name / lr_wd / run1
+
     # -------------------- 输出目录组织规则 --------------------
     # 期望目录结构：
     # <OUTPUT_DIR>/<DATA.NAME>/<DATA.FEATURE>/lr<lr>_wd<wd>/run<count>
@@ -86,6 +88,7 @@ def get_loaders(cfg, logger):
         - 其他任务：构建标准的 train / val / test
     """
     logger.info("Loading training data (final training data for vtab)...")
+
     if cfg.DATA.NAME.startswith("vtab-"):
         # VTAB 最终训练：使用 800/200 调参后，合并 train+val 作为最终训练集
         train_loader = data_loader.construct_trainval_loader(cfg)

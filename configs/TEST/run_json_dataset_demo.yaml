@@ -1,0 +1,15 @@
+DATA_ROOT: 'D:/postgraduate1/project/datasets/CUB/CUB_200_2011'
+GZSL: false         #   true  -> TEST_INCLUDE_SEEN = True  -> test_unseen_loc + test_seen_loc
+                    #   false -> TEST_INCLUDE_SEEN = False -> 只用 test_unseen_loc
+MODE: xlsa          #   "json" -> 走 JSON + dummy 数据
+                    #   "xlsa" -> 走 xlsa17 (res101.mat + att_splits.mat)
+SKIP_DUMMY: false
+
+SPLIT: train        #   "train" / "val" / "test"
+USE_TRAINVAL: false #   true  -> TRAIN_USE_TRAINVAL = True  -> trainval_loc
+                    #   false -> TRAIN_USE_TRAINVAL = False -> train_loc
+XLSA_ROOT: 'D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB'
+
+
+
+

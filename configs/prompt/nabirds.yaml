@@ -1,4 +1,4 @@
-_BASE_: "../base-prompt.yaml"
+_BASE_: "../debug_json_dataset.yaml"
 RUN_N_TIMES: 1
 DATA:
   NAME: "nabirds"

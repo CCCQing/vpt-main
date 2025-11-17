@@ -1,3 +1,6 @@
+"""
+实验结果汇总&可视化工具
+"""
 import datetime
 import os
 import glob

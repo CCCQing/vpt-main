@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+
+"""
+用 lr_scheduler.py 里的 scheduler 控制学习率随 epoch/step 怎么变化
+以下几种情况做修改：不同模块用不同 scheduler / 按 iteration（step）调度，而不是按 epoch / 多阶段训练
+"""
+
 import math
 
 import torch.optim as optim

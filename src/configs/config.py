@@ -85,6 +85,19 @@ _C.MODEL.PROMPT.VIT_POOL_TYPE = "original"
 _C.MODEL.PROMPT.DROPOUT = 0.0       # 对 prompt 嵌入做随机置零，用于正则化，缓解提示过拟合
 _C.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH = False
 # ----------------------------------------------------------------------
+# ===== 动态提示与多层融合设置 ===== 10.27 加入
+# ----------------------------------------------------------------------
+_C.MODEL.PROMPT_FUSION = CfgNode()
+_C.MODEL.PROMPT_FUSION.ENABLED = False  # 是否启用动态提示/多层融合模块
+_C.MODEL.PROMPT_FUSION.LATENT_DIM = 256  # 提示潜在空间维度
+_C.MODEL.PROMPT_FUSION.LAYER_IDS = [0, 6, 11]  # 在哪些 Transformer 层执行提示更新
+_C.MODEL.PROMPT_FUSION.KL_WEIGHT = 1e-4  # KL 正则权重（训练时可读）
+_C.MODEL.PROMPT_FUSION.DROPOUT = 0.0  # 采样后的提示向量 dropout
+_C.MODEL.PROMPT_FUSION.USE_SEMANTICS = False  # 是否拼接额外语义向量到提示生成器
+_C.MODEL.PROMPT_FUSION.SEMANTIC_DIM = 0  # 语义向量维度（USE_SEMANTICS=True 时生效）
+_C.MODEL.PROMPT_FUSION.AFFINITY_BIAS = True  # 在亲和矩阵上是否学习额外偏置
+_C.MODEL.PROMPT_FUSION.RETURN_AUX = False  # 默认推理是否返回辅助 loss/亲和信息
+# ----------------------------------------------------------------------
 # adapter options
 # ----------------------------------------------------------------------
 _C.MODEL.ADAPTER = CfgNode()
@@ -123,8 +136,8 @@ _C.SOLVER.DBG_TRAINABLE = False # if True, will print the name of trainable para
 # ----------------------------------------------------------------------
 _C.DATA = CfgNode()
 
-_C.DATA.NAME = ""
-_C.DATA.DATAPATH = ""
+_C.DATA.NAME = "CUB_200_2011"
+_C.DATA.DATAPATH = "D:/postgraduate1/project/datasets/CUB/CUB_200_2011"
 _C.DATA.FEATURE = ""  # e.g. inat2021_supervised
 
 _C.DATA.PERCENTAGE = 1.0
@@ -140,6 +153,20 @@ _C.DATA.BATCH_SIZE = 32
 _C.DATA.NUM_WORKERS = 4
 # Load data to pinned host memory 将数据加载到固定内存（pinned host memory）
 _C.DATA.PIN_MEMORY = True
+
+# -------------------------11.15新增：读入语义模态信息---------------------------------
+_C.DATA.XLSA = CfgNode()
+_C.DATA.XLSA.ENABLED = True
+_C.DATA.XLSA.RES101_PATH = "D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB/res101.mat"
+_C.DATA.XLSA.SPLIT_PATH = "D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB/att_splits.mat"
+_C.DATA.XLSA.TRAIN_KEY = "train_loc"
+_C.DATA.XLSA.VAL_KEY = "val_loc"
+_C.DATA.XLSA.TRAINVAL_KEY = "trainval_loc"
+_C.DATA.XLSA.TRAIN_USE_TRAINVAL = False     # 决定在 split="train" 时用 train_loc 还是 trainval_loc：
+_C.DATA.XLSA.TEST_KEY = "test_unseen_loc"
+_C.DATA.XLSA.TEST_SEEN_KEY = "test_seen_loc"
+_C.DATA.XLSA.TEST_INCLUDE_SEEN = False      # 是否把 seen 测试样本也拼到 test split 里。
+# -------------------------11.15新增结束---------------------------------
 
 _C.DIST_BACKEND = "gloo"      # Linux默认是 nccl，win默认是gloo
 _C.DIST_INIT_PATH = "env://"

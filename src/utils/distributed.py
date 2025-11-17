@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
-"""Distributed helpers."""
+"""
+Distributed helpers.
+分布式训练小工具
+以下几种情况要修改：训练/集群模式变了：从“单机多卡” → “多机多卡”，但你希望 rank 计算方式不同 / 要做“跨进程的特殊通信”
+"""
 
 import torch
 import torch.distributed as dist

@@ -9,7 +9,7 @@ from torch.utils.data.sampler import RandomSampler
 
 from ..utils import logging
 from .datasets.json_dataset import (
-    CUB200Dataset, CarsDataset, DogsDataset, FlowersDataset, NabirdsDataset
+    CUB200Dataset, AWA2Dataset, SUNAttributeDataset, FlowersDataset
 )
 # 日志器（项目统一的 logger），方便在控制台/文件中记录信息
 logger = logging.get_logger("visual_prompt")
@@ -18,9 +18,8 @@ logger = logging.get_logger("visual_prompt")
 _DATASET_CATALOG = {
     "CUB": CUB200Dataset,
     'OxfordFlowers': FlowersDataset,
-    'StanfordCars': CarsDataset,
-    'StanfordDogs': DogsDataset,
-    "nabirds": NabirdsDataset,
+    'AWA2': AWA2Dataset,
+    "SUN": SUNAttributeDataset,
 }
 
 

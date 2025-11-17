@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+"""
+训练过程的小工具
+"""
 import torch
 
 

@@ -23,6 +23,7 @@ from .vit_prompt.vit import PromptedVisionTransformer
 from .vit_prompt.swin_transformer import PromptedSwinTransformer
 from .vit_prompt.vit_moco import vit_base as prompt_vit_base
 from .vit_prompt.vit_mae import build_model as prompt_mae_vit_model
+
 # Adapter 版本骨干
 from .vit_adapter.vit_mae import build_model as adapter_mae_vit_model
 from .vit_adapter.vit_moco import vit_base as adapter_vit_base
@@ -432,8 +433,10 @@ def _build_swin_model(model_type, crop_size, model_root):
 
     return model, feat_dim
 
-
-def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, model_root=None, adapter_cfg=None, load_pretrain=True, vis=False):
+# 10.27 加入fusion_cfg=None
+# def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, model_root=None, adapter_cfg=None, load_pretrain=True, vis=False):
+def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, fusion_cfg=None, model_root=None, adapter_cfg=None,
+                             load_pretrain=True, vis=False):
     """
     构建“监督预训练”的 ViT 及其 Prompt/Adapter 变体，并按需加载 .npz 权重。
 
@@ -441,6 +444,7 @@ def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, model_root=None
         model_type   : 监督权重标识（见 MODEL_ZOO 中 sup_* 键）
         crop_size    : 输入裁剪尺寸（224/384/…）
         prompt_cfg   : Prompt 设置（不为 None 则构建 PromptedVisionTransformer）
+        fusion_cfg   : 动态提示/多层融合设置（若启用则构建 DynamicPromptedVisionTransformer）
         model_root   : 预训练权重根目录（.npz 放置于此）
         adapter_cfg  : Adapter 设置（不为 None 则构建 ADPT_VisionTransformer）
         load_pretrain: 是否从 .npz 加载监督预训练权重
@@ -464,6 +468,7 @@ def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, model_root=None
         "sup_vith14_imagenet21k": 1280,
     }
     # 选择具体骨干：Prompt > Adapter > 原生 ViT
+    # if prompt_cfg is not None:
     if prompt_cfg is not None:
         model = PromptedVisionTransformer(
             prompt_cfg, model_type,

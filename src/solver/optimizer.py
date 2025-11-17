@@ -3,6 +3,8 @@
 """
 optimizer, ref:
 https://github.com/huggingface/transformers/blob/master/transformers/optimization.property  #noqa
+把所有 requires_grad=True 的参数丢进 optimizer.py 里的优化器
+以下几种情况要修改：“不同模块不同学习率 / weight_decay” / 想对“文本编码器”完全禁用 weight_decay，但对视觉部分保留
 """
 import math
 

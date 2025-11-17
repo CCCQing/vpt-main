@@ -25,8 +25,7 @@ import numpy as np
 from torch.nn import Dropout, Softmax, Linear, Conv2d, LayerNorm
 from torch.nn.modules.utils import _pair
 from scipy import ndimage
-
-from ...configs import vit_configs as configs
+from ...configs import vit_configs as configs # 结构配置（B/16、L/16、H/14 等）
 
 
 logger = logging.getLogger(__name__)
@@ -77,17 +76,23 @@ ACT2FN = {"gelu": torch.nn.functional.gelu, "relu": torch.nn.functional.relu, "s
 
 
 class Attention(nn.Module):
-    """标准多头自注意力模块（MHSA）。"""
+    """
+    标准多头自注意力模块（MHSA）。
+    输入：hidden_states [B, N, D]（含 CLS，N=1+patches）
+    输出：attention_output [B, N, D]，可选返回注意力权重 weights（用于可视化）
+    """
     def __init__(self, config, vis):
         super(Attention, self).__init__()
         self.vis = vis  # 是否返回注意力权重以用于可视化
         self.num_attention_heads = config.transformer["num_heads"]  # 头数 h
         self.attention_head_size = int(config.hidden_size / self.num_attention_heads)   # 每头维度 d_k
         self.all_head_size = self.num_attention_heads * self.attention_head_size    # 总维度 D
+
         # Q/K/V 线性映射：输入/输出维度均为 hidden_size
         self.query = Linear(config.hidden_size, self.all_head_size)
         self.key = Linear(config.hidden_size, self.all_head_size)
         self.value = Linear(config.hidden_size, self.all_head_size)
+
         # 输出线性层 + dropout
         self.out = Linear(config.hidden_size, config.hidden_size)
         self.attn_dropout = Dropout(config.transformer["attention_dropout_rate"])
@@ -106,32 +111,40 @@ class Attention(nn.Module):
         输入：hidden_states，形状 [B, N, D]，N=1+num_patches（包含 cls token）
         返回：attention_output [B, N, D]，以及可选的注意力权重 weights
         """
+        # 线性映射到 Q/K/V，维度仍为 D
         mixed_query_layer = self.query(hidden_states) # B, num_patches, head_size*num_head # [B, N, D] -> [B, N, h*d_k]
         mixed_key_layer = self.key(hidden_states)
         mixed_value_layer = self.value(hidden_states)
+
         # 拆分为多头
         query_layer = self.transpose_for_scores(mixed_query_layer) # B, num_head, num_patches, head_size
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer) # B, num_head, num_patches, head_size
+
         # 注意力权重：Q * K^T / sqrt(d_k) -> [B, h, N, N]
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) # B, num_head, num_patches, num_patches
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         attention_probs = self.softmax(attention_scores) # B, num_head, num_patches(query), num_patches(key) # 行归一化
         weights = attention_probs if self.vis else None     # 用于可视化
         attention_probs = self.attn_dropout(attention_probs)
+
         # 上下文：Attn * V -> [B, h, N, d_k] -> [B, N, h*d_k]
         context_layer = torch.matmul(attention_probs, value_layer) # B, num_head, num_patches, head_size    # [B, h, N, d_k]
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()  # [B, N, h, d_k]
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,) # [B, N, D]
         context_layer = context_layer.view(*new_context_layer_shape)
-        # 输出投影
+
+        # 输出线性映射 + dropout
         attention_output = self.out(context_layer)  # [B, N, D]
         attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
 
 
 class Mlp(nn.Module):
-    """Transformer 前馈网络（FFN）/两层 MLP：D -> mlp_dim -> D。"""
+    """
+    前馈网络（FFN）：两层 MLP
+    输入/输出维度：D → mlp_dim → D（逐 token 的通道内非线性变换）
+    """
     def __init__(self, config):
         super(Mlp, self).__init__()
         self.fc1 = Linear(config.hidden_size, config.transformer["mlp_dim"])
@@ -149,6 +162,7 @@ class Mlp(nn.Module):
         nn.init.normal_(self.fc2.bias, std=1e-6)
 
     def forward(self, x):
+        # [B, N, D] → [B, N, mlp_dim] → [B, N, D]
         x = self.fc1(x)
         x = self.act_fn(x)
         x = self.dropout(x)
@@ -159,7 +173,12 @@ class Mlp(nn.Module):
 
 class Embeddings(nn.Module):
     """
-    Construct the embeddings from patch, position embeddings.图像分块嵌入 + 位置编码 + [CLS] token 的构建。
+    Construct the embeddings from patch, position embeddings.
+    将图像转换为 Transformer 的输入序列：
+    - 纯 ViT：以 patch_size 为 kernel=stride 的卷积划分 patch，再线性映射到隐藏维
+    - hybrid：先用 ResNetV2 提取特征（步幅 16），再以小 patch 做映射
+    - 加上可学习的 [CLS] 与绝对位置编码
+    输出：embeddings [B, 1+N, D]
     """
     def __init__(self, config, img_size, in_channels=3):
         super(Embeddings, self).__init__()
@@ -169,7 +188,8 @@ class Embeddings(nn.Module):
         # 1) hybrid 模式：使用 ResNetV2 做低层特征，随后以 16x16 的 stride 切块
         # 2) 纯 ViT：直接以 patch_size 卷积进行切块
         if config.patches.get("grid") is not None:
-            grid_size = config.patches["grid"]  # 先用 ResNetV2 提取特征，输出特征图的步幅是 16 再决定“patch 的核/步幅”
+            grid_size = config.patches["grid"]
+            # 由图像 / 16 再除 grid 得到“每个 patch 的核/步幅”，n_patches= (H/16) * (W/16)
             patch_size = (img_size[0] // 16 // grid_size[0], img_size[1] // 16 // grid_size[1])
             n_patches = (img_size[0] // 16) * (img_size[1] // 16)
             self.hybrid = True
@@ -216,22 +236,27 @@ class Embeddings(nn.Module):
 
 
 class Block(nn.Module):
-    """标准 Transformer Block：LN -> MHSA -> 残差；LN -> MLP -> 残差。"""
+    """
+    标准 Transformer Block：
+    段1：LN → MHSA → 残差
+    段2：LN → MLP  → 残差
+    """
     def __init__(self, config, vis):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size   # hidden_size=D：每个 token 的通道维度
-        self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)   # 一个 LayerNorm
-        self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)         # 两个 LayerNorm
-        self.ffn = Mlp(config)                  # 两层 MLP（D→H→D，通常 H≈4D），完成通道内的非线性变换
-        self.attn = Attention(config, vis)      # 多头自注意力
+        self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)   # 段1的 LayerNorm
+        self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)         # 段2的 LayerNorm
+        self.ffn = Mlp(config)                  # 段2的两层 MLP（D→H→D，通常 H≈4D），完成通道内的非线性变换
+        self.attn = Attention(config, vis)      # 段1的多头自注意力
 
     def forward(self, x):
-        # 自注意力子层（Pre-LN + 残差）
+        # 段1：注意力 + 残差
         h = x  # 残差分支
         x = self.attention_norm(x)  # LN
         x, weights = self.attn(x)   # MHSA（输出同形状）; weights 仅在 vis=True 时非 None
         x = x + h                   # 残差相加
-        # 前馈子层（Pre-LN + 残差）
+
+        # 段2：FFN + 残差
         h = x
         x = self.ffn_norm(x)        # LN
         x = self.ffn(x)             # MLP: D→H→D
@@ -261,6 +286,7 @@ class Block(nn.Module):
             self.attn.key.bias.copy_(key_bias)
             self.attn.value.bias.copy_(value_bias)
             self.attn.out.bias.copy_(out_bias)
+
             # MLP 两层
             mlp_weight_0 = np2th(weights[pjoin(ROOT, FC_0, "kernel")]).t()
             mlp_weight_1 = np2th(weights[pjoin(ROOT, FC_1, "kernel")]).t()
@@ -271,6 +297,7 @@ class Block(nn.Module):
             self.ffn.fc2.weight.copy_(mlp_weight_1)
             self.ffn.fc1.bias.copy_(mlp_bias_0)
             self.ffn.fc2.bias.copy_(mlp_bias_1)
+
             # 两个 LayerNorm
             self.attention_norm.weight.copy_(np2th(weights[pjoin(ROOT, ATTENTION_NORM, "scale")]))
             self.attention_norm.bias.copy_(np2th(weights[pjoin(ROOT, ATTENTION_NORM, "bias")]))
@@ -301,7 +328,8 @@ class Encoder(nn.Module):
 
     def forward_cls_layerwise(self, hidden_states):
         """
-        返回每一层（含输入与最终 LN 后）CLS token 的表征，便于层间分析/可视化。
+        返回“逐层 CLS 向量”：
+        [输入 embeddings 的 CLS] + [每层输出的 CLS（最后一层前）] + [末端 LN 后的 CLS]
         仅支持 batch_size=1。
         """
         # hidden_states: B, 1+n_patches, dim
@@ -311,10 +339,12 @@ class Encoder(nn.Module):
         
         cls_embeds = []
         cls_embeds.append(hidden_states[0][0])  # 输入 embeddings 的 CLS
+
         for i,layer_block in enumerate(self.layer):
             hidden_states, _ = layer_block(hidden_states)
             if i < len(self.layer)-1:
                 cls_embeds.append(hidden_states[0][0])  # 每个 block 输出的 CLS（最后一层前）
+
         encoded = self.encoder_norm(hidden_states)
         cls_embeds.append(hidden_states[0][0])  # 最终 LN 后的 CLS
 
@@ -324,7 +354,9 @@ class Encoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    """完整 Transformer：Embeddings + Encoder。"""
+    """
+    完整的 Transformer：Embeddings（CLS+patch+pos）+ Encoder（多层 Block）
+    """
     def __init__(self, config, img_size, vis):
         super(Transformer, self).__init__()
         self.embeddings = Embeddings(config, img_size=img_size)
@@ -560,8 +592,14 @@ class PreActBottleneck(nn.Module):
 
 
 class ResNetV2(nn.Module):
-    """Implementation of Pre-activation (v2) ResNet mode.
-    Pre-activation (v2) ResNet 主干的简化实现（root + 3 个 block）。"""
+    """
+    Implementation of Pre-activation (v2) ResNet mode.
+    Pre-activation (v2) ResNet 主干的简化实现（root + 3 个 block）。
+    - root：7×7 Conv（stride=2）+ GN + ReLU + 3×3 MaxPool（stride=2）
+    - body：三个 block（每个 block 含若干 PreActBottleneck；block2/3 的首个 unit stride=2 做下采样）
+    作为 ViT 的 hybrid 前端时，输出步幅固定为 16。
+
+    """
 
     def __init__(self, block_units, width_factor):
         """

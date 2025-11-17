@@ -2,6 +2,7 @@
 
 """
 Project specific pathmanagers for a project as recommended by Detectron2
+统一的路径管理器
 """
 from iopath.common.file_io import PathManager as PathManagerBase
 from iopath.common.file_io import HTTPURLHandler

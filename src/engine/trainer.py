@@ -51,17 +51,19 @@ class Trainer():
         self.device = device
 
         # solver related
-        # ---------- 优化器 / 学习率调度器 / 损失函数 ----------
+        # ================== 优化器 / 学习率调度器 / 损失函数 ==================
         logger.info("\tSetting up the optimizer...")
-        # 这里传入 [self.model] 以兼容可能的多模型场景
+        # 这里传入 [self.model] 是为了兼容“多模型联合优化”的情况
         self.optimizer = make_optimizer([self.model], cfg.SOLVER)
         self.scheduler = make_scheduler(self.optimizer, cfg.SOLVER)
-        # 分类损失构建器（可返回 CE / Focal / LDAM 等，视配置而定）
+        # 根据 cfg.SOLVER.LOSS 构建分类损失（默认 softmax cross-entropy）
         self.cls_criterion = build_loss(self.cfg)
-        # ---------- Checkpointer（保存/加载权重的统一入口） ----------
+
+        # ================== Checkpointer：统一管理保存/加载 ==================
+        # Checkpointer 会自动处理 state_dict 的保存与加载
         self.checkpointer = Checkpointer(
             self.model,
-            save_dir=cfg.OUTPUT_DIR,
+            save_dir=cfg.OUTPUT_DIR,    # checkpoint 的保存路径
             save_to_disk=True
         )
         # 若指定了 MODEL.WEIGHT_PATH，则先加载指定权重
@@ -77,16 +79,19 @@ class Trainer():
 
     def forward_one_batch(self, inputs, targets, is_train):
         """Train a single (full) epoch on the model using the given data loader.
-           前向一次（一个 batch），并在训练阶段执行反向与优化步
-        Args:
-            X: input dict
-            targets
-            is_train: bool，训练阶段为 True，验证/测试为 False
-        Returns:
-            loss
-            outputs: output logits（形状 [B, num_cls]）
+        对一个 batch 做前向（可选反向）计算。
+
+        参数：
+            inputs: 输入张量（一般形状为 [B, C, H, W] 或 [B, D]）
+            targets: 标签张量（一般形状为 [B]）
+            is_train: bool，训练阶段为 True，验证/测试阶段为 False
+
+        返回：
+            loss: 标量损失（训练阶段）或占位损失（某些特殊情况）
+            outputs: 模型输出 logits，形状 [B, num_classes]
         """
-        # move data to device ---------- 数据搬运到设备 ----------
+
+        # ========== 1. 把数据搬到指定设备 ==========
         inputs = inputs.to(self.device, non_blocking=True)    # (batchsize, 2048)
         targets = targets.to(self.device, non_blocking=True)  # (batchsize, )
 
@@ -94,27 +99,34 @@ class Trainer():
             logger.info(f"shape of inputs: {inputs.shape}")
             logger.info(f"shape of targets: {targets.shape}")
 
-        # forward ---------- 前向 ---------- set_grad_enabled：仅在训练阶段计算梯度，评测阶段节省显存与算力
+        # ========== 2. 前向推理（训练时开启梯度，验证/测试禁用梯度） ==========
         with torch.set_grad_enabled(is_train):
             outputs = self.model(inputs)  # (batchsize, num_cls)
             if self.cfg.DBG:
                 logger.info(
                     "shape of model output: {}, targets: {}".format(
                         outputs.shape, targets.shape))
+
+            # ================== 3. 计算损失 ==================
             # 一些“局部损失”（is_local=True）需要拿到 model / inputs 参与计算
             # 例如某些正则或提示学习的约束，且为了稳定会在 eval() 下运行
             if self.cls_criterion.is_local() and is_train:
-                self.model.eval() # 临时切 eval，避免 BN/Dropout 带来随机性
+                # 把模型暂时切到 eval，避免 BN/Dropout 带来随机性
+                self.model.eval()
                 loss = self.cls_criterion(
                     outputs, targets, self.cls_weights,
                     self.model, inputs
                 )
-            elif self.cls_criterion.is_local(): # 评测阶段且为“局部损失”，此处直接返回占位 loss=1（无实际意义）
+            elif self.cls_criterion.is_local():
+                # 评测阶段且是“局部损失”时，当前实现直接返回一个占位 loss（值=1）
+                # 这里只是为了接口统一，真正评测时一般只关心 logits。
                 return torch.tensor(1), outputs
             else:
-                loss = self.cls_criterion(      # 常规损失（如交叉熵）：只需 (outputs, targets, class_weights)
+                # 常规分类损失（如 SoftmaxLoss），只需要 outputs / targets / class_weights
+                loss = self.cls_criterion(
                     outputs, targets, self.cls_weights)
-            # ---------- 异常值检测 ----------
+
+            # ========== 4. 检查损失是否异常（inf 或 NaN） ==========
             if loss == float('inf'):
                 logger.info(
                     "encountered infinite loss, skip gradient updating for this batch!"
@@ -127,7 +139,7 @@ class Trainer():
                 return -1, -1
 
         # =======backward and optim step only if in training phase... =========
-        # ---------- 训练阶段：反向与优化 ----------
+        # ========== 5. 若处于训练阶段，则执行反向与参数更新 ==========
         if is_train:
             self.optimizer.zero_grad()
             loss.backward()
@@ -137,12 +149,18 @@ class Trainer():
 
     def get_input(self, data):
         """
-        将 dataloader 返回的数据 dict 统一转为 Tensor，并拆分出输入与标签。
-        期望输入字典结构：
-            data["image"] : np.ndarray 或 Tensor
-            data["label"] : np.ndarray 或 Tensor
+        从 DataLoader 返回的 data 字典中提取输入与标签。
+
+        预期 data 的结构：
+            data["image"]: np.ndarray 或 torch.Tensor
+            data["label"]: np.ndarray 或 torch.Tensor
+
+        返回：
+            inputs: float32 的图像张量
+            labels: 标签张量（通常为 long 类型）
         """
-        if not isinstance(data["image"], torch.Tensor): # 若是 numpy，则统一转为 torch
+        # 如果 dataloader 返回的是 numpy，则统一转成 torch.Tensor
+        if not isinstance(data["image"], torch.Tensor):
             for k, v in data.items():
                 data[k] = torch.from_numpy(v)
 
@@ -152,35 +170,48 @@ class Trainer():
 
     def train_classifier(self, train_loader, val_loader, test_loader):
         """
-        Train a classifier using epoch 以 epoch 为单位进行分类器训练与评测。
+        以 epoch 为单位训练分类器，并在每个 epoch 后进行验证和（可选）测试。
+
+        参数：
+            train_loader: 训练集 DataLoader
+            val_loader:   验证集 DataLoader
+            test_loader:  测试集 DataLoader（可为 None）
         """
+
+        # ================== 0. 在训练开始前可选地保存一次 prompt（VPT） ==================
         # save the model prompt if required before training 如需保存 “prompt embedding”，在训练开始前保存一次“epoch 0 前”的状态
         self.model.eval()
         self.save_prompt(0)
 
-        # setup training epoch params ---------- 训练超参 ----------
-        total_epoch = self.cfg.SOLVER.TOTAL_EPOCH
-        total_data = len(train_loader)
-        best_epoch = -1
-        best_metric = 0
-        log_interval = self.cfg.SOLVER.LOG_EVERY_N
+        # ================== 1. 一些训练超参数与状态变量 ==================
+        # setup training epoch params
+        total_epoch = self.cfg.SOLVER.TOTAL_EPOCH       # 总 epoch 数
+        total_data = len(train_loader)                  # 每个 epoch 的 batch 数
+        best_epoch = -1                                 # 当前最优 epoch
+        best_metric = 0                                 # 最优指标（比如 top1）
+        log_interval = self.cfg.SOLVER.LOG_EVERY_N      # 每多少个 batch 打一次日志
+
         # 若干计量器（统计平均损失/时间等，便于打印）
-        losses = AverageMeter('Loss', ':.4e')
-        batch_time = AverageMeter('Time', ':6.3f')
-        data_time = AverageMeter('Data', ':6.3f')
-        # 类别权重（用于不均衡数据的损失加权）
+        losses = AverageMeter('Loss', ':.4e')           # - losses: 每个 epoch 内的平均训练损失
+        batch_time = AverageMeter('Time', ':6.3f')      # - batch_time: 每个 batch 的时间
+        data_time = AverageMeter('Data', ':6.3f')       # - data_time: 数据加载时间
+
+        # 从训练集 Dataset 获取类别权重，传给损失函数（应对类分布不平衡）
         self.cls_weights = train_loader.dataset.get_class_weights(
             self.cfg.DATA.CLASS_WEIGHTS_TYPE)
         # logger.info(f"class weights: {self.cls_weights}")
+
+        # 早停用 patience：若验证集 metric 连续若干次不提升就停止
         patience = 0  # if > self.cfg.SOLVER.PATIENCE, stop training 早停计数器；若超过 cfg.SOLVER.PATIENCE 则停止训练
 
-        # ================== 主训练循环（按 epoch） ==================
+        # ================== 2. 主训练循环（按 epoch） ==================
         for epoch in range(total_epoch):
-            # reset averagemeters to measure per-epoch results 每个 epoch 重置平均器
+            # reset averagemeters to measure per-epoch results 每个 epoch 开始前，重置统计量
             losses.reset()
             batch_time.reset()
             data_time.reset()
 
+            # 当前学习率（假设 scheduler 里第一组 lr 代表全局 lr）
             lr = self.scheduler.get_lr()[0]
             logger.info(
                 "Training {} / {} epoch, with learning rate {}".format(
@@ -188,11 +219,12 @@ class Trainer():
                 )
             )
 
-            # Enable training mode 切训练态（启用 Dropout / 更新 BN 统计等）
+            # Enable training mode 切换到训练模式（启用 Dropout / 更新 BN 统计等）
             self.model.train()
 
             end = time.time()
-            # ---------- 遍历一个 epoch 的 batch ----------
+
+            # ---------- 遍历一个 epoch 的所有 batch ----------
             for idx, input_data in enumerate(train_loader):
                 if self.cfg.DBG and idx == 20:
                     # if debugging, only need to see the first few iterations # 调试模式：仅跑前 20 个 batch 以加速
@@ -202,23 +234,27 @@ class Trainer():
                 # logger.info(X.shape)
                 # logger.info(targets.shape)
                 # measure data loading time
-                data_time.update(time.time() - end) # 统计数据加载时间（I/O 与预处理）
+                # 统计数据加载时间
+                data_time.update(time.time() - end)
 
-                train_loss, _ = self.forward_one_batch(X, targets, True)    # 前向 + 反向（训练阶段）
+                # 前向 + （若 is_train=True）反向与优化
+                train_loss, _ = self.forward_one_batch(X, targets, True)
 
+                # 若 forward 返回 -1，说明出现 inf / NaN，直接停止训练
                 if train_loss == -1:
-                    # continue  若出现 nan/inf，被 forward_one_batch 拦截，此处直接返回
                     return None
 
-                losses.update(train_loss.item(), X.shape[0])    # 更新平均损失
+                # 更新本 epoch 的平均损失
+                losses.update(train_loss.item(), X.shape[0])
 
-                # measure elapsed time
-                batch_time.update(time.time() - end)            # 统计一个 batch 的时间
+                # measure elapsed time 统计 batch 处理时间
+                batch_time.update(time.time() - end)
                 end = time.time()
 
                 # log during one batch 每隔 log_interval 个 batch 打印一次训练日志
                 if (idx + 1) % log_interval == 0:
-                    seconds_per_batch = batch_time.val          # 估算剩余时间（本 epoch 剩余 + 后续 epoch）
+                    seconds_per_batch = batch_time.val
+                    # 估算剩余时间（本 epoch 剩余 + 后续 epoch）
                     eta = datetime.timedelta(seconds=int(
                         seconds_per_batch * (total_data - idx - 1) + seconds_per_batch*total_data*(total_epoch-epoch-1)))
                     logger.info(
@@ -244,7 +280,8 @@ class Trainer():
              # 按官方建议：scheduler.step() 应在 optimizer.step() 之后调用
             self.scheduler.step()
 
-            # Enable eval mode ---------- 验证 / 测试 ----------
+            # ================== 3. 验证 / 测试阶段 ==================
+            # 切换到 eval 模式
             self.model.eval()
             # 保存当下 epoch 的 prompt embeddings（如需求与配置指定）
             self.save_prompt(epoch + 1)
@@ -254,8 +291,9 @@ class Trainer():
             # self.eval_classifier(val_loader, "val", epoch == total_epoch - 1) # 验证集评测（prefix="val"）
 
             # 20250902改动：可视化实现，确保拿到最佳 checkpoint 的图
-            # 先评 val（不保存）
+            # -------- 先在 val 上评测 --------
             self.evaluator.update_iteration(epoch)
+            # save=False：验证阶段不需要立即保存 logits
             self.eval_classifier(val_loader, "val", save=False)
 
             # 读取本轮 val 的 top1，判断是否刷新最佳
@@ -263,11 +301,17 @@ class Trainer():
             try:
                 curr_acc = self.evaluator.results[f"epoch_{epoch}"]["classification"][t_name]["top1"]
             except KeyError:
+                # 若指标缺失（可能是评测流程问题），直接返回
                 return
+
             improved = curr_acc > best_metric
-            # 只有刷新最佳时，才在 test 上触发 save=True（从而在 eval_classifier 内部落盘 logits/CLS 等缓存）
+
+            # -------- 如果提供了 test_loader，则在 test 上也做评测 --------
+            # 只有刷新最佳时，才在 test 上触发 save=True
+            # 让 eval_classifier 内部保存 logits / CLS 特征等缓存，用于后续可视化。
             if test_loader is not None:
                 self.eval_classifier(test_loader, "test", save=improved)
+
             # 原来的代码做的是只保存最后一轮，这样容易受早停的影响
             # if test_loader is not None:                                       # 测试集评测（如提供了 test_loader）
             #     self.eval_classifier(test_loader, "test", epoch == total_epoch - 1)
@@ -279,6 +323,8 @@ class Trainer():
             # except KeyError: # 若评测指标缺失（例如数据/流程问题），则直接返回
             #     return
             # --- 早停与最佳记录（保持你的原逻辑不变，但只用刚刚那一次 curr_acc）---
+
+            # ================== 4. 早停逻辑（基于验证集 top1） ==================
             if improved:
                 best_metric = curr_acc
                 best_epoch = epoch + 1
@@ -301,19 +347,27 @@ class Trainer():
     @torch.no_grad()
     def save_prompt(self, epoch):
         """
-        按配置保存（VPT）prompt embeddings，便于后续分析或可视化。
-        保存条件： - cfg.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH 为 True
-                 - 模型类型为 ViT（cfg.MODEL.TYPE == "vit"）
-                 - 迁移方式包含 "prompt"（即使用了提示调优）
-        保存内容： - shallow_prompt : 形状 [1, P, D 或 d]
-                 - deep_prompt    : 若开启 DEEP，则还包含 [L-1, P, D 或 d]
-        保存路径： OUTPUT_DIR/prompt_ep{epoch}.pth
+        将当前模型中的 prompt embeddings 保存到磁盘（只在使用 ViT + prompt 时生效）。
+
+        条件：
+            - cfg.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH 为 True
+            - cfg.MODEL.TYPE == "vit"
+            - "prompt" in cfg.MODEL.TRANSFER_TYPE（即启用了 prompt tuning）
+
+        保存内容：
+            - "shallow_prompt": 浅层 prompt（前置 prompt），形状 [1, P, D 或 d]
+            - "deep_prompt": 若 PROMPT.DEEP=True，则再保存每层 deep prompt，形状 [L-1, P, D 或 d]
+
+        文件名：
+            OUTPUT_DIR/prompt_ep{epoch}.pth
         """
         # only save the prompt embed if below conditions are satisfied
         if self.cfg.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH:
             if self.cfg.MODEL.TYPE == "vit" and "prompt" in self.cfg.MODEL.TRANSFER_TYPE:
+                # ViT 封装里，prompt_embeddings 挂在 self.model.enc.transformer 上
                 prompt_embds = self.model.enc.transformer.prompt_embeddings.cpu().numpy()
                 out = {"shallow_prompt": prompt_embds}
+                # 如果开启 deep prompt，也一并保存
                 if self.cfg.MODEL.PROMPT.DEEP:
                     deep_embds = self.model.enc.transformer.deep_prompt_embeddings.cpu().numpy()
                     out["deep_prompt"] = deep_embds
@@ -323,11 +377,14 @@ class Trainer():
     @torch.no_grad()
     def eval_classifier(self, data_loader, prefix, save=False):
         """
-        evaluate classifier
-        在给定数据集上进行评测（不计算梯度）。
-        参数：data_loader : 验证/测试集的 DataLoader
-             prefix      : "val" 或 "test"（用于日志前缀与结果键名）
-             save        : 若为 True 且开启 SAVE_CKPT，则保存 logits 与 targets"""
+        在给定 data_loader（验证/测试集）上评估分类性能。
+
+        参数：
+            data_loader: DataLoader（val 或 test）
+            prefix: 字符串前缀，用于标识当前评测类型（"val" 或 "test"）
+            save: 若 True 且 cfg.MODEL.SAVE_CKPT=True，则保存 logits 与 targets，
+                  并在 test 阶段额外缓存 CLS 特征用于 t-SNE 可视化。
+        """
         batch_time = AverageMeter('Time', ':6.3f')
         data_time = AverageMeter('Data', ':6.3f')
         losses = AverageMeter('Loss', ':.4e')
@@ -340,23 +397,27 @@ class Trainer():
         total_logits = []
         total_targets = []
 
+        # ========== 遍历整个数据集 ==========
         for idx, input_data in enumerate(data_loader):
             end = time.time()
             X, targets = self.get_input(input_data)
-            # measure data loading time 统计数据时间
+
+            # 统计数据加载时间
             data_time.update(time.time() - end)
 
             if self.cfg.DBG:
                 logger.info("during eval: {}".format(X.shape))
-            # 前向（评测阶段）：不做反向
+
+            # 评测阶段：is_train=False → forward_one_batch 只做前向与 loss 计算
             loss, outputs = self.forward_one_batch(X, targets, False)
-            if loss == -1:
+            if loss == -1:                # 出现 inf / NaN 时，直接停止
                 return
             losses.update(loss, X.shape[0])
 
-            # measure elapsed time 统计 batch 时间
+            # 统计 batch 时间
             batch_time.update(time.time() - end)
-            # 间隔打印
+
+            # 周期性打印测试过程日志
             if (idx + 1) % log_interval == 0:
                 logger.info(
                     "\tTest {}/{}. loss: {:.3f}, {:.4f} s / batch. (data: {:.2e})".format(  # noqa
@@ -368,28 +429,33 @@ class Trainer():
                     ) + "max mem: {:.5f} GB ".format(gpu_mem_usage())
                 )
 
-            # targets: List[int] 收集标签与 logits，targets 为 Tensor，这里转为 python 列表（int）
+            # targets: Tensor → Python list[int]
             total_targets.extend(list(targets.numpy()))
+            # outputs: logits Tensor，先收集，最后再 cat
             total_logits.append(outputs)
-        # 评测阶段总体日志
+
+        # 整体评测日志
         logger.info(
             f"Inference ({prefix}):"
             + "avg data time: {:.2e}, avg batch time: {:.4f}, ".format(
                 data_time.avg, batch_time.avg)
             + "average loss: {:.4f}".format(losses.avg))
-        # 若模型使用了 sidetune 分支，额外打印融合系数 alpha
+
+        # 若模型使用了 side-tuning 分支，额外打印融合系数 alpha
         if self.model.side is not None:
             logger.info(
                 "--> side tuning alpha = {:.4f}".format(self.model.side_alpha))
-        # total_testimages x num_classes 拼接得到 (num_samples, num_classes) 的 logits
+
+        # 拼接得到 (num_samples, num_classes) 的 logits 矩阵
         joint_logits = torch.cat(total_logits, dim=0).cpu().numpy()
-        # 调用 evaluator 计算分类指标（会根据 cfg.DATA.MULTILABEL 走单/多标签分支）
+
+        # 调用 evaluator 计算分类指标（内部会根据 DATA.MULTILABEL 处理单/多标签场景）
         self.evaluator.classify(
             joint_logits, total_targets,
             test_name, self.cfg.DATA.MULTILABEL,
         )
 
-        # save the probs and targets （可选）保存 logits 与 targets 便于后处理/分析
+        # ========== 若需要，则保存 logits 与 targets 到文件中 ==========
         if save and self.cfg.MODEL.SAVE_CKPT:
             # 1) 已有
             out = {"targets": total_targets, "joint_logits": joint_logits}
@@ -397,20 +463,23 @@ class Trainer():
             torch.save(out, out_path)
             logger.info(f"Saved logits and targets for {test_name} at {out_path}")
 
+        # ========== 若是 test 阶段且 save=True，则额外缓存 CLS 特征用于 t-SNE ==========
         if save and prefix == "test":
             os.makedirs(os.path.join(self.cfg.OUTPUT_DIR, "cache"), exist_ok=True)
             cache_dir = os.path.join(self.cfg.OUTPUT_DIR, "cache")
 
-            # 1) CLS 特征（每类最多 100，避免样本过多）
+            # 1) 提取 CLS 特征（每类最多取 100 个样本，以免太大）
             X_cls, y = extract_features(
                 self.model, data_loader, self.device,
                 feat_type="cls", max_per_class=100
             )
             np.savez_compressed(
                 os.path.join(cache_dir, f"{test_name}_cls.npz"),
-                X=X_cls.astype("float32"), y=y, meta=dict(type="cls")
+                X=X_cls.astype("float32"),      # CLS 特征
+                y=y,                            # 对应标签
+                meta=dict(type="cls")           # 元信息
             )
 
             logger.info(f"[t-SNE cache] saved CLS features to {cache_dir}")
-        # === 结束 ===
+        # === eval_classifier 结束 ===
 

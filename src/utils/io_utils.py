@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 a bunch of helper functions for read and write data
+JSON & 图像读写辅助
 """
 import os
 import json
