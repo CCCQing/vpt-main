@@ -35,7 +35,8 @@ class PromptedTransformer(Transformer):
       - INITIATION == "random"（随机初始化）
       - 不启用 Deep-Shared / 指定层数的 deep prompt（NUM_DEEP_LAYERS is None 且 not DEEP_SHARED）
     """
-    def __init__(self, prompt_config, config, img_size, vis):
+
+    def __init__(self, prompt_config, config, img_size, vis, prompt_init=None, prompt_init_provider=None):
         # 该实现的假设：只支持“prepend”与“random”初始化；不支持 deep-shared/局部层数选择
         assert prompt_config.LOCATION == "prepend"  # 只支持前置提示（插在 CLS 后、patch 前）
         assert prompt_config.INITIATION == "random" # 提示向量随机初始化（Xavier 风格区间）
@@ -78,6 +79,9 @@ class PromptedTransformer(Transformer):
             prompt_dim = config.hidden_size  # prompt 已经是 D 维，不用投影
             self.prompt_proj = nn.Identity()
 
+        # runtime prompt provider (e.g., pre-ViT prompt distribution)
+        self.prompt_init_provider = prompt_init_provider
+
         # initiate prompt:
         # ====== 初始化提示 token 参数 ====== 让Prompt的数值尺度和“图像 patch 的嵌入”同量级,做一个上下界
         if self.prompt_config.INITIATION == "random":
@@ -92,8 +96,12 @@ class PromptedTransformer(Transformer):
             # 初始化前置 prompt
             # 前置提示：形状 (1, n_prompt, prompt_dim)，前向时会 expand 到 (B, n_prompt, prompt_dim)
             self.prompt_embeddings = nn.Parameter(torch.zeros(1, num_tokens, prompt_dim))
-            # xavier_uniform initialization
-            nn.init.uniform_(self.prompt_embeddings.data, -val, val)
+
+            # xavier_uniform initialization or external seed
+            if prompt_init is None:
+                nn.init.uniform_(self.prompt_embeddings.data, -val, val)
+            else:
+                self._seed_prompt(prompt_init, prompt_dim)
 
             # 初始化 deep prompt
             # Deep Prompt（若开启 Deep Prompt，会为每个中间层准备一组提示向量 token）：每个中间层再有一份 (P, d) 的提示向量，前向里会逐层替换那段 prompt
@@ -114,18 +122,42 @@ class PromptedTransformer(Transformer):
         输入：
           x: 原始图像张量 (B, C, H, W)
         流程：
-          1) self.embeddings(x) -> (B, 1 + N, D)，含 CLS + 全部 patch 的嵌入
-          2) 在 CLS 后插入 n_prompt 个提示 token（先过投影 + dropout）
-          3) 得到 (B, 1 + n_prompt + N, D)
+          1) 提取不带 CLS/位置编码的 patch tokens: V_raw [B, N, D]
+          2) 由 prompt_init_provider(V_raw) 生成提示，或使用已有 prompt 参数
+          3) 重新构造 [CLS|V_raw]+pos，随后在 CLS 后插入提示，得到 (B, 1 + n_prompt + N, D)
         """
-        # combine prompt embeddings with image-patch embeddings
+
         B = x.shape[0]
-        # after CLS token, all before image patches    # 先做标准 ViT 的 embeddings（包含 cls_token + pos_embed + patch_embed）
-        x = self.embeddings(x)  # (batch_size, 1 + n_patches, hidden_dim) # (B, 1 + n_patches, hidden_dim)
+
+        # 先拿到纯 patch 嵌入（无 CLS/pos）：V_raw
+        patch_tokens = self.embeddings.forward_patches(x)  # (B, n_patches, hidden_dim)
+
+        # 如果提供了运行时的 prompt_init_provider，则在每个 batch 里
+        # 基于当前的 V_raw 生成提示 token，用作“初始化后的”提示。
+        if self.prompt_init_provider is not None:
+            prompt_tokens = self.prompt_init_provider(patch_tokens)
+            if prompt_tokens.dim() == 2:
+                prompt_tokens = prompt_tokens.unsqueeze(0)
+            if prompt_tokens.shape[1] != self.num_tokens:
+                raise ValueError(
+                    f"prompt_init_provider returned shape {prompt_tokens.shape}, expected num_tokens={self.num_tokens}"
+                )
+            if prompt_tokens.shape[0] == 1 and B > 1:
+                prompt_tokens = prompt_tokens.expand(B, -1, -1)
+            elif prompt_tokens.shape[0] != B:
+                raise ValueError(
+                    f"prompt_init_provider batch {prompt_tokens.shape[0]} incompatible with input batch {B}"
+                )
+        else:
+            prompt_tokens = self.prompt_embeddings
+
+        # 重建带 CLS/位置编码的主序列
+        x = self.embeddings.add_cls_and_pos(patch_tokens)  # (B, 1 + n_patches, hidden_dim)
+
         # 拼接： [CLS] + [PROMPT * n] + [PATCH * N]
         x = torch.cat((
                 x[:, :1, :],    # 只取 CLS
-                self.prompt_dropout(self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)),
+                self.prompt_dropout(self.prompt_proj(prompt_tokens).expand(B, -1, -1)),
                 x[:, 1:, :]     # 全部 patch token
             ), dim=1)
         # (batch_size, cls_token + n_prompt + n_patches, hidden_dim) 最终形状: (B, 1 + n_prompt + n_patches, hidden_dim)
@@ -148,6 +180,8 @@ class PromptedTransformer(Transformer):
             self.embeddings.eval()
             self.prompt_proj.train()
             self.prompt_dropout.train()
+            if isinstance(self.prompt_init_provider, torch.nn.Module):
+                self.prompt_init_provider.train(mode)
         else:
             # eval: 评估期：统一按 mode 设置
             for module in self.children():
@@ -197,7 +231,6 @@ class PromptedTransformer(Transformer):
           - 返回编码后的序列与可选的注意力权重（由 vis 决定）
         """
         # 1) prepend prompt 并入前置提示
-        # this is the default version:
         embedding_output = self.incorporate_prompt(x)
         # 2) deep prompt（可选）
         if self.prompt_config.DEEP:
@@ -208,6 +241,19 @@ class PromptedTransformer(Transformer):
 
         return encoded, attn_weights
 
+    def _seed_prompt(self, prompt_init, prompt_dim):
+        """Use external prompt_init tensor to seed prompt embeddings."""
+        init = prompt_init.detach()
+        if init.dim() == 2:
+            init = init.unsqueeze(0)
+        if init.shape[1:] != (self.num_tokens, prompt_dim):
+            raise ValueError(
+                f"prompt_init has shape {init.shape}, expected (1, {self.num_tokens}, {prompt_dim})"
+            )
+        with torch.no_grad():
+            self.prompt_embeddings.copy_(init)
+
+
 
 class PromptedVisionTransformer(VisionTransformer):
     """
@@ -215,8 +261,7 @@ class PromptedVisionTransformer(VisionTransformer):
     - 复用原有 forward 接口/分类头写法（取 CLS 后线性分类）；
     - 仅改变编码阶段（加入提示 token），其余训练/评测流程不受影响。
     """
-    def __init__(self, prompt_cfg, model_type,img_size=224, num_classes=21843, vis=False):
-        # 当前实现只支持原生的 CLS 池化方式（original）
+    def __init__(self, prompt_cfg, model_type,img_size=224, num_classes=21843, vis=False, prompt_init=None, prompt_init_provider=None):        # 当前实现只支持原生的 CLS 池化方式（original）
         assert prompt_cfg.VIT_POOL_TYPE == "original"
         # 先按普通 ViT 初始化（构造 embeddings、head 等）
         super(PromptedVisionTransformer, self).__init__(
@@ -228,7 +273,10 @@ class PromptedVisionTransformer(VisionTransformer):
         # 取出结构规格（如 hidden_size、层数、patch 大小等）
         vit_cfg = CONFIGS[model_type]
         # 核心替换：把内部的 transformer 用“带 Prompt 的”版本替换
-        self.transformer = PromptedTransformer(prompt_cfg, vit_cfg, img_size, vis)
+        self.transformer = PromptedTransformer(
+            prompt_cfg, vit_cfg, img_size, vis,
+            prompt_init=prompt_init, prompt_init_provider=prompt_init_provider,
+        )
 
     def forward(self, x, vis=False):
         """

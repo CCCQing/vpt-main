@@ -436,7 +436,7 @@ def _build_swin_model(model_type, crop_size, model_root):
 # 10.27 加入fusion_cfg=None
 # def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, model_root=None, adapter_cfg=None, load_pretrain=True, vis=False):
 def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, fusion_cfg=None, model_root=None, adapter_cfg=None,
-                             load_pretrain=True, vis=False):
+                             load_pretrain=True, vis=False, prompt_init=None, prompt_init_provider=None):
     """
     构建“监督预训练”的 ViT 及其 Prompt/Adapter 变体，并按需加载 .npz 权重。
 
@@ -449,6 +449,12 @@ def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, fusion_cfg=None
         adapter_cfg  : Adapter 设置（不为 None 则构建 ADPT_VisionTransformer）
         load_pretrain: 是否从 .npz 加载监督预训练权重
         vis          : 可视化/调试标志（向下透传给骨干）
+
+        prompt_init  : （可选）外部提供的 prompt 初始化张量，形状应为
+                        (1, prompt_len, hidden_size)
+        prompt_init_provider: （可选）可调用对象，返回 prompt_init，用于
+                        在 build 阶段一次性从分布生成初始化（例如使用
+                        PreViTPromptDistributor）。仅当 prompt_init 为 None 时生效。
     返回：
         model        : 已构建（并可能加载了权重）的骨干（head 已经是 identity）
         feat_dim     : backbone 的输出特征维度（供上层 MLP 使用）
@@ -469,10 +475,14 @@ def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, fusion_cfg=None
     }
     # 选择具体骨干：Prompt > Adapter > 原生 ViT
     # if prompt_cfg is not None:
+    if prompt_init is None and prompt_init_provider is not None:
+        prompt_init = prompt_init_provider()
+
     if prompt_cfg is not None:
         model = PromptedVisionTransformer(
             prompt_cfg, model_type,
-            crop_size, num_classes=-1, vis=vis
+            crop_size, num_classes=-1, vis=vis,
+            prompt_init=prompt_init, prompt_init_provider=prompt_init_provider,
         )
     elif adapter_cfg is not None:
         model = ADPT_VisionTransformer(model_type, crop_size, num_classes=-1, adapter_cfg=adapter_cfg)

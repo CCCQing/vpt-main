@@ -106,13 +106,32 @@ class Attention(nn.Module):
         x = x.view(*new_x_shape)    # [B, N, h, d_k]
         return x.permute(0, 2, 1, 3)    # -> [B, h, N, d_k]
 
-    def forward(self, hidden_states):
+# ----------------11.17日更换函数名：构造亲和--------------------------------------------
+#    def forward(self, hidden_states):
+# ----------------11.17日更换函数名结束--------------------------------------------
+    def _project_qkv(self, hidden_states):
         """
-        输入：hidden_states，形状 [B, N, D]，N=1+num_patches（包含 cls token）
-        返回：attention_output [B, N, D]，以及可选的注意力权重 weights
+        对整段序列一次性做 Q/K/V 线性映射，并且直接变形为多头形式。
+
+        设计目的：
+        - 原来的 forward 每次都单独调用 query/key/value 三个 Linear；
+        - 现在把这一步封装出来，后续可以在“正常注意力”和“亲和矩阵构造”
+          两条分支中复用同一份 q/k/v，避免重复计算线性层。
+
+        输入:
+            hidden_states: [B, N, D]，其中 N = 1 + L_p + L_v
+                一般约定:
+                - 第 0 个 token 是 CLS
+                - 后面若干 token 是 prompt（长度为 prompt_length）
+                - 剩余 token 是视觉 patch
+
+        输出:
+            query_layer: [B, h, N, d_k]
+            key_layer:   [B, h, N, d_k]
+            value_layer: [B, h, N, d_k]
         """
         # 线性映射到 Q/K/V，维度仍为 D
-        mixed_query_layer = self.query(hidden_states) # B, num_patches, head_size*num_head # [B, N, D] -> [B, N, h*d_k]
+        mixed_query_layer = self.query(hidden_states)
         mixed_key_layer = self.key(hidden_states)
         mixed_value_layer = self.value(hidden_states)
 
@@ -121,15 +140,37 @@ class Attention(nn.Module):
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer) # B, num_head, num_patches, head_size
 
-        # 注意力权重：Q * K^T / sqrt(d_k) -> [B, h, N, N]
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2)) # B, num_head, num_patches, num_patches
+        return query_layer, key_layer, value_layer
+
+    def _scaled_attention(self, query_layer, key_layer, value_layer):
+        """
+        缩放点积注意力的核心计算部分。
+
+        输入:
+            query_layer: [B, h, N, d_k]
+            key_layer:   [B, h, N, d_k]
+            value_layer: [B, h, N, d_k]
+
+        步骤:
+            1) 计算未归一化注意力 logits: Q * K^T / sqrt(d_k)
+            2) softmax 行归一化 -> attention_probs
+            3) Dropout
+            4) 加权求和: Attn * V
+            5) 合并多头 -> [B, N, D]
+            6) 输出线性层 self.out + proj_dropout
+
+        返回:
+            attention_output: [B, N, D]
+            weights: [B, h, N, N] 或 None（仅在 vis=True 时保留，用于可视化）
+        """
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+
         attention_probs = self.softmax(attention_scores) # B, num_head, num_patches(query), num_patches(key) # 行归一化
         weights = attention_probs if self.vis else None     # 用于可视化
         attention_probs = self.attn_dropout(attention_probs)
 
-        # 上下文：Attn * V -> [B, h, N, d_k] -> [B, N, h*d_k]
-        context_layer = torch.matmul(attention_probs, value_layer) # B, num_head, num_patches, head_size    # [B, h, N, d_k]
+        context_layer = torch.matmul(attention_probs, value_layer)
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()  # [B, N, h, d_k]
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,) # [B, N, D]
         context_layer = context_layer.view(*new_context_layer_shape)
@@ -138,6 +179,113 @@ class Attention(nn.Module):
         attention_output = self.out(context_layer)  # [B, N, D]
         attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
+
+    def forward(self, hidden_states):
+        """
+        常规前向：
+        - 仅返回注意力后的输出和（可选）注意力权重；
+        - 不暴露 q/k，用于绝大多数训练/推理场景。
+        """
+        query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
+        return self._scaled_attention(query_layer, key_layer, value_layer)
+
+    def forward_with_projections(self, hidden_states):
+        """
+        拓展版前向：
+        - 与 forward 完全共享 Q/K/V 投影与注意力计算的逻辑；
+        - 额外返回多头形式的 q_proj / k_proj，便于后续构造 QQ / KK 亲和矩阵。
+
+        使用场景：
+        - 你想在保持 ViT 正常前向的同时，“窥视”这一层的几何结构（q/k），
+          用来自构 App / Avv / Apv 等亲和并做额外的损失。
+        """
+        query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
+        attention_output, weights = self._scaled_attention(query_layer, key_layer, value_layer)
+        return attention_output, weights, query_layer, key_layer
+
+    def compute_affinity(self, query_layer, key_layer, prompt_length, mode="qq", *,
+                         return_cross=False, normalize=True, detach=True):
+        """
+        使用（通常是被冻结的）W_q/W_k 投影后的 q/k，按 CLS | prompt | patch 切分，
+        构造提示段/视觉段内部及（可选）prompt→patch 的亲和矩阵。
+
+        参数:
+            query_layer / key_layer:
+                - 形状 [B, h, N, d_k]，来自 forward_with_projections 的输出
+                - 一般使用同一层的 q/k，这保证亲和与该层注意力共享几何基底
+            prompt_length:
+                - prompt token 的数量 L_p（不含 CLS）
+                - 序列结构假设为：
+                    index 0: CLS
+                    index 1..L_p: prompt token
+                    index 1+L_p..: patch token
+            mode:
+                - "qq": 使用 q 计算 self-similarity (Q Q^T)
+                - "kk": 使用 k 计算 self-similarity (K K^T)
+            return_cross:
+                - 若为 True，同时返回 Apv（prompt→patch）亲和矩阵
+            normalize:
+                - True: 在最后一维上做 softmax，得到“注意力风格”的亲和（行归一）
+                - False: 返回未归一化的相似度矩阵（可用于自定义归一/温度）
+            detach:
+                - True: 对用于构亲和的 q/k 调用 .detach()
+                    -> 亲和损失仅作为几何约束，不会对 W_q/W_k 产生梯度
+                - False: 允许亲和损失反向到 W_q/W_k（例如最后几层微调）
+
+        返回:
+            affinities: dict，键包括:
+                - "App": [B, h, L_p, L_p]，prompt 内自亲和
+                - "Avv": [B, h, L_v, L_v]，patch 内自亲和
+                - "Apv": [B, h, L_p, L_v]，prompt→patch 亲和（可选）
+        """
+        if mode not in {"qq", "kk"}:
+            raise ValueError(f"Unsupported affinity mode: {mode}")
+
+        # 选择使用 q 还是 k 作为特征基底
+        base = query_layer if mode == "qq" else key_layer
+        if detach:
+            base = base.detach()
+
+        # 基本长度检查，防止切片越界
+        if base.size(2) < 1 + prompt_length:
+            raise ValueError(
+                f"Sequence length {base.size(2)} is insufficient for prompt_length={prompt_length} (needs >= {1 + prompt_length})."
+            )
+
+        # token 维度切分：
+        # [0]            -> CLS
+        # [1 : 1+Lp]     -> prompt 段
+        # [1+Lp : end]   -> patch 段
+        cls_offset = 1
+        prompt_slice = slice(cls_offset, cls_offset + prompt_length)
+        patch_slice = slice(cls_offset + prompt_length, None)
+
+        # base: [B, h, N, d_k]
+        prompt_tokens = base[:, :, prompt_slice, :]
+        patch_tokens = base[:, :, patch_slice, :]
+        scale = 1.0 / math.sqrt(self.attention_head_size)
+
+        affinities = {}
+
+        # 提示段内部自亲和 App（若存在 prompt）
+        if prompt_tokens.numel() > 0:
+            # [B, h, L_p, d_k] @ [B, h, d_k, L_p] -> [B, h, L_p, L_p]
+            app = torch.matmul(prompt_tokens, prompt_tokens.transpose(-1, -2)) * scale
+            affinities["App"] = self.softmax(app) if normalize else app
+
+        # 视觉 patch 段内部自亲和 Avv
+        if patch_tokens.numel() > 0:
+            # [B, h, L_v, d_k] @ [B, h, d_k, L_v] -> [B, h, L_v, L_v]
+            avv = torch.matmul(patch_tokens, patch_tokens.transpose(-1, -2)) * scale
+            affinities["Avv"] = self.softmax(avv) if normalize else avv
+
+        # prompt→patch 的交叉亲和 Apv（可选）
+        if return_cross and prompt_tokens.numel() > 0 and patch_tokens.numel() > 0:
+            # [B, h, L_p, d_k] @ [B, h, d_k, L_v] -> [B, h, L_p, L_v]
+            apv = torch.matmul(prompt_tokens, patch_tokens.transpose(-1, -2)) * scale
+            affinities["Apv"] = self.softmax(apv) if normalize else apv
+
+        return affinities
 
 
 class Mlp(nn.Module):
@@ -215,24 +363,44 @@ class Embeddings(nn.Module):
 
         self.dropout = Dropout(config.transformer["dropout_rate"])
 
-    def forward(self, x):
+    def forward_patches(self, x: torch.Tensor) -> torch.Tensor:
         """
+        仅计算 patch 的嵌入，不加入 CLS 也不加位置编码。
         输入：x [B, C, H, W]
-        输出：embeddings [B, 1+N, D]
+        输出：patch_tokens [B, N, D]
         """
-        B = x.shape[0]
-        cls_tokens = self.cls_token.expand(B, -1, -1)   # [B, 1, D]
+
 
         if self.hybrid:
             x = self.hybrid_model(x)    # 先经过 ResNetV2
         x = self.patch_embeddings(x)    # 划分 patch 并升维到 D，形状 [B, D, H', W']
         x = x.flatten(2)                # -> [B, D, N]
-        x = x.transpose(-1, -2)         # -> [B, N, D]
-        x = torch.cat((cls_tokens, x), dim=1)   # 拼接 [CLS] -> [B, 1+N, D]
+        patch_tokens = x.transpose(-1, -2)         # -> [B, N, D]
+        return patch_tokens
+
+    def add_cls_and_pos(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+        """
+        在 patch tokens 前追加 CLS，并加上位置编码与 dropout。
+
+        输入：patch_tokens [B, N, D]
+        输出：embeddings [B, 1+N, D]
+        """
+        B = patch_tokens.shape[0]
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, D]
+        x = torch.cat((cls_tokens, patch_tokens), dim=1)  # 拼接 [CLS] -> [B, 1+N, D]
 
         embeddings = x + self.position_embeddings   # 加位置编码
         embeddings = self.dropout(embeddings)
         return embeddings
+
+    def forward(self, x):
+        """
+        输入：x [B, C, H, W]
+        输出：embeddings [B, 1+N, D]
+        """
+        patches = self.forward_patches(x)
+        return self.add_cls_and_pos(patches)
+
 
 
 class Block(nn.Module):
@@ -262,6 +430,67 @@ class Block(nn.Module):
         x = self.ffn(x)             # MLP: D→H→D
         x = x + h                   # 残差相加
         return x, weights
+
+    def forward_with_affinity(self, x, affinity_config):
+        """
+        带亲和矩阵输出的前向：
+
+        主干逻辑：
+            - 与标准 forward 完全一致：
+                h = x
+                x_norm = LN1(x)
+                x_attn = Attn(x_norm)
+                x = x_attn + h
+                h = x
+                x = LN2(x)
+                x_ffn = MLP(x)
+                x = x_ffn + h
+
+        额外逻辑：
+            - 在注意力部分，通过 forward_with_projections 一次性拿到 q_proj/k_proj；
+            - 使用 compute_affinity 在同一层的 Q/K 上构造 App/Avv(/Apv)；
+            - 将该层的亲和 dict 返回给上级 Encoder 统一收集。
+
+        affinity_config: dict，支持字段：
+            - "prompt_length": int，prompt token 数量 L_p
+            - "mode": "qq" 或 "kk"（决定使用 Q 还是 K）
+            - "return_cross": bool，是否额外返回 Apv
+            - "normalize": bool，是否 softmax 归一
+            - "detach": bool，是否在构亲和前对 q/k detach
+
+        返回:
+            x:          [B, N, D]，本层输出
+            weights:    注意力权重（仅 vis=True 时非 None）
+            affinities: dict，包含 App/Avv(/Apv)
+        """
+        # --- 注意力分支 + 残差 ---
+        h = x
+        x_norm = self.attention_norm(x)
+        # 同时拿到 MHSA 输出 + 多头形式的 q_proj / k_proj
+        x, weights, q_proj, k_proj = self.attn.forward_with_projections(x_norm)
+        x = x + h
+
+        # --- FFN 分支 + 残差 ---
+        h = x
+        x = self.ffn_norm(x)
+        x = self.ffn(x)
+        x = x + h
+
+        # --- 基于 Q/K 计算 prompt/patch 亲和 ---
+        affinities = self.attn.compute_affinity(
+            q_proj,
+            k_proj,
+            affinity_config.get("prompt_length", 0),
+            mode=affinity_config.get("mode", "qq"),
+            return_cross=affinity_config.get("return_cross", False),
+            normalize=affinity_config.get("normalize", True),
+            detach=affinity_config.get("detach", True),
+        )
+
+        return x, weights, affinities
+
+
+
 
     def load_from(self, weights, n_block):
         """从预训练权重字典中加载当前 block 的参数（处理维度与键名）。"""
@@ -326,6 +555,40 @@ class Encoder(nn.Module):
         encoded = self.encoder_norm(hidden_states)  # 对最后一层输出再做一次 LayerNorm，得到 encoded
         return encoded, attn_weights
 
+    def forward_with_affinity(self, hidden_states, affinity_config):
+        """
+        与标准 Encoder.forward 类似，但在遍历每一层 Block 时，
+        额外收集该层的 prompt/patch 亲和矩阵。
+
+        设计目的：
+            - 你可以得到:
+                - encoder_norm 之后的最终输出 encoded
+                - 每层 MHSA 的注意力权重 attn_weights（若 vis=True）
+                - 每层基于 W_q/W_k 的几何亲和信息 affinities
+            - 方便在外层做：
+                - 按层的 QQ/KK 消融（看哪几层几何更有用）
+                - 三元一致 / 蒸馏 / 校准 等损失的分层设计
+
+        输入:
+            hidden_states: [B, N, D]，embedding 输出（含 CLS + prompt + patch）
+            affinity_config: dict，同 Block.forward_with_affinity
+
+        返回:
+            encoded:     [B, N, D]，末端 LN 后的输出
+            attn_weights: list，长度 = num_layers（视 vis 而定）
+            affinities:   list，长度 = num_layers，每个元素是 dict(App/Avv/Apv)
+        """
+        attn_weights = []
+        affinities = []
+        for layer_block in self.layer:
+            hidden_states, weights, affinity = layer_block.forward_with_affinity(hidden_states, affinity_config)
+            if self.vis:
+                attn_weights.append(weights)
+            affinities.append(affinity)
+        encoded = self.encoder_norm(hidden_states)
+        return encoded, attn_weights, affinities
+
+
     def forward_cls_layerwise(self, hidden_states):
         """
         返回“逐层 CLS 向量”：
@@ -368,7 +631,28 @@ class Transformer(nn.Module):
 
         encoded, attn_weights = self.encoder(embedding_output)
         return encoded, attn_weights
-    
+
+
+    def forward_with_affinity(self, input_ids, affinity_config):
+        """
+        与标准 forward 类似，但返回“带亲和”的版本：
+
+        步骤:
+            1) Embeddings: x -> [CLS | prompt | patch] + pos_embed
+            2) Encoder.forward_with_affinity:
+                - 得到 encoded（末端 LN）
+                - attn_weights: 每层 MHSA 的 attention map（可选）
+                - affinities:   每层 App/Avv(/Apv) 亲和字典
+
+        返回:
+            encoded:   [B, N, D]
+            attn_weights: list
+            affinities:   list[dict]
+        """
+        embedding_output = self.embeddings(input_ids)
+        encoded, attn_weights, affinities = self.encoder.forward_with_affinity(embedding_output, affinity_config)
+        return encoded, attn_weights, affinities
+
     def forward_cls_layerwise(self, input_ids):
         """逐层返回 CLS 表征。"""
         embedding_output = self.embeddings(input_ids)
@@ -403,7 +687,39 @@ class VisionTransformer(nn.Module):
         if not vis:
             return logits
         return logits, attn_weights # attn_weights: num_layers, B, num_head, num_patches, num_patches [num_layers, B, h, N, N]
-    
+
+    def forward_with_affinity(self, x, affinity_config, vis=False):
+        """
+        顶层带亲和输出的前向接口：
+
+        输入:
+            x: [B, 3, H, W] 原始图像
+            affinity_config: dict，穿透传递给 Transformer / Encoder / Block
+            vis: 是否同时返回注意力权重（保持与原 forward 一致的开关语义）
+
+        步骤:
+            1) x -> Transformer.forward_with_affinity:
+                得到:
+                    - 序列输出 x_seq: [B, 1+N, D]
+                    - attn_weights:  每层 MHSA 权重（可选）
+                    - affinities:    每层 App/Avv(/Apv) 亲和字典
+            2) 分类头:
+                用 CLS token 的表征 x_seq[:, 0] 做线性分类
+
+        返回:
+            若 vis=False:
+                logits, affinities
+            若 vis=True:
+                logits, attn_weights, affinities
+        """
+        x, attn_weights, affinities = self.transformer.forward_with_affinity(x, affinity_config)
+        logits = self.head(x[:, 0])
+
+        if not vis:
+            return logits, affinities
+        return logits, attn_weights, affinities
+
+
     def forward_cls_layerwise(self, x):
         """返回每层 CLS 表征序列（便于可视化/诊断）。依次拿到“输入 embeddings 的 CLS、每层输出的 CLS、末端 LN 后的 CLS”"""
         cls_embeds = self.transformer.forward_cls_layerwise(x)
