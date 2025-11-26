@@ -1,0 +1,211 @@
+[11/26 15:41:44][INFO] visual_prompt:  174: Rank of current process: 0. World size: 1
+[11/26 15:41:44][INFO] visual_prompt:  175: Environment info:
+-------------------  -----------------------------------------------------------------------------------------------
+Python               3.7.12 | packaged by conda-forge | (default, Oct 26 2021, 05:35:01) [MSC v.1916 64 bit (AMD64)]
+ENV_MODULE           <not set>
+PyTorch              1.7.1
+PyTorch Debug Build  False
+CUDA available       True
+CUDA ID              (not set) -> detected GPUs: 0
+GPU 0                NVIDIA GeForce RTX 4080 SUPER
+Pillow               9.2.0
+-------------------  -----------------------------------------------------------------------------------------------
+PyTorch built with:
+  - C++ Version: 199711
+  - MSVC 192729112
+  - Intel(R) Math Kernel Library Version 2020.0.0 Product Build 20191125 for Intel(R) 64 architecture applications
+  - Intel(R) MKL-DNN v1.6.0 (Git Hash 5ef631a030a6f73131c77892041042805a06064f)
+  - OpenMP 2019
+  - CPU capability usage: AVX2
+  - CUDA Runtime 11.0
+  - NVCC architecture flags: -gencode;arch=compute_37,code=sm_37;-gencode;arch=compute_50,code=sm_50;-gencode;arch=compute_60,code=sm_60;-gencode;arch=compute_61,code=sm_61;-gencode;arch=compute_70,code=sm_70;-gencode;arch=compute_75,code=sm_75;-gencode;arch=compute_80,code=sm_80;-gencode;arch=compute_37,code=compute_37
+  - CuDNN 8.0.4
+  - Magma 2.5.4
+  - Build settings: BLAS=MKL, BUILD_TYPE=Release, CXX_FLAGS=/DWIN32 /D_WINDOWS /GR /EHsc /w /bigobj -openmp:experimental -DNDEBUG -DUSE_FBGEMM -DUSE_VULKAN_WRAPPER, PERF_WITH_AVX=1, PERF_WITH_AVX2=1, PERF_WITH_AVX512=1, USE_CUDA=ON, USE_EXCEPTION_PTR=1, USE_GFLAGS=OFF, USE_GLOG=OFF, USE_MKL=ON, USE_MKLDNN=ON, USE_MPI=OFF, USE_NCCL=OFF, USE_NNPACK=OFF, USE_OPENMP=ON, 
+
+[11/26 15:41:44][INFO] visual_prompt:  177: Command line arguments: Namespace(config_file='configs/prompt/cub.yaml', opts=['SEED', '1'], train_type='')
+[11/26 15:41:44][INFO] visual_prompt:  184: Contents of args.config_file=configs/prompt/cub.yaml:
+# _BASE_: "../TEST/run_json_dataset_demo.yaml"
+# Consolidated dataset/demo settings (migrated from TEST/run_json_dataset_demo.yaml)
+#  DATA_ROOT: 'D:/postgraduate1/project/datasets/CUB/CUB_200_2011'
+GZSL: false         # true -> include seen split when evaluating
+MODE: xlsa          # "json" -> JSON annotations + dummy data
+SKIP_DUMMY: false   # skip dummy data generation when using JSON mode
+SPLIT: train        # "train" / "val" / "test"
+USE_TRAINVAL: false # true -> TRAIN_USE_TRAINVAL = True -> trainval_loc
+
+RUN_N_TIMES: 1
+DATA:
+  NAME: "CUB"
+  # DATAPATH: "D:\\postgraduate1\\project\\datasets\\CUB\\CUB_200_2011"
+  # XLSA_ROOT: 'D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB'
+  NUMBER_CLASSES: 200
+  MULTILABEL: False
+  XLSA:
+    SPLIT_PATH: "D:\\postgraduate1\\project\\datasets\\xlsa17\\xlsa17\\data\\CUB\\att_splits.mat"
+    # ATTS_KEY: "att"
+MODEL:
+  TYPE: "vit"
+  PROMPT:                 # 08.29����
+    NUM_TOKENS: 50        # 08.29����
+    DROPOUT: 0.0          # 08.29����
+    DISTRIBUTION_ONLY: True   # True -> ��ʹ����ʾ�ֲ��ṩ�� prompt����������̬��ѵ�� prompt
+    DISTRIBUTOR:
+      ENABLE: True
+      LATENT_DIM: 256
+      HIDDEN_DIM: 512
+      POOL: "gap"
+      SEMANTIC_DIM: 312
+      SEMANTIC_PROJ_DIM: 256
+
+    SEMANTIC_CONCEPT:
+      ENABLE: True
+      NUM_SLOTS: 8
+      NUM_HEADS: 8
+      DROPOUT: 0.0
+      LAMBDA_INIT: 1.0
+      USE_LAYER_NORM: True
+      PROJ_NORM: True
+SOLVER:
+  EVAL_MODE: "zsl"    # switch to "gzsl" (and/or set GZSL: true) for generalized ZSL
+  GZSL: false
+  BASE_LR: 0.25           # 0.1
+  WEIGHT_DECAY: 0.001     # 0.01
+
+
+[11/26 15:41:44][INFO] visual_prompt:  189: Training with config:
+[11/26 15:41:44][INFO] visual_prompt:  190: {'CUDNN_BENCHMARK': False,
+ 'DATA': {'BATCH_SIZE': 32,
+          'CLASS_WEIGHTS_TYPE': 'none',
+          'CROPSIZE': 224,
+          'DATAPATH': 'D:/postgraduate1/project/datasets/CUB/CUB_200_2011',
+          'FEATURE': 'sup_vitb16_224',
+          'MULTILABEL': False,
+          'NAME': 'CUB',
+          'NO_TEST': False,
+          'NUMBER_CLASSES': 200,
+          'NUM_WORKERS': 4,
+          'PERCENTAGE': 1.0,
+          'PIN_MEMORY': True,
+          'XLSA': {'ENABLED': True,
+                   'RES101_PATH': 'D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB/res101.mat',
+                   'SPLIT_PATH': 'D:\\postgraduate1\\project\\datasets\\xlsa17\\xlsa17\\data\\CUB\\att_splits.mat',
+                   'TEST_INCLUDE_SEEN': False,
+                   'TEST_KEY': 'test_unseen_loc',
+                   'TEST_SEEN_KEY': 'test_seen_loc',
+                   'TRAINVAL_KEY': 'trainval_loc',
+                   'TRAIN_KEY': 'train_loc',
+                   'TRAIN_USE_TRAINVAL': False,
+                   'VAL_KEY': 'val_loc'}},
+ 'DATA_ROOT': '',
+ 'DBG': False,
+ 'DIST_BACKEND': 'gloo',
+ 'DIST_INIT_FILE': '',
+ 'DIST_INIT_PATH': 'env://',
+ 'GZSL': False,
+ 'MODE': 'xlsa',
+ 'MODEL': {'ADAPTER': CfgNode({'REDUCATION_FACTOR': 8, 'STYLE': 'Pfeiffer'}),
+           'LINEAR': CfgNode({'MLP_SIZES': [], 'DROPOUT': 0.1}),
+           'LOG_TRAINABLE': True,
+           'MLP_NUM': 0,
+           'MODEL_ROOT': 'D:/postgraduate1/project/vpt-main/weights/official',
+           'PROMPT': {'CLSEMB_FOLDER': '',
+                      'CLSEMB_PATH': '',
+                      'DEEP': True,
+                      'DEEP_SHARED': False,
+                      'DETACH_PROMPT_GRAD': False,
+                      'DISTRIBUTION_ONLY': True,
+                      'DISTRIBUTOR': {'ENABLE': True,
+                                      'HIDDEN_DIM': 512,
+                                      'LATENT_DIM': 256,
+                                      'POOL': 'gap',
+                                      'SEMANTIC_DIM': 312,
+                                      'SEMANTIC_PROJ_DIM': 256},
+                      'DROPOUT': 0.0,
+                      'FORWARD_DEEP_NOEXPAND': False,
+                      'INITIATION': 'random',
+                      'LOCATION': 'prepend',
+                      'NUM_DEEP_LAYERS': None,
+                      'NUM_TOKENS': 50,
+                      'PROJECT': -1,
+                      'REVERSE_DEEP': False,
+                      'SAVE_FOR_EACH_EPOCH': False,
+                      'SEMANTIC_CONCEPT': {'DROPOUT': 0.0,
+                                           'ENABLE': True,
+                                           'LAMBDA_INIT': 1.0,
+                                           'NUM_HEADS': 8,
+                                           'NUM_SLOTS': 8,
+                                           'PROJ_NORM': True,
+                                           'USE_LAYER_NORM': True},
+                      'VIT_POOL_TYPE': 'original'},
+           'PROMPT_FUSION': {'AFFINITY_BIAS': True,
+                             'DROPOUT': 0.0,
+                             'ENABLED': False,
+                             'KL_WEIGHT': 0.0001,
+                             'LATENT_DIM': 256,
+                             'LAYER_IDS': [0, 6, 11],
+                             'RETURN_AUX': False,
+                             'SEMANTIC_DIM': 0,
+                             'USE_SEMANTICS': False},
+           'R_SIMILARITY': {'ENABLE': False,
+                            'LOGIT_SCALE_INIT': 10.0,
+                            'PROJ_DIM': -1,
+                            'USE_COSINE': True},
+           'SAVE_CKPT': False,
+           'TRANSFER_TYPE': 'prompt',
+           'TYPE': 'vit',
+           'WEIGHT_PATH': ''},
+ 'NUM_GPUS': 1,
+ 'NUM_SHARDS': 1,
+ 'OUTPUT_DIR': './output\\CUB\\sup_vitb16_224\\lr0.25_wd0.001\\run1',
+ 'RUN_N_TIMES': 1,
+ 'SEED': 1,
+ 'SKIP_DUMMY': False,
+ 'SOLVER': {'BASE_LR': 0.25,
+            'BIAS_MULTIPLIER': 1.0,
+            'DBG_TRAINABLE': False,
+            'EVAL_MODE': 'zsl',
+            'GZSL': False,
+            'LOG_EVERY_N': 1000,
+            'LOSS': 'softmax',
+            'LOSS_ALPHA': 0.01,
+            'MOMENTUM': 0.9,
+            'OPTIMIZER': 'sgd',
+            'PATIENCE': 300,
+            'SCHEDULER': 'cosine',
+            'TOTAL_EPOCH': 30,
+            'WARMUP_EPOCH': 5,
+            'WEIGHT_DECAY': 0.001,
+            'WEIGHT_DECAY_BIAS': 0},
+ 'SPLIT': 'train',
+ 'USE_TRAINVAL': False}
+[11/26 15:41:44][INFO] visual_prompt:  116: Loading training data (final training data for vtab)...
+[11/26 15:41:44][INFO] visual_prompt:  231: Constructing CUB dataset train...
+[11/26 15:41:44][INFO] visual_prompt:  483: Constructing imdb from xlsa17 files: D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB/res101.mat + D:\postgraduate1\project\datasets\xlsa17\xlsa17\data\CUB\att_splits.mat
+[11/26 15:41:45][INFO] visual_prompt:  188: Loaded attributes with shape (200, 312) from D:\postgraduate1\project\datasets\xlsa17\xlsa17\data\CUB\att_splits.mat::att; available for 200/200 classes.
+[11/26 15:41:45][INFO] visual_prompt:  423: Using xlsa17 split 'train_loc' for train
+[11/26 15:41:45][INFO] visual_prompt:  608: Constructed imdb using xlsa17 split 'train': 4702 images (100 unique classes).
+[11/26 15:41:45][INFO] visual_prompt:  124: Loading validation data...
+[11/26 15:41:45][INFO] visual_prompt:  231: Constructing CUB dataset val...
+[11/26 15:41:45][INFO] visual_prompt:  483: Constructing imdb from xlsa17 files: D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB/res101.mat + D:\postgraduate1\project\datasets\xlsa17\xlsa17\data\CUB\att_splits.mat
+[11/26 15:41:46][INFO] visual_prompt:  188: Loaded attributes with shape (200, 312) from D:\postgraduate1\project\datasets\xlsa17\xlsa17\data\CUB\att_splits.mat::att; available for 200/200 classes.
+[11/26 15:41:46][INFO] visual_prompt:  423: Using xlsa17 split 'val_loc' for val
+[11/26 15:41:46][INFO] visual_prompt:  608: Constructed imdb using xlsa17 split 'val': 2355 images (50 unique classes).
+[11/26 15:41:46][INFO] visual_prompt:  128: Loading test data...
+[11/26 15:41:46][INFO] visual_prompt:  231: Constructing CUB dataset test...
+[11/26 15:41:46][INFO] visual_prompt:  483: Constructing imdb from xlsa17 files: D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB/res101.mat + D:\postgraduate1\project\datasets\xlsa17\xlsa17\data\CUB\att_splits.mat
+[11/26 15:41:46][INFO] visual_prompt:  188: Loaded attributes with shape (200, 312) from D:\postgraduate1\project\datasets\xlsa17\xlsa17\data\CUB\att_splits.mat::att; available for 200/200 classes.
+[11/26 15:41:46][INFO] visual_prompt:  571: Appending xlsa17 split 'test_unseen_loc' for test
+[11/26 15:41:47][INFO] visual_prompt:  608: Constructed imdb using xlsa17 split 'test': 2967 images (50 unique classes).
+[11/26 15:41:47][INFO] visual_prompt:  171: Constructing models...
+[11/26 15:41:59][INFO] visual_prompt:  338: Trainable params: 58421504/144220160 (40.51%); examples: ['enc.transformer.deep_prompt_embeddings', 'enc.transformer.encoder.layer.0.semantic_norm.weight', 'enc.transformer.encoder.layer.0.semantic_norm.bias', 'enc.transformer.encoder.layer.0.semantic_attn.query.weight', 'enc.transformer.encoder.layer.0.semantic_attn.query.bias', 'enc.transformer.encoder.layer.0.semantic_attn.key.weight', 'enc.transformer.encoder.layer.0.semantic_attn.key.bias', 'enc.transformer.encoder.layer.0.semantic_attn.value.weight', 'enc.transformer.encoder.layer.0.semantic_attn.value.bias', 'enc.transformer.encoder.layer.0.semantic_attn.out.weight', 'enc.transformer.encoder.layer.0.semantic_attn.out.bias', 'enc.transformer.encoder.layer.1.semantic_norm.weight', 'enc.transformer.encoder.layer.1.semantic_norm.bias', 'enc.transformer.encoder.layer.1.semantic_attn.query.weight', 'enc.transformer.encoder.layer.1.semantic_attn.query.bias', 'enc.transformer.encoder.layer.1.semantic_attn.key.weight', 'enc.transformer.encoder.layer.1.semantic_attn.key.bias', 'enc.transformer.encoder.layer.1.semantic_attn.value.weight', 'enc.transformer.encoder.layer.1.semantic_attn.value.bias', 'enc.transformer.encoder.layer.1.semantic_attn.out.weight']
+[11/26 15:41:59][INFO] visual_prompt:  346: Trainable breakdown (sorted): semantic: 36642816 train / 36642816 total (62.72% of trainable, 25.41% of all); prompt: 21778688 train / 21778688 total (37.28% of trainable, 15.10% of all); backbone: 0 train / 85798656 total (0.00% of trainable, 59.49% of all)
+[11/26 15:41:59][INFO] visual_prompt:  348: Largest trainable share: semantic (36642816 params, 62.72% of trainable)
+[11/26 15:41:59][INFO] visual_prompt:   87: Total Parameters: 144373960	 Gradient Parameters: 58575304
+[11/26 15:41:59][INFO] visual_prompt:   90: tuned percent:40.572
+[11/26 15:42:00][INFO] visual_prompt:   60: Device used for model: 0
+[11/26 15:42:00][INFO] visual_prompt:  338: Trainable params: 58575304/144373960 (40.57%); examples: ['enc.transformer.deep_prompt_embeddings', 'enc.transformer.encoder.layer.0.semantic_norm.weight', 'enc.transformer.encoder.layer.0.semantic_norm.bias', 'enc.transformer.encoder.layer.0.semantic_attn.query.weight', 'enc.transformer.encoder.layer.0.semantic_attn.query.bias', 'enc.transformer.encoder.layer.0.semantic_attn.key.weight', 'enc.transformer.encoder.layer.0.semantic_attn.key.bias', 'enc.transformer.encoder.layer.0.semantic_attn.value.weight', 'enc.transformer.encoder.layer.0.semantic_attn.value.bias', 'enc.transformer.encoder.layer.0.semantic_attn.out.weight', 'enc.transformer.encoder.layer.0.semantic_attn.out.bias', 'enc.transformer.encoder.layer.1.semantic_norm.weight', 'enc.transformer.encoder.layer.1.semantic_norm.bias', 'enc.transformer.encoder.layer.1.semantic_attn.query.weight', 'enc.transformer.encoder.layer.1.semantic_attn.query.bias', 'enc.transformer.encoder.layer.1.semantic_attn.key.weight', 'enc.transformer.encoder.layer.1.semantic_attn.key.bias', 'enc.transformer.encoder.layer.1.semantic_attn.value.weight', 'enc.transformer.encoder.layer.1.semantic_attn.value.bias', 'enc.transformer.encoder.layer.1.semantic_attn.out.weight']
+[11/26 15:42:00][INFO] visual_prompt:  346: Trainable breakdown (sorted): semantic: 36642816 train / 36642816 total (62.56% of trainable, 25.38% of all); prompt: 21778688 train / 21778688 total (37.18% of trainable, 15.08% of all); head: 153800 train / 153800 total (0.26% of trainable, 0.11% of all); backbone: 0 train / 85798656 total (0.00% of trainable, 59.43% of all)
+[11/26 15:42:00][INFO] visual_prompt:  348: Largest trainable share: semantic (36642816 params, 62.56% of trainable)
+[11/26 15:42:00][INFO] visual_prompt:  191: Setting up Evalutator...
+[11/26 15:42:00][INFO] visual_prompt:  193: Setting up Trainer...
