@@ -1,15 +1,47 @@
-_BASE_: "../debug_json_dataset.yaml"
+# _BASE_: "../TEST/run_json_dataset_demo.yaml"
+# Consolidated dataset/demo settings (migrated from TEST/run_json_dataset_demo.yaml)
+#  DATA_ROOT: 'D:/postgraduate1/project/datasets/CUB/CUB_200_2011'
+GZSL: false         # true -> include seen split when evaluating
+MODE: xlsa          # "json" -> JSON annotations + dummy data
+SKIP_DUMMY: false   # skip dummy data generation when using JSON mode
+SPLIT: train        # "train" / "val" / "test"
+USE_TRAINVAL: false # true -> TRAIN_USE_TRAINVAL = True -> trainval_loc
+
 RUN_N_TIMES: 1
 DATA:
   NAME: "CUB"
-  DATAPATH: "D:\\postgraduate1\\project\\datasets\\CUB\\CUB_200_2011"  #TODO: need to specify here
+  # DATAPATH: "D:\\postgraduate1\\project\\datasets\\CUB\\CUB_200_2011"
+  # XLSA_ROOT: 'D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB'
   NUMBER_CLASSES: 200
   MULTILABEL: False
+  XLSA:
+    SPLIT_PATH: "D:\\postgraduate1\\project\\datasets\\xlsa17\\xlsa17\\data\\CUB\\att_splits.mat"
+    # ATTS_KEY: "att"
 MODEL:
   TYPE: "vit"
   PROMPT:                 # 08.29加入
     NUM_TOKENS: 50        # 08.29加入
     DROPOUT: 0.0          # 08.29加入
+    DISTRIBUTION_ONLY: True   # True -> 仅使用提示分布提供的 prompt，不创建静态可训练 prompt
+    DISTRIBUTOR:
+      ENABLE: True
+      LATENT_DIM: 256
+      HIDDEN_DIM: 512
+      POOL: "gap"
+      SEMANTIC_DIM: 312
+      SEMANTIC_PROJ_DIM: 256
+
+    SEMANTIC_CONCEPT:
+      ENABLE: True
+      NUM_SLOTS: 8
+      NUM_HEADS: 8
+      DROPOUT: 0.0
+      LAMBDA_INIT: 1.0
+      USE_LAYER_NORM: True
+      PROJ_NORM: True
 SOLVER:
+  EVAL_MODE: "zsl"    # switch to "gzsl" (and/or set GZSL: true) for generalized ZSL
+  GZSL: false
   BASE_LR: 0.25           # 0.1
   WEIGHT_DECAY: 0.001     # 0.01
+

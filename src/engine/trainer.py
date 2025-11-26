@@ -77,7 +77,7 @@ class Trainer():
         self.evaluator = evaluator
         self.cpu_device = torch.device("cpu")
 
-    def forward_one_batch(self, inputs, targets, is_train):
+    def forward_one_batch(self, inputs, targets, is_train, attributes=None):
         """Train a single (full) epoch on the model using the given data loader.
         对一个 batch 做前向（可选反向）计算。
 
@@ -94,6 +94,8 @@ class Trainer():
         # ========== 1. 把数据搬到指定设备 ==========
         inputs = inputs.to(self.device, non_blocking=True)    # (batchsize, 2048)
         targets = targets.to(self.device, non_blocking=True)  # (batchsize, )
+        if attributes is not None:
+            attributes = attributes.to(self.device, non_blocking=True)
 
         if self.cfg.DBG:
             logger.info(f"shape of inputs: {inputs.shape}")
@@ -101,7 +103,11 @@ class Trainer():
 
         # ========== 2. 前向推理（训练时开启梯度，验证/测试禁用梯度） ==========
         with torch.set_grad_enabled(is_train):
-            outputs = self.model(inputs)  # (batchsize, num_cls)
+            if attributes is not None:
+                outputs = self.model(inputs, semantics=attributes)  # (batchsize, num_cls)
+            else:
+                outputs = self.model(inputs)  # (batchsize, num_cls)
+
             if self.cfg.DBG:
                 logger.info(
                     "shape of model output: {}, targets: {}".format(
@@ -166,7 +172,11 @@ class Trainer():
 
         inputs = data["image"].float()  # 保证 float（模型一般期望 float）
         labels = data["label"]
-        return inputs, labels
+
+        attributes = data.get("attribute") if isinstance(data, dict) else None
+        if attributes is not None and not isinstance(attributes, torch.Tensor):
+            attributes = torch.from_numpy(attributes)
+        return inputs, labels, attributes
 
     def train_classifier(self, train_loader, val_loader, test_loader):
         """
@@ -230,7 +240,7 @@ class Trainer():
                     # if debugging, only need to see the first few iterations # 调试模式：仅跑前 20 个 batch 以加速
                     break
                 
-                X, targets = self.get_input(input_data)
+                X, targets, attributes = self.get_input(input_data)
                 # logger.info(X.shape)
                 # logger.info(targets.shape)
                 # measure data loading time
@@ -238,7 +248,7 @@ class Trainer():
                 data_time.update(time.time() - end)
 
                 # 前向 + （若 is_train=True）反向与优化
-                train_loss, _ = self.forward_one_batch(X, targets, True)
+                train_loss, _ = self.forward_one_batch(X, targets, True, attributes=attributes)
 
                 # 若 forward 返回 -1，说明出现 inf / NaN，直接停止训练
                 if train_loss == -1:
@@ -364,13 +374,22 @@ class Trainer():
         # only save the prompt embed if below conditions are satisfied
         if self.cfg.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH:
             if self.cfg.MODEL.TYPE == "vit" and "prompt" in self.cfg.MODEL.TRANSFER_TYPE:
-                # ViT 封装里，prompt_embeddings 挂在 self.model.enc.transformer 上
-                prompt_embds = self.model.enc.transformer.prompt_embeddings.cpu().numpy()
-                out = {"shallow_prompt": prompt_embds}
-                # 如果开启 deep prompt，也一并保存
-                if self.cfg.MODEL.PROMPT.DEEP:
-                    deep_embds = self.model.enc.transformer.deep_prompt_embeddings.cpu().numpy()
-                    out["deep_prompt"] = deep_embds
+                prompt_module = self.model.enc.transformer
+                out = {}
+
+                prompt_embds = getattr(prompt_module, "prompt_embeddings", None)
+                if prompt_embds is not None:
+                    out["shallow_prompt"] = prompt_embds.cpu().numpy()
+
+                if self.cfg.MODEL.PROMPT.DEEP and hasattr(prompt_module, "deep_prompt_embeddings"):
+                    deep_embds = prompt_module.deep_prompt_embeddings
+                    if deep_embds is not None:
+                        out["deep_prompt"] = deep_embds.cpu().numpy()
+
+                if not out:
+                    logger.warning("No prompt parameters to save for this epoch; skipping dump.")
+                    return
+
                 torch.save(out, os.path.join(
                     self.cfg.OUTPUT_DIR, f"prompt_ep{epoch}.pth"))
 
@@ -400,7 +419,7 @@ class Trainer():
         # ========== 遍历整个数据集 ==========
         for idx, input_data in enumerate(data_loader):
             end = time.time()
-            X, targets = self.get_input(input_data)
+            X, targets, attributes = self.get_input(input_data)
 
             # 统计数据加载时间
             data_time.update(time.time() - end)
@@ -409,7 +428,7 @@ class Trainer():
                 logger.info("during eval: {}".format(X.shape))
 
             # 评测阶段：is_train=False → forward_one_batch 只做前向与 loss 计算
-            loss, outputs = self.forward_one_batch(X, targets, False)
+            loss, outputs = self.forward_one_batch(X, targets, False, attributes=attributes)
             if loss == -1:                # 出现 inf / NaN 时，直接停止
                 return
             losses.update(loss, X.shape[0])

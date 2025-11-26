@@ -24,6 +24,31 @@ from launch import default_argument_parser, logging_train_setup
 warnings.filterwarnings("ignore")   # 屏蔽第三方库的一些非关键警告，避免日志噪声
 
 
+def _sync_zero_shot_mode(cfg):
+    """Ensure all ZSL/GZSL toggles are aligned before freezing the config."""
+
+    # Read desired evaluation mode from solver / legacy top-level flags.
+    eval_mode = str(getattr(cfg.SOLVER, "EVAL_MODE", "zsl") or "zsl").lower()
+    gzsl_requested = any(
+        [
+            getattr(cfg, "GZSL", False),
+            getattr(cfg.SOLVER, "GZSL", False),
+            eval_mode == "gzsl",
+        ]
+    )
+
+    if gzsl_requested:
+        eval_mode = "gzsl"
+
+    cfg.GZSL = gzsl_requested
+    cfg.SOLVER.GZSL = gzsl_requested
+    cfg.SOLVER.EVAL_MODE = eval_mode
+
+    # Keep DATA.XLSA aligned with the evaluation choice so Dataset picks correct splits.
+    xlsa_cfg = getattr(cfg.DATA, "XLSA", None)
+    if xlsa_cfg is not None:
+        xlsa_cfg.TEST_INCLUDE_SEEN = bool(gzsl_requested)
+
 def setup(args):
     """
     Create configs and perform basic setups.创建配置并做基础环境设置（包含：合并配置、分布式地址、输出目录等）
@@ -31,6 +56,7 @@ def setup(args):
     cfg = get_cfg()                             # 拿到默认配置（ConfigNode 的克隆）
     cfg.merge_from_file(args.config_file)       # 从命令行指定的 yaml 文件合并配置
     cfg.merge_from_list(args.opts)              # 从命令行的 KEY VALUE 形式补充/覆盖配置
+    _sync_zero_shot_mode(cfg)  # 统一 ZSL / GZSL 配置，避免 KeyError
 
     # setup dist
     # cfg.DIST_INIT_PATH = "tcp://{}:12399".format(os.environ["SLURMD_NODENAME"])
@@ -145,6 +171,21 @@ def train(cfg, args):
     logger.info("Constructing models...")   # 打一条 INFO 级别的日志
     model, cur_device = build_model(cfg)    # 根据prompt/linear/adapter 等与骨干网络类型（如 ViT/Swin）来实例化对应的模型与放置设备
     # -----------------------------------
+
+    # 如需调试冻结策略，可主动打印当前可训练参数列表
+    if cfg.MODEL.LOG_TRAINABLE or cfg.SOLVER.DBG_TRAINABLE:
+        log_fn = getattr(model, "log_trainable_parameters", None)
+        if callable(log_fn):
+            log_fn()
+
+    if cfg.MODEL.R_SIMILARITY.ENABLE:
+        # 从数据集获取类别级属性矩阵
+        class_attr = getattr(getattr(train_loader, "dataset", None), "class_attributes", None)
+        if class_attr is None:
+            raise ValueError("R-similarity head enabled but no class_attributes provided by dataset")
+        if hasattr(model, "attach_r_similarity_head"):
+            # 在训练前安装R-相似度分类器
+            model.attach_r_similarity_head(class_attr)
 
     # ---------- 评估器与训练器 ----------
     logger.info("Setting up Evalutator...")

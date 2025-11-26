@@ -12,6 +12,7 @@ from typing import Optional
 from ..utils import logging
 logger = logging.get_logger("visual_prompt")
 
+from ..models.vit_prompt.vit import SharedConceptAligner
 
 class SigmoidLoss(nn.Module):
     """
@@ -169,6 +170,63 @@ LOSS = {
     # "clip": ClipContrastiveLoss,
     # "softmax_clip": SoftmaxWithClipLoss,
 }
+class RSimilarityClassifier(nn.Module):
+    """使用共享概念基 R 生成的语义原型与 CLS 对齐的分类头。
+
+    视觉侧：CLS -> M_v；语义侧：类属性 -> SharedConceptAligner.encode_semantics_only -> R 空间原型 -> M_s。
+    logits 基于余弦相似度（可选）计算，并带可学习温度。
+    """
+
+    def __init__(
+        self,
+        semantic_concept: SharedConceptAligner,
+        class_attr: torch.Tensor,
+        hidden_size: int,
+        proj_dim: int = None,
+        use_cosine: bool = True,
+        logit_scale_init: float = 10.0,
+    ) -> None:
+        super().__init__()
+        if proj_dim is None or proj_dim <= 0:
+            proj_dim = hidden_size
+
+        self.semantic_concept = semantic_concept
+        self.register_buffer("class_attr", class_attr.float())
+        self.num_classes = class_attr.shape[0]
+
+        self.visual_proj = nn.Linear(hidden_size, proj_dim)
+        self.semantic_proj = nn.Linear(hidden_size, proj_dim)
+
+        self.use_cosine = use_cosine
+        if use_cosine:
+            self.logit_scale = nn.Parameter(
+                torch.log(torch.tensor(logit_scale_init, dtype=torch.float32))
+            )
+        else:
+            self.logit_scale = None
+
+    def _class_prototypes(self) -> torch.Tensor:
+        """通过共享概念基获取 R 空间语义原型。"""
+
+        attr = self.class_attr.to(self.semantic_concept.concept_slots.device)
+        return self.semantic_concept.encode_semantics_only(attr)
+
+    def forward(self, cls_feat: torch.Tensor) -> torch.Tensor:
+        prototypes = self._class_prototypes()  # [C, D]
+
+        visual = self.visual_proj(cls_feat)  # [B, d]
+        semantic = self.semantic_proj(prototypes)  # [C, d]
+
+        if self.use_cosine:
+            visual = F.normalize(visual, dim=-1)
+            semantic = F.normalize(semantic, dim=-1)
+            logits = visual @ semantic.t()
+            logits = logits * self.logit_scale.exp()
+        else:
+            logits = visual @ semantic.t()
+
+        return logits
+
 
 
 def build_loss(cfg):

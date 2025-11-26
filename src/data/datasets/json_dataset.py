@@ -18,8 +18,177 @@ from ...utils import logging
 from ...utils.io_utils import read_json
 logger = logging.get_logger("visual_prompt")
 
+class AttributeLoaderMixin:
+    """
+    AttributeLoaderMixin：封装“类级语义属性（attributes）”的通用加载逻辑。
 
-class JSONDataset(torch.utils.data.Dataset):
+    设计目的：
+    - 一些经典 ZSL 数据集（CUB/AWA2/SUN）会提供类级属性矩阵 att（att_splits.mat 里的 att）；
+    - 不同 Dataset 子类（CUB、AWA2、SUN 等）可以复用本 mixin 提供的加载 / 对齐逻辑；
+    - JSONDataset 只需要继承本 mixin，就具备属性加载能力，无需在每个数据集中重复写代码。
+    """
+
+    # 这三个是“类属性”的类型标注（typing hint），实际使用时在 __init__ 里会按实例级重新赋值。
+    has_attributes: bool = False                        # 是否已经成功加载过类级属性
+    class_attributes: Optional[torch.Tensor] = None     # [num_classes, att_dim]，每类一行属性向量
+    _class_has_attribute: Optional[torch.Tensor] = None # [num_classes]，True 表示该类在属性矩阵中有定义
+
+    def _load_attributes_if_available(self, cfg):
+        """
+        从 cfg.DATA.ATTS_PATH 指定的 .mat 文件中加载类级属性向量（通常也是 att_splits.mat），
+        作为“通用 fallback 入口”：
+
+        - 如果之前已经通过 XLSA split（_load_attributes_from_split_dict）加载过属性，
+          self.has_attributes 会被置 True，此时直接 return，避免重复读取。
+        - 否则：
+          1）检查 DATA.ATTS_PATH 是否配置，且文件是否存在；
+          2）从 .mat 中读取 key=ATTS_KEY（默认 'att'）；
+          3）调用 _populate_class_attributes 统一完成 numpy → torch → class 映射。
+        """
+        # 若已有属性（例如已在 XLSA 构建阶段加载），则不再重复加载
+        if self.has_attributes:
+            return
+
+        # 从配置中取属性文件路径（例如 D:/.../CUB/att_splits.mat）
+        atts_path = getattr(cfg.DATA, "ATTS_PATH", None)
+        if not atts_path:
+            logger.info("No DATA.ATTS_PATH specified, skip loading attributes.")
+            return
+        if not os.path.exists(atts_path):
+            logger.warning("Attribute file %s not found, skip.", atts_path)
+            return
+
+        logger.info("Loading class-level attributes from %s ...", atts_path)
+        # 读取 .mat 文件为字典形式（key -> numpy 数组）
+        atts_mat = sio.loadmat(atts_path)
+        # 属性矩阵在 .mat 中对应的 key 名（默认 'att'）
+        att_key = getattr(cfg.DATA, "ATTS_KEY", "att")
+        if att_key not in atts_mat:
+            logger.warning(
+                "Key '%s' not found in %s, cannot load attributes.", att_key, atts_path
+            )
+            return
+
+        # 将原始 numpy 数组交给统一的处理函数，source_name 仅用于日志打印
+        self._populate_class_attributes(
+            np.asarray(atts_mat[att_key]),
+            cfg,
+            source_name=atts_path,
+        )
+
+    def _load_attributes_from_split_dict(self, cfg, split_mat, source_path: str):
+        """
+        直接从“已经加载好的 att_splits.mat 字典 split_mat”中注入属性。
+
+        典型场景：
+        - 在 XLSA 模式下，_construct_imdb_from_xlsa 已经通过
+          split_mat = sio.loadmat(att_splits.mat) 得到一个字典；
+        - 这里就可以复用这个 split_mat，从其中的 att 字段直接构造类级属性，
+          避免再额外打开一次磁盘。
+        """
+        # 若已经加载过属性，则不需要再次注入
+        if self.has_attributes:
+            return
+
+        # 从配置中拿属性矩阵在 .mat 中的 key 名（默认 'att'）
+        att_key = getattr(cfg.DATA, "ATTS_KEY", "att")
+        if att_key not in split_mat:
+            # 某些数据集可能没有 att 字段，此时直接跳过
+            return
+
+        # 取出 numpy 数组，交由 _populate_class_attributes 处理
+        self._populate_class_attributes(
+            np.asarray(split_mat[att_key]),
+            cfg,
+            # source_name 记录为 “att_splits.mat::att”，方便之后在日志中区分来源
+            source_name="{}::{}".format(source_path, att_key) if source_path else att_key,
+        )
+
+    def _populate_class_attributes(self, atts_np: np.ndarray, cfg, source_name: str):
+        """
+        通用的 numpy -> torch 属性写入逻辑，供不同数据来源（XLSA split / ATTS_PATH）复用。
+
+        功能：
+        1）检查当前数据集是否在支持列表（CUB/AWA/AWA2/SUN）中；
+        2）将 att 矩阵规整成 [num_classes, att_dim] 形状；
+        3）按 self._class_ids（一般为 0..C-1）对每个类别取出一行属性；
+        4）填充 class_attributes（属性矩阵）与 _class_has_attribute（可用性掩码）；
+        5）将 has_attributes 置为 True，并打印日志说明加载情况。
+        """
+        # 只在经典 ZSL 数据集上启用属性逻辑，避免其它数据集误用
+        dataset_key = cfg.DATA.NAME.lower()
+        supported = {"cub", "awa", "awa2", "sun"}
+        if dataset_key not in supported:
+            logger.info(
+                "Attribute loading is currently only implemented for CUB/AWA/SUN. "
+                "Dataset '%s' will skip attribute injection.",
+                cfg.DATA.NAME,
+            )
+            return
+
+        # 至少保证是二维矩阵：[num_rows, att_dim]
+        if atts_np.ndim < 2:
+            atts_np = np.atleast_2d(atts_np)
+
+        # 典型 att_splits.mat 中 att 的形状为 [att_dim, num_classes]，
+        # 若行数 != 类数、但列数 == 类数，则说明需要转置为 [num_classes, att_dim]
+        if atts_np.shape[0] != len(self._class_ids) and atts_np.shape[1] == len(self._class_ids):
+            atts_np = atts_np.T
+
+        # 一些数据集可能用 1-based id 存储类索引，用 ATTS_ID_SHIFT 做纠偏（一般为 0）
+        id_shift = getattr(cfg.DATA, "ATTS_ID_SHIFT", 0)
+        total_rows = atts_np.shape[0]   # 属性矩阵行数（原始类 id 数量）
+        att_dim = atts_np.shape[1]      # 属性维度（例如 CUB 为 312）
+
+        attr_tensor = torch.from_numpy(atts_np).float()
+        # 初始化一个 [num_classes, att_dim] 的零矩阵，对应连续类 id（0..C-1）
+        class_attributes = torch.zeros((len(self._class_ids), att_dim), dtype=torch.float32)
+        has_attr_mask = torch.zeros(len(self._class_ids), dtype=torch.bool)
+        missing_original_ids = []
+
+        # 遍历每个连续类 id（cont_id）及其原始 id（orig_id）
+        # 对于 XLSA 场景，orig_id 和 cont_id 通常相同（0..C-1）
+        for cont_id, orig_id in enumerate(self._class_ids):
+            # 根据 shift 后的原始 id 确定在属性矩阵中的行索引
+            row_idx = int(orig_id) + id_shift
+            if row_idx < 0 or row_idx >= total_rows:
+                # 若越界，说明该类在属性矩阵中缺失（例如某些类没有标注 att）
+                missing_original_ids.append(orig_id)
+                continue
+            # 将该行属性写入连续类 id 对应位置
+            class_attributes[cont_id] = attr_tensor[row_idx]
+            has_attr_mask[cont_id] = True
+
+        available = int(has_attr_mask.sum().item())
+        if available == 0:
+            logger.warning(
+                "No matching attributes found for classes in split '%s'.", self._split
+            )
+            return
+
+        if missing_original_ids:
+            logger.warning(
+                "Attributes missing for %d/%d classes (e.g., %s). Samples from these "
+                "classes will not include attribute vectors.",
+                len(missing_original_ids),
+                len(self._class_ids),
+                missing_original_ids[:5],
+            )
+
+        # 将最终结果挂到实例上，供 __getitem__ 或 Trainer 使用
+        self.class_attributes = class_attributes          # [num_classes, att_dim]
+        self._class_has_attribute = has_attr_mask         # [num_classes]
+        self.has_attributes = True                        # 标记：已经有可用属性
+
+        logger.info(
+            "Loaded attributes with shape %s from %s; available for %d/%d classes.",
+            tuple(class_attributes.shape),
+            source_name,
+            available,
+            len(self._class_ids),
+        )
+
+class JSONDataset(AttributeLoaderMixin, torch.utils.data.Dataset):
     """
     一个通用的图像数据集基类：通过 JSON 标注构建样本列表，再交给 DataLoader 使用。
 
@@ -67,6 +236,14 @@ class JSONDataset(torch.utils.data.Dataset):
         self.data_dir = cfg.DATA.DATAPATH        # 数据集根目录
         self.data_percentage = cfg.DATA.PERCENTAGE  # 训练阶段是否按比例采样子集。若 <1.0，表示只用一部分训练数据做子集
 
+        # AttributeLoaderMixin 中声明的是“类级属性的类型 hint”，这里按实例级初始化：
+        # 当前这个 Dataset 实例是否已经加载了类级属性
+        self.has_attributes = False
+        # 保存每个类的属性向量，[num_classes, att_dim]
+        self.class_attributes = None
+        # 标记哪些类有属性，哪些类缺失
+        self._class_has_attribute = None
+
         # 1) 按当前配置构建 imdb：
         #    - 若启用 XLSA，则优先从 res101.mat + att_splits.mat 构建 imdb；
         #    - 若未启用或失败，则退回到 JSON 标注模式。
@@ -77,16 +254,12 @@ class JSONDataset(torch.utils.data.Dataset):
         #    - val/test: center crop + 归一化。
         self.transform = get_transforms(split, cfg.DATA.CROPSIZE)
 
-        # ----------------11.14新增：语义属性相关成员变量------------
-        # 表示是否成功从 .mat 文件中加载了“类级属性向量”（att）
-        self.has_attributes: bool = False
-        # 每个连续类 id(0..C-1) 对应的一行属性向量，形状 [num_classes, att_dim]
-        self.class_attributes: Optional[torch.Tensor] = None
-        # 标记哪些类在属性矩阵中是“有属性”的（True），哪些类缺失（False） 形状 [num_classes]
-        self._class_has_attribute: Optional[torch.Tensor] = None
-        # 从 cfg.DATA.ATTS_PATH 中尝试加载属性（如果配置了）
+        # 3) 从 DATA.ATTS_PATH 中尝试加载属性（如果配置了 ATTS_PATH 且尚未加载属性）；
+        #    - 若已经在 _construct_imdb_from_xlsa 中通过 XLSA split 成功加载，has_attributes=True，
+        #      此时 _load_attributes_if_available 会直接返回，避免重复 IO；
+        #    - 若尚未加载属性，则此处作为“通用 fallback”，从单独的 att_splits.mat / 属性文件中读取。
         self._load_attributes_if_available(cfg)
-        # ------------------------------------------------------
+
 
     def get_anno(self):
         """
@@ -344,6 +517,14 @@ class JSONDataset(torch.utils.data.Dataset):
         self._class_ids = list(range(num_classes))
         self._class_id_cont_id = {i: i for i in self._class_ids}
 
+        # 优先尝试从已经加载的 split 字典中抽取语义属性，避免重复读取 .mat
+        # - split_mat = sio.loadmat(att_splits.mat) 已经作为字典在当前函数中存在；
+        # - 其中通常包含 att 矩阵（key 为 cfg.DATA.ATTS_KEY，默认 'att'）；
+        # - 本调用会尝试直接从 split_mat 中读出 att，并映射到 self.class_attributes 上。
+        # 注意：如果读取成功，self.has_attributes 会被置 True，
+        #       后续 __init__ 里的 _load_attributes_if_available 将不会再从 ATTS_PATH 读一次。
+        self._load_attributes_from_split_dict(cfg, split_mat, source_path=split_path)
+
         # 小工具：确保配置项可以既接受单个字符串，也接受列表
         def ensure_tuple(value: Iterable[str]) -> Sequence[str]:
             if isinstance(value, (list, tuple)):
@@ -428,104 +609,7 @@ class JSONDataset(torch.utils.data.Dataset):
         )
         return True
 
-    def _load_attributes_if_available(self, cfg):
-        """
-        尝试加载 CUB/AWA/SUN 风格的类级属性向量（att_splits.mat 里的 att）。
-
-        功能：
-        1) 从 DATA.ATTS_PATH 指定的 .mat 文件中读取 key = ATTS_KEY（默认 'att'）；
-        2) 将该矩阵转换为 [num_classes, att_dim] 的形式；
-        3) 按 self._class_ids（一般是 0..C-1）建立映射，填充 self.class_attributes。
-
-        注意：
-        - 此处只支持 CUB / AWA / SUN 这类经典 ZSL 数据集；
-        - 对其它数据集会直接跳过属性加载。
-        """
-        atts_path = getattr(cfg.DATA, "ATTS_PATH", None)
-        if not atts_path:
-            logger.info("No DATA.ATTS_PATH specified, skip loading attributes.")
-            return
-        if not os.path.exists(atts_path):
-            logger.warning("Attribute file %s not found, skip.", atts_path)
-            return
-
-        # 只在 CUB / AWA2 / SUN 这类经典 ZSL 数据集上启用
-        dataset_key = cfg.DATA.NAME.lower()
-        supported = {"cub","awa", "awa2", "sun" }     # "sunattribute""cub_200_2011"
-        if dataset_key not in supported:
-            logger.info(
-                "Attribute loading is currently only implemented for CUB/AWA/SUN. "
-                "Dataset '%s' will skip attribute injection.",
-                cfg.DATA.NAME,
-            )
-            return
-
-        logger.info("Loading class-level attributes from %s ...", atts_path)
-        atts_mat = sio.loadmat(atts_path)
-        att_key = getattr(cfg.DATA, "ATTS_KEY", "att")
-        if att_key not in atts_mat:
-            logger.warning(
-                "Key '%s' not found in %s, cannot load attributes.", att_key, atts_path
-            )
-            return
-
-        atts_np = np.asarray(atts_mat[att_key])
-        if atts_np.ndim < 2:
-            atts_np = np.atleast_2d(atts_np)
-
-        # 大多数 att_splits.mat 中 att 的形状为 [att_dim, num_classes]
-        # 若行数 != 类数 且列数 == 类数，则认为需要转置为 [num_classes, att_dim]
-        if atts_np.shape[0] != len(self._class_ids) and atts_np.shape[1] == len(self._class_ids):
-            atts_np = atts_np.T
-
-        # ATTS_ID_SHIFT 用于 0/1-based 差异纠偏，一般设为 0
-        id_shift = getattr(cfg.DATA, "ATTS_ID_SHIFT", 0)
-        total_rows = atts_np.shape[0]
-        att_dim = atts_np.shape[1]
-
-        attr_tensor = torch.from_numpy(atts_np).float()
-        # 初始化一个 [num_classes, att_dim] 的零矩阵
-        class_attributes = torch.zeros((len(self._class_ids), att_dim), dtype=torch.float32)
-        has_attr_mask = torch.zeros(len(self._class_ids), dtype=torch.bool)
-        missing_original_ids = []
-
-        # 遍历每个连续类 id（cont_id）及其原始 id（orig_id）
-        # 对于 XLSA 场景，orig_id 和 cont_id 通常相同（0..C-1）
-        for cont_id, orig_id in enumerate(self._class_ids):
-            row_idx = int(orig_id) + id_shift
-            if row_idx < 0 or row_idx >= total_rows:
-                # 若对应行越界，则说明该类在属性矩阵中缺失
-                missing_original_ids.append(orig_id)
-                continue
-            class_attributes[cont_id] = attr_tensor[row_idx]
-            has_attr_mask[cont_id] = True
-
-        available = int(has_attr_mask.sum().item())
-        if available == 0:
-            logger.warning(
-                "No matching attributes found for classes in split '%s'.", self._split
-            )
-            return
-
-        if missing_original_ids:
-            logger.warning(
-                "Attributes missing for %d/%d classes (e.g., %s). Samples from these "
-                "classes will not include attribute vectors.",
-                len(missing_original_ids),
-                len(self._class_ids),
-                missing_original_ids[:5],
-            )
-
-        self.class_attributes = class_attributes
-        self._class_has_attribute = has_attr_mask
-        self.has_attributes = True
-        logger.info(
-            "Loaded attributes with shape %s; available for %d/%d classes.",
-            tuple(class_attributes.shape),
-            available,
-            len(self._class_ids),
-        )
-    # -------------------------11.15新增结束---------------------------------
+    # mixin already provides _load_attributes_* helpers
 
     def get_info(self):
         """

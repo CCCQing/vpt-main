@@ -19,6 +19,8 @@ from .mlp import MLP
 from ..utils import logging
 logger = logging.get_logger("visual_prompt")
 
+from ..solver.losses import RSimilarityClassifier
+
 
 class ViT(nn.Module):
     """
@@ -40,6 +42,9 @@ class ViT(nn.Module):
           vis            : 可视化/调试相关开关（由构建函数透传）
         """
         super(ViT, self).__init__()
+
+        # 先缓存 cfg，后续构建主干/冻结策略和日志打印都会使用
+        self.cfg = cfg
 
         # 如果 TRANSFER_TYPE 里包含 "prompt"，则需要传入 prompt 配置；否则不使用 prompt
         if "prompt" in cfg.MODEL.TRANSFER_TYPE:
@@ -68,13 +73,14 @@ class ViT(nn.Module):
         # ===== 核心：构建 ViT 主干，并根据 transfer_type 设置参数可训练性 =====
         self.build_backbone(
             prompt_cfg, cfg, adapter_cfg, load_pretrain, vis=vis)
-        self.cfg = cfg
 
         # 可选：构建 side 分支（用 AlexNet 做旁路特征）
         self.setup_side()
 
         # 最终分类头：MLP(输入维度 = feat_dim, 输出维度 = 类别数)
         self.setup_head(cfg)
+        self.r_similarity_head = None
+
 
     # --------------------------------------------------------------------- #
     #  side 分支：旁路特征（AlexNet），用于 "side" 迁移类型
@@ -193,8 +199,12 @@ class ViT(nn.Module):
         # ---------- prompt：只训练 prompt 模块 ----------
         elif transfer_type == "prompt":
             # 仅训练 prompt 相关参数（如前置/中间插入的虚拟 token）
+            # ⚠️ 本项目还存在语义概念槽/跨模态注意等可学习模块，参数名通常包含
+            #    "semantic" / "concept" / "semantic_attn"，需要随提示一起解冻；
+            #    否则它们会被误冻住，梯度无法落到共享概念基或亲和调制上。
+            trainable_keys = ("prompt", "semantic", "concept", "semantic_attn")
             for k, p in self.enc.named_parameters():
-                if "prompt" not in k:
+                if not any(key in k for key in trainable_keys):
                     p.requires_grad = False
 
         # ---------- prompt+bias：训练 prompt + 所有 bias ----------
@@ -264,6 +274,88 @@ class ViT(nn.Module):
             raise ValueError("transfer type {} is not supported".format(
                 transfer_type))
 
+        # 可选：打印可训练参数统计，便于确认冻结策略是否符合预期
+        if self.cfg.MODEL.LOG_TRAINABLE or self.cfg.SOLVER.DBG_TRAINABLE:
+            self._log_trainable_parameters()
+
+    def _log_trainable_parameters(self):
+        """打印可训练参数数量，并按模块类别统计占比，便于定位“占比最大的部分”。"""
+
+        # 按类别聚合：优先匹配更细的语义/概念/提示模块，否则归为 backbone/其他
+        buckets = {
+            "prompt": {"trainable": 0, "total": 0},
+            "semantic": {"trainable": 0, "total": 0},
+            "concept": {"trainable": 0, "total": 0},
+            "adapter": {"trainable": 0, "total": 0},
+            "head": {"trainable": 0, "total": 0},
+            "side": {"trainable": 0, "total": 0},
+            "r_similarity": {"trainable": 0, "total": 0},
+            "backbone": {"trainable": 0, "total": 0},
+        }
+
+        def _bucket_name(name: str) -> str:
+            if "prompt" in name:
+                return "prompt"
+            if "semantic" in name:
+                return "semantic"
+            if "concept" in name:
+                return "concept"
+            if "adapter" in name:
+                return "adapter"
+            if name.startswith("head"):
+                return "head"
+            if name.startswith("side"):
+                return "side"
+            if name.startswith("r_similarity_head"):
+                return "r_similarity"
+            return "backbone"
+        total, trainable = 0, 0
+        trainable_names = []
+
+        for name, param in self.named_parameters():
+            n = param.numel()
+            total += n
+            bucket = _bucket_name(name)
+            buckets[bucket]["total"] += n
+            if param.requires_grad:
+                trainable += n
+                buckets[bucket]["trainable"] += n
+                trainable_names.append(name)
+        ratio = trainable / total if total > 0 else 0
+        # 统计各模块占比，按可训练参数量从大到小排序打印
+        parts = []
+        for key, stats in buckets.items():
+            if stats["total"] == 0:
+                continue
+            total_pct = stats["total"] / total if total else 0
+            train_pct = stats["trainable"] / trainable if trainable else 0
+            parts.append((key, stats["trainable"], stats["total"], train_pct, total_pct))
+        parts.sort(key=lambda x: x[1], reverse=True)
+
+        if parts:
+            top_name, top_train, _, top_train_pct, _ = parts[0]
+            logger.info(
+                f"Trainable params: {trainable}/{total} ({ratio:.2%}); examples: {trainable_names[:20]}"
+            )
+            breakdown = "; ".join(
+                [
+                    f"{name}: {trn} train / {ttl} total ({train_pct:.2%} of trainable, {total_pct:.2%} of all)"
+                    for name, trn, ttl, train_pct, total_pct in parts
+                ]
+            )
+            logger.info(f"Trainable breakdown (sorted): {breakdown}")
+            logger.info(
+                f"Largest trainable share: {top_name} ({top_train} params, {top_train_pct:.2%} of trainable)"
+            )
+        else:
+            logger.info(
+                f"Trainable params: {trainable}/{total} ({ratio:.2%}); examples: {trainable_names[:20]}"
+            )
+
+    def log_trainable_parameters(self):
+        """公有接口：在模型构建后主动打印可训练参数。"""
+        self._log_trainable_parameters()
+
     def setup_head(self, cfg):
         """
         构建分类头（MLP）。维度规则：
@@ -279,10 +371,43 @@ class ViT(nn.Module):
             special_bias=True
         )
 
+    def attach_r_similarity_head(self, class_attributes):
+        """Install the R-similarity classifier when concept alignment is enabled.
+
+        Args:
+            class_attributes: Tensor or numpy array shaped [C, d_s].
+        """
+        if not self.cfg.MODEL.R_SIMILARITY.ENABLE:
+            return
+
+        concept = getattr(getattr(self.enc, "transformer", None), "semantic_concept", None)
+        if concept is None:
+            raise ValueError("R-similarity head requires semantic concept aligner to be enabled")
+
+        if class_attributes is None:
+            raise ValueError("class_attributes must be provided when R-similarity is enabled")
+        if not isinstance(class_attributes, torch.Tensor):
+            class_attributes = torch.from_numpy(class_attributes)
+        class_attributes = class_attributes.float()
+
+        device = next(self.parameters()).device
+        class_attributes = class_attributes.to(device)
+
+        proj_dim = self.cfg.MODEL.R_SIMILARITY.PROJ_DIM
+        self.r_similarity_head = RSimilarityClassifier(
+            concept,
+            class_attributes,
+            hidden_size=self.feat_dim,
+            proj_dim=proj_dim,
+            use_cosine=self.cfg.MODEL.R_SIMILARITY.USE_COSINE,
+            logit_scale_init=self.cfg.MODEL.R_SIMILARITY.LOGIT_SCALE_INIT,
+        ).to(device)
+
+
     # --------------------------------------------------------------------- #
     #  分类头：统一用一个 MLP
     # --------------------------------------------------------------------- #
-    def forward(self, x, return_feature=False):
+    def forward(self, x, return_feature=False, semantics=None):
         """
         主前向：
           1) 若配置了 side 分支，则先通过 side 提取 AlexNet 特征，并线性投影；
@@ -304,7 +429,7 @@ class ViT(nn.Module):
             self.enc.eval()
 
         # 3) 主干编码器获取全局特征（通常是 CLS 或 GAP 后的 embedding）
-        x = self.enc(x)  # batch_size x self.feat_dim
+        x = self.enc(x, semantics=semantics)  # batch_size x self.feat_dim
 
         # 4) 若有 side 分支，用一个标量 alpha（经 sigmoid 后）融合主干与 side 特征
         if self.side is not None:
@@ -315,12 +440,15 @@ class ViT(nn.Module):
         if return_feature:
             return x, x
 
-        # 6) 通过 MLP 头输出 logits
-        x = self.head(x)
+        # 6) 通过 MLP 或 R-similarity 头输出 logits
+        if self.r_similarity_head is not None:
+            x = self.r_similarity_head(x)
+        else:
+            x = self.head(x)
 
         return x
     
-    def forward_cls_layerwise(self, x):
+    def forward_cls_layerwise(self, x, semantics=None):
         """
         获取“逐层的 CLS 表征”：
         - 调用 self.enc.forward_cls_layerwise(x)；

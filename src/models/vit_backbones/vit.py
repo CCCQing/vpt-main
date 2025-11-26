@@ -179,29 +179,111 @@ class Attention(nn.Module):
         attention_output = self.out(context_layer)  # [B, N, D]
         attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
-
     def forward(self, hidden_states):
         """
-        常规前向：
-        - 仅返回注意力后的输出和（可选）注意力权重；
-        - 不暴露 q/k，用于绝大多数训练/推理场景。
+        对整段序列执行标准 self-attention 前向。
+
+        返回 attention 输出及（可选）注意力权重，兼容原有调用路径。
         """
         query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
         return self._scaled_attention(query_layer, key_layer, value_layer)
 
     def forward_with_projections(self, hidden_states):
         """
-        拓展版前向：
-        - 与 forward 完全共享 Q/K/V 投影与注意力计算的逻辑；
-        - 额外返回多头形式的 q_proj / k_proj，便于后续构造 QQ / KK 亲和矩阵。
+        在返回 self-attention 输出的同时，额外暴露多头形式的 q/k。
 
-        使用场景：
-        - 你想在保持 ViT 正常前向的同时，“窥视”这一层的几何结构（q/k），
-          用来自构 App / Avv / Apv 等亲和并做额外的损失。
+        供亲和矩阵等附加分支复用，避免重复线性映射计算。
         """
         query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
         attention_output, weights = self._scaled_attention(query_layer, key_layer, value_layer)
         return attention_output, weights, query_layer, key_layer
+
+
+class SemanticCrossAttention(nn.Module):
+    """Cross-attention from visual patch queries to semantic tokens."""
+
+    def __init__(self, hidden_size: int, semantic_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.all_head_size = self.head_dim * num_heads
+
+        # patch → query；semantics → key/value
+        # 注意：这里 Q 的输入是视觉 hidden_size=D，K/V 输入是语义维度 d_s
+        self.query = Linear(hidden_size, self.all_head_size)   # W_q^v
+        self.key = Linear(semantic_dim, self.all_head_size)    # W_k^s
+        self.value = Linear(semantic_dim, self.all_head_size)  # W_v^s
+        self.out = Linear(hidden_size, hidden_size)            # 输出映射回 D
+
+        self.attn_dropout = Dropout(dropout)
+        self.proj_dropout = Dropout(dropout)
+        self.softmax = Softmax(dim=-1)
+
+    def _transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        将 [B, L, D_all] reshape 成多头格式 [B, h, L, d]。
+        用于 patch/semantic 两侧的 Q/K/V 统一处理。
+        """
+        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_dim)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(self, hidden_states: torch.Tensor, semantics: torch.Tensor, num_prompt_tokens: int = 0) -> torch.Tensor:
+        """
+        仅对 patch tokens 做“视觉→语义”的跨注意力。
+
+        参数:
+            hidden_states: [B, 1+P+N, D] (CLS + prompt + patch)
+                - 第 0 个 token：CLS
+                - 1..P：prompt
+                - P+1..：视觉 patch
+            semantics: [B, d_s] 或 [B, N_s, d_s]
+                - 若是 [B, d_s]，视为单个语义 token；
+                - 若是 [B, N_s, d_s]，则可以支持多个语义 token。
+            num_prompt_tokens: prompt 个数 P，用于切分 CLS / prompt / patch
+
+        返回:
+            更新后的 hidden_states：
+                - CLS/prompt 段保持不变；
+                - patch 段在原有基础上加上语义 cross-attention 的残差。
+        """
+        if semantics.dim() == 2:
+            semantics = semantics.unsqueeze(1)
+
+        # 按 CLS / prompt / patch 切分序列
+        cls_tokens = hidden_states[:, :1, :]                           # [B, 1, D]
+        prompt_tokens = hidden_states[:, 1:1 + num_prompt_tokens, :]   # [B, P, D]
+        patch_tokens = hidden_states[:, 1 + num_prompt_tokens:, :]     # [B, N, D]
+
+        # 视觉 patch 作为 Query：[B, N, D] -> [B, h, N, d]
+        query_layer = self._transpose_for_scores(self.query(patch_tokens))
+        # 语义作为 Key/Value：[B, N_s, d_s] -> [B, h, N_s, d]
+        key_layer = self._transpose_for_scores(self.key(semantics))
+        value_layer = self._transpose_for_scores(self.value(semantics))
+
+        # QK^T / sqrt(d) 得到 patch→sem 的注意力得分
+        attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attn_scores = attn_scores / math.sqrt(self.head_dim)
+
+        # 对最后一维（语义 token 维）做 softmax，得到每个 patch 对各个语义的权重
+        attn_probs = self.softmax(attn_scores)
+        attn_probs = self.attn_dropout(attn_probs)
+
+        # 注意力权重加权 Value：[B, h, N, N_s] * [B, h, N_s, d] -> [B, h, N, d]
+        context_layer = torch.matmul(attn_probs, value_layer)
+        # [B, h, N, d] -> [B, N, h, d]
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        # 合并多头：[B, N, h, d] -> [B, N, all_head_size=D]
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+        # 映射回 hidden_size 并做 dropout
+        context_layer = self.out(context_layer)
+        context_layer = self.proj_dropout(context_layer)
+
+        # 只在 patch 段加上 cross-attention 的残差
+        patch_tokens = patch_tokens + context_layer
+        # 再拼回 CLS + prompt + patch
+        return torch.cat([cls_tokens, prompt_tokens, patch_tokens], dim=1)
 
     def compute_affinity(self, query_layer, key_layer, prompt_length, mode="qq", *,
                          return_cross=False, normalize=True, detach=True):
@@ -286,6 +368,7 @@ class Attention(nn.Module):
             affinities["Apv"] = self.softmax(apv) if normalize else apv
 
         return affinities
+
 
 
 class Mlp(nn.Module):
@@ -409,20 +492,57 @@ class Block(nn.Module):
     段1：LN → MHSA → 残差
     段2：LN → MLP  → 残差
     """
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, semantic_dim=None):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size   # hidden_size=D：每个 token 的通道维度
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)   # 段1的 LayerNorm
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)         # 段2的 LayerNorm
         self.ffn = Mlp(config)                  # 段2的两层 MLP（D→H→D，通常 H≈4D），完成通道内的非线性变换
         self.attn = Attention(config, vis)      # 段1的多头自注意力
+        self.semantic_norm = LayerNorm(config.hidden_size, eps=1e-6)
+        self.semantic_attn = None if semantic_dim is None else SemanticCrossAttention(
+            config.hidden_size,
+            semantic_dim,
+            config.transformer["num_heads"],
+            dropout=config.transformer["attention_dropout_rate"],
+        )
+        self._semantic_dim = semantic_dim
 
-    def forward(self, x):
+    def _ensure_semantic_attn(self, semantics: torch.Tensor, device: torch.device = None):
+        """
+        Lazy 初始化 semantic_attn：
+        - 若构造 Block 时 semantic_dim=None，但运行时传入了 semantics，
+          则在第一次调用时根据 semantics.size(-1) 实例化 SemanticCrossAttention。
+        - 同时把新建的 semantic_attn 移到当前 device，避免参数留在 CPU。
+        """
+        if self.semantic_attn is None and semantics is not None:
+            # 根据当前语义张量的最后一维确定 semantic_dim
+            self._semantic_dim = semantics.size(-1)
+            self.semantic_attn = SemanticCrossAttention(
+                self.hidden_size,
+                self._semantic_dim,
+                self.attn.num_attention_heads,
+                dropout=self.attn.attn_dropout.p,
+            )
+            if device is not None:
+                self.semantic_attn = self.semantic_attn.to(device)
+
+
+    def forward(self, x, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
         # 段1：注意力 + 残差
         h = x  # 残差分支
         x = self.attention_norm(x)  # LN
         x, weights = self.attn(x)   # MHSA（输出同形状）; weights 仅在 vis=True 时非 None
         x = x + h                   # 残差相加
+
+        # 语义交叉注意力（可选）
+        if semantics is not None:
+            self._ensure_semantic_attn(semantics, device=x.device)
+            if self.semantic_attn is not None:
+                h = x
+                x = self.semantic_norm(x)
+                x = h + self.semantic_attn(x, semantics, num_prompt_tokens)
+
 
         # 段2：FFN + 残差
         h = x
@@ -431,7 +551,7 @@ class Block(nn.Module):
         x = x + h                   # 残差相加
         return x, weights
 
-    def forward_with_affinity(self, x, affinity_config):
+    def forward_with_affinity(self, x, affinity_config, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
         """
         带亲和矩阵输出的前向：
 
@@ -469,6 +589,14 @@ class Block(nn.Module):
         # 同时拿到 MHSA 输出 + 多头形式的 q_proj / k_proj
         x, weights, q_proj, k_proj = self.attn.forward_with_projections(x_norm)
         x = x + h
+
+        # 语义交叉注意力（可选）
+        if semantics is not None:
+            self._ensure_semantic_attn(semantics, device=x.device)
+            if self.semantic_attn is not None:
+                h = x
+                x = self.semantic_norm(x)
+                x = h + self.semantic_attn(x, semantics, num_prompt_tokens)
 
         # --- FFN 分支 + 残差 ---
         h = x
@@ -536,26 +664,26 @@ class Block(nn.Module):
 
 class Encoder(nn.Module):
     """堆叠多个 Transformer Block，并在末尾加一层 LayerNorm。"""
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, semantic_dim: int = None):
         super(Encoder, self).__init__()
         self.vis = vis
         self.layer = nn.ModuleList()    # 保存有序的多层子模块
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6) # 在所有 block 之后再做一次 LayerNorm
         for _ in range(config.transformer["num_layers"]):
-            layer = Block(config, vis)  # 每层都是同结构的 Transformer Block（内部是 LN→MHSA→残差；LN→MLP→残差）
+            layer = Block(config, vis, semantic_dim)  # 每层都是同结构的 Transformer Block（内部是 LN→MHSA→残差；LN→MLP→残差）
             self.layer.append(copy.deepcopy(layer))
         # 本实现的 Block 属于 Pre-LN（在每个子层前 LN），额外的末端 LN（有些论文称 final LN）有助于稳定训练并改善表征
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
         """常规前向：返回编码结果与（可选）各层注意力权重。"""
         attn_weights = []
         for layer_block in self.layer:
-            hidden_states, weights = layer_block(hidden_states) # hidden_states为(B, 1+N, D)D 为 hidden_size
+            hidden_states, weights = layer_block(hidden_states, semantics) # hidden_states为(B, 1+N, D)D 为 hidden_size
             if self.vis:
                 attn_weights.append(weights)    # 把每层的 weights 保存到列表里否则返回空列表
         encoded = self.encoder_norm(hidden_states)  # 对最后一层输出再做一次 LayerNorm，得到 encoded
         return encoded, attn_weights
 
-    def forward_with_affinity(self, hidden_states, affinity_config):
+    def forward_with_affinity(self, hidden_states, affinity_config, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
         """
         与标准 Encoder.forward 类似，但在遍历每一层 Block 时，
         额外收集该层的 prompt/patch 亲和矩阵。
@@ -581,7 +709,7 @@ class Encoder(nn.Module):
         attn_weights = []
         affinities = []
         for layer_block in self.layer:
-            hidden_states, weights, affinity = layer_block.forward_with_affinity(hidden_states, affinity_config)
+            hidden_states, weights, affinity = layer_block.forward_with_affinity(hidden_states, affinity_config, semantics, num_prompt_tokens)
             if self.vis:
                 attn_weights.append(weights)
             affinities.append(affinity)
@@ -620,20 +748,20 @@ class Transformer(nn.Module):
     """
     完整的 Transformer：Embeddings（CLS+patch+pos）+ Encoder（多层 Block）
     """
-    def __init__(self, config, img_size, vis):
+    def __init__(self, config, img_size, vis, semantic_dim: int = None):
         super(Transformer, self).__init__()
         self.embeddings = Embeddings(config, img_size=img_size)
-        self.encoder = Encoder(config, vis)
+        self.encoder = Encoder(config, vis, semantic_dim)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, semantics: torch.Tensor = None):
         """标准前向：返回编码后的序列与注意力权重。"""
         embedding_output = self.embeddings(input_ids)
 
-        encoded, attn_weights = self.encoder(embedding_output)
+        encoded, attn_weights = self.encoder(embedding_output, semantics)
         return encoded, attn_weights
 
 
-    def forward_with_affinity(self, input_ids, affinity_config):
+    def forward_with_affinity(self, input_ids, affinity_config, semantics: torch.Tensor = None):
         """
         与标准 forward 类似，但返回“带亲和”的版本：
 
@@ -650,7 +778,7 @@ class Transformer(nn.Module):
             affinities:   list[dict]
         """
         embedding_output = self.embeddings(input_ids)
-        encoded, attn_weights, affinities = self.encoder.forward_with_affinity(embedding_output, affinity_config)
+        encoded, attn_weights, affinities = self.encoder.forward_with_affinity(embedding_output, affinity_config, semantics)
         return encoded, attn_weights, affinities
 
     def forward_cls_layerwise(self, input_ids):
@@ -676,19 +804,19 @@ class VisionTransformer(nn.Module):
         # 分类头：若 num_classes<=0 则用恒等映射（仅提取特征）
         self.head = Linear(config.hidden_size, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward(self, x, vis=False):
+    def forward(self, x, vis=False, semantics: torch.Tensor = None):
         """
         输入：x [B, 3, H, W]
         输出：若 vis=False 返回 logits；否则返回 (logits, attn_weights)
         """
-        x, attn_weights = self.transformer(x)   # x: [B, 1+N, D]，attn_weights 典型形状：[num_layers, B, num_heads, 1+N, 1+N]（仅在 vis=True 时非空）
+        x, attn_weights = self.transformer(x, semantics)   # x: [B, 1+N, D]，attn_weights 典型形状：[num_layers, B, num_heads, 1+N, 1+N]（仅在 vis=True 时非空）
         logits = self.head(x[:, 0])     # 取 CLS token 做分类，x[:, 0] 始终是 CLS 的向量，维度 D=config.hidden_size
 
         if not vis:
             return logits
         return logits, attn_weights # attn_weights: num_layers, B, num_head, num_patches, num_patches [num_layers, B, h, N, N]
 
-    def forward_with_affinity(self, x, affinity_config, vis=False):
+    def forward_with_affinity(self, x, affinity_config, vis=False, semantics: torch.Tensor = None):
         """
         顶层带亲和输出的前向接口：
 
@@ -712,7 +840,7 @@ class VisionTransformer(nn.Module):
             若 vis=True:
                 logits, attn_weights, affinities
         """
-        x, attn_weights, affinities = self.transformer.forward_with_affinity(x, affinity_config)
+        x, attn_weights, affinities = self.transformer.forward_with_affinity(x, affinity_config, semantics)
         logits = self.head(x[:, 0])
 
         if not vis:
@@ -728,7 +856,7 @@ class VisionTransformer(nn.Module):
     def load_from(self, weights):
         """
         从预训练（通常是 JAX/TF）权重字典加载参数，并处理位置编码尺寸不一致。
-        网格是什么：图像会按照patch大小切块，每个 patch 相当于一个 token，放回二维排布，就得到一个 patch 网格（grid）
+        网格是什么：图像会按照patch大小切块，每个 patch 相当于一个 token，放回二维排布，就得到一个 patch 网格（g   rid）
             ViT 的 绝对位置编码是给网格里每个格子（每个 patch）分配一个 D 维向量
             很多实现把网格当作方形（H=W、且p相同），包括在输入之后进行裁剪
             预训练网格（G）= gs×gs故gs = sqrt(G),eg:224×224图,patch=16 → 14×14 网格 →G=196

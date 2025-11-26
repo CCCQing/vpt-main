@@ -15,7 +15,10 @@ class CfgNode(_CfgNode):
 
     @classmethod
     def _open_cfg(cls, filename):
-        return PathManager.open(filename, "r")
+        # Explicitly use UTF-8 to avoid locale-dependent decoding errors when
+        # reading YAML configs on platforms with non-UTF-8 defaults (e.g.,
+        # Windows CP936/GBK).
+        return PathManager.open(filename, "r", encoding="utf-8")
 
     def dump(self, *args, **kwargs):
         """

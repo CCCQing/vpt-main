@@ -40,8 +40,10 @@ class PromptedTransformer(Transformer):
             img_size += 2 * prompt_config.NUM_TOKENS
 
         # 构建标准 ViT（embeddings + encoder）
+        semantic_dim = getattr(prompt_config, "SEMANTIC_DIM", None)
+
         super(PromptedTransformer, self).__init__(
-            config, img_size, vis)
+            config, img_size, vis, semantic_dim=semantic_dim)
 
         self.prompt_config = prompt_config  # 所有 prompt 的配置超参
         self.vit_config = config  # ViT 结构规格（层数、hidden_size、patch 等）
@@ -348,7 +350,7 @@ class PromptedTransformer(Transformer):
             for module in self.children():
                 module.train(mode)
 
-    def forward_deep_prompt(self, embedding_output):
+    def forward_deep_prompt(self, embedding_output, semantics=None):
         """
         “标准” deep-prompt 前向（逐层替换）：
         - 第0层：使用“前置 prompt 后”的序列直接进入；
@@ -365,7 +367,7 @@ class PromptedTransformer(Transformer):
         for i in range(num_layers):
             if i == 0:
                 # 第0层：直接吃“前置 prompt 后”的序列
-                hidden_states, weights = self.encoder.layer[i](embedding_output)
+                hidden_states, weights = self.encoder.layer[i](embedding_output, semantics, self.num_tokens)
             else:
                 # 1..L-1 层：可选择替换“提示段”再进层
                 if i <= self.deep_prompt_embeddings.shape[0]:
@@ -401,7 +403,7 @@ class PromptedTransformer(Transformer):
                         raise ValueError("prompt location {} is not supported".format(self.prompt_config.LOCATION))
 
                 # 进入该层计算
-                hidden_states, weights = self.encoder.layer[i](hidden_states)
+                hidden_states, weights = self.encoder.layer[i](hidden_states, semantics, self.num_tokens)
 
             if self.encoder.vis:
                 attn_weights.append(weights)
@@ -409,7 +411,7 @@ class PromptedTransformer(Transformer):
         encoded = self.encoder.encoder_norm(hidden_states)
         return encoded, attn_weights
 
-    def forward_reverse_deep_prompt(self, x):
+    def forward_reverse_deep_prompt(self, x, semantics=None):
         """
         “反向” deep-prompt 前向：
         - 先不带任何 prompt 跑前面若干层；
@@ -428,7 +430,7 @@ class PromptedTransformer(Transformer):
         # no prompt
         # （一）前半段：不插 prompt
         for i in range(num_layers - num_deep_layers):
-            hidden_states, weights = self.encoder.layer[i](hidden_states)
+            hidden_states, weights = self.encoder.layer[i](hidden_states, semantics, 0)
             if self.encoder.vis:
                 attn_weights.append(weights)
 
@@ -455,7 +457,7 @@ class PromptedTransformer(Transformer):
             else:
                 raise ValueError("prompt location {} is not supported".format(self.prompt_config.LOCATION))
 
-            hidden_states, weights = self.encoder.layer[i](hidden_states)
+            hidden_states, weights = self.encoder.layer[i](hidden_states, semantics)
 
             if self.encoder.vis:
                 attn_weights.append(weights)
@@ -463,7 +465,7 @@ class PromptedTransformer(Transformer):
         encoded = self.encoder.encoder_norm(hidden_states)
         return encoded, attn_weights
 
-    def forward_noexpand_deep_prompt(self, embedding_output):
+    def forward_noexpand_deep_prompt(self, embedding_output, semantics=None):
         """
         “不扩展长度”的 deep-prompt 前向（只支持 prepend）：
         - 在前若干层临时插入（替换）deep-prompt；
@@ -479,10 +481,12 @@ class PromptedTransformer(Transformer):
         weights = None
         B = embedding_output.shape[0]
         num_layers = self.vit_config.transformer["num_layers"]
+        prompt_len = self.num_tokens
+
 
         for i in range(num_layers):
             if i == 0:
-                hidden_states, weights = self.encoder.layer[i](embedding_output)
+                hidden_states, weights = self.encoder.layer[i](embedding_output, semantics, prompt_len)
             else:
                 if i <= self.deep_prompt_embeddings.shape[0]:
                     # 在第 1..K 层入口用 deep prompt 替换
@@ -501,8 +505,10 @@ class PromptedTransformer(Transformer):
                         hidden_states[:, :1, :],
                         hidden_states[:, (1+self.num_tokens):, :]
                     ), dim=1)
+                    prompt_len = 0
 
-                hidden_states, weights = self.encoder.layer[i](hidden_states)
+
+                hidden_states, weights = self.encoder.layer[i](hidden_states, semantics, prompt_len)
 
             if self.encoder.vis:
                 attn_weights.append(weights)
@@ -510,20 +516,20 @@ class PromptedTransformer(Transformer):
         encoded = self.encoder.encoder_norm(hidden_states)
         return encoded, attn_weights
 
-    def forward(self, x):
+    def forward(self, x, semantics=None):
         """
         总前向入口：根据配置选择三条 deep-prompt 路径之一；
         若未启用 deep，则走标准“prepend/add/... + encoder”的路径。
         """
         if self.prompt_config.REVERSE_DEEP:
             # 只在最后若干层插入 deep
-            encoded, attn_weights = self.forward_reverse_deep_prompt(x)
+            encoded, attn_weights = self.forward_reverse_deep_prompt(x, semantics)
 
         elif self.prompt_config.FORWARD_DEEP_NOEXPAND:
             # 先并入“前置 prompt”，再走“不扩展长度”的 deep 前向
             embedding_output = self.incorporate_prompt(x)
             encoded, attn_weights = self.forward_noexpand_deep_prompt(
-                embedding_output)
+                embedding_output, semantics)
 
         else:
             # this is the default version: # 默认：标准路径
@@ -531,9 +537,9 @@ class PromptedTransformer(Transformer):
 
             if self.prompt_config.DEEP:
                 encoded, attn_weights = self.forward_deep_prompt(
-                    embedding_output)
+                    embedding_output, semantics)
             else:
-                encoded, attn_weights = self.encoder(embedding_output)
+                encoded, attn_weights = self.encoder(embedding_output, semantics)
 
         return encoded, attn_weights
 
@@ -561,9 +567,9 @@ class PromptedVisionTransformer(VisionTransformer):
         self.transformer = PromptedTransformer(
             prompt_cfg, vit_cfg, img_size, vis)
 
-    def forward(self, x, vis=False):
+    def forward(self, x, vis=False, semantics=None):
         # 得到编码后的整段序列（可能含 CLS + Prompt + Patch）
-        x, attn_weights = self.transformer(x)
+        x, attn_weights = self.transformer(x, semantics)
 
         # 依据池化策略选择输出向量
         if self.prompt_cfg.VIT_POOL_TYPE == "original":

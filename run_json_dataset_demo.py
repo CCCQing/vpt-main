@@ -194,6 +194,11 @@ def _configure_for_xlsa(cfg, data_root: Path, xlsa_root: Path, gzsl: bool, use_t
     cfg.DATA.XLSA.TEST_SEEN_KEY = "test_seen_loc"
     cfg.DATA.XLSA.TEST_INCLUDE_SEEN = bool(gzsl)
 
+    cfg.SOLVER.EVAL_MODE = "gzsl" if gzsl else "zsl"
+    cfg.SOLVER.GZSL = bool(gzsl)
+    cfg.GZSL = bool(gzsl)
+
+
     cfg.DATA.ATTS_PATH = os.fspath(split_path)
     cfg.DATA.ATTS_KEY = "att"
 

@@ -23,6 +23,7 @@ from .vit_prompt.vit import PromptedVisionTransformer
 from .vit_prompt.swin_transformer import PromptedSwinTransformer
 from .vit_prompt.vit_moco import vit_base as prompt_vit_base
 from .vit_prompt.vit_mae import build_model as prompt_mae_vit_model
+from .prompting.prompt_distribution import PreViTPromptDistributor
 
 # Adapter 版本骨干
 from .vit_adapter.vit_mae import build_model as adapter_mae_vit_model
@@ -462,11 +463,11 @@ def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, fusion_cfg=None
     # 各监督模型类型到输出维度的映射（来自官方配置/论文）
     # image size is the size of actual image
     m2featdim = {
-        "sup_vitb16_224": 768,
-        "sup_vitb16": 768,
-        "sup_vitl16_224": 1024,
-        "sup_vitl16": 1024,
-        "sup_vitb8_imagenet21k": 768,
+        "sup_vitb16_224": 768,              # sup = supervised
+        "sup_vitb16": 768,                  # vitb  ViT-Base 768/ vitl  ViT-Large 1024/ vith ViT-Huge 1280
+        "sup_vitl16_224": 1024,             # vitb8 → 8×8 patch /vitb16 → 16×16 patch
+        "sup_vitl16": 1024,                 # _224以 224×224 分辨率训练 / 没 _224 的，有时候代表“默认高分辨率版本”
+        "sup_vitb8_imagenet21k": 768,       # _imagenet21k预训练时用了 ImageNet-21k（21000 类的超大版本），而不是普通的 ImageNet-1k（1000 类）
         "sup_vitb16_imagenet21k": 768,
         "sup_vitb32_imagenet21k": 768,
         "sup_vitl16_imagenet21k": 1024,
@@ -475,14 +476,36 @@ def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, fusion_cfg=None
     }
     # 选择具体骨干：Prompt > Adapter > 原生 ViT
     # if prompt_cfg is not None:
-    if prompt_init is None and prompt_init_provider is not None:
-        prompt_init = prompt_init_provider()
+    distribution_only = False   # 仅运行时调用 provider 生成 prompt，而不在构建阶段预生成/持有 prompt 参数（用于“分布专用”模式）
+    prompt_provider = prompt_init_provider
+    if prompt_cfg is not None:
+        distribution_only = getattr(prompt_cfg, "DISTRIBUTION_ONLY", False)
+
+        # 如配置启用提示分布模块，则在此构建 PreViTPromptDistributor 作为 provider
+        dist_cfg = getattr(prompt_cfg, "DISTRIBUTOR", None)
+        if dist_cfg is not None and getattr(dist_cfg, "ENABLE", False) and prompt_provider is None:
+            semantic_dim = dist_cfg.SEMANTIC_DIM if dist_cfg.SEMANTIC_DIM > 0 else None
+            semantic_proj_dim = dist_cfg.SEMANTIC_PROJ_DIM if dist_cfg.SEMANTIC_PROJ_DIM > 0 else None
+            prompt_provider = PreViTPromptDistributor(
+                dim=m2featdim[model_type],
+                prompt_len=prompt_cfg.NUM_TOKENS,
+                latent_dim=dist_cfg.LATENT_DIM,
+                hidden_dim=dist_cfg.HIDDEN_DIM,
+                pool=dist_cfg.POOL,
+                semantic_dim=semantic_dim,
+                semantic_proj_dim=semantic_proj_dim,
+            )
+
+
+    if (not distribution_only and prompt_init is None and
+            prompt_provider is not None):
+        prompt_init = prompt_provider()
 
     if prompt_cfg is not None:
         model = PromptedVisionTransformer(
             prompt_cfg, model_type,
             crop_size, num_classes=-1, vis=vis,
-            prompt_init=prompt_init, prompt_init_provider=prompt_init_provider,
+            prompt_init=prompt_init, prompt_init_provider=prompt_provider,
         )
     elif adapter_cfg is not None:
         model = ADPT_VisionTransformer(model_type, crop_size, num_classes=-1, adapter_cfg=adapter_cfg)

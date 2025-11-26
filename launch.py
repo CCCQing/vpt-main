@@ -176,10 +176,12 @@ def logging_train_setup(args, cfg) -> None:
     # 4) 记录命令行与配置文件内容（方便复现实验）
     logger.info("Command line arguments: " + str(args))
     if hasattr(args, "config_file") and args.config_file != "":
+        with PathManager.open(args.config_file, "r", encoding="utf-8") as f:
+            cfg_text = f.read()
         logger.info(
             "Contents of args.config_file={}:\n{}".format(
                 args.config_file,
-                PathManager.open(args.config_file, "r").read()  # 直接把 YAML 内容打进日志
+                cfg_text  # 直接把 YAML 内容打进日志
             )
         )
     # Show the config
