@@ -19,10 +19,12 @@ DATA:
     # ATTS_KEY: "att"
 MODEL:
   TYPE: "vit"
-  PROMPT:                 # 08.29加入
-    NUM_TOKENS: 50        # 08.29加入
-    DROPOUT: 0.0          # 08.29加入
+  PROMPT:
+    NUM_TOKENS: 50
+    DROPOUT: 0.0
     DISTRIBUTION_ONLY: True   # True -> 仅使用提示分布提供的 prompt，不创建静态可训练 prompt
+    FREEZE_EMBEDDINGS: True
+    DETACH_PROMPT_GRAD: True
     DISTRIBUTOR:
       ENABLE: True
       LATENT_DIM: 256

@@ -68,7 +68,6 @@ _C.MODEL.PROMPT.LOCATION = "prepend"
 _C.MODEL.PROMPT.INITIATION = "random"  # "final-cls", "cls-first12"
 _C.MODEL.PROMPT.CLSEMB_FOLDER = ""
 _C.MODEL.PROMPT.CLSEMB_PATH = ""
-_C.MODEL.PROMPT.PROJECT = -1  # "projection mlp hidden dim""projection mlp 隐藏维度"
 # Prompt 类型 （深度或浅层）指定
 _C.MODEL.PROMPT.DEEP = True # True# False # "whether do deep prompt or not, only for prepend location"是否进行深度 prompt，仅在 prepend 位置支持
 
@@ -96,6 +95,8 @@ _C.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH = False
 # 是否在模型构建后打印可训练参数统计，便于确认冻结策略和提示/语义模块是否参与训练
 _C.MODEL.LOG_TRAINABLE = True
 
+_C.MODEL.PROMPT.FREEZE_EMBEDDINGS = True
+
 # 共享概念基（语义-视觉对齐）
 _C.MODEL.PROMPT.SEMANTIC_CONCEPT = CfgNode()
 _C.MODEL.PROMPT.SEMANTIC_CONCEPT.ENABLE = False
@@ -118,8 +119,9 @@ _C.MODEL.PROMPT.DISTRIBUTOR.SEMANTIC_PROJ_DIM = 0  # 语义投影维度（0 表�
 
 # R-similarity classification head (CLS ↔ R-space prototypes)
 _C.MODEL.R_SIMILARITY = CfgNode()
-_C.MODEL.R_SIMILARITY.ENABLE = False
+_C.MODEL.R_SIMILARITY.ENABLE = True               # 用r_similarity_head分类头
 _C.MODEL.R_SIMILARITY.PROJ_DIM = -1
+_C.MODEL.R_SIMILARITY.VISUAL_PROJ_ENABLE = False  # 是否对 CLS 额外做线性投影（默认直接用 CLS）
 _C.MODEL.R_SIMILARITY.USE_COSINE = True
 _C.MODEL.R_SIMILARITY.LOGIT_SCALE_INIT = 10.0
 # ----------------------------------------------------------------------
@@ -136,6 +138,17 @@ _C.MODEL.PROMPT_FUSION.SEMANTIC_DIM = 0  # 语义向量维度（USE_SEMANTICS=Tr
 _C.MODEL.PROMPT_FUSION.AFFINITY_BIAS = True  # 在亲和矩阵上是否学习额外偏置
 _C.MODEL.PROMPT_FUSION.RETURN_AUX = False  # 默认推理是否返回辅助 loss/亲和信息
 # ----------------------------------------------------------------------
+# Affinity options（是否走亲和分支及其计算配置）
+# ----------------------------------------------------------------------
+_C.MODEL.AFFINITY = CfgNode()
+_C.MODEL.AFFINITY.ENABLE = True           # 是否启用 forward_with_affinity 分支
+_C.MODEL.AFFINITY.PROMPT_LENGTH = 0        # prompt 长度（缺省时由 NUM_TOKENS 填充）
+_C.MODEL.AFFINITY.RETURN_CROSS = False     # 是否返回跨模态亲和
+_C.MODEL.AFFINITY.NORMALIZE = True         # 亲和矩阵是否归一化
+_C.MODEL.AFFINITY.DETACH = True            # 计算亲和时是否分离梯度
+_C.MODEL.AFFINITY.VIS = False              # 是否同时返回注意力权重（vis 模式）
+
+# ----------------------------------------------------------------------
 # adapter options
 # ----------------------------------------------------------------------
 _C.MODEL.ADAPTER = CfgNode()
@@ -148,7 +161,7 @@ _C.MODEL.ADAPTER.STYLE = "Pfeiffer"
 
 
 _C.SOLVER = CfgNode()
-_C.SOLVER.LOSS = "softmax"
+_C.SOLVER.LOSS = "softmax_prompt_align"
 _C.SOLVER.LOSS_ALPHA = 0.01
 
 _C.SOLVER.OPTIMIZER = "sgd"  # or "adamw"
@@ -156,7 +169,7 @@ _C.SOLVER.MOMENTUM = 0.9
 _C.SOLVER.WEIGHT_DECAY = 0.0001         # 权重衰减
 _C.SOLVER.WEIGHT_DECAY_BIAS = 0
 
-_C.SOLVER.PATIENCE = 300
+_C.SOLVER.PATIENCE = 300        # 早停
 
 # Zero-shot evaluation mode: "zsl" (default unseen-only) or "gzsl" (include seen + unseen)
 _C.SOLVER.EVAL_MODE = "zsl"

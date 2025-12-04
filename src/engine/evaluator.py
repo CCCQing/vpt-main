@@ -30,7 +30,13 @@ class Evaluator():
           "final": {...}  # 若未设置迭代/epoch，则全部记到 final 下
         }
     """
-    def __init__(self,) -> None:
+
+    def __init__(
+            self,
+            seen_classes: np.ndarray = None,
+            unseen_classes: np.ndarray = None,
+            task_type: str = "standard",
+    ) -> None:
         # 用 defaultdict(dict) 便于后续直接按 key 累加子项
         self.results = defaultdict(dict)
         # 当前迭代/轮次（外部可在每个 epoch 开头更新）；默认 -1 表示“尚未设定”，落到 'final'
@@ -38,6 +44,10 @@ class Evaluator():
         # 多标签评测中，搜索“最佳 F1 阈值”的上界（闭区间的右端点），默认 0.5
         # 例如从 0.0 ~ 0.5 的阈值范围内搜索能使 F1 最优的分割点
         self.threshold_end = 0.5
+        # ZSL / GZSL 评测所需的类划分与任务类型（standard / zsl / gzsl）
+        self.task_type = task_type
+        self.seen_classes = seen_classes
+        self.unseen_classes = unseen_classes
 
     def update_iteration(self, iteration: int) -> None:
         """update iteration info
@@ -89,7 +99,34 @@ class Evaluator():
         if multilabel:
             self._eval_multilabel(probs, targets, test_data)
         else:
-            self._eval_singlelabel(probs, targets, test_data)
+            if self.task_type in ["zsl", "gzsl"]:
+                self._eval_zsl_gzsl_singlelabel(probs, targets, test_data)
+            else:
+                self._eval_singlelabel(probs, targets, test_data)
+
+    def _eval_zsl_gzsl_singlelabel(self, scores: np.ndarray, targets: List[int], eval_type: str) -> None:
+        """
+        ZSL / GZSL 评测：
+          - ZSL：仅 unseen 类别上的 per-class top1。
+          - GZSL：seen/unseen 上的 per-class top1 及调和平均 H。
+        """
+        if self.seen_classes is None or self.unseen_classes is None:
+            logger.warning("ZSL/GZSL evaluation requires seen_classes and unseen_classes. Falling back to standard metrics.")
+            self._eval_singlelabel(scores, targets, eval_type)
+            return
+
+        metrics = singlelabel.compute_zsl_gzsl_metrics(
+            scores,
+            np.asarray(targets, dtype=np.int64),
+            np.asarray(self.seen_classes, dtype=np.int64),
+            np.asarray(self.unseen_classes, dtype=np.int64),
+        )
+
+        # 日志用百分比显示、保留两位小数；存盘保持原始小数（0~1）
+        log_results = {k: np.around(v * 100, decimals=2) for k, v in metrics.items()}
+        save_results = metrics
+
+        self.log_and_update(log_results, save_results, eval_type)
 
     def _eval_singlelabel(self,scores: np.ndarray,targets: List[int],eval_type: str) -> None:
         """

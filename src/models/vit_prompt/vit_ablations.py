@@ -367,7 +367,7 @@ class PromptedTransformer(Transformer):
         for i in range(num_layers):
             if i == 0:
                 # 第0层：直接吃“前置 prompt 后”的序列
-                hidden_states, weights = self.encoder.layer[i](embedding_output, semantics, self.num_tokens)
+                hidden_states, weights, semantics = self.encoder.layer[i](hidden_states, semantics, self.num_tokens)
             else:
                 # 1..L-1 层：可选择替换“提示段”再进层
                 if i <= self.deep_prompt_embeddings.shape[0]:
@@ -430,7 +430,7 @@ class PromptedTransformer(Transformer):
         # no prompt
         # （一）前半段：不插 prompt
         for i in range(num_layers - num_deep_layers):
-            hidden_states, weights = self.encoder.layer[i](hidden_states, semantics, 0)
+            hidden_states, weights, semantics = self.encoder.layer[i](hidden_states, semantics, 0)
             if self.encoder.vis:
                 attn_weights.append(weights)
 
@@ -457,7 +457,7 @@ class PromptedTransformer(Transformer):
             else:
                 raise ValueError("prompt location {} is not supported".format(self.prompt_config.LOCATION))
 
-            hidden_states, weights = self.encoder.layer[i](hidden_states, semantics)
+            hidden_states, weights, semantics = self.encoder.layer[i](hidden_states, semantics)
 
             if self.encoder.vis:
                 attn_weights.append(weights)
@@ -486,7 +486,7 @@ class PromptedTransformer(Transformer):
 
         for i in range(num_layers):
             if i == 0:
-                hidden_states, weights = self.encoder.layer[i](embedding_output, semantics, prompt_len)
+                hidden_states, weights, semantics = self.encoder.layer[i](embedding_output, semantics, prompt_len)
             else:
                 if i <= self.deep_prompt_embeddings.shape[0]:
                     # 在第 1..K 层入口用 deep prompt 替换
@@ -508,7 +508,7 @@ class PromptedTransformer(Transformer):
                     prompt_len = 0
 
 
-                hidden_states, weights = self.encoder.layer[i](hidden_states, semantics, prompt_len)
+                hidden_states, weights, semantics = self.encoder.layer[i](hidden_states, semantics, prompt_len)
 
             if self.encoder.vis:
                 attn_weights.append(weights)

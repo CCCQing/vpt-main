@@ -175,6 +175,44 @@ def get_loaders(cfg, logger, final_runs=False):
     return train_loader, val_loader, test_loader
 
 
+def _extract_class_ids_from_dataset(dataset) -> set:
+    """Best-effort extraction of class ids from a dataset instance."""
+    if dataset is None:
+        return set()
+
+    for attr in ["_class_ids", "class_ids", "class_id_list", "classes"]:
+        value = getattr(dataset, attr, None)
+        if value is not None:
+            return set(int(x) for x in list(value))
+
+    for attr in ["_targets", "targets"]:
+        value = getattr(dataset, attr, None)
+        if value is not None:
+            return set(int(x) for x in np.asarray(value).reshape(-1))
+
+    imdb = getattr(dataset, "_imdb", None)
+    if imdb is not None:
+        return set(int(item.get("class")) for item in imdb if "class" in item)
+
+    return set()
+
+
+def _infer_seen_unseen_classes(train_loader, test_loader):
+    """Infer seen/unseen class id lists from loaders (best effort)."""
+    seen_classes = _extract_class_ids_from_dataset(getattr(train_loader, "dataset", None))
+    test_classes = _extract_class_ids_from_dataset(getattr(test_loader, "dataset", None))
+
+    if seen_classes and test_classes:
+        unseen_classes = test_classes.difference(seen_classes)
+    else:
+        unseen_classes = set()
+
+    return (
+        sorted(list(seen_classes)) if seen_classes else None,
+        sorted(list(unseen_classes)) if unseen_classes else None,
+    )
+
+
 def train(cfg, args, final_runs):
     # clear up residual cache from previous runs
     if torch.cuda.is_available():
@@ -197,7 +235,15 @@ def train(cfg, args, final_runs):
     model, cur_device = build_model(cfg)
 
     logger.info("Setting up Evalutator...")
-    evaluator = Evaluator()
+    seen_classes, unseen_classes = _infer_seen_unseen_classes(train_loader, test_loader)
+    task_type = getattr(cfg.SOLVER, "EVAL_MODE", "standard").lower()
+    if not seen_classes or not unseen_classes:
+        task_type = "standard"
+    evaluator = Evaluator(
+        seen_classes=np.asarray(seen_classes) if seen_classes else None,
+        unseen_classes=np.asarray(unseen_classes) if unseen_classes else None,
+        task_type=task_type,
+    )
     logger.info("Setting up Trainer...")
     trainer = Trainer(cfg, model, evaluator, cur_device)
 

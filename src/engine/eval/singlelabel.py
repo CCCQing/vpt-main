@@ -56,6 +56,57 @@ def compute_acc_auc(y_probs, y_true_ids):
     top5 = top_n_accuracy(y_probs, y_true_ids, k)
     return {"top1": top1, f"top{k}": top5}
 
+def _per_class_accuracy(preds: np.ndarray, targets: np.ndarray, class_ids: np.ndarray) -> float:
+    """
+    Compute mean per-class accuracy over the provided class id set.
+    """
+    accs = []
+    for cid in class_ids:
+        mask = targets == cid
+        if mask.sum() == 0:
+            # 若该类在当前 targets 中没有出现，则跳过，保持与 ZSL 文献一致（只对出现的类求均值）
+            continue
+        accs.append(float((preds[mask] == targets[mask]).mean()))
+    if not accs:
+        return 0.0
+    return float(np.mean(accs))
+
+
+def compute_zsl_gzsl_metrics(
+    scores: np.ndarray,
+    targets: np.ndarray,
+    seen_classes: np.ndarray,
+    unseen_classes: np.ndarray,
+) -> dict:
+    """
+    Compute ZSL / GZSL metrics used in zero-shot literature.
+
+    返回一个包含：
+      - zsl_unseen : 仅在 unseen 类别上的 per-class top1（ZSL 场景）
+      - gzsl_seen  : GZSL 场景下 seen 类的 per-class top1（S）
+      - gzsl_unseen: GZSL 场景下 unseen 类的 per-class top1（U）
+      - gzsl_h     : 调和平均 H = 2SU / (S+U+1e-8)
+    """
+    preds = np.asarray(scores).argmax(axis=1)
+    targets = np.asarray(targets).astype(np.int64)
+    seen_classes = np.asarray(seen_classes).astype(np.int64)
+    unseen_classes = np.asarray(unseen_classes).astype(np.int64)
+
+    zsl_unseen = _per_class_accuracy(preds, targets, unseen_classes)
+    gzsl_seen = _per_class_accuracy(preds, targets, seen_classes)
+    gzsl_unseen = _per_class_accuracy(preds, targets, unseen_classes)
+
+    gzsl_h = 0.0
+    if (gzsl_seen + gzsl_unseen) > 0:
+        gzsl_h = 2 * gzsl_seen * gzsl_unseen / (gzsl_seen + gzsl_unseen + 1e-8)
+
+    return {
+        "zsl_unseen": zsl_unseen,
+        "gzsl_seen": gzsl_seen,
+        "gzsl_unseen": gzsl_unseen,
+        "gzsl_h": gzsl_h,
+    }
+
 
 def topks_correct(preds, labels, ks):
     """Computes the number of top-k correct predictions for each k."""

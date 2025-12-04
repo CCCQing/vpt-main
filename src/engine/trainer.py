@@ -50,6 +50,29 @@ class Trainer():
         self.model = model
         self.device = device
 
+        # prompt 对齐损失是否启用（仅在选择 softmax_prompt_align 且 alpha>0 时开启，对应 L_avg 正则）
+        self.align_loss_enabled = (
+                cfg.SOLVER.LOSS == "softmax_prompt_align" and getattr(cfg.SOLVER, "LOSS_ALPHA", 0.0) > 0
+        )
+
+        # affinity branch configuration：按需走 forward_with_affinity 分支
+        self.use_affinity = cfg.MODEL.AFFINITY.ENABLE or self.align_loss_enabled
+        if self.use_affinity:
+            prompt_length = cfg.MODEL.AFFINITY.PROMPT_LENGTH
+            if prompt_length <= 0:
+                prompt_length = cfg.MODEL.PROMPT.NUM_TOKENS
+            self.affinity_cfg = {
+                "prompt_length": prompt_length,
+                # 对齐损失需要 prompt→patch 亲和，确保 return_cross 打开
+                "return_cross": cfg.MODEL.AFFINITY.RETURN_CROSS or self.align_loss_enabled,
+                "normalize": cfg.MODEL.AFFINITY.NORMALIZE,
+                "detach": cfg.MODEL.AFFINITY.DETACH,
+            }
+            self.affinity_vis = cfg.MODEL.AFFINITY.VIS
+        else:
+            self.affinity_cfg = None
+            self.affinity_vis = False
+
         # solver related
         # ================== 优化器 / 学习率调度器 / 损失函数 ==================
         logger.info("\tSetting up the optimizer...")
@@ -103,15 +126,40 @@ class Trainer():
 
         # ========== 2. 前向推理（训练时开启梯度，验证/测试禁用梯度） ==========
         with torch.set_grad_enabled(is_train):
-            if attributes is not None:
-                outputs = self.model(inputs, semantics=attributes)  # (batchsize, num_cls)
+            if self.use_affinity:
+                if attributes is not None:
+                    if self.affinity_vis:
+                        outputs, attn_weights, affinities = self.model.forward_with_affinity(
+                            inputs, self.affinity_cfg, semantics=attributes, vis=True
+                        )
+                    else:
+                        outputs, affinities = self.model.forward_with_affinity(
+                            inputs, self.affinity_cfg, semantics=attributes
+                        )
+                else:
+                    if self.affinity_vis:
+                        outputs, attn_weights, affinities = self.model.forward_with_affinity(
+                            inputs, self.affinity_cfg, vis=True
+                        )
+                    else:
+                        outputs, affinities = self.model.forward_with_affinity(
+                            inputs, self.affinity_cfg
+                        )
+
+                if self.align_loss_enabled: # forward_with_affinity 返回逐层亲和矩阵，按层提取对齐损失所需的 attn_pv/attn_vs
+                    aux = self._extract_alignment_aux(affinities) # 取亲和并做头平均
+                    outputs = (outputs if not isinstance(outputs, tuple) else outputs[0], aux)
+                else:
+                    outputs = outputs if not isinstance(outputs, tuple) else outputs[0]
             else:
-                outputs = self.model(inputs)  # (batchsize, num_cls)
+                outputs = self.model(inputs, semantics=attributes)
 
             if self.cfg.DBG:
+                _logits = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+
                 logger.info(
                     "shape of model output: {}, targets: {}".format(
-                        outputs.shape, targets.shape))
+                        _logits.shape, targets.shape))
 
             # ================== 3. 计算损失 ==================
             # 一些“局部损失”（is_local=True）需要拿到 model / inputs 参与计算
@@ -152,6 +200,40 @@ class Trainer():
             self.optimizer.step()
 
         return loss, outputs
+
+    def _extract_alignment_aux(self, affinities):
+        """
+        从 forward_with_affinity 的亲和列表中提取对齐损失需要的 attn_pv / attn_vs。
+        兼容多层：构造 {layer_idx: tensor} 的字典，缺失时返回 None。（模型前向返回所有层的亲和矩阵，方便在 loss 侧灵活选择使用哪一层或多层。）
+        """
+        if affinities is None:
+            return None
+
+        attn_pv = {}
+        attn_vs = {}
+
+        for idx, affinity in enumerate(affinities):
+            if not isinstance(affinity, dict):
+                continue
+
+            apv = affinity.get("Apv")
+            if apv is not None:
+                if apv.dim() == 4:
+                    attn_pv[idx] = apv.mean(dim=1)
+                elif apv.dim() == 3:
+                    attn_pv[idx] = apv
+
+            avs = affinity.get("Avs")
+            if avs is not None:
+                if avs.dim() == 4:
+                    attn_vs[idx] = avs.mean(dim=1).transpose(-1, -2)
+                elif avs.dim() == 3:
+                    attn_vs[idx] = avs.transpose(-1, -2)
+
+        if not attn_pv or not attn_vs:
+            return None
+
+        return {"attn_pv": attn_pv, "attn_vs": attn_vs}
 
     def get_input(self, data):
         """
@@ -451,7 +533,15 @@ class Trainer():
             # targets: Tensor → Python list[int]
             total_targets.extend(list(targets.numpy()))
             # outputs: logits Tensor，先收集，最后再 cat
-            total_logits.append(outputs)
+            # outputs 可能为 logits Tensor / (logits, aux) / {"logits": ...}
+            # 统一提取 logits 以便后续 cat
+            logits = outputs
+            if isinstance(outputs, (list, tuple)) and len(outputs) > 0:
+                logits = outputs[0]
+            if isinstance(outputs, dict) and "logits" in outputs:
+                logits = outputs["logits"]
+
+            total_logits.append(logits)
 
         # 整体评测日志
         logger.info(

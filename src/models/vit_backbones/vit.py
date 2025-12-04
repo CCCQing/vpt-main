@@ -8,6 +8,7 @@ https://github.com/jeonsworld/ViT-pytorch/blob/main/models/modeling.py
 import copy
 import logging
 import math
+from typing import Any, Dict, Optional
 # 8.21改动
 # 原有 Win 下 os.path.join 会产生反斜杠 "\"，会影响从权重字典中取键（键名一般用 "/"）
 # 因此改为从 posixpath 导入 join，确保键名分隔符始终为 "/"
@@ -198,93 +199,6 @@ class Attention(nn.Module):
         attention_output, weights = self._scaled_attention(query_layer, key_layer, value_layer)
         return attention_output, weights, query_layer, key_layer
 
-
-class SemanticCrossAttention(nn.Module):
-    """Cross-attention from visual patch queries to semantic tokens."""
-
-    def __init__(self, hidden_size: int, semantic_dim: int, num_heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.all_head_size = self.head_dim * num_heads
-
-        # patch → query；semantics → key/value
-        # 注意：这里 Q 的输入是视觉 hidden_size=D，K/V 输入是语义维度 d_s
-        self.query = Linear(hidden_size, self.all_head_size)   # W_q^v
-        self.key = Linear(semantic_dim, self.all_head_size)    # W_k^s
-        self.value = Linear(semantic_dim, self.all_head_size)  # W_v^s
-        self.out = Linear(hidden_size, hidden_size)            # 输出映射回 D
-
-        self.attn_dropout = Dropout(dropout)
-        self.proj_dropout = Dropout(dropout)
-        self.softmax = Softmax(dim=-1)
-
-    def _transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        将 [B, L, D_all] reshape 成多头格式 [B, h, L, d]。
-        用于 patch/semantic 两侧的 Q/K/V 统一处理。
-        """
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_dim)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
-    def forward(self, hidden_states: torch.Tensor, semantics: torch.Tensor, num_prompt_tokens: int = 0) -> torch.Tensor:
-        """
-        仅对 patch tokens 做“视觉→语义”的跨注意力。
-
-        参数:
-            hidden_states: [B, 1+P+N, D] (CLS + prompt + patch)
-                - 第 0 个 token：CLS
-                - 1..P：prompt
-                - P+1..：视觉 patch
-            semantics: [B, d_s] 或 [B, N_s, d_s]
-                - 若是 [B, d_s]，视为单个语义 token；
-                - 若是 [B, N_s, d_s]，则可以支持多个语义 token。
-            num_prompt_tokens: prompt 个数 P，用于切分 CLS / prompt / patch
-
-        返回:
-            更新后的 hidden_states：
-                - CLS/prompt 段保持不变；
-                - patch 段在原有基础上加上语义 cross-attention 的残差。
-        """
-        if semantics.dim() == 2:
-            semantics = semantics.unsqueeze(1)
-
-        # 按 CLS / prompt / patch 切分序列
-        cls_tokens = hidden_states[:, :1, :]                           # [B, 1, D]
-        prompt_tokens = hidden_states[:, 1:1 + num_prompt_tokens, :]   # [B, P, D]
-        patch_tokens = hidden_states[:, 1 + num_prompt_tokens:, :]     # [B, N, D]
-
-        # 视觉 patch 作为 Query：[B, N, D] -> [B, h, N, d]
-        query_layer = self._transpose_for_scores(self.query(patch_tokens))
-        # 语义作为 Key/Value：[B, N_s, d_s] -> [B, h, N_s, d]
-        key_layer = self._transpose_for_scores(self.key(semantics))
-        value_layer = self._transpose_for_scores(self.value(semantics))
-
-        # QK^T / sqrt(d) 得到 patch→sem 的注意力得分
-        attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-        attn_scores = attn_scores / math.sqrt(self.head_dim)
-
-        # 对最后一维（语义 token 维）做 softmax，得到每个 patch 对各个语义的权重
-        attn_probs = self.softmax(attn_scores)
-        attn_probs = self.attn_dropout(attn_probs)
-
-        # 注意力权重加权 Value：[B, h, N, N_s] * [B, h, N_s, d] -> [B, h, N, d]
-        context_layer = torch.matmul(attn_probs, value_layer)
-        # [B, h, N, d] -> [B, N, h, d]
-        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-        # 合并多头：[B, N, h, d] -> [B, N, all_head_size=D]
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-        context_layer = context_layer.view(*new_context_layer_shape)
-        # 映射回 hidden_size 并做 dropout
-        context_layer = self.out(context_layer)
-        context_layer = self.proj_dropout(context_layer)
-
-        # 只在 patch 段加上 cross-attention 的残差
-        patch_tokens = patch_tokens + context_layer
-        # 再拼回 CLS + prompt + patch
-        return torch.cat([cls_tokens, prompt_tokens, patch_tokens], dim=1)
-
     def compute_affinity(self, query_layer, key_layer, prompt_length, mode="qq", *,
                          return_cross=False, normalize=True, detach=True):
         """
@@ -323,52 +237,122 @@ class SemanticCrossAttention(nn.Module):
         if mode not in {"qq", "kk"}:
             raise ValueError(f"Unsupported affinity mode: {mode}")
 
-        # 选择使用 q 还是 k 作为特征基底
         base = query_layer if mode == "qq" else key_layer
         if detach:
             base = base.detach()
 
-        # 基本长度检查，防止切片越界
         if base.size(2) < 1 + prompt_length:
             raise ValueError(
                 f"Sequence length {base.size(2)} is insufficient for prompt_length={prompt_length} (needs >= {1 + prompt_length})."
             )
 
-        # token 维度切分：
-        # [0]            -> CLS
-        # [1 : 1+Lp]     -> prompt 段
-        # [1+Lp : end]   -> patch 段
         cls_offset = 1
         prompt_slice = slice(cls_offset, cls_offset + prompt_length)
         patch_slice = slice(cls_offset + prompt_length, None)
 
-        # base: [B, h, N, d_k]
         prompt_tokens = base[:, :, prompt_slice, :]
         patch_tokens = base[:, :, patch_slice, :]
         scale = 1.0 / math.sqrt(self.attention_head_size)
 
         affinities = {}
 
-        # 提示段内部自亲和 App（若存在 prompt）
         if prompt_tokens.numel() > 0:
-            # [B, h, L_p, d_k] @ [B, h, d_k, L_p] -> [B, h, L_p, L_p]
             app = torch.matmul(prompt_tokens, prompt_tokens.transpose(-1, -2)) * scale
             affinities["App"] = self.softmax(app) if normalize else app
 
-        # 视觉 patch 段内部自亲和 Avv
         if patch_tokens.numel() > 0:
-            # [B, h, L_v, d_k] @ [B, h, d_k, L_v] -> [B, h, L_v, L_v]
             avv = torch.matmul(patch_tokens, patch_tokens.transpose(-1, -2)) * scale
             affinities["Avv"] = self.softmax(avv) if normalize else avv
 
-        # prompt→patch 的交叉亲和 Apv（可选）
         if return_cross and prompt_tokens.numel() > 0 and patch_tokens.numel() > 0:
-            # [B, h, L_p, d_k] @ [B, h, d_k, L_v] -> [B, h, L_p, L_v]
             apv = torch.matmul(prompt_tokens, patch_tokens.transpose(-1, -2)) * scale
             affinities["Apv"] = self.softmax(apv) if normalize else apv
 
         return affinities
 
+class SemanticCrossAttention(nn.Module):
+    """Cross-attention adapter that only updates semantics (S ← S + CrossAttn(S, F))."""
+
+    def __init__(self, hidden_size: int, semantic_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.all_head_size = self.head_dim * num_heads
+
+        # semantics → query；patch → key/value
+        # 遵循 VSPCN 式 adapter：S ← S + CrossAttn(S, F)，视觉序列不在此处被改写
+        self.query = Linear(hidden_size, self.all_head_size)  # W_q^s
+        self.key = Linear(semantic_dim, self.all_head_size)  # W_k^v
+        self.value = Linear(semantic_dim, self.all_head_size)  # W_v^v
+        self.out = Linear(hidden_size, hidden_size)            # 输出映射回 D
+
+        self.attn_dropout = Dropout(dropout)
+        self.proj_dropout = Dropout(dropout)
+        self.softmax = Softmax(dim=-1)
+
+    def _transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        将 [B, L, D_all] reshape 成多头格式 [B, h, L, d]。
+        用于 patch/semantic 两侧的 Q/K/V 统一处理。
+        """
+        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_dim)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def forward(self, hidden_states: torch.Tensor, semantics: torch.Tensor, num_prompt_tokens: int = 0):
+        """
+        仅对语义分支做 CrossAttn 适配（S ← S + CrossAttn(S, F)），视觉序列保持原样。
+
+        参数:
+            hidden_states: [B, 1+P+N, D] (CLS + prompt + patch)
+            semantics: [B, d_s] 或 [B, 1, d_s]
+
+            num_prompt_tokens: prompt 个数 P，用于切分 CLS / prompt / patch
+
+        返回:
+            hidden_states: 原样返回，CLS/prompt/patch 不在此处改写
+            semantics_out: 语义残差更新后的张量 [B, d_s]
+        """
+        if semantics.dim() == 2:
+            semantics = semantics.unsqueeze(1)
+
+        # 按 CLS / prompt / patch 切分序列        # 序列切分：视觉序列仅作为上下文，保持不改写
+        cls_tokens = hidden_states[:, :1, :]                           # [B, 1, D]
+        prompt_tokens = hidden_states[:, 1:1 + num_prompt_tokens, :]   # [B, P, D]
+        patch_tokens = hidden_states[:, 1 + num_prompt_tokens:, :]     # [B, N, D]
+
+        # 语义统一成长度为 1 的序列，便于与多头注意力接口对齐
+        if semantics.dim() == 2:
+            semantics_seq = semantics.unsqueeze(1)  # [B, 1, D]
+        elif semantics.dim() == 3:
+            semantics_seq = semantics  # 约定为 [B, 1, D]
+        else:
+            raise ValueError(f"Unexpected semantics shape: {semantics.shape}")
+
+        # Q: semantics；K/V: patch tokens（视觉特征）
+        query_layer = self._transpose_for_scores(self.query(semantics_seq))
+        key_layer = self._transpose_for_scores(self.key(patch_tokens))
+        value_layer = self._transpose_for_scores(self.value(patch_tokens))
+
+        # 缩放点积注意力，遵循 VSPCN 式“仅更新 S”的适配器设计
+        attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+        attn_scores = attn_scores / math.sqrt(self.head_dim)
+
+        attn_probs = self.softmax(attn_scores)
+        attn_probs = self.attn_dropout(attn_probs)
+
+        context_layer = torch.matmul(attn_probs, value_layer)                  # [B, h, 1, d]
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()         # [B, 1, h, d]
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        context_layer = context_layer.view(*new_context_layer_shape)  # [B, 1, D]
+        context_layer = self.out(context_layer)
+        context_layer = self.proj_dropout(context_layer)
+
+        # 语义残差更新（S ← S + CrossAttn(S, F)），视觉序列保持不变
+        delta = context_layer.squeeze(1)  # [B, D]
+        semantics_out = semantics + delta
+
+        return torch.cat([cls_tokens, prompt_tokens, patch_tokens], dim=1), semantics_out
 
 
 class Mlp(nn.Module):
@@ -527,6 +511,60 @@ class Block(nn.Module):
             if device is not None:
                 self.semantic_attn = self.semantic_attn.to(device)
 
+    def _compute_semantic_affinity(
+            self,
+            q_proj: torch.Tensor,
+            semantics: Optional[torch.Tensor],
+            affinity_config: Optional[Dict[str, Any]],
+            num_prompt_tokens: int,
+    ) -> Dict[str, torch.Tensor]:
+        """基于 self-attention 的 q 与语义侧 k 计算 Avs/Aps 亲和矩阵。"""
+
+        if semantics is None or self.semantic_attn is None or affinity_config is None:
+            return {}
+
+        prompt_length = affinity_config.get("prompt_length", num_prompt_tokens)
+        normalize = affinity_config.get("normalize", True)
+        detach = affinity_config.get("detach", True)
+
+        if q_proj.size(2) < 1 + prompt_length:
+            return {}
+
+        cls_offset = 1
+        prompt_slice = slice(cls_offset, cls_offset + prompt_length)
+        patch_slice = slice(cls_offset + prompt_length, None)
+
+        if semantics.dim() == 2:
+            semantics_seq = semantics.unsqueeze(1)
+        elif semantics.dim() == 3:
+            semantics_seq = semantics
+        else:
+            raise ValueError(f"Unexpected semantics shape: {semantics.shape}")
+
+        sem_key = self.semantic_attn._transpose_for_scores(
+            self.semantic_attn.key(semantics_seq)
+        )
+
+        prompt_query = q_proj[:, :, prompt_slice, :]
+        patch_query = q_proj[:, :, patch_slice, :]
+
+        if detach:
+            sem_key = sem_key.detach()
+            prompt_query = prompt_query.detach()
+            patch_query = patch_query.detach()
+
+        scale = 1.0 / math.sqrt(self.attn.attention_head_size)
+        sem_aff: Dict[str, torch.Tensor] = {}
+
+        if patch_query.numel() > 0:
+            avs_logits = torch.matmul(patch_query, sem_key.transpose(-1, -2)) * scale
+            sem_aff["Avs"] = F.softmax(avs_logits, dim=-1) if normalize else avs_logits
+
+        if prompt_query.numel() > 0:
+            aps_logits = torch.matmul(prompt_query, sem_key.transpose(-1, -2)) * scale
+            sem_aff["Aps"] = F.softmax(aps_logits, dim=-1) if normalize else aps_logits
+
+        return sem_aff
 
     def forward(self, x, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
         # 段1：注意力 + 残差
@@ -539,17 +577,17 @@ class Block(nn.Module):
         if semantics is not None:
             self._ensure_semantic_attn(semantics, device=x.device)
             if self.semantic_attn is not None:
-                h = x
-                x = self.semantic_norm(x)
-                x = h + self.semantic_attn(x, semantics, num_prompt_tokens)
-
+                # 仅更新语义分支：遵循 VSPCN 式适配器，视觉序列保持由 ViT+prompt 控制
+                x_norm = self.semantic_norm(x)
+                _, semantics = self.semantic_attn(x_norm, semantics, num_prompt_tokens)
 
         # 段2：FFN + 残差
         h = x
         x = self.ffn_norm(x)        # LN
         x = self.ffn(x)             # MLP: D→H→D
         x = x + h                   # 残差相加
-        return x, weights
+
+        return x, weights, semantics
 
     def forward_with_affinity(self, x, affinity_config, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
         """
@@ -581,7 +619,7 @@ class Block(nn.Module):
         返回:
             x:          [B, N, D]，本层输出
             weights:    注意力权重（仅 vis=True 时非 None）
-            affinities: dict，包含 App/Avv(/Apv)
+            affinities: dict，包含 App/Avv(/Apv) 以及 Avs/Aps（若传入 semantics）
         """
         # --- 注意力分支 + 残差 ---
         h = x
@@ -594,9 +632,8 @@ class Block(nn.Module):
         if semantics is not None:
             self._ensure_semantic_attn(semantics, device=x.device)
             if self.semantic_attn is not None:
-                h = x
-                x = self.semantic_norm(x)
-                x = h + self.semantic_attn(x, semantics, num_prompt_tokens)
+                x_norm = self.semantic_norm(x)
+                _, semantics = self.semantic_attn(x_norm, semantics, num_prompt_tokens)
 
         # --- FFN 分支 + 残差 ---
         h = x
@@ -605,7 +642,7 @@ class Block(nn.Module):
         x = x + h
 
         # --- 基于 Q/K 计算 prompt/patch 亲和 ---
-        affinities = self.attn.compute_affinity(
+        attn_aff = self.attn.compute_affinity(
             q_proj,
             k_proj,
             affinity_config.get("prompt_length", 0),
@@ -615,13 +652,17 @@ class Block(nn.Module):
             detach=affinity_config.get("detach", True),
         )
 
-        return x, weights, affinities
+        sem_aff = self._compute_semantic_affinity(
+            q_proj, semantics, affinity_config, num_prompt_tokens
+        )
 
+        affinities = {**attn_aff, **sem_aff}
 
-
+        return x, weights, affinities, semantics
 
     def load_from(self, weights, n_block):
         """从预训练权重字典中加载当前 block 的参数（处理维度与键名）。"""
+
         ROOT = f"Transformer/encoderblock_{n_block}"
         with torch.no_grad():
             # Q/K/V/Out 权重与偏置（需要转置到 PyTorch 线性层格式）
@@ -677,7 +718,8 @@ class Encoder(nn.Module):
         """常规前向：返回编码结果与（可选）各层注意力权重。"""
         attn_weights = []
         for layer_block in self.layer:
-            hidden_states, weights = layer_block(hidden_states, semantics) # hidden_states为(B, 1+N, D)D 为 hidden_size
+            hidden_states, weights, semantics = layer_block(hidden_states, semantics,
+                    num_prompt_tokens)  # hidden_states为(B, 1+N, D)D 为 hidden_size
             if self.vis:
                 attn_weights.append(weights)    # 把每层的 weights 保存到列表里否则返回空列表
         encoded = self.encoder_norm(hidden_states)  # 对最后一层输出再做一次 LayerNorm，得到 encoded
@@ -709,7 +751,7 @@ class Encoder(nn.Module):
         attn_weights = []
         affinities = []
         for layer_block in self.layer:
-            hidden_states, weights, affinity = layer_block.forward_with_affinity(hidden_states, affinity_config, semantics, num_prompt_tokens)
+            hidden_states, weights, affinity, semantics = layer_block.forward_with_affinity(hidden_states, affinity_config, semantics, num_prompt_tokens)
             if self.vis:
                 attn_weights.append(weights)
             affinities.append(affinity)
@@ -732,7 +774,7 @@ class Encoder(nn.Module):
         cls_embeds.append(hidden_states[0][0])  # 输入 embeddings 的 CLS
 
         for i,layer_block in enumerate(self.layer):
-            hidden_states, _ = layer_block(hidden_states)
+            hidden_states, _, _ = layer_block(hidden_states)
             if i < len(self.layer)-1:
                 cls_embeds.append(hidden_states[0][0])  # 每个 block 输出的 CLS（最后一层前）
 

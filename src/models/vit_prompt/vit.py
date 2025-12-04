@@ -211,25 +211,25 @@ class SharedConceptAligner(nn.Module):
         semantic_tokens = self.semantic_proj_norm(semantic_tokens)
 
         # ====== 阶段 1：语义/视觉 → 槽 R 的注意力，得到 R_S, R_V ======
-        # 批大小 B，用于将共享槽 R 扩展到 batch 维度
+        # 批大小 B，用于将共享槽 R 扩展到 batch 维度.  此处做的是构造R 的 batch 视图
         B, _, _ = patch_tokens.shape
         # slots: [B, K, D]，所有样本共享参数，但在 batch 维度做了 expand
-        slots = self.concept_slots.unsqueeze(0).expand(B, -1, -1)  # [B, K, D]
+        slots = self.concept_slots.unsqueeze(0).expand(B, -1, -1)  # [batch数, R槽数num_slots, hidden_size 768 D]
 
         # 槽的 Key/Value：K_R, V_R 形状 [B, H, K, d]
         slot_keys = self._transpose_for_scores(self.key_slots(slots))
         slot_values = self._transpose_for_scores(self.value_slots(slots))
 
         # —— 语义→R：R_S —— #
-        # Q_s: [B, H, 1, d]
+        # Q_s: [B, H, 1, d]     D = 768：ViT hidden size ;H = 8：注意力头数 ;d = D / H = 96：每个 head 的维度
         sem_query = self._transpose_for_scores(self.query_semantic(semantic_tokens))
-        # r_s: [B, 1, D]，每个样本的“概念化语义”
+        # 计算r_s: [B, 1, D]，每个样本的“概念化语义”
         r_s = self._attention(sem_query, slot_keys, slot_values)  # [B, 1, D]
 
         # —— 视觉→R：R_V —— #
         # Q_v: [B, H, N, d]
         vis_query = self._transpose_for_scores(self.query_visual(patch_tokens))
-        # r_v: [B, N, D]，每个 patch 经 R 重新表达后的“概念化视觉 token”
+        # 计算r_v: [B, N, D]，每个 patch 经 R 重新表达后的“概念化视觉 token”
         r_v = self._attention(vis_query, slot_keys, slot_values)  # [B, N, D]
 
         # ====== 阶段 2：R_S ↔ R_V 交叉注意力，得到视觉补充 v_hat ======
@@ -241,10 +241,12 @@ class SharedConceptAligner(nn.Module):
         v_hat = self._attention(cross_q, cross_k, cross_v)  # [B, 1, D]
 
         # ====== 阶段 3：残差融合，得到 S^# ======
+        # 以概念化语义 R_S 作为残差基准，而非原始语义 S_raw
+        base_semantics = r_s
         # 拼接 r_s 与 v_hat：[B, 1, 2D] → [B, 1, D]，再减去 U r_s
-        delta = self.delta_mlp(torch.cat([r_s, v_hat], dim=-1)) - self.skip_proj(r_s)
-        # 通道门控 λ：逐维缩放 Δ，得到 s_1 + λ ∘ Δ
-        fused = r_s + self.lambda_gate * delta
+        delta = self.delta_mlp(torch.cat([base_semantics, v_hat], dim=-1)) - self.skip_proj(base_semantics)
+        # 通道门控 λ：逐维缩放 Δ，得到 R_S + λ ∘ Δ（不直接回落到原始语义）
+        fused = base_semantics + self.lambda_gate * delta
         # 最终归一化，得到 S^#（去掉长度 1 维度，输出 [B, D]）
         fused = self.out_norm(fused)
         return fused.squeeze(1)
@@ -324,21 +326,16 @@ class PromptedTransformer(Transformer):
         # 对提示 token 可选的 dropout（训练期随机丢弃，增强鲁棒性）
         self.prompt_dropout = Dropout(self.prompt_config.DROPOUT)
 
-        # ====== 提示 token 维度设定与投影 ======
-        # prompt_config.PROJECT 含义：
-        # - 若 PROJECT > -1，则表示在参数中以低维 d 存储 prompt，并通过 Linear 投影到 ViT 的 hidden_size D；
-        # - 若 PROJECT == -1，则直接在 D 维空间中存储 prompt（无需额外投影层）。
-        if self.prompt_config.PROJECT > -1:
-            # only for prepend / add # 仅在 prepend/add 场景有意义
-            prompt_dim = self.prompt_config.PROJECT # prompt 的“存储维度”d
-            # 将 prompt_dim 线性投影到 ViT 的 hidden_size（D）
-            self.prompt_proj = nn.Linear(prompt_dim, config.hidden_size)
-            # 使用 Kaiming 正态初始化线性层权重，有利于后续训练稳定
-            nn.init.kaiming_normal_(self.prompt_proj.weight, a=0, mode='fan_out')
-        else:
-            # 不做降维存储，直接在 hidden_size 维度上维护 prompt 参数
-            prompt_dim = config.hidden_size
-            self.prompt_proj = nn.Identity()
+        # ====== 提示 token 维度设定 ======
+        # 直接在 ViT hidden_size 维度上维护/生成 prompt，同时保留可训练的 prompt 映射层
+        prompt_dim = config.hidden_size
+        self.prompt_proj = Linear(prompt_dim, config.hidden_size)
+        if prompt_dim == config.hidden_size:
+            # 维度一致时初始化为接近恒等映射，梯度主要落在可训练的映射层
+            with torch.no_grad():
+                self.prompt_proj.weight.copy_(torch.eye(config.hidden_size))
+                if self.prompt_proj.bias is not None:
+                    self.prompt_proj.bias.zero_()
 
         # 在前向过程中根据视觉 token 生成 prompt 的模块，比如你自己的“提示分布网络”，输入 patch_tokens，输出 prompt_tokens
         self.prompt_init_provider = prompt_init_provider
@@ -399,9 +396,31 @@ class PromptedTransformer(Transformer):
                     total_d_layer, num_tokens, prompt_dim))
                 # 均匀分布初始化 deep prompt
                 nn.init.uniform_(self.deep_prompt_embeddings.data, -val, val)
-        # [CLS] + [ prompt_proj(prompt) × P ] + [ PATCH × N ]   →  (B, 1+P+N, D)
+        # [CLS] + [ PROMPT × P ] + [ PATCH × N ]   →  (B, 1+P+N, D)
         else:
             raise ValueError("Other initiation scheme is not supported")
+
+        # 是否冻结原始 prompt 嵌入参数，使梯度主要落在分布网络等其他支路上
+        self.freeze_embeddings = getattr(self.prompt_config, "FREEZE_EMBEDDINGS", True)
+        if self.freeze_embeddings:
+            if self.prompt_embeddings is not None:
+                self.prompt_embeddings.requires_grad = False
+            if hasattr(self, "deep_prompt_embeddings"):
+                self.deep_prompt_embeddings.requires_grad = False
+
+        # —— Layer-wise prompt evolution：第 1…L-1 层通过线性层更新上一层的 prompt —— #
+        num_layers = config.transformer["num_layers"]
+        hidden_size = config.hidden_size
+        self.prompt_update_layers = nn.ModuleList([
+            Linear(hidden_size, hidden_size) for _ in range(num_layers - 1)
+        ])
+        # 近似恒等初始化，确保初始行为稳定
+        with torch.no_grad():
+            for layer in self.prompt_update_layers:
+                eye = torch.eye(hidden_size, device=layer.weight.device, dtype=layer.weight.dtype)
+                layer.weight.copy_(eye)
+                if layer.bias is not None:
+                    layer.bias.zero_()
 
     def incorporate_prompt(self, x, semantics=None):
         """
@@ -434,7 +453,20 @@ class PromptedTransformer(Transformer):
         # 2) 生成 prompt_tokens
         if self.prompt_init_provider is not None:
             # 由“提示分布网络”或其他模块，基于 patch_tokens 生成 prompt
-            prompt_tokens = self.prompt_init_provider(patch_tokens)
+            provider_out = self.prompt_init_provider(patch_tokens)
+            # 兼容返回 (prompts, stats) 的形式，仅取 prompts
+            if isinstance(provider_out, tuple):
+                prompt_tokens = provider_out[0]
+            elif isinstance(provider_out, dict) and "prompts" in provider_out:
+                prompt_tokens = provider_out["prompts"]
+            else:
+                prompt_tokens = provider_out
+
+            if not torch.is_tensor(prompt_tokens):
+                raise TypeError(
+                    "prompt_init_provider must return a Tensor or (Tensor, stats), "
+                    f"got {type(prompt_tokens)}"
+                )
             # 若输出为 [P, D]，则视为单样本模板，扩展 batch 维
             if prompt_tokens.dim() == 2:
                 prompt_tokens = prompt_tokens.unsqueeze(0)
@@ -462,17 +494,23 @@ class PromptedTransformer(Transformer):
                     "supply a provider."
                 )
             prompt_tokens = self.prompt_embeddings
-            if self.detach_prompt_grad:
+            if self.detach_prompt_grad or self.freeze_embeddings:
                 prompt_tokens = prompt_tokens.detach()# 其余各层
+                # 冻结 prompt 参数表，只训练映射层（prompt_proj）及后续模块
+                prompt_tokens = prompt_tokens.detach()
+        if prompt_tokens.shape[-1] != self.vit_config.hidden_size:
+            raise ValueError(
+                f"Prompt feature dim {prompt_tokens.shape[-1]} incompatible with hidden_size {self.vit_config.hidden_size}"
+            )
         # 3) 重建带 CLS/位置编码的主序列：[CLS|PATCH] + pos
         x = self.embeddings.add_cls_and_pos(patch_tokens)  # (B, 1 + n_patches, hidden_dim)
 
         # 4) 拼接序列：[CLS] + [PROMPT × P] + [PATCH × N]
+        prompt_tokens = self.prompt_proj(prompt_tokens)
         x = torch.cat((
                 x[:, :1, :],    # 只取 CLS
-                # 投影到 hidden_size 并做 dropout，
-                # expand(B, -1, -1) 将 [1, P, D] 扩展为 [B, P, D]
-                self.prompt_dropout(self.prompt_proj(prompt_tokens).expand(B, -1, -1)),
+                # 直接使用与 hidden_size 对齐的 prompt，并做 dropout
+                self.prompt_dropout(prompt_tokens.expand(B, -1, -1)),
                 x[:, 1:, :]     # 其余 patch token
             ), dim=1)
         # (batch_size, cls_token + n_prompt + n_patches, hidden_dim) 最终形状: (B, 1 + n_prompt + n_patches, hidden_dim)
@@ -486,7 +524,7 @@ class PromptedTransformer(Transformer):
         行为：
         - 当 mode=True（训练模式）：
             * encoder / embeddings 置为 eval()（冻结、关闭 Dropout/BN 的随机性）；
-            * prompt_proj、prompt_dropout 仍处于 train() 状态；
+            * prompt_dropout 仍处于 train() 状态；
             * 若 prompt_init_provider 是 nn.Module，也会根据 mode 设置。
         - 当 mode=False（评估模式）：
             * 对所有子模块调用 module.train(False)，统一切到 eval。
@@ -498,8 +536,9 @@ class PromptedTransformer(Transformer):
             self.embeddings.eval()
 
             # 只让 prompt 相关层保持 train 状态
-            self.prompt_proj.train()
+            self.prompt_proj.train(mode)
             self.prompt_dropout.train()
+            self.prompt_update_layers.train(mode)
 
             # 若 provider 本身是一个可学习模块，则也遵循 mode 设置
             if isinstance(self.prompt_init_provider, torch.nn.Module):
@@ -508,6 +547,9 @@ class PromptedTransformer(Transformer):
             # 评估/推理时：所有子模块统一跟随 mode
             for module in self.children():
                 module.train(mode)
+
+            if isinstance(self.prompt_init_provider, torch.nn.Module):
+                self.prompt_init_provider.train(mode)
 
     def forward_deep_prompt(self, embedding_output, semantics=None):
         """
@@ -523,36 +565,37 @@ class PromptedTransformer(Transformer):
         机制：
           - 第 0 层：直接对 [CLS + 前置 PROMPT + PATCH] 做 self-attention 与 MLP；
           - 第 1 … L-1 层：
-              * 使用该层专属的 deep_prompt_embeddings[i-1] 替换掉序列中的 prompt 段；
-              * 然后再过 encoder.layer[i]。
+              * 从上一层输出中截取 prompt 段，通过该层专属 Linear 做“prompt 演化”；
+              * 用演化后的 prompt 替换序列中的 prompt 段，再过 encoder.layer[i]。
         """
         attn_weights: list = []           # 按需保存每层的注意力权重（vis=True 时有效）
-        hidden_states = None
+        hidden_states = embedding_output
         weights = None
-        B = embedding_output.shape[0]
         num_layers = self.vit_config.transformer["num_layers"]
 
         for i in range(num_layers):
             if i == 0:
-                # 第 0 层：直接用前置 prompt 的序列进行编码（此时序列已是 [CLS|PROMPT|PATCH]）
-                hidden_states, weights = self.encoder.layer[i](embedding_output, semantics, self.num_tokens)
+                # 第 0 层：使用 provider/表初始化得到的 [CLS|P^0|PATCH] 序列，梯度流向 provider
+                hidden_states, weights, semantics = self.encoder.layer[i](hidden_states, semantics, self.num_tokens)
             else:
-                # 其余各层：若 deep prompt 可用，则替换掉上一层输出中的 prompt 段
-                deep_prompt_src = self.deep_prompt_embeddings[i - 1]
-                if self.detach_prompt_grad:
-                    deep_prompt_src = deep_prompt_src.detach()
-                if i <= self.deep_prompt_embeddings.shape[0]:
-                    deep_prompt_emb = self.prompt_dropout(self.prompt_proj(     # 若设置 PROMPT.PROJECT > -1，则将prompt投到ViT 的 hidden 维
-                        deep_prompt_src).expand(B, -1, -1))
-                    # 维持总长不变：CLS + 新 deep prompt + 原始的 PATCH 段
-                    hidden_states = torch.cat((
-                        hidden_states[:, :1, :],                           # 保留 CLS
-                        deep_prompt_emb,                                   # 插入新的深层 prompt
-                        hidden_states[:, (1 + self.num_tokens):, :]        # 跳过旧的 prompt 段，保留后续 patch
-                    ), dim=1)
+                # 1) 取出上一层输出中的 prompt 段（长度固定为 self.num_tokens）
+                prev_prompt = hidden_states[:, 1:1 + self.num_tokens, :]
 
-                # 经过当前第 i 层 Transformer block，这里 encoder.layer[i] 已被扩展支持 semantics
-                hidden_states, weights = self.encoder.layer[i](hidden_states, semantics, self.num_tokens)
+                # 2) 通过该层专属的线性层演化 prompt，梯度落在 prompt_update_layers
+                evolved_prompt = self.prompt_update_layers[i - 1](prev_prompt)
+                evolved_prompt = self.prompt_dropout(evolved_prompt)
+
+                # 3) 重组序列：[CLS | P^i | PATCH]，保持长度 1 + P + N 不变
+                hidden_states = torch.cat(
+                    (
+                        hidden_states[:, :1, :],  # CLS
+                        evolved_prompt,  # 更新后的 prompt
+                        hidden_states[:, 1 + self.num_tokens:, :],  # PATCH 段
+                    ),
+                    dim=1,)
+
+                # 4) 经过第 i 层 Transformer block（仍支持语义 cross-attn）
+                hidden_states, weights, semantics = self.encoder.layer[i](hidden_states, semantics, self.num_tokens)
 
             if self.encoder.vis:
                 attn_weights.append(weights)
@@ -561,6 +604,50 @@ class PromptedTransformer(Transformer):
         encoded = self.encoder.encoder_norm(hidden_states)  # 最后层的 LayerNorm
         return encoded, attn_weights
 
+    def forward_deep_prompt_with_affinity(self, embedding_output, affinity_config, semantics=None):
+        """
+        带亲和分支的 Deep Prompt 前向：与 forward_deep_prompt 平行。
+
+        对应关系：
+          - forward_deep_prompt           ↔ forward_deep_prompt_with_affinity
+          - encoder.layer[i].forward      ↔ encoder.layer[i].forward_with_affinity
+          - forward/forward_with_affinity 同样共享 incorporate_prompt 生成的 [CLS|P|PATCH]
+
+        返回:
+          encoded:     LayerNorm 后的最终序列
+          attn_weights: 可视化用注意力权重（vis=True 时）
+          affinities:   每层的亲和矩阵列表，来自 compute_affinity（逐层收集，方便上层按需挑选做对齐损失或调试）
+        """
+        attn_weights: list = []
+        affinities: list = []
+        hidden_states = embedding_output
+        weights = None
+        num_layers = self.vit_config.transformer["num_layers"]
+
+        for i in range(num_layers):
+            if i == 0:
+                # 第 0 层：直接使用 provider/表生成的 prompt 序列，并走带亲和的前向
+                hidden_states, weights, affinity, semantics = self.encoder.layer[i].forward_with_affinity(
+                    hidden_states, affinity_config, semantics, self.num_tokens
+                )
+            else:
+                prev_prompt = hidden_states[:, 1:1 + self.num_tokens, :]
+                evolved_prompt = self.prompt_update_layers[i - 1](prev_prompt)
+                evolved_prompt = self.prompt_dropout(evolved_prompt)
+
+                hidden_states = torch.cat(
+                    (hidden_states[:, :1, :],evolved_prompt,hidden_states[:, 1 + self.num_tokens:, :],),dim=1,)
+
+                hidden_states, weights, affinity, semantics = self.encoder.layer[i].forward_with_affinity(
+                    hidden_states, affinity_config, semantics, self.num_tokens
+                )
+
+            if self.encoder.vis:
+                attn_weights.append(weights)
+            affinities.append(affinity)
+
+        encoded = self.encoder.encoder_norm(hidden_states)
+        return encoded, attn_weights, affinities
     def forward(self, x, semantics=None):
         """
         标准前向：
@@ -587,6 +674,27 @@ class PromptedTransformer(Transformer):
             encoded, attn_weights = self.encoder(embedding_output, semantics, self.num_tokens)
 
         return encoded, attn_weights
+
+    def forward_with_affinity(self, x, affinity_config, semantics=None):
+        """
+        带亲和矩阵输出的前向，与 forward 平行：
+
+        - incorporate_prompt 提供 [CLS|P|PATCH]
+        - 若启用 Deep Prompt，则调用 forward_deep_prompt_with_affinity
+        - 否则走 encoder.forward_with_affinity
+        """
+        embedding_output, semantics = self.incorporate_prompt(x, semantics)
+
+        if self.prompt_config.DEEP:
+            encoded, attn_weights, affinities = self.forward_deep_prompt_with_affinity(
+                embedding_output, affinity_config, semantics
+            )
+        else:
+            encoded, attn_weights, affinities = self.encoder.forward_with_affinity(
+                embedding_output, affinity_config, semantics, self.num_tokens
+            )
+
+        return encoded, attn_weights, affinities
 
     def _seed_prompt(self, prompt_init, prompt_dim):
         """
@@ -668,3 +776,19 @@ class PromptedVisionTransformer(VisionTransformer):
         if not vis:
             return logits
         return logits, attn_weights
+
+    def forward_with_affinity(self, x, affinity_config, vis=False, semantics=None):
+        """
+        带亲和矩阵输出的前向接口（与 VisionTransformer.forward_with_affinity 平行）。
+
+        - 调用内部 PromptedTransformer.forward_with_affinity 返回序列/权重/亲和
+        - 取 CLS 做分类
+        - vis=False 返回 (logits, affinities)，vis=True 额外返回 attn_weights
+        """
+        x, attn_weights, affinities = self.transformer.forward_with_affinity(x, affinity_config, semantics)
+
+        logits = self.head(x[:, 0])
+
+        if not vis:
+            return logits, affinities
+        return logits, attn_weights, affinities

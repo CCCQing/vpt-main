@@ -19,6 +19,7 @@ from src.engine.evaluator import Evaluator
 from src.engine.trainer import Trainer
 from src.models.build_model import build_model
 from src.utils.file_io import PathManager
+from src.utils.param_logging import log_trainable_parameters
 
 from launch import default_argument_parser, logging_train_setup
 warnings.filterwarnings("ignore")   # 屏蔽第三方库的一些非关键警告，避免日志噪声
@@ -135,6 +136,45 @@ def get_loaders(cfg, logger):
     return train_loader,  val_loader, test_loader
 
 
+def _extract_class_ids_from_dataset(dataset) -> set:
+    """Best-effort extraction of class ids from a dataset instance."""
+    if dataset is None:
+        return set()
+
+    for attr in ["_class_ids", "class_ids", "class_id_list", "classes"]:
+        value = getattr(dataset, attr, None)
+        if value is not None:
+            return set(int(x) for x in list(value))
+
+    for attr in ["_targets", "targets"]:
+        value = getattr(dataset, attr, None)
+        if value is not None:
+            return set(int(x) for x in np.asarray(value).reshape(-1))
+
+    imdb = getattr(dataset, "_imdb", None)
+    if imdb is not None:
+        return set(int(item.get("class")) for item in imdb if "class" in item)
+
+    return set()
+
+
+def _infer_seen_unseen_classes(train_loader, test_loader):
+    """Infer seen/unseen class id lists from loaders (best effort)."""
+    seen_classes = _extract_class_ids_from_dataset(getattr(train_loader, "dataset", None))
+    test_classes = _extract_class_ids_from_dataset(getattr(test_loader, "dataset", None))
+
+    if seen_classes and test_classes:
+        unseen_classes = test_classes.difference(seen_classes)
+    else:
+        unseen_classes = set()
+
+    return (
+        sorted(list(seen_classes)) if seen_classes else None,
+        sorted(list(unseen_classes)) if unseen_classes else None,
+    )
+
+
+
 def train(cfg, args):
     """
         训练与评估主流程：
@@ -174,9 +214,7 @@ def train(cfg, args):
 
     # 如需调试冻结策略，可主动打印当前可训练参数列表
     if cfg.MODEL.LOG_TRAINABLE or cfg.SOLVER.DBG_TRAINABLE:
-        log_fn = getattr(model, "log_trainable_parameters", None)
-        if callable(log_fn):
-            log_fn()
+        log_trainable_parameters(model, logger, max_examples_per_group=10)
 
     if cfg.MODEL.R_SIMILARITY.ENABLE:
         # 从数据集获取类别级属性矩阵
@@ -189,7 +227,16 @@ def train(cfg, args):
 
     # ---------- 评估器与训练器 ----------
     logger.info("Setting up Evalutator...")
-    evaluator = Evaluator()                 # 组织评估指标与评测逻辑
+    seen_classes, unseen_classes = _infer_seen_unseen_classes(train_loader, test_loader)
+    task_type = getattr(cfg.SOLVER, "EVAL_MODE", "standard").lower()
+    if not seen_classes or not unseen_classes:
+        # 若无法推断 ZSL/GZSL 类划分，则退化为标准评测
+        task_type = "standard"
+    evaluator = Evaluator(  # 组织评估指标与评测逻辑
+        seen_classes=np.asarray(seen_classes) if seen_classes else None,
+        unseen_classes=np.asarray(unseen_classes) if unseen_classes else None,
+        task_type=task_type,
+    )
     logger.info("Setting up Trainer...")
     trainer = Trainer(cfg, model, evaluator, cur_device)    # Trainer 封装了训练/验证/测试的循环与保存逻辑
     # -----------------------------------

@@ -20,6 +20,7 @@ from ..utils import logging
 logger = logging.get_logger("visual_prompt")
 
 from ..solver.losses import RSimilarityClassifier
+from ..utils.param_logging import log_trainable_parameters
 
 
 class ViT(nn.Module):
@@ -280,77 +281,7 @@ class ViT(nn.Module):
 
     def _log_trainable_parameters(self):
         """打印可训练参数数量，并按模块类别统计占比，便于定位“占比最大的部分”。"""
-
-        # 按类别聚合：优先匹配更细的语义/概念/提示模块，否则归为 backbone/其他
-        buckets = {
-            "prompt": {"trainable": 0, "total": 0},
-            "semantic": {"trainable": 0, "total": 0},
-            "concept": {"trainable": 0, "total": 0},
-            "adapter": {"trainable": 0, "total": 0},
-            "head": {"trainable": 0, "total": 0},
-            "side": {"trainable": 0, "total": 0},
-            "r_similarity": {"trainable": 0, "total": 0},
-            "backbone": {"trainable": 0, "total": 0},
-        }
-
-        def _bucket_name(name: str) -> str:
-            if "prompt" in name:
-                return "prompt"
-            if "semantic" in name:
-                return "semantic"
-            if "concept" in name:
-                return "concept"
-            if "adapter" in name:
-                return "adapter"
-            if name.startswith("head"):
-                return "head"
-            if name.startswith("side"):
-                return "side"
-            if name.startswith("r_similarity_head"):
-                return "r_similarity"
-            return "backbone"
-        total, trainable = 0, 0
-        trainable_names = []
-
-        for name, param in self.named_parameters():
-            n = param.numel()
-            total += n
-            bucket = _bucket_name(name)
-            buckets[bucket]["total"] += n
-            if param.requires_grad:
-                trainable += n
-                buckets[bucket]["trainable"] += n
-                trainable_names.append(name)
-        ratio = trainable / total if total > 0 else 0
-        # 统计各模块占比，按可训练参数量从大到小排序打印
-        parts = []
-        for key, stats in buckets.items():
-            if stats["total"] == 0:
-                continue
-            total_pct = stats["total"] / total if total else 0
-            train_pct = stats["trainable"] / trainable if trainable else 0
-            parts.append((key, stats["trainable"], stats["total"], train_pct, total_pct))
-        parts.sort(key=lambda x: x[1], reverse=True)
-
-        if parts:
-            top_name, top_train, _, top_train_pct, _ = parts[0]
-            logger.info(
-                f"Trainable params: {trainable}/{total} ({ratio:.2%}); examples: {trainable_names[:20]}"
-            )
-            breakdown = "; ".join(
-                [
-                    f"{name}: {trn} train / {ttl} total ({train_pct:.2%} of trainable, {total_pct:.2%} of all)"
-                    for name, trn, ttl, train_pct, total_pct in parts
-                ]
-            )
-            logger.info(f"Trainable breakdown (sorted): {breakdown}")
-            logger.info(
-                f"Largest trainable share: {top_name} ({top_train} params, {top_train_pct:.2%} of trainable)"
-            )
-        else:
-            logger.info(
-                f"Trainable params: {trainable}/{total} ({ratio:.2%}); examples: {trainable_names[:20]}"
-            )
+        log_trainable_parameters(self, logger, max_examples_per_group=10)
 
     def log_trainable_parameters(self):
         """公有接口：在模型构建后主动打印可训练参数。"""
@@ -372,36 +303,62 @@ class ViT(nn.Module):
         )
 
     def attach_r_similarity_head(self, class_attributes):
-        """Install the R-similarity classifier when concept alignment is enabled.
-
-        Args:
-            class_attributes: Tensor or numpy array shaped [C, d_s].
         """
+        根据共享概念基（SharedConceptAligner）构建 R-similarity 分类头。
+
+        使用场景：
+          - 当你在 transformer 里启用了语义-视觉共享空间（semantic_concept），
+            并且希望用“CLS 特征 ↔ 语义原型”的相似度来做分类（ZSL/GZSL 风格）时，
+            通过本函数把 RSimilarityClassifier 挂到 self.r_similarity_head 上。
+
+        参数:
+            class_attributes:
+                形状为 [C, d_s] 的类级语义属性（如 attribute 向量），
+                其中 C 为类别数，d_s 为语义特征维度。
+                可以是 numpy 数组或 torch.Tensor。
+        """
+        # 1) 若配置中没有开启 R-similarity 功能，则直接返回，
+        #    保持使用默认的 self.head MLP 分类头，不做任何改动。
         if not self.cfg.MODEL.R_SIMILARITY.ENABLE:
             return
 
+        # 2) 从编码器中取出共享概念基模块：
+        #    - self.enc 通常是 VisionTransformer 或 PromptedVisionTransformer
+        #    - 其内部的 transformer 里若启用了 SharedConceptAligner，则会挂在 semantic_concept 上
+        #    - getattr(getattr(...)) 的写法是：若中间任意一层不存在，对应返回 None 而不是报错
         concept = getattr(getattr(self.enc, "transformer", None), "semantic_concept", None)
         if concept is None:
+            # 若未找到 semantic_concept，说明你没有在 backbone 中启用共享概念基，
+            # 此时构建 R-similarity 头没有意义，直接报错提示配置不一致。
             raise ValueError("R-similarity head requires semantic concept aligner to be enabled")
 
+        # 3) 检查并规范类属性矩阵：
+        #    - 训练 R-similarity 头必须有类级语义属性，否则无法构造语义原型
         if class_attributes is None:
             raise ValueError("class_attributes must be provided when R-similarity is enabled")
+        #    - 若传入的是 numpy，则转成 torch.Tensor；若本身是 Tensor，则直接复用
         if not isinstance(class_attributes, torch.Tensor):
             class_attributes = torch.from_numpy(class_attributes)
+        #    - 统一为 float 类型，避免后续参与计算时出现 dtype 冲突
         class_attributes = class_attributes.float()
 
+        # 4) 将语义属性张量挪到与模型相同的 device 上（GPU/CPU 一致）：
+        #    - next(self.parameters()) 取模型中任意一个参数，获取当前所在 device
         device = next(self.parameters()).device
         class_attributes = class_attributes.to(device)
 
+        # 5) 从配置中读出投影维度等超参数，并真正实例化 RSimilarityClassifier：
+        #    - proj_dim: 语义/视觉在 R 空间中的对齐维度（若为 None/<=0，则内部会退化为 hidden_size）
         proj_dim = self.cfg.MODEL.R_SIMILARITY.PROJ_DIM
         self.r_similarity_head = RSimilarityClassifier(
-            concept,
-            class_attributes,
-            hidden_size=self.feat_dim,
-            proj_dim=proj_dim,
-            use_cosine=self.cfg.MODEL.R_SIMILARITY.USE_COSINE,
-            logit_scale_init=self.cfg.MODEL.R_SIMILARITY.LOGIT_SCALE_INIT,
-        ).to(device)
+            concept,                                            # 共享概念基模块（用于把语义映射到 R 空间）
+            class_attributes,                                   # 类级语义属性矩阵 [C, d_s]
+            hidden_size=self.feat_dim,                          # ViT 输出的特征维度（通常等于 hidden_size）
+            proj_dim=proj_dim,                                  # R 空间中使用的维度
+            use_cosine=self.cfg.MODEL.R_SIMILARITY.USE_COSINE,  # 是否用余弦相似度计算 logits
+            logit_scale_init=self.cfg.MODEL.R_SIMILARITY.LOGIT_SCALE_INIT,  # 初始温度/缩放因子
+            visual_proj_enable=self.cfg.MODEL.R_SIMILARITY.VISUAL_PROJ_ENABLE,  # 是否对视觉侧再做一层投影
+        ).to(device)                    # 把整个分类头移动到与主模型相同的 device 上，保证前向/反向都在同一设备执行
 
 
     # --------------------------------------------------------------------- #
@@ -465,6 +422,35 @@ class ViT(nn.Module):
         """
         x = self.enc(x)  # batch_size x self.feat_dim
         return x
+
+    def forward_with_affinity(self, x, affinity_config, semantics=None, vis=False):
+        """
+        带亲和输出的前向接口：与 enc/backbone 的 forward_with_affinity 平行。
+
+        返回:
+          - vis=False: logits, affinities
+          - vis=True:  logits, attn_weights, affinities
+        """
+        if not hasattr(self.enc, "forward_with_affinity"):
+            raise AttributeError("backbone does not implement forward_with_affinity")
+
+        if vis:
+            feats, attn_weights, affinities = self.enc.forward_with_affinity(
+                x, affinity_config, semantics=semantics, vis=vis
+            )
+        else:
+            feats, affinities = self.enc.forward_with_affinity(
+                x, affinity_config, semantics=semantics
+            )
+            attn_weights = None
+
+        # 与 forward 对齐：enc 输出可能是 [B, 1+N, D] 或 [B, D]，取 CLS 后接头部
+        feats = feats[:, 0] if feats.dim() == 3 else feats
+        logits = self.r_similarity_head(feats) if self.r_similarity_head is not None else self.head(feats)
+
+        if not vis:
+            return logits, affinities
+        return logits, attn_weights, affinities
 
 
 # ===================================================================== #

@@ -179,8 +179,10 @@ class PromptGenerator(nn.Module):
     ):
         super().__init__()
         self.prompt_len = prompt_len
+        self.semantic_dim = semantic_dim or 0
+
         # 若引入语义条件，则先在特征维度上与 z 拼接
-        fusion_dim = latent_dim + (semantic_dim or 0)
+        fusion_dim = latent_dim + self.semantic_dim
         # 先做一次线性变换，把 (z, s) 融合到一个 hidden 向量
         self.fusion = nn.Linear(fusion_dim, hidden_dim)
         # 后续 MLP：hidden -> hidden -> (prompt_len * prompt_dim)
@@ -201,7 +203,14 @@ class PromptGenerator(nn.Module):
         输出：
             prompts: [B, prompt_len, prompt_dim] 生成的提示 tokens。
         """
-        if semantics is not None:
+        if self.semantic_dim > 0:
+            if semantics is None:
+                # 若启用了语义条件但未提供语义，使用零向量占位，保持维度一致
+                semantics = torch.zeros(z.size(0), self.semantic_dim, device=z.device, dtype=z.dtype)
+            elif semantics.size(-1) != self.semantic_dim:
+                raise ValueError(
+                    f"Expected semantic_dim={self.semantic_dim}, got {semantics.size(-1)}"
+                )
             # 条件生成：将 z 与语义向量在特征维度上拼接
             fused = torch.cat([z, semantics], dim=-1)
         else:
