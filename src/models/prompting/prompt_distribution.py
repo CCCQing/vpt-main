@@ -260,6 +260,8 @@ class PreViTPromptDistributor(nn.Module):
                                 再与 z 拼接进入 PromptGenerator。
         """
         super().__init__()
+        # Debug/ablation switch: if True, bypass reparameterized sampling and use z=mu.
+        self.disable_sampling = False
         # 在做统计前先对 V_raw 做 LayerNorm，相当于 “LN(V_raw)” 的步骤
         self.norm = nn.LayerNorm(dim)
         # 视觉统计编码器：LN 后的 V_raw -> h_v
@@ -303,7 +305,10 @@ class PreViTPromptDistributor(nn.Module):
         # 3) 后验头输出 mu 与 logvar
         mu, logvar = self.posterior(h_v)           # 各为 [B, latent_dim]
         # 4) 重参数化采样 z
-        z = _reparameterize(mu, logvar)            # [B, latent_dim]
+        if self.disable_sampling:
+            z = mu
+        else:
+            z = _reparameterize(mu, logvar)            # [B, latent_dim]
 
         # 5) 语义条件处理（若提供）
         if S_raw is not None:

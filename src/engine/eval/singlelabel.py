@@ -87,14 +87,38 @@ def compute_zsl_gzsl_metrics(
       - gzsl_unseen: GZSL 场景下 unseen 类的 per-class top1（U）
       - gzsl_h     : 调和平均 H = 2SU / (S+U+1e-8)
     """
-    preds = np.asarray(scores).argmax(axis=1)
+    scores = np.asarray(scores)
     targets = np.asarray(targets).astype(np.int64)
     seen_classes = np.asarray(seen_classes).astype(np.int64)
     unseen_classes = np.asarray(unseen_classes).astype(np.int64)
 
-    zsl_unseen = _per_class_accuracy(preds, targets, unseen_classes)
-    gzsl_seen = _per_class_accuracy(preds, targets, seen_classes)
-    gzsl_unseen = _per_class_accuracy(preds, targets, unseen_classes)
+    num_classes = scores.shape[1]
+
+    def _sanitize_ids(class_ids: np.ndarray) -> np.ndarray:
+        ids = np.asarray(class_ids).astype(np.int64).reshape(-1)
+        valid = (ids >= 0) & (ids < num_classes)
+        return np.unique(ids[valid])
+
+    def _masked_argmax(s: np.ndarray, allowed_ids: np.ndarray) -> np.ndarray:
+        allowed_ids = _sanitize_ids(allowed_ids)
+        if allowed_ids.size == 0:
+            return s.argmax(axis=1)
+        masked = np.full_like(s, fill_value=-np.inf, dtype=np.float64)
+        masked[:, allowed_ids] = s[:, allowed_ids]
+        return masked.argmax(axis=1)
+
+    seen_valid = _sanitize_ids(seen_classes)
+    unseen_valid = _sanitize_ids(unseen_classes)
+    gzsl_candidates = np.unique(np.concatenate([seen_valid, unseen_valid]))
+
+    # ZSL: candidate set is unseen classes only.
+    zsl_preds = _masked_argmax(scores, unseen_valid)
+    # GZSL: candidate set is seen ∪ unseen.
+    gzsl_preds = _masked_argmax(scores, gzsl_candidates)
+
+    zsl_unseen = _per_class_accuracy(zsl_preds, targets, unseen_valid)
+    gzsl_seen = _per_class_accuracy(gzsl_preds, targets, seen_valid)
+    gzsl_unseen = _per_class_accuracy(gzsl_preds, targets, unseen_valid)
 
     gzsl_h = 0.0
     if (gzsl_seen + gzsl_unseen) > 0:
@@ -145,4 +169,3 @@ def topk_accuracies(preds, labels, ks):
     """Computes the top-k accuracy for each k."""
     num_topks_correct = topks_correct(preds, labels, ks)
     return [(x / preds.size(0)) for x in num_topks_correct]
-

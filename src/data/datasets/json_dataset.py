@@ -243,6 +243,11 @@ class JSONDataset(AttributeLoaderMixin, torch.utils.data.Dataset):
         self.class_attributes = None
         # 标记哪些类有属性，哪些类缺失
         self._class_has_attribute = None
+        # Class-level splits for ZSL/GZSL (only populated in XLSA mode).
+        self.seen_classes = None
+        self.unseen_classes = None
+        self.seen_classnames = None
+        self.unseen_classnames = None
 
         # 1) 按当前配置构建 imdb：
         #    - 若启用 XLSA，则优先从 res101.mat + att_splits.mat 构建 imdb；
@@ -543,6 +548,36 @@ class JSONDataset(AttributeLoaderMixin, torch.utils.data.Dataset):
             seen_key = getattr(xlsa_cfg, "TEST_SEEN_KEY", "test_seen_loc")
             test_keys.append(seen_key)
 
+        # Derive authoritative class-level seen/unseen splits from sample-level XLSA locs.
+        # Seen classes follow the training split policy (train_loc or trainval_loc).
+        seen_preferred_keys = trainval_keys if getattr(xlsa_cfg, "TRAIN_USE_TRAINVAL", False) else train_keys
+        try:
+            seen_indices = self._select_split_indices(
+                split_mat, seen_preferred_keys, "seen-classes (training split)"
+            )
+        except KeyError:
+            seen_indices = self._select_split_indices(
+                split_mat, trainval_keys, "seen-classes (fallback trainval)"
+            )
+        # Unseen class definition is fixed to XLSA official unseen split.
+        unseen_indices = self._select_split_indices(
+            split_mat,
+            ("test_unseen_loc",),
+            "unseen-classes (fixed test_unseen_loc)",
+        )
+
+        seen_label_ids = np.unique(labels_all[np.asarray(seen_indices, dtype=np.int64)])
+        unseen_label_ids = np.unique(labels_all[np.asarray(unseen_indices, dtype=np.int64)])
+        self.seen_classes = sorted(int(x) for x in seen_label_ids.tolist())
+        self.unseen_classes = sorted(int(x) for x in unseen_label_ids.tolist())
+
+        all_class_names_raw = split_mat.get("allclasses_names")
+        if all_class_names_raw is not None:
+            all_class_names = self._matlab_cell_to_list(np.asarray(all_class_names_raw))
+            if len(all_class_names) >= num_classes:
+                self.seen_classnames = [all_class_names[i] for i in self.seen_classes]
+                self.unseen_classnames = [all_class_names[i] for i in self.unseen_classes]
+
         # ---------------- 根据当前 split 选择使用哪个 *_loc ----------------
         if self._split == "train":
             preferred = train_keys
@@ -790,7 +825,5 @@ class FlowersDataset(JSONDataset):
         直接使用 cfg.DATA.DATAPATH。
         """
         return self.data_dir
-
-
 
 

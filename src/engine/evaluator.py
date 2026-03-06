@@ -48,6 +48,42 @@ class Evaluator():
         self.task_type = task_type
         self.seen_classes = seen_classes
         self.unseen_classes = unseen_classes
+        self._candidate_trace_logged = set()
+
+    @staticmethod
+    def _split_from_eval_type(eval_type: str) -> str:
+        # eval_type examples: val_CUB200Dataset / test_CUB200Dataset
+        if not isinstance(eval_type, str) or len(eval_type) == 0:
+            return "unknown"
+        return eval_type.split("_", 1)[0].lower()
+
+    @staticmethod
+    def _sanitize_ids(class_ids: np.ndarray, num_classes: int) -> np.ndarray:
+        ids = np.asarray(class_ids, dtype=np.int64).reshape(-1)
+        valid = (ids >= 0) & (ids < int(num_classes))
+        return np.unique(ids[valid])
+
+    def _resolve_zsl_candidates(self, scores: np.ndarray, targets: np.ndarray, eval_type: str) -> np.ndarray:
+        split = self._split_from_eval_type(eval_type)
+        num_classes = int(scores.shape[1])
+        if split == "val":
+            # dev-unseen: use classes present in current val split instead of test-unseen pool
+            candidate_ids = self._sanitize_ids(np.unique(targets), num_classes)
+        else:
+            candidate_ids = self._sanitize_ids(self.unseen_classes, num_classes)
+            if split == "test" and candidate_ids.size == 0:
+                raise ValueError("Test ZSL evaluation has empty unseen candidate_ids; refusing unmasked argmax.")
+
+        trace_key = f"{split}:zsl_candidates"
+        if trace_key not in self._candidate_trace_logged:
+            logger.info(
+                "[eval-candidate] split=%s candidate_count=%d head=%s",
+                split,
+                int(candidate_ids.size),
+                candidate_ids[:10].tolist() if candidate_ids.size > 0 else [],
+            )
+            self._candidate_trace_logged.add(trace_key)
+        return candidate_ids
 
     def update_iteration(self, iteration: int) -> None:
         """update iteration info
@@ -111,15 +147,22 @@ class Evaluator():
           - GZSL：seen/unseen 上的 per-class top1 及调和平均 H。
         """
         if self.seen_classes is None or self.unseen_classes is None:
-            logger.warning("ZSL/GZSL evaluation requires seen_classes and unseen_classes. Falling back to standard metrics.")
-            self._eval_singlelabel(scores, targets, eval_type)
-            return
+            raise ValueError(
+                "ZSL/GZSL evaluation requires seen_classes and unseen_classes, "
+                "but got None."
+            )
+        if len(self.seen_classes) == 0 or len(self.unseen_classes) == 0:
+            raise ValueError(
+                "ZSL/GZSL evaluation requires non-empty seen/unseen class sets."
+            )
 
+        targets_np = np.asarray(targets, dtype=np.int64)
+        unseen_eval = self._resolve_zsl_candidates(scores, targets_np, eval_type)
         metrics = singlelabel.compute_zsl_gzsl_metrics(
             scores,
-            np.asarray(targets, dtype=np.int64),
+            targets_np,
             np.asarray(self.seen_classes, dtype=np.int64),
-            np.asarray(self.unseen_classes, dtype=np.int64),
+            unseen_eval,
         )
 
         # 日志用百分比显示、保留两位小数；存盘保持原始小数（0~1）

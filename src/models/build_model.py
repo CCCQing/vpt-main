@@ -8,7 +8,7 @@ import torch
 
 from .resnet import ResNet
 from .convnext import ConvNeXt
-from .vit_models import ViT, Swin, SSLViT
+from .vit_models import ViT
 from ..utils import logging
 # 获取一个名为 "visual_prompt" 的 logger，用于打印训练/构建信息
 logger = logging.get_logger("visual_prompt")
@@ -20,8 +20,6 @@ _MODEL_TYPES = {
     "resnet": ResNet,
     "convnext": ConvNeXt,
     "vit": ViT,
-    "swin": Swin,
-    "ssl-vit": SSLViT,
 }
 
 

@@ -159,18 +159,20 @@ def _extract_class_ids_from_dataset(dataset) -> set:
 
 
 def _infer_seen_unseen_classes(train_loader, test_loader):
-    """Infer seen/unseen class id lists from loaders (best effort)."""
-    seen_classes = _extract_class_ids_from_dataset(getattr(train_loader, "dataset", None))
-    test_classes = _extract_class_ids_from_dataset(getattr(test_loader, "dataset", None))
+    """Read seen/unseen classes from dataset-provided fields (XLSA authority)."""
+    train_dataset = getattr(train_loader, "dataset", None)
+    test_dataset = getattr(test_loader, "dataset", None)
 
-    if seen_classes and test_classes:
-        unseen_classes = test_classes.difference(seen_classes)
-    else:
-        unseen_classes = set()
+    seen_classes = getattr(train_dataset, "seen_classes", None)
+    unseen_classes = getattr(train_dataset, "unseen_classes", None)
+    if seen_classes is None and test_dataset is not None:
+        seen_classes = getattr(test_dataset, "seen_classes", None)
+    if unseen_classes is None and test_dataset is not None:
+        unseen_classes = getattr(test_dataset, "unseen_classes", None)
 
     return (
-        sorted(list(seen_classes)) if seen_classes else None,
-        sorted(list(unseen_classes)) if unseen_classes else None,
+        sorted(int(x) for x in list(seen_classes)) if seen_classes is not None else None,
+        sorted(int(x) for x in list(unseen_classes)) if unseen_classes is not None else None,
     )
 
 
@@ -228,7 +230,40 @@ def train(cfg, args):
     # ---------- 评估器与训练器 ----------
     logger.info("Setting up Evalutator...")
     seen_classes, unseen_classes = _infer_seen_unseen_classes(train_loader, test_loader)
-    task_type = getattr(cfg.SOLVER, "EVAL_MODE", "standard").lower()
+    task_type = str(getattr(cfg.SOLVER, "EVAL_MODE", "standard") or "standard").lower()
+    xlsa_cfg = getattr(cfg.DATA, "XLSA", None)
+    xlsa_enabled = bool(getattr(xlsa_cfg, "ENABLED", False)) if xlsa_cfg is not None else False
+    if xlsa_enabled:
+        if task_type not in {"zsl", "gzsl"}:
+            raise ValueError(
+                f"XLSA mode requires SOLVER.EVAL_MODE in {{'zsl', 'gzsl'}}, got '{task_type}'."
+            )
+        if not seen_classes or not unseen_classes:
+            raise ValueError(
+                "XLSA mode requires non-empty dataset.seen_classes and dataset.unseen_classes."
+            )
+        overlap = set(seen_classes).intersection(set(unseen_classes))
+        if overlap:
+            raise ValueError(
+                "Invalid XLSA split: seen/unseen overlap detected (e.g., {}).".format(
+                    sorted(list(overlap))[:10]
+                )
+            )
+        logger.info(
+            "XLSA class split ready: seen=%d unseen=%d; seen_head=%s; unseen_head=%s",
+            len(seen_classes),
+            len(unseen_classes),
+            seen_classes[:10],
+            unseen_classes[:10],
+        )
+        test_dataset = getattr(test_loader, "dataset", None)
+        if test_dataset is not None:
+            test_seen = getattr(test_dataset, "seen_classes", None)
+            test_unseen = getattr(test_dataset, "unseen_classes", None)
+            if test_seen is not None and sorted(int(x) for x in list(test_seen)) != seen_classes:
+                raise ValueError("Mismatch between train/test dataset seen_classes in XLSA mode.")
+            if test_unseen is not None and sorted(int(x) for x in list(test_unseen)) != unseen_classes:
+                raise ValueError("Mismatch between train/test dataset unseen_classes in XLSA mode.")
     if not seen_classes or not unseen_classes:
         # 若无法推断 ZSL/GZSL 类划分，则退化为标准评测
         task_type = "standard"

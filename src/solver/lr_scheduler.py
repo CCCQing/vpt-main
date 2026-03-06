@@ -61,7 +61,8 @@ class WarmupCosineSchedule(LambdaLR):
 
     def lr_lambda(self, step):
         if step < self.warmup_steps:
-            return float(step) / float(max(1.0, self.warmup_steps))
+            # Avoid zero lr at the first optimization step.
+            return float(step + 1) / float(max(1.0, self.warmup_steps))
         # progress after warmup
         progress = float(step - self.warmup_steps) / float(max(
             1, self.t_total - self.warmup_steps))
@@ -87,7 +88,8 @@ class WarmupCosineWithHardRestartsSchedule(LambdaLR):
 
     def lr_lambda(self, step):
         if step < self.warmup_steps:
-            return float(step) / float(max(1, self.warmup_steps))
+            # Avoid zero lr at the first optimization step.
+            return float(step + 1) / float(max(1, self.warmup_steps))
         # progress after warmup
         progress = float(step - self.warmup_steps) / float(
             max(1, self.t_total - self.warmup_steps))

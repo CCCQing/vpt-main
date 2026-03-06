@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 
 """
-ViT-related models ViT 系列模型定义与封装。
+ViT-related models ViT 绯诲垪妯″瀷瀹氫箟涓庡皝瑁呫€?
 Note: models return logits instead of prob
-注意：各模型的 forward 返回的是“logits”（未过 softmax），方便配合交叉熵等损失。
+娉ㄦ剰锛氬悇妯″瀷鐨?forward 杩斿洖鐨勬槸鈥渓ogits鈥濓紙鏈繃 softmax锛夛紝鏂逛究閰嶅悎浜ゅ弶鐔电瓑鎹熷け銆?
 """
 import torch
 import torch.nn as nn
@@ -12,9 +12,14 @@ from collections import OrderedDict
 from torchvision import models
 
 from .build_vit_backbone import (
-    build_vit_sup_models, build_swin_model,
-    build_mocov3_model, build_mae_model
+    build_vit_sup_models
 )
+try:
+    from .build_vit_backbone import build_swin_model, build_mocov3_model, build_mae_model
+except ImportError:
+    build_swin_model = None
+    build_mocov3_model = None
+    build_mae_model = None
 from .mlp import MLP
 from ..utils import logging
 logger = logging.get_logger("visual_prompt")
@@ -27,37 +32,37 @@ class ViT(nn.Module):
     """
     ViT-related model.
 
-    这个类是“统一的 ViT 外壳”：
-    - 负责根据 cfg 构建不同类型的 ViT 主干（监督 / 自监督 / 带 prompt / 带 adapter 等）；
-    - 根据 TRANSFER_TYPE 控制“哪些参数需要训练、哪些被冻结”；
-    - 可选 side 分支（旁路 AlexNet 特征）；
-    - 顶层统一接一个 MLP 头做分类。
+    杩欎釜绫绘槸鈥滅粺涓€鐨?ViT 澶栧３鈥濓細
+    - 璐熻矗鏍规嵁 cfg 鏋勫缓涓嶅悓绫诲瀷鐨?ViT 涓诲共锛堢洃鐫?/ 鑷洃鐫?/ 甯?prompt / 甯?adapter 绛夛級锛?
+    - 鏍规嵁 TRANSFER_TYPE 鎺у埗鈥滃摢浜涘弬鏁伴渶瑕佽缁冦€佸摢浜涜鍐荤粨鈥濓紱
+    - 鍙€?side 鍒嗘敮锛堟梺璺?AlexNet 鐗瑰緛锛夛紱
+    - 椤跺眰缁熶竴鎺ヤ竴涓?MLP 澶村仛鍒嗙被銆?
 
-    真正的 ViT 编码器本体在 self.enc 里，由 build_vit_sup_models 构建。
+    鐪熸鐨?ViT 缂栫爜鍣ㄦ湰浣撳湪 self.enc 閲岋紝鐢?build_vit_sup_models 鏋勫缓銆?
     """
     def __init__(self, cfg, load_pretrain=True, vis=False):
         """
-        参数:
-          cfg            : 全局配置对象
-          load_pretrain  : 是否从预训练权重初始化 backbone
-          vis            : 可视化/调试相关开关（由构建函数透传）
+        鍙傛暟:
+          cfg            : 鍏ㄥ眬閰嶇疆瀵硅薄
+          load_pretrain  : 鏄惁浠庨璁粌鏉冮噸鍒濆鍖?backbone
+          vis            : 鍙鍖?璋冭瘯鐩稿叧寮€鍏筹紙鐢辨瀯寤哄嚱鏁伴€忎紶锛?
         """
         super(ViT, self).__init__()
 
-        # 先缓存 cfg，后续构建主干/冻结策略和日志打印都会使用
+        # 鍏堢紦瀛?cfg锛屽悗缁瀯寤轰富骞?鍐荤粨绛栫暐鍜屾棩蹇楁墦鍗伴兘浼氫娇鐢?
         self.cfg = cfg
 
-        # 如果 TRANSFER_TYPE 里包含 "prompt"，则需要传入 prompt 配置；否则不使用 prompt
+        # 濡傛灉 TRANSFER_TYPE 閲屽寘鍚?"prompt"锛屽垯闇€瑕佷紶鍏?prompt 閰嶇疆锛涘惁鍒欎笉浣跨敤 prompt
         if "prompt" in cfg.MODEL.TRANSFER_TYPE:
             prompt_cfg = cfg.MODEL.PROMPT
         else:
             prompt_cfg = None
 
-        # self.froze_enc 标记“是否把编码器整体看作是冻结的”
-        # - 当 transfer_type 不是 end2end 且不含 prompt 时（例如 linear、cls、adapter、partial 等），
-        #   默认认为是“冻主干、只训头部/局部”，这里置 True；
-        # - 当是 end2end 或包含 prompt 的模式下（prompt / cls+prompt），置 False，
-        #   后续会按更细粒度控制哪些参数 requires_grad。
+        # self.froze_enc 鏍囪鈥滄槸鍚︽妸缂栫爜鍣ㄦ暣浣撶湅浣滄槸鍐荤粨鐨勨€?
+        # - 褰?transfer_type 涓嶆槸 end2end 涓斾笉鍚?prompt 鏃讹紙渚嬪 linear銆乧ls銆乤dapter銆乸artial 绛夛級锛?
+        #   榛樿璁や负鏄€滃喕涓诲共銆佸彧璁ご閮?灞€閮ㄢ€濓紝杩欓噷缃?True锛?
+        # - 褰撴槸 end2end 鎴栧寘鍚?prompt 鐨勬ā寮忎笅锛坧rompt / cls+prompt锛夛紝缃?False锛?
+        #   鍚庣画浼氭寜鏇寸粏绮掑害鎺у埗鍝簺鍙傛暟 requires_grad銆?
         if cfg.MODEL.TRANSFER_TYPE != "end2end" and "prompt" not in cfg.MODEL.TRANSFER_TYPE:
             # linear, cls, tiny-tl, parital, adapter
             self.froze_enc = True
@@ -65,99 +70,101 @@ class ViT(nn.Module):
             # prompt, end2end, cls+prompt
             self.froze_enc = False
 
-        # adapter 模式时，才需要读取 ADAPTER 配置，其余情况 adapter_cfg 置 None
+        # adapter 妯″紡鏃讹紝鎵嶉渶瑕佽鍙?ADAPTER 閰嶇疆锛屽叾浣欐儏鍐?adapter_cfg 缃?None
         if cfg.MODEL.TRANSFER_TYPE == "adapter":
             adapter_cfg = cfg.MODEL.ADAPTER
         else:
             adapter_cfg = None
 
-        # ===== 核心：构建 ViT 主干，并根据 transfer_type 设置参数可训练性 =====
+        # ===== 鏍稿績锛氭瀯寤?ViT 涓诲共锛屽苟鏍规嵁 transfer_type 璁剧疆鍙傛暟鍙缁冩€?=====
         self.build_backbone(
             prompt_cfg, cfg, adapter_cfg, load_pretrain, vis=vis)
 
-        # 可选：构建 side 分支（用 AlexNet 做旁路特征）
+        # 鍙€夛細鏋勫缓 side 鍒嗘敮锛堢敤 AlexNet 鍋氭梺璺壒寰侊級
         self.setup_side()
 
-        # 最终分类头：MLP(输入维度 = feat_dim, 输出维度 = 类别数)
+        # 鏈€缁堝垎绫诲ご锛歁LP(杈撳叆缁村害 = feat_dim, 杈撳嚭缁村害 = 绫诲埆鏁?
         self.setup_head(cfg)
         self.r_similarity_head = None
+        self.debug_trace_once = bool(getattr(cfg.SOLVER, "DEBUG_TRACE_ONCE", False))
+        self._debug_head_route_logged = False
 
 
     # --------------------------------------------------------------------- #
-    #  side 分支：旁路特征（AlexNet），用于 "side" 迁移类型
+    #  side 鍒嗘敮锛氭梺璺壒寰侊紙AlexNet锛夛紝鐢ㄤ簬 "side" 杩佺Щ绫诲瀷
     # --------------------------------------------------------------------- #
     def setup_side(self):
         """
-        side 分支（旁路特征）只在 TRANSFER_TYPE == "side" 时启用。
+        side 鍒嗘敮锛堟梺璺壒寰侊級鍙湪 TRANSFER_TYPE == "side" 鏃跺惎鐢ㄣ€?
 
-        做法：
-        - 使用 torchvision 的 AlexNet 预训练特征部分（features + avgpool）；
-        - 将输出 (B, 9216) 线性投影到和 ViT 主干相同的 feat_dim；
-        - 在 forward 里，使用一个可训练标量 alpha，通过 sigmoid(alpha) 把主干和 side 的特征做凸组合：
-              x = σ(alpha) * vit_feat + (1 - σ(alpha)) * side_feat
+        鍋氭硶锛?
+        - 浣跨敤 torchvision 鐨?AlexNet 棰勮缁冪壒寰侀儴鍒嗭紙features + avgpool锛夛紱
+        - 灏嗚緭鍑?(B, 9216) 绾挎€ф姇褰卞埌鍜?ViT 涓诲共鐩稿悓鐨?feat_dim锛?
+        - 鍦?forward 閲岋紝浣跨敤涓€涓彲璁粌鏍囬噺 alpha锛岄€氳繃 sigmoid(alpha) 鎶婁富骞插拰 side 鐨勭壒寰佸仛鍑哥粍鍚堬細
+              x = 蟽(alpha) * vit_feat + (1 - 蟽(alpha)) * side_feat
         """
         if self.cfg.MODEL.TRANSFER_TYPE != "side":
             self.side = None
         else:
-            # 可学习的融合系数，初始化为 0，后续通过 sigmoid 压到 (0,1)
+            # 鍙涔犵殑铻嶅悎绯绘暟锛屽垵濮嬪寲涓?0锛屽悗缁€氳繃 sigmoid 鍘嬪埌 (0,1)
             self.side_alpha = nn.Parameter(torch.tensor(0.0))
 
-            # AlexNet 作为 side 分支
+            # AlexNet 浣滀负 side 鍒嗘敮
             m = models.alexnet(pretrained=True)
             self.side = nn.Sequential(OrderedDict([
-                ("features", m.features),   # 卷积特征
-                ("avgpool", m.avgpool),     # 平均池化到固定空间
+                ("features", m.features),   # 鍗风Н鐗瑰緛
+                ("avgpool", m.avgpool),     # 骞冲潎姹犲寲鍒板浐瀹氱┖闂?
             ]))
 
-            # AlexNet 展平特征维度为 9216（典型 6*6*256），投影到与 ViT 一致的 self.feat_dim
+            # AlexNet 灞曞钩鐗瑰緛缁村害涓?9216锛堝吀鍨?6*6*256锛夛紝鎶曞奖鍒颁笌 ViT 涓€鑷寸殑 self.feat_dim
             self.side_projection = nn.Linear(9216, self.feat_dim, bias=False)
 
     # --------------------------------------------------------------------- #
-    #  构建 ViT 主干并设置冻结策略
+    #  鏋勫缓 ViT 涓诲共骞惰缃喕缁撶瓥鐣?
     # --------------------------------------------------------------------- #
     def build_backbone(self, prompt_cfg, cfg, adapter_cfg, load_pretrain, vis):
         """
-        构建 ViT 主干，并依据 TRANSFER_TYPE 设置各层参数的 requires_grad。
+        鏋勫缓 ViT 涓诲共锛屽苟渚濇嵁 TRANSFER_TYPE 璁剧疆鍚勫眰鍙傛暟鐨?requires_grad銆?
 
-        步骤：
-          1) 使用 build_vit_sup_models 构建编码器 self.enc 以及其特征维度 self.feat_dim；
-          2) 根据 transfer_type 的不同，在 self.enc.named_parameters() 上修改 requires_grad；
-             通过字符串匹配参数名的方式，精确地解冻/冻结对应的层或模块。
+        姝ラ锛?
+          1) 浣跨敤 build_vit_sup_models 鏋勫缓缂栫爜鍣?self.enc 浠ュ強鍏剁壒寰佺淮搴?self.feat_dim锛?
+          2) 鏍规嵁 transfer_type 鐨勪笉鍚岋紝鍦?self.enc.named_parameters() 涓婁慨鏀?requires_grad锛?
+             閫氳繃瀛楃涓插尮閰嶅弬鏁板悕鐨勬柟寮忥紝绮剧‘鍦拌В鍐?鍐荤粨瀵瑰簲鐨勫眰鎴栨ā鍧椼€?
         """
         transfer_type = cfg.MODEL.TRANSFER_TYPE
 
-        # enc: 具体的 ViT 编码器（VisionTransformer 或 PromptedVisionTransformer 等）
-        # feat_dim: 编码器最后输出的特征维度（一般是 hidden_size，如 768）
+        # enc: 鍏蜂綋鐨?ViT 缂栫爜鍣紙VisionTransformer 鎴?PromptedVisionTransformer 绛夛級
+        # feat_dim: 缂栫爜鍣ㄦ渶鍚庤緭鍑虹殑鐗瑰緛缁村害锛堜竴鑸槸 hidden_size锛屽 768锛?
         self.enc, self.feat_dim = build_vit_sup_models(
-            cfg.DATA.FEATURE,         # 预训练名称，如 "imagenet21k_sup_vitb16"
-            cfg.DATA.CROPSIZE,        # 输入裁剪尺寸（如 224）
-            prompt_cfg,               # prompt 子配置（可能为 None）
-            cfg.MODEL.MODEL_ROOT,     # 存放预训练权重的路径
-            adapter_cfg,              # adapter 子配置（可能为 None）
-            load_pretrain,            # 是否加载预训练权重
-            vis                       # 可视化/调试开关
+            cfg.DATA.FEATURE,         # 棰勮缁冨悕绉帮紝濡?"imagenet21k_sup_vitb16"
+            cfg.DATA.CROPSIZE,        # 杈撳叆瑁佸壀灏哄锛堝 224锛?
+            prompt_cfg,               # prompt 瀛愰厤缃紙鍙兘涓?None锛?
+            cfg.MODEL.MODEL_ROOT,     # 瀛樻斁棰勮缁冩潈閲嶇殑璺緞
+            adapter_cfg,              # adapter 瀛愰厤缃紙鍙兘涓?None锛?
+            load_pretrain,            # 鏄惁鍔犺浇棰勮缁冩潈閲?
+            vis                       # 鍙鍖?璋冭瘯寮€鍏?
         )
-        # ====== 下方分支控制“参数可训练性” ======
-        # 约定：
-        # - partial-k：仅微调最后 k 层 encoder block（以及 layernorm）
-        # - linear/side：完全冻结编码器，仅训练顶层线性/融合头
-        # - tinytl-bias：只训练 bias 参数
-        # - prompt：只训练 prompt 相关参数（可选：below 时也训练 patch embed）
-        # - prompt+bias：训练 prompt 与全部 bias
-        # - prompt-noupdate：prompt 也不训练（完全冻结）
-        # - cls：只训练 cls_token
-        # - cls-reinit：重置 cls_token 后，只训练 cls_token
-        # - cls+prompt / cls-reinit+prompt：同时训练 prompt 与 cls_token
-        # - adapter：只训练 adapter 模块
-        # - end2end：全量训练
+        # ====== 涓嬫柟鍒嗘敮鎺у埗鈥滃弬鏁板彲璁粌鎬р€?======
+        # 绾﹀畾锛?
+        # - partial-k锛氫粎寰皟鏈€鍚?k 灞?encoder block锛堜互鍙?layernorm锛?
+        # - linear/side锛氬畬鍏ㄥ喕缁撶紪鐮佸櫒锛屼粎璁粌椤跺眰绾挎€?铻嶅悎澶?
+        # - tinytl-bias锛氬彧璁粌 bias 鍙傛暟
+        # - prompt锛氬彧璁粌 prompt 鐩稿叧鍙傛暟锛堝彲閫夛細below 鏃朵篃璁粌 patch embed锛?
+        # - prompt+bias锛氳缁?prompt 涓庡叏閮?bias
+        # - prompt-noupdate锛歱rompt 涔熶笉璁粌锛堝畬鍏ㄥ喕缁擄級
+        # - cls锛氬彧璁粌 cls_token
+        # - cls-reinit锛氶噸缃?cls_token 鍚庯紝鍙缁?cls_token
+        # - cls+prompt / cls-reinit+prompt锛氬悓鏃惰缁?prompt 涓?cls_token
+        # - adapter锛氬彧璁粌 adapter 妯″潡
+        # - end2end锛氬叏閲忚缁?
         # linear, prompt, cls, cls+prompt, partial_1
 
-        # ---------- partial-k：只微调最后若干层 block + encoder_norm ----------
+        # ---------- partial-k锛氬彧寰皟鏈€鍚庤嫢骞插眰 block + encoder_norm ----------
         if transfer_type == "partial-1":
-            total_layer = len(self.enc.transformer.encoder.layer) # 总层数 L
+            total_layer = len(self.enc.transformer.encoder.layer) # 鎬诲眰鏁?L
             # tuned_params = [
             #     "transformer.encoder.layer.{}".format(i-1) for i in range(total_layer)]
-            # 仅允许“最后 1 层 block + encoder_norm”更新，其余冻结
+            # 浠呭厑璁糕€滄渶鍚?1 灞?block + encoder_norm鈥濇洿鏂帮紝鍏朵綑鍐荤粨
             for k, p in self.enc.named_parameters():
                 if "transformer.encoder.layer.{}".format(total_layer - 1) not in k and "transformer.encoder.encoder_norm" not in k: # noqa
                     p.requires_grad = False
@@ -165,91 +172,91 @@ class ViT(nn.Module):
         elif transfer_type == "partial-2":
             total_layer = len(self.enc.transformer.encoder.layer)
             for k, p in self.enc.named_parameters():
-                # 只保留倒数第1、第2层 block + encoder_norm
+                # 鍙繚鐣欏€掓暟绗?銆佺2灞?block + encoder_norm
                 if "transformer.encoder.layer.{}".format(total_layer - 1) not in k and "transformer.encoder.layer.{}".format(total_layer - 2) not in k and "transformer.encoder.encoder_norm" not in k: # noqa
                     p.requires_grad = False
 
         elif transfer_type == "partial-4":
             total_layer = len(self.enc.transformer.encoder.layer)
             for k, p in self.enc.named_parameters():
-                # 只保留倒数 4 层 block + encoder_norm
+                # 鍙繚鐣欏€掓暟 4 灞?block + encoder_norm
                 if "transformer.encoder.layer.{}".format(total_layer - 1) not in k and "transformer.encoder.layer.{}".format(total_layer - 2) not in k and "transformer.encoder.layer.{}".format(total_layer - 3) not in k and "transformer.encoder.layer.{}".format(total_layer - 4) not in k and "transformer.encoder.encoder_norm" not in k: # noqa
                     p.requires_grad = False
 
-        # ---------- linear / side：完全冻结主干，只训练线性头或 side ----------
+        # ---------- linear / side锛氬畬鍏ㄥ喕缁撲富骞诧紝鍙缁冪嚎鎬уご鎴?side ----------
         elif transfer_type == "linear" or transfer_type == "side":
-            # 纯线性微调或 side 融合，完全冻结 backbone
+            # 绾嚎鎬у井璋冩垨 side 铻嶅悎锛屽畬鍏ㄥ喕缁?backbone
             for k, p in self.enc.named_parameters():
                 p.requires_grad = False
 
-        # ---------- tinytl-bias：只训练所有 bias ----------
+        # ---------- tinytl-bias锛氬彧璁粌鎵€鏈?bias ----------
         elif transfer_type == "tinytl-bias":
-            # TinyTL：仅训练 bias，显著降低可训练参数量与显存占用
+            # TinyTL锛氫粎璁粌 bias锛屾樉钁楅檷浣庡彲璁粌鍙傛暟閲忎笌鏄惧瓨鍗犵敤
             for k, p in self.enc.named_parameters():
                 if 'bias' not in k:
                     p.requires_grad = False
 
-        # ---------- prompt（below）：只训练 prompt + patch embedding ----------
+        # ---------- prompt锛坆elow锛夛細鍙缁?prompt + patch embedding ----------
         elif transfer_type == "prompt" and prompt_cfg.LOCATION == "below":
-            # ViT “below 模式”：在输入通道维或 patch embedding 上引入 prompt
-            # 这里允许 prompt 和 patch_embeddings（weight, bias）更新，其余冻结
+            # ViT 鈥渂elow 妯″紡鈥濓細鍦ㄨ緭鍏ラ€氶亾缁存垨 patch embedding 涓婂紩鍏?prompt
+            # 杩欓噷鍏佽 prompt 鍜?patch_embeddings锛坵eight, bias锛夋洿鏂帮紝鍏朵綑鍐荤粨
             for k, p in self.enc.named_parameters():
                 if "prompt" not in k and "embeddings.patch_embeddings.weight" not in k  and "embeddings.patch_embeddings.bias" not in k:
                     p.requires_grad = False
 
-        # ---------- prompt：只训练 prompt 模块 ----------
+        # ---------- prompt锛氬彧璁粌 prompt 妯″潡 ----------
         elif transfer_type == "prompt":
-            # 仅训练 prompt 相关参数（如前置/中间插入的虚拟 token）
-            # ⚠️ 本项目还存在语义概念槽/跨模态注意等可学习模块，参数名通常包含
-            #    "semantic" / "concept" / "semantic_attn"，需要随提示一起解冻；
-            #    否则它们会被误冻住，梯度无法落到共享概念基或亲和调制上。
+            # 浠呰缁?prompt 鐩稿叧鍙傛暟锛堝鍓嶇疆/涓棿鎻掑叆鐨勮櫄鎷?token锛?
+            # 鈿狅笍 鏈」鐩繕瀛樺湪璇箟姒傚康妲?璺ㄦā鎬佹敞鎰忕瓑鍙涔犳ā鍧楋紝鍙傛暟鍚嶉€氬父鍖呭惈
+            #    "semantic" / "concept" / "semantic_attn"锛岄渶瑕侀殢鎻愮ず涓€璧疯В鍐伙紱
+            #    鍚﹀垯瀹冧滑浼氳璇喕浣忥紝姊害鏃犳硶钀藉埌鍏变韩姒傚康鍩烘垨浜插拰璋冨埗涓娿€?
             trainable_keys = ("prompt", "semantic", "concept", "semantic_attn")
             for k, p in self.enc.named_parameters():
                 if not any(key in k for key in trainable_keys):
                     p.requires_grad = False
 
-        # ---------- prompt+bias：训练 prompt + 所有 bias ----------
+        # ---------- prompt+bias锛氳缁?prompt + 鎵€鏈?bias ----------
         elif transfer_type == "prompt+bias":
-            # 训练 prompt 与所有 bias
+            # 璁粌 prompt 涓庢墍鏈?bias
             for k, p in self.enc.named_parameters():
                 if "prompt" not in k and 'bias' not in k:
                     p.requires_grad = False
 
-        # ---------- prompt-noupdate：prompt 也不更新（全冻结，用于 ablation） ----------
+        # ---------- prompt-noupdate锛歱rompt 涔熶笉鏇存柊锛堝叏鍐荤粨锛岀敤浜?ablation锛?----------
         elif transfer_type == "prompt-noupdate":
-            # prompt 也不更新（全冻结，常用于 ablation）
+            # prompt 涔熶笉鏇存柊锛堝叏鍐荤粨锛屽父鐢ㄤ簬 ablation锛?
             for k, p in self.enc.named_parameters():
                 p.requires_grad = False
 
-        # ---------- cls：只训练 cls_token ----------
+        # ---------- cls锛氬彧璁粌 cls_token ----------
         elif transfer_type == "cls":
-            # 仅训练 cls_token（其他全冻结）
+            # 浠呰缁?cls_token锛堝叾浠栧叏鍐荤粨锛?
             for k, p in self.enc.named_parameters():
                 if "cls_token" not in k:
                     p.requires_grad = False
 
-        # ---------- cls-reinit：重置 cls_token 再只训练 cls_token ----------
+        # ---------- cls-reinit锛氶噸缃?cls_token 鍐嶅彧璁粌 cls_token ----------
         elif transfer_type == "cls-reinit":
-            # 先重置 cls_token，再仅训练 cls_token
+            # 鍏堥噸缃?cls_token锛屽啀浠呰缁?cls_token
             nn.init.normal_(
                 self.enc.transformer.embeddings.cls_token,
                 std=1e-6
             )
-            # 再只训练 cls_token
+            # 鍐嶅彧璁粌 cls_token
             for k, p in self.enc.named_parameters():
                 if "cls_token" not in k:
                     p.requires_grad = False
 
-        # ---------- cls+prompt：同时训练 cls_token 和 prompt ----------
+        # ---------- cls+prompt锛氬悓鏃惰缁?cls_token 鍜?prompt ----------
         elif transfer_type == "cls+prompt":
-            # 同时训练 cls_token 与 prompt
+            # 鍚屾椂璁粌 cls_token 涓?prompt
             for k, p in self.enc.named_parameters():
                 if "prompt" not in k and "cls_token" not in k:
                     p.requires_grad = False
 
-        # ---------- cls-reinit+prompt：重置 cls_token + 训练 cls_token 和 prompt ----------
+        # ---------- cls-reinit+prompt锛氶噸缃?cls_token + 璁粌 cls_token 鍜?prompt ----------
         elif transfer_type == "cls-reinit+prompt":
-            # 重置 cls_token，并同时训练 cls_token 与 prompt
+            # 閲嶇疆 cls_token锛屽苟鍚屾椂璁粌 cls_token 涓?prompt
             nn.init.normal_(
                 self.enc.transformer.embeddings.cls_token,
                 std=1e-6
@@ -258,43 +265,37 @@ class ViT(nn.Module):
                 if "prompt" not in k and "cls_token" not in k:
                     p.requires_grad = False
         
-        # ---------- adapter：只训练 adapter 模块 ----------
+        # ---------- adapter锛氬彧璁粌 adapter 妯″潡 ----------
         elif transfer_type == "adapter":
-            # 仅训练注入到各层的 adapter 模块，其余冻结
+            # 浠呰缁冩敞鍏ュ埌鍚勫眰鐨?adapter 妯″潡锛屽叾浣欏喕缁?
             for k, p in self.enc.named_parameters():
                 if "adapter" not in k:
                     p.requires_grad = False
 
-        # ---------- end2end：所有参数都可训练 ----------
+        # ---------- end2end锛氭墍鏈夊弬鏁伴兘鍙缁?----------
         elif transfer_type == "end2end":
-            # 端到端全量更新（不做冻结）
+            # 绔埌绔叏閲忔洿鏂帮紙涓嶅仛鍐荤粨锛?
             logger.info("Enable all parameters update during training")
 
-        # ---------- 其他未支持的类型 ----------
+        # ---------- 鍏朵粬鏈敮鎸佺殑绫诲瀷 ----------
         else:
             raise ValueError("transfer type {} is not supported".format(
                 transfer_type))
 
-        # 可选：打印可训练参数统计，便于确认冻结策略是否符合预期
+        # 鍙€夛細鎵撳嵃鍙缁冨弬鏁扮粺璁★紝渚夸簬纭鍐荤粨绛栫暐鏄惁绗﹀悎棰勬湡
         if self.cfg.MODEL.LOG_TRAINABLE or self.cfg.SOLVER.DBG_TRAINABLE:
             self._log_trainable_parameters()
 
     def _log_trainable_parameters(self):
-        """打印可训练参数数量，并按模块类别统计占比，便于定位“占比最大的部分”。"""
+
         log_trainable_parameters(self, logger, max_examples_per_group=10)
 
     def log_trainable_parameters(self):
-        """公有接口：在模型构建后主动打印可训练参数。"""
+
         self._log_trainable_parameters()
 
     def setup_head(self, cfg):
-        """
-        构建分类头（MLP）。维度规则：
-          - 输入维度：self.feat_dim（来自 backbone）
-          - 中间层：重复 self.cfg.MODEL.MLP_NUM 次的 feat_dim 全连接层
-          - 输出层：类别数 cfg.DATA.NUMBER_CLASSES
-          - special_bias=True：MLP 实现中可能使用特殊的偏置初始化/形态（与项目实现相关）
-        """
+
         self.head = MLP(
             input_dim=self.feat_dim,
             mlp_dims=[self.feat_dim] * self.cfg.MODEL.MLP_NUM + \
@@ -303,131 +304,119 @@ class ViT(nn.Module):
         )
 
     def attach_r_similarity_head(self, class_attributes):
-        """
-        根据共享概念基（SharedConceptAligner）构建 R-similarity 分类头。
 
-        使用场景：
-          - 当你在 transformer 里启用了语义-视觉共享空间（semantic_concept），
-            并且希望用“CLS 特征 ↔ 语义原型”的相似度来做分类（ZSL/GZSL 风格）时，
-            通过本函数把 RSimilarityClassifier 挂到 self.r_similarity_head 上。
-
-        参数:
-            class_attributes:
-                形状为 [C, d_s] 的类级语义属性（如 attribute 向量），
-                其中 C 为类别数，d_s 为语义特征维度。
-                可以是 numpy 数组或 torch.Tensor。
-        """
-        # 1) 若配置中没有开启 R-similarity 功能，则直接返回，
-        #    保持使用默认的 self.head MLP 分类头，不做任何改动。
+        # 1) 鑻ラ厤缃腑娌℃湁寮€鍚?R-similarity 鍔熻兘锛屽垯鐩存帴杩斿洖锛?
+        #    淇濇寔浣跨敤榛樿鐨?self.head MLP 鍒嗙被澶达紝涓嶅仛浠讳綍鏀瑰姩銆?
         if not self.cfg.MODEL.R_SIMILARITY.ENABLE:
             return
 
-        # 2) 从编码器中取出共享概念基模块：
-        #    - self.enc 通常是 VisionTransformer 或 PromptedVisionTransformer
-        #    - 其内部的 transformer 里若启用了 SharedConceptAligner，则会挂在 semantic_concept 上
-        #    - getattr(getattr(...)) 的写法是：若中间任意一层不存在，对应返回 None 而不是报错
+        # 2) 浠庣紪鐮佸櫒涓彇鍑哄叡浜蹇靛熀妯″潡锛?
+        #    - self.enc 閫氬父鏄?VisionTransformer 鎴?PromptedVisionTransformer
+        #    - 鍏跺唴閮ㄧ殑 transformer 閲岃嫢鍚敤浜?SharedConceptAligner锛屽垯浼氭寕鍦?semantic_concept 涓?
+        #    - getattr(getattr(...)) 鐨勫啓娉曟槸锛氳嫢涓棿浠绘剰涓€灞備笉瀛樺湪锛屽搴旇繑鍥?None 鑰屼笉鏄姤閿?
         concept = getattr(getattr(self.enc, "transformer", None), "semantic_concept", None)
         if concept is None:
-            # 若未找到 semantic_concept，说明你没有在 backbone 中启用共享概念基，
-            # 此时构建 R-similarity 头没有意义，直接报错提示配置不一致。
+            # 鑻ユ湭鎵惧埌 semantic_concept锛岃鏄庝綘娌℃湁鍦?backbone 涓惎鐢ㄥ叡浜蹇靛熀锛?
+            # 姝ゆ椂鏋勫缓 R-similarity 澶存病鏈夋剰涔夛紝鐩存帴鎶ラ敊鎻愮ず閰嶇疆涓嶄竴鑷淬€?
             raise ValueError("R-similarity head requires semantic concept aligner to be enabled")
 
-        # 3) 检查并规范类属性矩阵：
-        #    - 训练 R-similarity 头必须有类级语义属性，否则无法构造语义原型
+        # 3) 妫€鏌ュ苟瑙勮寖绫诲睘鎬х煩闃碉細
+        #    - 璁粌 R-similarity 澶村繀椤绘湁绫荤骇璇箟灞炴€э紝鍚﹀垯鏃犳硶鏋勯€犺涔夊師鍨?
         if class_attributes is None:
             raise ValueError("class_attributes must be provided when R-similarity is enabled")
-        #    - 若传入的是 numpy，则转成 torch.Tensor；若本身是 Tensor，则直接复用
+        #    - 鑻ヤ紶鍏ョ殑鏄?numpy锛屽垯杞垚 torch.Tensor锛涜嫢鏈韩鏄?Tensor锛屽垯鐩存帴澶嶇敤
         if not isinstance(class_attributes, torch.Tensor):
             class_attributes = torch.from_numpy(class_attributes)
-        #    - 统一为 float 类型，避免后续参与计算时出现 dtype 冲突
+        #    - 缁熶竴涓?float 绫诲瀷锛岄伩鍏嶅悗缁弬涓庤绠楁椂鍑虹幇 dtype 鍐茬獊
         class_attributes = class_attributes.float()
 
-        # 4) 将语义属性张量挪到与模型相同的 device 上（GPU/CPU 一致）：
-        #    - next(self.parameters()) 取模型中任意一个参数，获取当前所在 device
+        # 4) 灏嗚涔夊睘鎬у紶閲忔尓鍒颁笌妯″瀷鐩稿悓鐨?device 涓婏紙GPU/CPU 涓€鑷达級锛?
+        #    - next(self.parameters()) 鍙栨ā鍨嬩腑浠绘剰涓€涓弬鏁帮紝鑾峰彇褰撳墠鎵€鍦?device
         device = next(self.parameters()).device
         class_attributes = class_attributes.to(device)
 
-        # 5) 从配置中读出投影维度等超参数，并真正实例化 RSimilarityClassifier：
-        #    - proj_dim: 语义/视觉在 R 空间中的对齐维度（若为 None/<=0，则内部会退化为 hidden_size）
+        # 5) 浠庨厤缃腑璇诲嚭鎶曞奖缁村害绛夎秴鍙傛暟锛屽苟鐪熸瀹炰緥鍖?RSimilarityClassifier锛?
+        #    - proj_dim: 璇箟/瑙嗚鍦?R 绌洪棿涓殑瀵归綈缁村害锛堣嫢涓?None/<=0锛屽垯鍐呴儴浼氶€€鍖栦负 hidden_size锛?
         proj_dim = self.cfg.MODEL.R_SIMILARITY.PROJ_DIM
         self.r_similarity_head = RSimilarityClassifier(
-            concept,                                            # 共享概念基模块（用于把语义映射到 R 空间）
-            class_attributes,                                   # 类级语义属性矩阵 [C, d_s]
-            hidden_size=self.feat_dim,                          # ViT 输出的特征维度（通常等于 hidden_size）
-            proj_dim=proj_dim,                                  # R 空间中使用的维度
-            use_cosine=self.cfg.MODEL.R_SIMILARITY.USE_COSINE,  # 是否用余弦相似度计算 logits
-            logit_scale_init=self.cfg.MODEL.R_SIMILARITY.LOGIT_SCALE_INIT,  # 初始温度/缩放因子
-            visual_proj_enable=self.cfg.MODEL.R_SIMILARITY.VISUAL_PROJ_ENABLE,  # 是否对视觉侧再做一层投影
-        ).to(device)                    # 把整个分类头移动到与主模型相同的 device 上，保证前向/反向都在同一设备执行
+            concept,                                            # 鍏变韩姒傚康鍩烘ā鍧楋紙鐢ㄤ簬鎶婅涔夋槧灏勫埌 R 绌洪棿锛?
+            class_attributes,                                   # 绫荤骇璇箟灞炴€х煩闃?[C, d_s]
+            hidden_size=self.feat_dim,                          # ViT 杈撳嚭鐨勭壒寰佺淮搴︼紙閫氬父绛変簬 hidden_size锛?
+            proj_dim=proj_dim,                                  # R 绌洪棿涓娇鐢ㄧ殑缁村害
+            use_cosine=self.cfg.MODEL.R_SIMILARITY.USE_COSINE,  # 鏄惁鐢ㄤ綑寮︾浉浼煎害璁＄畻 logits
+            logit_scale_init=self.cfg.MODEL.R_SIMILARITY.LOGIT_SCALE_INIT,  # 鍒濆娓╁害/缂╂斁鍥犲瓙
+            visual_proj_enable=self.cfg.MODEL.R_SIMILARITY.VISUAL_PROJ_ENABLE,  # 鏄惁瀵硅瑙変晶鍐嶅仛涓€灞傛姇褰?
+            fixed_logit_scale=getattr(self.cfg.MODEL.R_SIMILARITY, "FIXED_LOGIT_SCALE", 0.0),
+        ).to(device)                    # 鎶婃暣涓垎绫诲ご绉诲姩鍒颁笌涓绘ā鍨嬬浉鍚岀殑 device 涓婏紝淇濊瘉鍓嶅悜/鍙嶅悜閮藉湪鍚屼竴璁惧鎵ц
 
 
     # --------------------------------------------------------------------- #
-    #  分类头：统一用一个 MLP
+    #  鍒嗙被澶达細缁熶竴鐢ㄤ竴涓?MLP
     # --------------------------------------------------------------------- #
     def forward(self, x, return_feature=False, semantics=None):
-        """
-        主前向：
-          1) 若配置了 side 分支，则先通过 side 提取 AlexNet 特征，并线性投影；
-          2) 如果在训练阶段且标记 froze_enc=True，则将 enc 设为 eval()（冻结 BN/Dropout 行为）；
-          3) 通过 enc 得到全局特征（batch_size, feat_dim）；
-          4) 若存在 side 分支，则用 α 做凸组合：x = σ(α)*x + (1-σ(α))*side；
-          5) 若请求 return_feature=True，直接返回特征（用于下游或可视化）；
-          6) 否则通过 MLP 分类头，输出 logits。
-        """
-        # 1) side 分支（可选）
+
+        # 1) side 鍒嗘敮锛堝彲閫夛級
         if self.side is not None:
             side_output = self.side(x)
             side_output = side_output.view(side_output.size(0), -1)
             side_output = self.side_projection(side_output)
 
-        # 2) 若 enc 被标记为“整体冻结”，且当前确实在训练阶段，则把 enc 切到 eval()
-        #    —— 这样其中的 Dropout/LayerNorm/BatchNorm 行为固定下来，更接近“固定特征”的语义。
+        # 2) 鑻?enc 琚爣璁颁负鈥滄暣浣撳喕缁撯€濓紝涓斿綋鍓嶇‘瀹炲湪璁粌闃舵锛屽垯鎶?enc 鍒囧埌 eval()
+        #    鈥斺€?杩欐牱鍏朵腑鐨?Dropout/LayerNorm/BatchNorm 琛屼负鍥哄畾涓嬫潵锛屾洿鎺ヨ繎鈥滃浐瀹氱壒寰佲€濈殑璇箟銆?
         if self.froze_enc and self.enc.training:
             self.enc.eval()
 
-        # 3) 主干编码器获取全局特征（通常是 CLS 或 GAP 后的 embedding）
+        # 3) 涓诲共缂栫爜鍣ㄨ幏鍙栧叏灞€鐗瑰緛锛堥€氬父鏄?CLS 鎴?GAP 鍚庣殑 embedding锛?
         x = self.enc(x, semantics=semantics)  # batch_size x self.feat_dim
 
-        # 4) 若有 side 分支，用一个标量 alpha（经 sigmoid 后）融合主干与 side 特征
+        # 4) 鑻ユ湁 side 鍒嗘敮锛岀敤涓€涓爣閲?alpha锛堢粡 sigmoid 鍚庯級铻嶅悎涓诲共涓?side 鐗瑰緛
         if self.side is not None:
-            alpha_squashed = torch.sigmoid(self.side_alpha) # 标量 ∈ (0,1)
+            alpha_squashed = torch.sigmoid(self.side_alpha) # 鏍囬噺 鈭?(0,1)
             x = alpha_squashed * x + (1 - alpha_squashed) * side_output
 
-        # 5) 若只需要特征，不需要分类 logits，则直接返回特征（第二个返回值为同样的 x，兼容旧接口）
+        # 5) 鑻ュ彧闇€瑕佺壒寰侊紝涓嶉渶瑕佸垎绫?logits锛屽垯鐩存帴杩斿洖鐗瑰緛锛堢浜屼釜杩斿洖鍊间负鍚屾牱鐨?x锛屽吋瀹规棫鎺ュ彛锛?
         if return_feature:
             return x, x
 
-        # 6) 通过 MLP 或 R-similarity 头输出 logits
+        # 6) 閫氳繃 MLP 鎴?R-similarity 澶磋緭鍑?logits
         if self.r_similarity_head is not None:
             x = self.r_similarity_head(x)
+            logits_source = "r_similarity_head"
         else:
             x = self.head(x)
+            logits_source = "head"
+
+        if self.debug_trace_once and not self._debug_head_route_logged:
+            trace_id = getattr(self, "_debug_trace_id", "trace=NA")
+            logger.info(
+                "[trace] %s node=C.vit_models.forward use_r_similarity_head=%s logits_source=%s logits_shape=%s",
+                trace_id,
+                bool(self.r_similarity_head is not None),
+                logits_source,
+                tuple(x.shape) if torch.is_tensor(x) else None,
+            )
+            self._debug_head_route_logged = True
 
         return x
     
     def forward_cls_layerwise(self, x, semantics=None):
-        """
-        获取“逐层的 CLS 表征”：
-        - 调用 self.enc.forward_cls_layerwise(x)；
-        - 输出格式视 backbone 实现而定，一般是 (num_layers, B, D) 或类似结构。
-        常用于分析可视化或层级特征蒸馏等。
-        """
+
         cls_embeds = self.enc.forward_cls_layerwise(x)
         return cls_embeds
 
     def get_features(self, x):
         """
         get a (batch_size, self.feat_dim) feature
-        仅提取 (batch_size, feat_dim) 的全局特征，不过分类头。
+        浠呮彁鍙?(batch_size, feat_dim) 鐨勫叏灞€鐗瑰緛锛屼笉杩囧垎绫诲ご銆?
         """
         x = self.enc(x)  # batch_size x self.feat_dim
         return x
 
     def forward_with_affinity(self, x, affinity_config, semantics=None, vis=False):
         """
-        带亲和输出的前向接口：与 enc/backbone 的 forward_with_affinity 平行。
+        甯︿翰鍜岃緭鍑虹殑鍓嶅悜鎺ュ彛锛氫笌 enc/backbone 鐨?forward_with_affinity 骞宠銆?
 
-        返回:
+        杩斿洖:
           - vis=False: logits, affinities
           - vis=True:  logits, attn_weights, affinities
         """
@@ -444,7 +433,7 @@ class ViT(nn.Module):
             )
             attn_weights = None
 
-        # 与 forward 对齐：enc 输出可能是 [B, 1+N, D] 或 [B, D]，取 CLS 后接头部
+        # 涓?forward 瀵归綈锛歟nc 杈撳嚭鍙兘鏄?[B, 1+N, D] 鎴?[B, D]锛屽彇 CLS 鍚庢帴澶撮儴
         feats = feats[:, 0] if feats.dim() == 3 else feats
         logits = self.r_similarity_head(feats) if self.r_similarity_head is not None else self.head(feats)
 
@@ -468,6 +457,8 @@ class Swin(ViT):
         构建 Swin 主干，并根据 TRANSFER_TYPE 选择性冻结。
         Swin 的模块命名与 ViT 不同，这里针对其层级结构（layers/blocks）做了适配。
         """
+        if build_swin_model is None:
+            raise ImportError("build_swin_model is unavailable in this repository build.")
         transfer_type = cfg.MODEL.TRANSFER_TYPE
         self.enc, self.feat_dim = build_swin_model(
             cfg.DATA.FEATURE, cfg.DATA.CROPSIZE,
@@ -549,8 +540,12 @@ class SSLViT(ViT):
         随后按照 TRANSFER_TYPE 冻结/解冻参数。
         """
         if "moco" in cfg.DATA.FEATURE:
+            if build_mocov3_model is None:
+                raise ImportError("build_mocov3_model is unavailable in this repository build.")
             build_fn = build_mocov3_model
         elif "mae" in cfg.DATA.FEATURE:
+            if build_mae_model is None:
+                raise ImportError("build_mae_model is unavailable in this repository build.")
             build_fn = build_mae_model
 
         self.enc, self.feat_dim = build_fn(
@@ -617,3 +612,5 @@ class SSLViT(ViT):
         else:
             raise ValueError("transfer type {} is not supported".format(
                 transfer_type))
+
+

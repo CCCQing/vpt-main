@@ -345,6 +345,8 @@ class PromptedTransformer(Transformer):
             self.prompt_config, "DISTRIBUTION_ONLY", False)
         self.detach_prompt_grad = getattr(
             self.prompt_config, "DETACH_PROMPT_GRAD", False)
+        self.debug_prompt_flow = getattr(self.prompt_config, "DEBUG_FLOW", False)
+        self._debug_prompt_flow_logged = False
 
         if self.runtime_prompt_only:
             # 既然说“只靠分布/生成器”，那就必须提供一个 prompt_init_provider
@@ -506,6 +508,22 @@ class PromptedTransformer(Transformer):
         x = self.embeddings.add_cls_and_pos(patch_tokens)  # (B, 1 + n_patches, hidden_dim)
 
         # 4) 拼接序列：[CLS] + [PROMPT × P] + [PATCH × N]
+        if self.debug_prompt_flow and not self._debug_prompt_flow_logged:
+            trace_id = getattr(self, "_debug_trace_id", "trace=NA")
+            logger.info(
+                "[trace] %s node=B.incorporate_prompt provider_used=%s detach_prompt_grad=%s freeze_embeddings=%s "
+                "prompt_requires_grad=%s token_len_before=%d token_len_after=%d prompt_shape=%s refined_semantics=%s",
+                trace_id,
+                bool(self.prompt_init_provider is not None),
+                bool(self.detach_prompt_grad),
+                bool(self.freeze_embeddings),
+                bool(getattr(prompt_tokens, "requires_grad", False)),
+                int(1 + patch_tokens.shape[1]),
+                int(1 + self.num_tokens + patch_tokens.shape[1]),
+                tuple(prompt_tokens.shape),
+                tuple(refined_semantics.shape) if torch.is_tensor(refined_semantics) else None,
+            )
+            self._debug_prompt_flow_logged = True
         prompt_tokens = self.prompt_proj(prompt_tokens)
         x = torch.cat((
                 x[:, :1, :],    # 只取 CLS

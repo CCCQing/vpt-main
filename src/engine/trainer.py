@@ -99,6 +99,449 @@ class Trainer():
 
         self.evaluator = evaluator
         self.cpu_device = torch.device("cpu")
+        self.debug_grad_norm = bool(getattr(cfg.SOLVER, "DEBUG_GRAD_NORM", False))
+        self.debug_trace_once = bool(getattr(cfg.SOLVER, "DEBUG_TRACE_ONCE", False))
+        self.overfit_one_batch_steps = int(getattr(cfg.SOLVER, "OVERFIT_ONE_BATCH_STEPS", 0))
+        self._debug_batch_stats_logged = False
+        self._debug_grad_logged = False
+        self._debug_step_logged = False
+        self._debug_forward_trace_logged = False
+        self._debug_semantic_param_names_logged = False
+        self._overfit_cached_batch = None
+        self._named_param_cache = None
+        self.use_seen_only_train_ce = False
+        self.train_seen_ids = None
+        self.train_seen_ids_tensor = None
+        self.train_seen_remap = None
+        self.cls_weights_seen = None
+        self._last_train_debug = {}
+        self._last_ce_logits = None
+        self._last_raw_logits = None
+        self.overfit_disable_prompt_sampling = bool(
+            getattr(cfg.SOLVER, "OVERFIT_DISABLE_PROMPT_SAMPLING", False)
+        )
+        self._trace_epoch = -1
+        self._trace_iter = -1
+        self._trace_stage = "init"
+        self._trace_global_step = 0
+        self._trace_rank = int(getattr(cfg, "DIST_RANK", 0))
+
+        if self.debug_grad_norm:
+            self._log_optimizer_param_groups()
+        if self.debug_trace_once:
+            self._log_semantic_param_names_once()
+
+    @staticmethod
+    def _get_output_type_name(outputs):
+        if torch.is_tensor(outputs):
+            return "tensor"
+        if isinstance(outputs, tuple):
+            return "tuple"
+        if isinstance(outputs, list):
+            return "list"
+        if isinstance(outputs, dict):
+            return "dict"
+        return type(outputs).__name__
+
+    @staticmethod
+    def _shape_or_none(t):
+        if torch.is_tensor(t):
+            return tuple(t.shape)
+        return None
+
+    def _make_trace_id(self):
+        return "stage={}|rank={}|epoch={}|iter={}|gstep={}".format(
+            self._trace_stage,
+            self._trace_rank,
+            self._trace_epoch,
+            self._trace_iter,
+            self._trace_global_step,
+        )
+
+    def _set_model_trace_context(self, trace_id):
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        setattr(model_ref, "_debug_trace_id", trace_id)
+        enc = getattr(model_ref, "enc", None)
+        if enc is not None:
+            setattr(enc, "_debug_trace_id", trace_id)
+            transformer = getattr(enc, "transformer", None)
+            if transformer is not None:
+                setattr(transformer, "_debug_trace_id", trace_id)
+        setattr(self.model, "_debug_trace_id", trace_id)
+
+    def _named_params(self):
+        if self._named_param_cache is None:
+            self._named_param_cache = dict(self.model.named_parameters())
+        return self._named_param_cache
+
+    def _find_param_by_name_contains(self, candidates):
+        named = self._named_params()
+        for needle in candidates:
+            for name, param in named.items():
+                if needle in name:
+                    return name, param
+        return None, None
+
+    def _collect_debug_param_refs(self):
+        refs = {}
+        refs["head.last_layer.weight"] = self._find_param_by_name_contains(
+            ["head.last_layer.weight"]
+        )
+        refs["head.last_layer.bias"] = self._find_param_by_name_contains(
+            ["head.last_layer.bias"]
+        )
+        refs["posterior.mu_head"] = self._find_param_by_name_contains(
+            ["prompt_init_provider.posterior.mu_head.0.weight"]
+        )
+        refs["posterior.logvar_head"] = self._find_param_by_name_contains(
+            ["prompt_init_provider.posterior.logvar_head.0.weight"]
+        )
+        refs["prompt_generator"] = self._find_param_by_name_contains(
+            ["prompt_init_provider.prompt_generator.mlp.3.weight", "prompt_init_provider.prompt_generator"]
+        )
+        refs["r_head.visual_proj"] = self._find_param_by_name_contains(
+            ["r_similarity_head.visual_proj.weight", "r_similarity_head.visual_proj"]
+        )
+        refs["r_head.semantic_proj"] = self._find_param_by_name_contains(
+            ["r_similarity_head.semantic_proj.weight", "r_similarity_head.semantic_proj"]
+        )
+        refs["r_head.logit_scale"] = self._find_param_by_name_contains(
+            ["r_similarity_head.logit_scale"]
+        )
+        refs["semantic_concept"] = self._find_param_by_name_contains(
+            ["semantic_concept.concept_slots", "semantic_cross_attn", "semantic_concept"]
+        )
+        refs["semantic_concept.proj"] = self._find_param_by_name_contains(
+            [
+                "semantic_concept.query_semantic.weight",
+                "semantic_concept.semantic_proj.weight",
+                "semantic_concept.key_slots.weight",
+            ]
+        )
+        # Track layer-wise prompt evolution with first/middle/last layers.
+        prompt_layers = [
+            name for name in self._named_params().keys()
+            if "prompt_update_layers." in name and name.endswith(".weight")
+        ]
+        layer_ids = sorted(
+            set(
+                int(name.split("prompt_update_layers.")[1].split(".")[0])
+                for name in prompt_layers
+                if "prompt_update_layers." in name
+            )
+        )
+        if layer_ids:
+            first_id = layer_ids[0]
+            mid_id = layer_ids[len(layer_ids) // 2]
+            last_id = layer_ids[-1]
+            refs["prompt_update.first"] = self._find_param_by_name_contains(
+                [f"prompt_update_layers.{first_id}.weight"]
+            )
+            refs["prompt_update.mid"] = self._find_param_by_name_contains(
+                [f"prompt_update_layers.{mid_id}.weight"]
+            )
+            refs["prompt_update.last"] = self._find_param_by_name_contains(
+                [f"prompt_update_layers.{last_id}.weight"]
+            )
+        return refs
+
+    def _log_semantic_param_names_once(self):
+        if self._debug_semantic_param_names_logged:
+            return
+        names = [n for n, _ in self.model.named_parameters() if "semantic_concept" in n]
+        logger.info(
+            "[trace] semantic_concept param names (%d): %s",
+            len(names),
+            names if len(names) <= 40 else names[:40] + ["..."],
+        )
+        self._debug_semantic_param_names_logged = True
+
+    def _log_optimizer_param_groups(self):
+        named = self._named_params()
+        id2name = {id(p): n for n, p in named.items()}
+        logger.info("Optimizer param_groups summary:")
+        for idx, group in enumerate(self.optimizer.param_groups):
+            params = group.get("params", [])
+            names = [id2name.get(id(p), "<unnamed>") for p in params]
+            logger.info(
+                "  group[%d]: lr=%s wd=%s params=%d (head=%s, r_head=%s, prompt_dist=%s, prompt_update=%s, semantic=%s)",
+                idx,
+                group.get("lr", None),
+                group.get("weight_decay", None),
+                len(params),
+                any("head." in n for n in names),
+                any("r_similarity_head" in n for n in names),
+                any("prompt_init_provider" in n for n in names),
+                any("prompt_update_layers" in n for n in names),
+                any(("semantic_concept" in n) or ("semantic_cross_attn" in n) for n in names),
+            )
+
+    def _log_batch_stats_once(self, logits, targets):
+        if self._debug_batch_stats_logged or logits is None:
+            return
+        if not torch.is_tensor(logits):
+            return
+        with torch.no_grad():
+            logger.info(
+                "[debug] logits stats: shape=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
+                tuple(logits.shape),
+                float(logits.mean().item()),
+                float(logits.std().item()),
+                float(logits.min().item()),
+                float(logits.max().item()),
+            )
+            logger.info(
+                "[debug] targets stats: min=%d max=%d unique_count=%d",
+                int(targets.min().item()),
+                int(targets.max().item()),
+                int(targets.unique().numel()),
+            )
+            probs = torch.softmax(logits.float(), dim=-1)
+            entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1).mean()
+            max_entropy = float(np.log(max(int(logits.shape[-1]), 1)))
+            logger.info(
+                "[debug] softmax entropy: mean=%.6f max=%.6f classes=%d",
+                float(entropy.item()),
+                max_entropy,
+                int(logits.shape[-1]),
+            )
+            r_head = getattr(self.model, "r_similarity_head", None)
+            if r_head is not None:
+                fixed_scale = float(getattr(r_head, "fixed_logit_scale", 0.0))
+                learnable_scale = None
+                if getattr(r_head, "logit_scale", None) is not None:
+                    learnable_scale = float(r_head.logit_scale.exp().item())
+                effective_scale = fixed_scale if fixed_scale > 0 else learnable_scale
+                logger.info(
+                    "[debug] r_head scale: fixed=%.6f learnable_exp=%s effective=%.6f mode=%s",
+                    fixed_scale,
+                    "{:.6f}".format(learnable_scale) if learnable_scale is not None else "None",
+                    float(effective_scale) if effective_scale is not None else float("nan"),
+                    "fixed" if fixed_scale > 0 else "learnable",
+                )
+        self._debug_batch_stats_logged = True
+
+    def _log_grad_norms_once(self, refs):
+        if self._debug_grad_logged:
+            return
+        for alias, (name, param) in refs.items():
+            if param is None:
+                logger.info("[debug] grad %-24s : MISSING", alias)
+                continue
+            grad = param.grad
+            if grad is None:
+                logger.info("[debug] grad %-24s : None (%s)", alias, name)
+            else:
+                logger.info(
+                    "[debug] grad %-24s : %.6e (%s)",
+                    alias,
+                    float(grad.norm().item()),
+                    name,
+                )
+        self._debug_grad_logged = True
+
+    def _capture_param_norms(self, refs):
+        norms = {}
+        for alias, (_, param) in refs.items():
+            if param is None:
+                norms[alias] = None
+            else:
+                norms[alias] = float(param.data.norm().item())
+        return norms
+
+    def _log_update_once(self, before_norms, after_norms):
+        if self._debug_step_logged:
+            return
+        for alias in before_norms.keys():
+            b = before_norms[alias]
+            a = after_norms[alias]
+            if b is None or a is None:
+                logger.info("[debug] step %-24s : unavailable", alias)
+                continue
+            logger.info(
+                "[debug] step %-24s : before=%.6e after=%.6e delta=%.6e",
+                alias,
+                b,
+                a,
+                a - b,
+            )
+        self._debug_step_logged = True
+
+    @staticmethod
+    def _tensor_stats(t: torch.Tensor):
+        if t is None or (not torch.is_tensor(t)):
+            return None
+        return {
+            "shape": tuple(t.shape),
+            "mean": float(t.mean().item()),
+            "std": float(t.std().item()),
+            "min": float(t.min().item()),
+            "max": float(t.max().item()),
+        }
+
+    def _capture_train_debug(self, loss_outputs, raw_outputs, loss_targets):
+        ce_logits = self._extract_logits(loss_outputs)
+        raw_logits = self._extract_logits(raw_outputs)
+        if not torch.is_tensor(ce_logits):
+            return
+
+        with torch.no_grad():
+            self._last_ce_logits = ce_logits.detach()
+            self._last_raw_logits = raw_logits.detach() if torch.is_tensor(raw_logits) else None
+            ce_probs = torch.softmax(ce_logits.float(), dim=-1)
+            ce_entropy = -(ce_probs * torch.log(ce_probs.clamp_min(1e-12))).sum(dim=-1).mean()
+            top1 = (ce_logits.argmax(dim=1) == loss_targets).float().mean()
+
+            same_tensor = (
+                torch.is_tensor(raw_logits)
+                and ce_logits.data_ptr() == raw_logits.data_ptr()
+                and ce_logits.shape == raw_logits.shape
+            )
+
+            raw_entropy = None
+            if torch.is_tensor(raw_logits):
+                raw_probs = torch.softmax(raw_logits.float(), dim=-1)
+                raw_entropy = float(
+                    (-(raw_probs * torch.log(raw_probs.clamp_min(1e-12))).sum(dim=-1).mean()).item()
+                )
+
+            self._last_train_debug = {
+                "ce_logits_stats": self._tensor_stats(ce_logits),
+                "raw_logits_stats": self._tensor_stats(raw_logits) if torch.is_tensor(raw_logits) else None,
+                "ce_entropy": float(ce_entropy.item()),
+                "raw_entropy": raw_entropy,
+                "entropy_from_ce_logits": True,
+                "entropy_logits_is_ce_tensor": True,
+                "ce_vs_raw_same_tensor": bool(same_tensor),
+                "seen_only_top1": float(top1.item()),
+                "ce_classes": int(ce_logits.shape[-1]),
+            }
+
+    def _set_prompt_sampling_mode(self, disable_sampling: bool):
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        provider = getattr(
+            getattr(getattr(model_ref, "enc", None), "transformer", None),
+            "prompt_init_provider",
+            None,
+        )
+        if provider is None:
+            return
+        if hasattr(provider, "disable_sampling"):
+            provider.disable_sampling = bool(disable_sampling)
+            logger.info(
+                "[debug] prompt provider sampling mode: disable_sampling=%s (overfit=%s)",
+                bool(disable_sampling),
+                self.overfit_one_batch_steps > 0,
+            )
+        else:
+            logger.warning(
+                "[debug] prompt provider does not expose disable_sampling switch; cannot force z=mu."
+            )
+
+    @staticmethod
+    def _extract_logits(outputs):
+        if isinstance(outputs, (list, tuple)) and len(outputs) > 0:
+            return outputs[0]
+        if isinstance(outputs, dict) and "logits" in outputs:
+            return outputs["logits"]
+        return outputs
+
+    @staticmethod
+    def _replace_logits(outputs, logits):
+        if isinstance(outputs, tuple):
+            if len(outputs) == 0:
+                return logits
+            return (logits,) + tuple(outputs[1:])
+        if isinstance(outputs, list):
+            if len(outputs) == 0:
+                return logits
+            out = list(outputs)
+            out[0] = logits
+            return out
+        if isinstance(outputs, dict) and "logits" in outputs:
+            out = dict(outputs)
+            out["logits"] = logits
+            return out
+        return logits
+
+    def _configure_seen_only_train_ce(self, train_loader):
+        self.use_seen_only_train_ce = False
+        self.train_seen_ids = None
+        self.train_seen_ids_tensor = None
+        self.train_seen_remap = None
+        self.cls_weights_seen = None
+
+        xlsa_cfg = getattr(self.cfg.DATA, "XLSA", None)
+        xlsa_enabled = bool(getattr(xlsa_cfg, "ENABLED", False)) if xlsa_cfg is not None else False
+        if not xlsa_enabled:
+            return
+
+        dataset = getattr(train_loader, "dataset", None)
+        seen = getattr(dataset, "seen_classes", None)
+        if seen is None:
+            raise ValueError("XLSA training requires train_loader.dataset.seen_classes.")
+
+        seen_ids = sorted(set(int(x) for x in list(seen)))
+        if len(seen_ids) == 0:
+            raise ValueError("XLSA training requires non-empty seen_classes.")
+
+        total_classes = len(self.cls_weights)
+        bad_ids = [cid for cid in seen_ids if cid < 0 or cid >= total_classes]
+        if bad_ids:
+            raise ValueError(
+                "seen_classes contain out-of-range ids for class count {} (e.g., {}).".format(
+                    total_classes, bad_ids[:10]
+                )
+            )
+
+        seen_tensor = torch.tensor(seen_ids, dtype=torch.long, device=self.device)
+        remap = torch.full((total_classes,), -1, dtype=torch.long, device=self.device)
+        remap[seen_tensor] = torch.arange(len(seen_ids), dtype=torch.long, device=self.device)
+
+        weights_np = np.asarray(self.cls_weights, dtype=np.float32)
+        self.cls_weights_seen = weights_np[seen_ids].tolist()
+        self.train_seen_ids = seen_ids
+        self.train_seen_ids_tensor = seen_tensor
+        self.train_seen_remap = remap
+        self.use_seen_only_train_ce = True
+
+        unseen = getattr(dataset, "unseen_classes", None)
+        unseen_count = len(unseen) if unseen is not None else -1
+        logger.info(
+            "Seen-only train CE enabled: seen=%d unseen=%d ln(S)=%.6f seen_head=%s",
+            len(seen_ids),
+            unseen_count,
+            float(np.log(max(len(seen_ids), 1))),
+            seen_ids[:10],
+        )
+
+    def _prepare_seen_only_loss(self, outputs, targets):
+        if not self.use_seen_only_train_ce:
+            return outputs, targets, self.cls_weights
+
+        logits = self._extract_logits(outputs)
+        if not torch.is_tensor(logits):
+            raise TypeError("Expected tensor logits for seen-only CE, got {}".format(type(logits)))
+
+        if logits.dim() != 2:
+            raise ValueError("Expected 2D logits [B, C], got shape {}".format(tuple(logits.shape)))
+
+        max_t = int(targets.max().item())
+        if max_t >= self.train_seen_remap.numel():
+            raise ValueError(
+                "Target id {} exceeds remap size {}.".format(max_t, self.train_seen_remap.numel())
+            )
+
+        mapped_targets = self.train_seen_remap[targets]
+        if (mapped_targets < 0).any():
+            bad = targets[mapped_targets < 0][:8].detach().cpu().tolist()
+            raise ValueError(
+                "Train batch contains non-seen target ids under seen-only CE (e.g., {}).".format(bad)
+            )
+
+        logits_seen = logits.index_select(dim=1, index=self.train_seen_ids_tensor)
+        outputs_seen = self._replace_logits(outputs, logits_seen)
+        return outputs_seen, mapped_targets, self.cls_weights_seen
 
     def forward_one_batch(self, inputs, targets, is_train, attributes=None):
         """Train a single (full) epoch on the model using the given data loader.
@@ -124,7 +567,11 @@ class Trainer():
             logger.info(f"shape of inputs: {inputs.shape}")
             logger.info(f"shape of targets: {targets.shape}")
 
+        trace_id = self._make_trace_id()
+        self._set_model_trace_context(trace_id)
+
         # ========== 2. 前向推理（训练时开启梯度，验证/测试禁用梯度） ==========
+        debug_logits = None
         with torch.set_grad_enabled(is_train):
             if self.use_affinity:
                 if attributes is not None:
@@ -154,6 +601,39 @@ class Trainer():
             else:
                 outputs = self.model(inputs, semantics=attributes)
 
+            loss_outputs = outputs
+            loss_targets = targets
+            loss_weights = self.cls_weights
+            if is_train and self.use_seen_only_train_ce and not self.cls_criterion.is_local():
+                loss_outputs, loss_targets, loss_weights = self._prepare_seen_only_loss(
+                    outputs, targets
+                )
+            if (self.debug_trace_once or self.debug_grad_norm) and not self._debug_forward_trace_logged:
+                logits_full = self._extract_logits(outputs)
+                logits_loss = self._extract_logits(loss_outputs)
+                with torch.no_grad():
+                    logger.info(
+                        "[trace] %s node=A.forward_one_batch inputs=%s targets[min,max,uniq]=(%d,%d,%d) "
+                        "outputs_type=%s logits_full=%s logits_loss=%s seen_only=%s targets_seen_min=%s",
+                        trace_id,
+                        tuple(inputs.shape),
+                        int(targets.min().item()),
+                        int(targets.max().item()),
+                        int(targets.unique().numel()),
+                        self._get_output_type_name(outputs),
+                        self._shape_or_none(logits_full),
+                        self._shape_or_none(logits_loss),
+                        bool(self.use_seen_only_train_ce),
+                        int(loss_targets.min().item()) if torch.is_tensor(loss_targets) else "NA",
+                    )
+                self._debug_forward_trace_logged = True
+            if is_train:
+                self._capture_train_debug(loss_outputs, outputs, loss_targets)
+
+            debug_logits = self._extract_logits(loss_outputs)
+            if self.debug_grad_norm:
+                self._log_batch_stats_once(debug_logits, loss_targets)
+
             if self.cfg.DBG:
                 _logits = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
 
@@ -178,7 +658,7 @@ class Trainer():
             else:
                 # 常规分类损失（如 SoftmaxLoss），只需要 outputs / targets / class_weights
                 loss = self.cls_criterion(
-                    outputs, targets, self.cls_weights)
+                    loss_outputs, loss_targets, loss_weights)
 
             # ========== 4. 检查损失是否异常（inf 或 NaN） ==========
             if loss == float('inf'):
@@ -197,7 +677,16 @@ class Trainer():
         if is_train:
             self.optimizer.zero_grad()
             loss.backward()
+            refs = None
+            before_norms = None
+            if self.debug_grad_norm:
+                refs = self._collect_debug_param_refs()
+                self._log_grad_norms_once(refs)
+                before_norms = self._capture_param_norms(refs)
             self.optimizer.step()
+            if self.debug_grad_norm and refs is not None:
+                after_norms = self._capture_param_norms(refs)
+                self._log_update_once(before_norms, after_norms)
 
         return loss, outputs
 
@@ -226,9 +715,9 @@ class Trainer():
             avs = affinity.get("Avs")
             if avs is not None:
                 if avs.dim() == 4:
-                    attn_vs[idx] = avs.mean(dim=1).transpose(-1, -2)
+                    attn_vs[idx] = avs.mean(dim=1)
                 elif avs.dim() == 3:
-                    attn_vs[idx] = avs.transpose(-1, -2)
+                    attn_vs[idx] = avs
 
         if not attn_pv or not attn_vs:
             return None
@@ -260,6 +749,32 @@ class Trainer():
             attributes = torch.from_numpy(attributes)
         return inputs, labels, attributes
 
+    def _pick_primary_metric(self, metric_dict):
+        """
+        Select the early-stop metric according to evaluator task type.
+        Returns: (metric_name, metric_value) or (None, None) if unavailable.
+        """
+        if not isinstance(metric_dict, dict):
+            return None, None
+
+        task_type = str(getattr(self.evaluator, "task_type", "standard") or "standard").lower()
+        if task_type == "gzsl":
+            candidates = ["gzsl_h", "zsl_unseen", "top1", "rocauc"]
+        elif task_type == "zsl":
+            candidates = ["zsl_unseen", "gzsl_h", "top1", "rocauc"]
+        else:
+            candidates = ["top1", "rocauc", "top5"]
+
+        for key in candidates:
+            val = metric_dict.get(key, None)
+            if val is None:
+                continue
+            try:
+                return key, float(val)
+            except (TypeError, ValueError):
+                continue
+        return None, None
+
     def train_classifier(self, train_loader, val_loader, test_loader):
         """
         以 epoch 为单位训练分类器，并在每个 epoch 后进行验证和（可选）测试。
@@ -279,35 +794,50 @@ class Trainer():
         # setup training epoch params
         total_epoch = self.cfg.SOLVER.TOTAL_EPOCH       # 总 epoch 数
         total_data = len(train_loader)                  # 每个 epoch 的 batch 数
+        effective_total_epoch = total_epoch
+        if self.overfit_one_batch_steps > 0:
+            effective_total_epoch = 1
+            total_data = self.overfit_one_batch_steps
+            if self._overfit_cached_batch is None:
+                self._overfit_cached_batch = next(iter(train_loader))
+            logger.info(
+                "[debug] OVERFIT_ONE_BATCH_STEPS enabled: repeat one batch for %d steps",
+                self.overfit_one_batch_steps,
+            )
         best_epoch = -1                                 # 当前最优 epoch
         best_metric = 0                                 # 最优指标（比如 top1）
         log_interval = self.cfg.SOLVER.LOG_EVERY_N      # 每多少个 batch 打一次日志
 
         # 若干计量器（统计平均损失/时间等，便于打印）
         losses = AverageMeter('Loss', ':.4e')           # - losses: 每个 epoch 内的平均训练损失
+        seen_top1_meter = AverageMeter('SeenTop1', ':.4e')  # - seen_top1_meter: 训练口径 top1
         batch_time = AverageMeter('Time', ':6.3f')      # - batch_time: 每个 batch 的时间
         data_time = AverageMeter('Data', ':6.3f')       # - data_time: 数据加载时间
 
         # 从训练集 Dataset 获取类别权重，传给损失函数（应对类分布不平衡）
         self.cls_weights = train_loader.dataset.get_class_weights(
             self.cfg.DATA.CLASS_WEIGHTS_TYPE)
+        self._configure_seen_only_train_ce(train_loader)
+        if self.overfit_one_batch_steps > 0:
+            self._set_prompt_sampling_mode(self.overfit_disable_prompt_sampling)
         # logger.info(f"class weights: {self.cls_weights}")
 
         # 早停用 patience：若验证集 metric 连续若干次不提升就停止
         patience = 0  # if > self.cfg.SOLVER.PATIENCE, stop training 早停计数器；若超过 cfg.SOLVER.PATIENCE 则停止训练
 
         # ================== 2. 主训练循环（按 epoch） ==================
-        for epoch in range(total_epoch):
+        for epoch in range(effective_total_epoch):
             # reset averagemeters to measure per-epoch results 每个 epoch 开始前，重置统计量
             losses.reset()
+            seen_top1_meter.reset()
             batch_time.reset()
             data_time.reset()
 
             # 当前学习率（假设 scheduler 里第一组 lr 代表全局 lr）
-            lr = self.scheduler.get_lr()[0]
+            lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
             logger.info(
                 "Training {} / {} epoch, with learning rate {}".format(
-                    epoch + 1, total_epoch, lr
+                    epoch + 1, effective_total_epoch, lr
                 )
             )
 
@@ -317,7 +847,16 @@ class Trainer():
             end = time.time()
 
             # ---------- 遍历一个 epoch 的所有 batch ----------
-            for idx, input_data in enumerate(train_loader):
+            if self.overfit_one_batch_steps > 0:
+                batch_iter = ((i, self._overfit_cached_batch) for i in range(self.overfit_one_batch_steps))
+            else:
+                batch_iter = enumerate(train_loader)
+
+            for idx, input_data in batch_iter:
+                self._trace_stage = "train"
+                self._trace_epoch = int(epoch)
+                self._trace_iter = int(idx)
+                self._trace_global_step += 1
                 if self.cfg.DBG and idx == 20:
                     # if debugging, only need to see the first few iterations # 调试模式：仅跑前 20 个 batch 以加速
                     break
@@ -338,6 +877,8 @@ class Trainer():
 
                 # 更新本 epoch 的平均损失
                 losses.update(train_loss.item(), X.shape[0])
+                if isinstance(self._last_train_debug, dict) and "seen_only_top1" in self._last_train_debug:
+                    seen_top1_meter.update(float(self._last_train_debug["seen_only_top1"]), X.shape[0])
 
                 # measure elapsed time 统计 batch 处理时间
                 batch_time.update(time.time() - end)
@@ -348,7 +889,7 @@ class Trainer():
                     seconds_per_batch = batch_time.val
                     # 估算剩余时间（本 epoch 剩余 + 后续 epoch）
                     eta = datetime.timedelta(seconds=int(
-                        seconds_per_batch * (total_data - idx - 1) + seconds_per_batch*total_data*(total_epoch-epoch-1)))
+                        seconds_per_batch * (total_data - idx - 1) + seconds_per_batch*total_data*(effective_total_epoch-epoch-1)))
                     logger.info(
                         "\tTraining {}/{}. train loss: {:.4f},".format(
                             idx + 1,
@@ -362,15 +903,91 @@ class Trainer():
                         )
                         + "max mem: {:.1f} GB ".format(gpu_mem_usage())
                     )
+                    if self.overfit_one_batch_steps > 0 and self._last_train_debug:
+                        dbg = self._last_train_debug
+                        ce_stats = dbg.get("ce_logits_stats")
+                        raw_stats = dbg.get("raw_logits_stats")
+                        logger.info(
+                            "[overfit-debug] loss=%.6f seen_top1=%.4f ce_classes=%d "
+                            "ce_logits(mean/std/min/max)=%.6f/%.6f/%.6f/%.6f "
+                            "entropy(ce)=%.6f entropy_from_ce=%s ce_vs_raw_same_tensor=%s",
+                            float(train_loss),
+                            float(dbg.get("seen_only_top1", 0.0)),
+                            int(dbg.get("ce_classes", -1)),
+                            float(ce_stats["mean"]) if ce_stats else float("nan"),
+                            float(ce_stats["std"]) if ce_stats else float("nan"),
+                            float(ce_stats["min"]) if ce_stats else float("nan"),
+                            float(ce_stats["max"]) if ce_stats else float("nan"),
+                            float(dbg.get("ce_entropy", float("nan"))),
+                            bool(dbg.get("entropy_from_ce_logits", False)),
+                            bool(dbg.get("ce_vs_raw_same_tensor", False)),
+                        )
+                        if raw_stats is not None:
+                            logger.info(
+                                "[overfit-debug] raw_logits(mean/std/min/max)=%.6f/%.6f/%.6f/%.6f entropy(raw)=%.6f",
+                                float(raw_stats["mean"]),
+                                float(raw_stats["std"]),
+                                float(raw_stats["min"]),
+                                float(raw_stats["max"]),
+                                float(dbg.get("raw_entropy", float("nan"))),
+                            )
+
+                        r_head = getattr(self.model, "r_similarity_head", None)
+                        if r_head is not None:
+                            raw_sim = getattr(r_head, "_debug_last_raw_sim", None)
+                            scaled_logits = getattr(r_head, "_debug_last_scaled_logits", None)
+                            raw_sim_stats = self._tensor_stats(raw_sim)
+                            scaled_stats = self._tensor_stats(scaled_logits)
+                            if raw_sim_stats is not None and scaled_stats is not None:
+                                logger.info(
+                                    "[overfit-debug] r_head raw_sim(mean/std/min/max)=%.6f/%.6f/%.6f/%.6f "
+                                    "scaled(mean/std/min/max)=%.6f/%.6f/%.6f/%.6f",
+                                    float(raw_sim_stats["mean"]),
+                                    float(raw_sim_stats["std"]),
+                                    float(raw_sim_stats["min"]),
+                                    float(raw_sim_stats["max"]),
+                                    float(scaled_stats["mean"]),
+                                    float(scaled_stats["std"]),
+                                    float(scaled_stats["min"]),
+                                    float(scaled_stats["max"]),
+                                )
+                                ce_logits = self._last_ce_logits
+                                ce_from_scaled = False
+                                if torch.is_tensor(ce_logits):
+                                    if (
+                                        ce_logits.shape == scaled_logits.shape
+                                        and torch.allclose(ce_logits, scaled_logits, rtol=1e-5, atol=1e-6)
+                                    ):
+                                        ce_from_scaled = True
+                                    elif (
+                                        self.use_seen_only_train_ce
+                                        and self.train_seen_ids_tensor is not None
+                                        and ce_logits.shape[0] == scaled_logits.shape[0]
+                                        and ce_logits.shape[1] == int(self.train_seen_ids_tensor.numel())
+                                    ):
+                                        scaled_seen = scaled_logits.index_select(
+                                            dim=1, index=self.train_seen_ids_tensor
+                                        )
+                                        ce_from_scaled = bool(
+                                            torch.allclose(ce_logits, scaled_seen, rtol=1e-5, atol=1e-6)
+                                        )
+                                logger.info(
+                                    "[overfit-debug] CE logits sourced from scaled_logits=%s (seen_only=%s)",
+                                    bool(ce_from_scaled),
+                                    bool(self.use_seen_only_train_ce),
+                                )
             # 一个 epoch 的汇总日志
             logger.info(
-                "Epoch {} / {}: ".format(epoch + 1, total_epoch)
+                "Epoch {} / {}: ".format(epoch + 1, effective_total_epoch)
                 + "avg data time: {:.2e}, avg batch time: {:.4f}, ".format(
                     data_time.avg, batch_time.avg)
-                + "average train loss: {:.4f}".format(losses.avg))
+                + "average train loss: {:.4f}, train_seen_top1: {:.4f}".format(
+                    losses.avg, seen_top1_meter.avg
+                ))
              # update lr, scheduler.step() must be called after optimizer.step() according to the docs: https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate  # noqa
              # 按官方建议：scheduler.step() 应在 optimizer.step() 之后调用
-            self.scheduler.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
 
             # ================== 3. 验证 / 测试阶段 ==================
             # 切换到 eval 模式
@@ -388,13 +1005,27 @@ class Trainer():
             # save=False：验证阶段不需要立即保存 logits
             self.eval_classifier(val_loader, "val", save=False)
 
-            # 读取本轮 val 的 top1，判断是否刷新最佳
+            # 读取本轮 val 的主指标（standard: top1; zsl: zsl_unseen; gzsl: gzsl_h）
             t_name = "val_" + val_loader.dataset.name
-            try:
-                curr_acc = self.evaluator.results[f"epoch_{epoch}"]["classification"][t_name]["top1"]
-            except KeyError:
-                # 若指标缺失（可能是评测流程问题），直接返回
-                return
+            metrics_this_epoch = (
+                self.evaluator.results
+                .get(f"epoch_{epoch}", {})
+                .get("classification", {})
+                .get(t_name, {})
+            )
+            metric_name, curr_acc = self._pick_primary_metric(metrics_this_epoch)
+            if metric_name is None:
+                logger.warning(
+                    "No usable validation metric found for %s at epoch %d. Available keys: %s",
+                    t_name,
+                    epoch + 1,
+                    sorted(list(metrics_this_epoch.keys())) if isinstance(metrics_this_epoch, dict) else [],
+                )
+                patience += 1
+                if patience >= self.cfg.SOLVER.PATIENCE:
+                    logger.info("No improvement. Breaking out of loop.")
+                    break
+                continue
 
             improved = curr_acc > best_metric
 
@@ -420,7 +1051,12 @@ class Trainer():
             if improved:
                 best_metric = curr_acc
                 best_epoch = epoch + 1
-                logger.info(f'Best epoch {best_epoch}: best metric: {best_metric:.3f}')
+                logger.info(
+                    "Best epoch %d: best %s = %.3f",
+                    best_epoch,
+                    metric_name,
+                    best_metric,
+                )
                 patience = 0
             else:
                 patience += 1
@@ -500,6 +1136,9 @@ class Trainer():
 
         # ========== 遍历整个数据集 ==========
         for idx, input_data in enumerate(data_loader):
+            self._trace_stage = f"eval_{prefix}"
+            self._trace_iter = int(idx)
+            self._trace_global_step += 1
             end = time.time()
             X, targets, attributes = self.get_input(input_data)
 
@@ -591,4 +1230,3 @@ class Trainer():
 
             logger.info(f"[t-SNE cache] saved CLS features to {cache_dir}")
         # === eval_classifier 结束 ===
-
