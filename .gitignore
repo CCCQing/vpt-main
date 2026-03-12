@@ -140,3 +140,28 @@ dmypy.json
 .pyre/
 imagenet21k_ViT-B_16.npz
 *.npz
+
+# =========================
+# Project-specific ignores
+# =========================
+
+# experiment outputs
+output/
+**/cache/
+**/monitor/
+**/diagnose/
+
+# model checkpoints / eval artifacts
+*.pth
+*.pt
+*_logits.pth
+logs.txt
+
+# IDE
+.idea/
+.vscode/
+Thumbs.db
+
+# local packages / dataset blobs
+*.whl
+*.mat

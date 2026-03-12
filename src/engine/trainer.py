@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 import os
 import numpy as np
+import json
+import csv
 
 from fvcore.common.config import CfgNode
 from fvcore.common.checkpoint import Checkpointer
@@ -125,11 +127,35 @@ class Trainer():
         self._trace_stage = "init"
         self._trace_global_step = 0
         self._trace_rank = int(getattr(cfg, "DIST_RANK", 0))
+        diag_cfg = getattr(cfg.SOLVER, "DIAG", None)
+        self.diag_shuffle_raw_targets = bool(getattr(diag_cfg, "SHUFFLE_RAW_TARGETS", False)) if diag_cfg is not None else False
+        mon_cfg = getattr(cfg.SOLVER, "MONITOR", None)
+        self.monitor_enable = bool(getattr(mon_cfg, "ENABLE", False)) if mon_cfg is not None else False
+        self.monitor_every_epoch = max(1, int(getattr(mon_cfg, "EVERY_EPOCH", 1))) if mon_cfg is not None else 1
+        self.monitor_max_samples = max(1, int(getattr(mon_cfg, "MAX_SAMPLES", 512))) if mon_cfg is not None else 512
+        self.monitor_save_json = bool(getattr(mon_cfg, "SAVE_JSON", True)) if mon_cfg is not None else True
+        self.monitor_save_csv = bool(getattr(mon_cfg, "SAVE_CSV", True)) if mon_cfg is not None else True
+        self.monitor_save_heatmap = bool(getattr(mon_cfg, "SAVE_HEATMAP", False)) if mon_cfg is not None else False
+        self.monitor_heatmap_topk = max(1, int(getattr(mon_cfg, "HEATMAP_TOPK", 50))) if mon_cfg is not None else 50
+        self.monitor_dir = os.path.join(self.cfg.OUTPUT_DIR, "monitor")
+        self._monitor_csv_path = os.path.join(self.monitor_dir, "summary.csv")
+        self._monitor_warned_no_refined = False
 
         if self.debug_grad_norm:
             self._log_optimizer_param_groups()
         if self.debug_trace_once:
             self._log_semantic_param_names_once()
+        if self.monitor_enable:
+            os.makedirs(self.monitor_dir, exist_ok=True)
+            logger.info(
+                "[monitor] enable=%s every_epoch=%d max_samples=%d save_json=%s save_csv=%s save_heatmap=%s",
+                bool(self.monitor_enable),
+                int(self.monitor_every_epoch),
+                int(self.monitor_max_samples),
+                bool(self.monitor_save_json),
+                bool(self.monitor_save_csv),
+                bool(self.monitor_save_heatmap),
+            )
 
     @staticmethod
     def _get_output_type_name(outputs):
@@ -416,6 +442,17 @@ class Trainer():
                 "seen_only_top1": float(top1.item()),
                 "ce_classes": int(ce_logits.shape[-1]),
             }
+            model_ref = self.model.module if hasattr(self.model, "module") else self.model
+            r_head = getattr(model_ref, "r_similarity_head", None)
+            if r_head is not None:
+                fixed_scale = float(getattr(r_head, "fixed_logit_scale", 0.0))
+                self._last_train_debug["whether_fixed_logit_scale"] = bool(fixed_scale > 0)
+                scale_t = getattr(r_head, "_loss_last_scale", None)
+                if torch.is_tensor(scale_t):
+                    self._last_train_debug["effective_logit_scale"] = float(scale_t.detach().mean().item())
+            hn_stats = getattr(self.cls_criterion, "_last_hn_stats", None)
+            if isinstance(hn_stats, dict) and len(hn_stats) > 0:
+                self._last_train_debug.update(hn_stats)
 
     def _set_prompt_sampling_mode(self, disable_sampling: bool):
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
@@ -543,6 +580,448 @@ class Trainer():
         outputs_seen = self._replace_logits(outputs, logits_seen)
         return outputs_seen, mapped_targets, self.cls_weights_seen
 
+    @staticmethod
+    def _model_ref(model):
+        return model.module if hasattr(model, "module") else model
+
+    @staticmethod
+    def _safe_cosine_matrix(x: torch.Tensor) -> torch.Tensor:
+        x = torch.nn.functional.normalize(x.float(), dim=-1)
+        return x @ x.t()
+
+    @staticmethod
+    def _upper_tri_flat(m: torch.Tensor) -> torch.Tensor:
+        if m.dim() != 2 or m.shape[0] != m.shape[1] or m.shape[0] < 2:
+            return torch.empty(0, device=m.device)
+        idx = torch.triu_indices(m.shape[0], m.shape[1], offset=1, device=m.device)
+        return m[idx[0], idx[1]]
+
+    @staticmethod
+    def _pearson_corr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        x = x.float().reshape(-1)
+        y = y.float().reshape(-1)
+        if x.numel() != y.numel() or x.numel() < 2:
+            return x.new_tensor(float("nan"))
+        x = x - x.mean()
+        y = y - y.mean()
+        denom = (x.norm(p=2) * y.norm(p=2)).clamp_min(1e-12)
+        return (x * y).sum() / denom
+
+    def _should_run_monitor(self, epoch: int) -> bool:
+        if not self.monitor_enable:
+            return False
+        return ((epoch + 1) % self.monitor_every_epoch) == 0
+
+    def _resolve_candidate_ids(self, split: str, dataset, targets_np: np.ndarray, num_classes: int) -> np.ndarray:
+        split = str(split).lower()
+        if split == "train":
+            source = getattr(dataset, "seen_classes", None)
+            if source is None:
+                source = np.unique(targets_np)
+        elif split == "val":
+            source = np.unique(targets_np)
+        else:
+            source = getattr(dataset, "unseen_classes", None)
+            if source is None:
+                source = np.unique(targets_np)
+        ids = np.asarray(list(source), dtype=np.int64).reshape(-1)
+        valid = (ids >= 0) & (ids < int(num_classes))
+        return np.unique(ids[valid])
+
+    @torch.no_grad()
+    def _collect_monitor_samples(self, data_loader, split: str):
+        model_ref = self._model_ref(self.model)
+        dataset = getattr(data_loader, "dataset", None)
+        class_attr = getattr(dataset, "class_attributes", None)
+        if class_attr is None:
+            logger.warning("[monitor] split=%s skipped: dataset.class_attributes is missing", split)
+            return None
+
+        max_samples = int(self.monitor_max_samples)
+        feats_all, labels_all = [], []
+        raw_all, refined_all = [], []
+        total = 0
+
+        for input_data in data_loader:
+            X, targets, attributes = self.get_input(input_data)
+            X = X.to(self.device, non_blocking=True)
+            targets = targets.to(self.device, non_blocking=True)
+            if attributes is not None:
+                attributes = attributes.to(self.device, non_blocking=True)
+
+            feats = model_ref.enc(X, semantics=attributes)
+            feats = feats[:, 0] if torch.is_tensor(feats) and feats.dim() == 3 else feats
+            if not torch.is_tensor(feats):
+                break
+
+            transformer = getattr(getattr(model_ref, "enc", None), "transformer", None)
+            raw_sem = getattr(transformer, "_monitor_last_raw_semantics", None) if transformer is not None else None
+            refined_sem = getattr(transformer, "_monitor_last_refined_semantics", None) if transformer is not None else None
+            if (raw_sem is None) and (attributes is not None):
+                raw_sem = attributes
+
+            bsz = int(feats.shape[0])
+            remain = max_samples - total
+            if remain <= 0:
+                break
+            keep = min(remain, bsz)
+
+            feats_all.append(feats[:keep].detach().cpu())
+            labels_all.append(targets[:keep].detach().cpu())
+            if torch.is_tensor(raw_sem):
+                raw_all.append(raw_sem[:keep].detach().cpu())
+            if torch.is_tensor(refined_sem):
+                refined_all.append(refined_sem[:keep].detach().cpu())
+
+            total += keep
+            if total >= max_samples:
+                break
+
+        if total == 0:
+            return None
+
+        feats = torch.cat(feats_all, dim=0).float().to(self.device)
+        labels = torch.cat(labels_all, dim=0).long().to(self.device)
+        raw_sem = torch.cat(raw_all, dim=0).float().to(self.device) if len(raw_all) == len(feats_all) and len(raw_all) > 0 else None
+        refined_sem = torch.cat(refined_all, dim=0).float().to(self.device) if len(refined_all) == len(feats_all) and len(refined_all) > 0 else None
+
+        return {
+            "split": str(split),
+            "dataset": dataset,
+            "features": feats,
+            "labels": labels,
+            "raw_sem_batch": raw_sem,
+            "refined_sem_batch": refined_sem,
+            "num_samples": int(total),
+        }
+
+    @torch.no_grad()
+    def _build_monitor_semantic_banks(self, dataset, candidate_ids: np.ndarray, r_head):
+        class_attr = getattr(dataset, "class_attributes", None)
+        if class_attr is None:
+            return None
+        class_attr = class_attr.to(self.device).float() if torch.is_tensor(class_attr) else torch.tensor(class_attr, device=self.device).float()
+        cids = torch.as_tensor(candidate_ids, device=self.device, dtype=torch.long)
+        raw_attr_cand = class_attr.index_select(0, cids)
+
+        bank = {
+            "candidate_ids": cids,
+            "raw_attr": raw_attr_cand,
+            "orig_proj": None,
+            "refined_proj": None,
+        }
+
+        concept = getattr(r_head, "semantic_concept", None) if r_head is not None else None
+        if concept is not None and getattr(concept, "semantic_proj", None) is not None:
+            raw_embed = concept.semantic_proj(raw_attr_cand.unsqueeze(1))
+            raw_embed = concept.semantic_proj_norm(raw_embed).squeeze(1)
+            bank["orig_proj"] = r_head.semantic_proj(raw_embed)
+
+        if r_head is not None:
+            refined_all = r_head._class_prototypes()
+            refined_cand = refined_all.index_select(0, cids)
+            bank["refined_proj"] = r_head.semantic_proj(refined_cand)
+
+        return bank
+
+    @torch.no_grad()
+    def _compute_monitor_metrics(self, sample_pack):
+        split = sample_pack["split"]
+        dataset = sample_pack["dataset"]
+        feats = sample_pack["features"]
+        labels = sample_pack["labels"]
+        raw_sem_batch = sample_pack["raw_sem_batch"]
+        refined_sem_batch = sample_pack["refined_sem_batch"]
+        num_samples = int(sample_pack["num_samples"])
+
+        model_ref = self._model_ref(self.model)
+        r_head = getattr(model_ref, "r_similarity_head", None)
+        if r_head is None:
+            logger.warning("[monitor] split=%s skipped: r_similarity_head is missing", split)
+            return None
+
+        num_classes = int(getattr(r_head, "num_classes", feats.shape[-1]))
+        targets_np = labels.detach().cpu().numpy()
+        candidate_ids_np = self._resolve_candidate_ids(split, dataset, targets_np, num_classes)
+        if candidate_ids_np.size == 0:
+            logger.warning("[monitor] split=%s skipped: empty candidate_ids", split)
+            return None
+
+        banks = self._build_monitor_semantic_banks(dataset, candidate_ids_np, r_head)
+        if banks is None:
+            return None
+
+        cids = banks["candidate_ids"]
+        cid_set = set(int(x) for x in cids.detach().cpu().tolist())
+        keep_mask = torch.tensor([int(y.item()) in cid_set for y in labels], device=self.device, dtype=torch.bool)
+        if keep_mask.sum() == 0:
+            logger.warning("[monitor] split=%s skipped: no labels in candidate_ids", split)
+            return None
+
+        feats = feats[keep_mask]
+        labels = labels[keep_mask]
+        if raw_sem_batch is not None:
+            raw_sem_batch = raw_sem_batch[keep_mask]
+        if refined_sem_batch is not None:
+            refined_sem_batch = refined_sem_batch[keep_mask]
+
+        v_proj = r_head.visual_proj(feats) if getattr(r_head, "visual_proj", None) is not None else feats
+        v_norm = torch.nn.functional.normalize(v_proj.float(), dim=-1)
+
+        local_index = {int(cid): i for i, cid in enumerate(cids.detach().cpu().tolist())}
+        y_local = torch.tensor([local_index[int(y.item())] for y in labels], device=self.device, dtype=torch.long)
+
+        metrics = {
+            "epoch": int(self._trace_epoch + 1),
+            "split": split,
+            "num_samples": int(feats.shape[0]),
+            "candidate_count": int(cids.numel()),
+            "candidate_head": [int(x) for x in cids[:10].detach().cpu().tolist()],
+        }
+
+        # Layer 1: single-modality separability in visual space.
+        uniq = torch.unique(labels)
+        centers = []
+        intra_vals = []
+        for cls in uniq:
+            cls_feat = feats[labels == cls]
+            if cls_feat.shape[0] == 0:
+                continue
+            center = cls_feat.mean(dim=0)
+            centers.append(center)
+            intra_vals.append(torch.norm(cls_feat - center.unsqueeze(0), dim=-1).mean())
+        if len(intra_vals) > 0:
+            metrics["visual_intra_l2"] = float(torch.stack(intra_vals).mean().item())
+        if len(centers) >= 2:
+            center_t = torch.stack(centers, dim=0)
+            dmat = torch.cdist(center_t, center_t, p=2)
+            tri = self._upper_tri_flat(dmat)
+            if tri.numel() > 0:
+                metrics["visual_inter_l2"] = float(tri.mean().item())
+
+        refined_proj = banks.get("refined_proj")
+        orig_proj = banks.get("orig_proj")
+        if torch.is_tensor(refined_proj):
+            sem_sim = self._safe_cosine_matrix(refined_proj)
+            tri = self._upper_tri_flat(sem_sim)
+            if tri.numel() > 0:
+                metrics["semantic_refined_sep_cos_dissim"] = float((1.0 - tri).mean().item())
+        if torch.is_tensor(orig_proj):
+            sem_sim_o = self._safe_cosine_matrix(orig_proj)
+            tri_o = self._upper_tri_flat(sem_sim_o)
+            if tri_o.numel() > 0:
+                metrics["semantic_orig_sep_cos_dissim"] = float((1.0 - tri_o).mean().item())
+
+        # Layer 2: cross-modal alignment (refined as main).
+        if torch.is_tensor(refined_proj):
+            s_ref = torch.nn.functional.normalize(refined_proj.float(), dim=-1)
+            sim_ref = v_norm @ s_ref.t()
+            pos_ref = sim_ref.gather(1, y_local.view(-1, 1)).squeeze(1)
+            neg_ref = sim_ref.clone()
+            neg_ref.scatter_(1, y_local.view(-1, 1), -1e9)
+            hard_ref = neg_ref.max(dim=1).values
+            margin_ref = pos_ref - hard_ref
+            metrics["pos_sim_mean"] = float(pos_ref.mean().item())
+            metrics["pos_sim_std"] = float(pos_ref.std().item())
+            metrics["hard_neg_sim_mean"] = float(hard_ref.mean().item())
+            metrics["hard_neg_sim_std"] = float(hard_ref.std().item())
+            metrics["margin_mean"] = float(margin_ref.mean().item())
+            metrics["margin_std"] = float(margin_ref.std().item())
+
+            seen_ids = set(int(x) for x in list(getattr(dataset, "seen_classes", []) or []))
+            unseen_ids = set(int(x) for x in list(getattr(dataset, "unseen_classes", []) or []))
+            if len(seen_ids) > 0:
+                m_seen = torch.tensor([int(y.item()) in seen_ids for y in labels], device=self.device, dtype=torch.bool)
+                if m_seen.any():
+                    metrics["margin_seen_mean"] = float(margin_ref[m_seen].mean().item())
+            if len(unseen_ids) > 0:
+                m_unseen = torch.tensor([int(y.item()) in unseen_ids for y in labels], device=self.device, dtype=torch.bool)
+                if m_unseen.any():
+                    metrics["margin_unseen_mean"] = float(margin_ref[m_unseen].mean().item())
+
+            # Class-center to semantic prototype matrix.
+            if len(centers) > 0:
+                center_cls_ids = uniq.detach().cpu().tolist()
+                center_t = torch.stack(centers, dim=0)
+                center_n = torch.nn.functional.normalize(center_t.float(), dim=-1)
+                m_v2s = center_n @ s_ref.t()
+                diag_vals = []
+                top1 = []
+                for row_idx, cid in enumerate(center_cls_ids):
+                    if int(cid) in local_index:
+                        col = local_index[int(cid)]
+                        diag_vals.append(m_v2s[row_idx, col])
+                        top1.append(int(m_v2s[row_idx].argmax().item() == col))
+                if len(diag_vals) > 0:
+                    diag_t = torch.stack(diag_vals)
+                    metrics["v2s_diag_mean"] = float(diag_t.mean().item())
+                    metrics["v2s_diag_top1_rate"] = float(np.mean(top1))
+                off_mean = float(m_v2s.mean().item())
+                if len(diag_vals) > 0:
+                    metrics["v2s_offdiag_mean"] = off_mean - float(np.mean([x.item() for x in diag_vals])) / max(m_v2s.shape[1] - 1, 1)
+                metrics["_m_v2s"] = m_v2s.detach().cpu().numpy()
+                metrics["_m_v2s_rows"] = [int(x) for x in center_cls_ids]
+                metrics["_m_v2s_cols"] = [int(x) for x in cids.detach().cpu().tolist()]
+
+        # Layer 3: S^# specific monitoring.
+        if torch.is_tensor(refined_sem_batch):
+            concept = getattr(r_head, "semantic_concept", None)
+            if (raw_sem_batch is not None) and (concept is not None) and (getattr(concept, "semantic_proj", None) is not None):
+                raw_map = concept.semantic_proj(raw_sem_batch.unsqueeze(1))
+                raw_map = concept.semantic_proj_norm(raw_map).squeeze(1)
+                faith = torch.nn.functional.cosine_similarity(
+                    torch.nn.functional.normalize(refined_sem_batch.float(), dim=-1),
+                    torch.nn.functional.normalize(raw_map.float(), dim=-1),
+                    dim=-1,
+                )
+                metrics["sref_faith_mean"] = float(faith.mean().item())
+                metrics["sref_faith_min"] = float(faith.min().item())
+                metrics["sref_faith_max"] = float(faith.max().item())
+
+            # Intra-class stability of instance-conditioned refined semantics.
+            st_vals = []
+            for cls in torch.unique(labels):
+                s_cls = refined_sem_batch[labels == cls]
+                if s_cls.shape[0] <= 1:
+                    continue
+                c_s = s_cls.mean(dim=0, keepdim=True)
+                st_vals.append(torch.norm(s_cls - c_s, dim=-1).mean())
+            if len(st_vals) > 0:
+                metrics["sref_intra_l2"] = float(torch.stack(st_vals).mean().item())
+
+        if torch.is_tensor(orig_proj) and torch.is_tensor(refined_proj):
+            s_org = torch.nn.functional.normalize(orig_proj.float(), dim=-1)
+            s_ref = torch.nn.functional.normalize(refined_proj.float(), dim=-1)
+            sim_org = v_norm @ s_org.t()
+            sim_ref = v_norm @ s_ref.t()
+            pos_org = sim_org.gather(1, y_local.view(-1, 1)).squeeze(1)
+            pos_ref = sim_ref.gather(1, y_local.view(-1, 1)).squeeze(1)
+            neg_org = sim_org.clone()
+            neg_ref = sim_ref.clone()
+            neg_org.scatter_(1, y_local.view(-1, 1), -1e9)
+            neg_ref.scatter_(1, y_local.view(-1, 1), -1e9)
+            margin_org = pos_org - neg_org.max(dim=1).values
+            margin_ref = pos_ref - neg_ref.max(dim=1).values
+            gain = margin_ref - margin_org
+            metrics["sref_margin_gain_mean"] = float(gain.mean().item())
+
+            # Structural consistency corr(M^V, M^S) vs corr(M^V, M^S#).
+            if len(centers) >= 2:
+                center_t = torch.stack(centers, dim=0)
+                mv = self._safe_cosine_matrix(center_t)
+                # Align semantic matrices to classes available in centers.
+                center_cls_ids = [int(x) for x in uniq.detach().cpu().tolist()]
+                cols = [local_index[cid] for cid in center_cls_ids if cid in local_index]
+                if len(cols) >= 2:
+                    so = s_org.index_select(0, torch.tensor(cols, device=self.device, dtype=torch.long))
+                    sr = s_ref.index_select(0, torch.tensor(cols, device=self.device, dtype=torch.long))
+                    ms_o = self._safe_cosine_matrix(so)
+                    ms_r = self._safe_cosine_matrix(sr)
+                    v_flat = self._upper_tri_flat(mv)
+                    o_flat = self._upper_tri_flat(ms_o)
+                    r_flat = self._upper_tri_flat(ms_r)
+                    if v_flat.numel() > 1:
+                        corr_o = self._pearson_corr(v_flat, o_flat)
+                        corr_r = self._pearson_corr(v_flat, r_flat)
+                        metrics["struct_corr_v_s_orig"] = float(corr_o.item())
+                        metrics["struct_corr_v_s_refined"] = float(corr_r.item())
+
+        metrics["num_samples"] = num_samples
+        return metrics
+
+    def _write_monitor_outputs(self, metrics: dict):
+        if metrics is None:
+            return
+        os.makedirs(self.monitor_dir, exist_ok=True)
+        epoch = int(metrics.get("epoch", self._trace_epoch + 1))
+        split = str(metrics.get("split", "na"))
+
+        logger.info(
+            "[monitor] epoch=%d split=%s n=%s cand=%s margin=%.4f pos=%.4f hard_neg=%.4f gain=%.4f faith=%.4f",
+            epoch,
+            split,
+            metrics.get("num_samples", "NA"),
+            metrics.get("candidate_count", "NA"),
+            float(metrics.get("margin_mean", float("nan"))),
+            float(metrics.get("pos_sim_mean", float("nan"))),
+            float(metrics.get("hard_neg_sim_mean", float("nan"))),
+            float(metrics.get("sref_margin_gain_mean", float("nan"))),
+            float(metrics.get("sref_faith_mean", float("nan"))),
+        )
+
+        if self.monitor_save_json:
+            out = {}
+            for k, v in metrics.items():
+                if k.startswith("_"):
+                    continue
+                if isinstance(v, (np.floating, np.integer)):
+                    out[k] = v.item()
+                else:
+                    out[k] = v
+            p = os.path.join(self.monitor_dir, "epoch_{:04d}_{}.json".format(epoch, split))
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, indent=2)
+
+        if self.monitor_save_csv:
+            csv_fields = [
+                "epoch", "split", "num_samples", "candidate_count",
+                "margin_mean", "margin_std", "pos_sim_mean", "hard_neg_sim_mean",
+                "sref_margin_gain_mean", "sref_faith_mean", "sref_intra_l2",
+                "visual_intra_l2", "visual_inter_l2",
+                "semantic_orig_sep_cos_dissim", "semantic_refined_sep_cos_dissim",
+                "struct_corr_v_s_orig", "struct_corr_v_s_refined",
+                "v2s_diag_mean", "v2s_diag_top1_rate",
+                "margin_seen_mean", "margin_unseen_mean",
+            ]
+            row = {k: metrics.get(k, "") for k in csv_fields}
+            csv_exists = os.path.exists(self._monitor_csv_path)
+            with open(self._monitor_csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=csv_fields)
+                if not csv_exists:
+                    writer.writeheader()
+                writer.writerow(row)
+
+        if self.monitor_save_heatmap and ("_m_v2s" in metrics):
+            try:
+                import matplotlib.pyplot as plt
+                m = metrics["_m_v2s"]
+                r = min(m.shape[0], self.monitor_heatmap_topk)
+                c = min(m.shape[1], self.monitor_heatmap_topk)
+                fig = plt.figure(figsize=(6, 5))
+                ax = fig.add_subplot(111)
+                im = ax.imshow(m[:r, :c], aspect="auto", cmap="viridis")
+                ax.set_title("V-center vs S-prototype (epoch {} {})".format(epoch, split))
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                heat_dir = os.path.join(self.monitor_dir, "heatmap")
+                os.makedirs(heat_dir, exist_ok=True)
+                fig.savefig(os.path.join(heat_dir, "epoch_{:04d}_{}_v2s.png".format(epoch, split)), dpi=160, bbox_inches="tight")
+                plt.close(fig)
+            except Exception as e:
+                logger.warning("[monitor] heatmap save failed: %s", str(e))
+
+    @torch.no_grad()
+    def _run_monitor_epoch(self, epoch: int, train_loader, val_loader, test_loader):
+        model_was_training = self.model.training
+        self.model.eval()
+        split_loaders = [
+            ("train", train_loader),
+            ("val", val_loader),
+            ("test", test_loader),
+        ]
+        for split, loader in split_loaders:
+            if loader is None:
+                continue
+            pack = self._collect_monitor_samples(loader, split=split)
+            if pack is None:
+                continue
+            metrics = self._compute_monitor_metrics(pack)
+            if metrics is None:
+                continue
+            metrics["epoch"] = int(epoch + 1)
+            self._write_monitor_outputs(metrics)
+        if model_was_training:
+            self.model.train()
+
     def forward_one_batch(self, inputs, targets, is_train, attributes=None):
         """Train a single (full) epoch on the model using the given data loader.
         对一个 batch 做前向（可选反向）计算。
@@ -573,6 +1052,10 @@ class Trainer():
         # ========== 2. 前向推理（训练时开启梯度，验证/测试禁用梯度） ==========
         debug_logits = None
         with torch.set_grad_enabled(is_train):
+            effective_targets = targets
+            if is_train and self.diag_shuffle_raw_targets and targets.numel() > 1:
+                perm = torch.randperm(targets.shape[0], device=targets.device)
+                effective_targets = targets.index_select(0, perm)
             if self.use_affinity:
                 if attributes is not None:
                     if self.affinity_vis:
@@ -602,7 +1085,7 @@ class Trainer():
                 outputs = self.model(inputs, semantics=attributes)
 
             loss_outputs = outputs
-            loss_targets = targets
+            loss_targets = effective_targets
             loss_weights = self.cls_weights
             if is_train and self.use_seen_only_train_ce and not self.cls_criterion.is_local():
                 loss_outputs, loss_targets, loss_weights = self._prepare_seen_only_loss(
@@ -644,6 +1127,14 @@ class Trainer():
             # ================== 3. 计算损失 ==================
             # 一些“局部损失”（is_local=True）需要拿到 model / inputs 参与计算
             # 例如某些正则或提示学习的约束，且为了稳定会在 eval() 下运行
+            model_ref = self.model.module if hasattr(self.model, "module") else self.model
+            loss_kwargs = {
+                "model": model_ref,
+                "raw_targets": targets,
+                "epoch": int(self._trace_epoch + 1),
+            }
+            if self.train_seen_ids_tensor is not None:
+                loss_kwargs["seen_ids"] = self.train_seen_ids_tensor
             if self.cls_criterion.is_local() and is_train:
                 # 把模型暂时切到 eval，避免 BN/Dropout 带来随机性
                 self.model.eval()
@@ -658,7 +1149,7 @@ class Trainer():
             else:
                 # 常规分类损失（如 SoftmaxLoss），只需要 outputs / targets / class_weights
                 loss = self.cls_criterion(
-                    loss_outputs, loss_targets, loss_weights)
+                    loss_outputs, loss_targets, loss_weights, kwargs=loss_kwargs)
 
             # ========== 4. 检查损失是否异常（inf 或 NaN） ==========
             if loss == float('inf'):
@@ -700,6 +1191,7 @@ class Trainer():
 
         attn_pv = {}
         attn_vs = {}
+        attn_ps = {}
 
         for idx, affinity in enumerate(affinities):
             if not isinstance(affinity, dict):
@@ -719,10 +1211,20 @@ class Trainer():
                 elif avs.dim() == 3:
                     attn_vs[idx] = avs
 
+            aps = affinity.get("Aps")
+            if aps is not None:
+                if aps.dim() == 4:
+                    attn_ps[idx] = aps.mean(dim=1)
+                elif aps.dim() == 3:
+                    attn_ps[idx] = aps
+
         if not attn_pv or not attn_vs:
             return None
 
-        return {"attn_pv": attn_pv, "attn_vs": attn_vs}
+        out = {"attn_pv": attn_pv, "attn_vs": attn_vs}
+        if attn_ps:
+            out["attn_ps"] = attn_ps
+        return out
 
     def get_input(self, data):
         """
@@ -811,6 +1313,12 @@ class Trainer():
         # 若干计量器（统计平均损失/时间等，便于打印）
         losses = AverageMeter('Loss', ':.4e')           # - losses: 每个 epoch 内的平均训练损失
         seen_top1_meter = AverageMeter('SeenTop1', ':.4e')  # - seen_top1_meter: 训练口径 top1
+        hn_margin_meter = AverageMeter('HNMargin', ':.4e')
+        pos_score_meter = AverageMeter('PosScore', ':.4e')
+        hn_score_meter = AverageMeter('HNScore', ':.4e')
+        train_margin_meter = AverageMeter('TrainMargin', ':.4e')
+        p_margin_lt0_meter = AverageMeter('PMarginLT0', ':.4e')
+        p_margin_ltneg1_meter = AverageMeter('PMarginLTNeg1', ':.4e')
         batch_time = AverageMeter('Time', ':6.3f')      # - batch_time: 每个 batch 的时间
         data_time = AverageMeter('Data', ':6.3f')       # - data_time: 数据加载时间
 
@@ -830,6 +1338,12 @@ class Trainer():
             # reset averagemeters to measure per-epoch results 每个 epoch 开始前，重置统计量
             losses.reset()
             seen_top1_meter.reset()
+            hn_margin_meter.reset()
+            pos_score_meter.reset()
+            hn_score_meter.reset()
+            train_margin_meter.reset()
+            p_margin_lt0_meter.reset()
+            p_margin_ltneg1_meter.reset()
             batch_time.reset()
             data_time.reset()
 
@@ -879,6 +1393,19 @@ class Trainer():
                 losses.update(train_loss.item(), X.shape[0])
                 if isinstance(self._last_train_debug, dict) and "seen_only_top1" in self._last_train_debug:
                     seen_top1_meter.update(float(self._last_train_debug["seen_only_top1"]), X.shape[0])
+                if isinstance(self._last_train_debug, dict):
+                    if "hn_margin_loss" in self._last_train_debug:
+                        hn_margin_meter.update(float(self._last_train_debug["hn_margin_loss"]), X.shape[0])
+                    if "pos_score_mean" in self._last_train_debug:
+                        pos_score_meter.update(float(self._last_train_debug["pos_score_mean"]), X.shape[0])
+                    if "hn_score_mean" in self._last_train_debug:
+                        hn_score_meter.update(float(self._last_train_debug["hn_score_mean"]), X.shape[0])
+                    if "train_margin_mean" in self._last_train_debug:
+                        train_margin_meter.update(float(self._last_train_debug["train_margin_mean"]), X.shape[0])
+                    if "p_train_margin_lt_0" in self._last_train_debug:
+                        p_margin_lt0_meter.update(float(self._last_train_debug["p_train_margin_lt_0"]), X.shape[0])
+                    if "p_train_margin_lt_neg1" in self._last_train_debug:
+                        p_margin_ltneg1_meter.update(float(self._last_train_debug["p_train_margin_lt_neg1"]), X.shape[0])
 
                 # measure elapsed time 统计 batch 处理时间
                 batch_time.update(time.time() - end)
@@ -903,6 +1430,18 @@ class Trainer():
                         )
                         + "max mem: {:.1f} GB ".format(gpu_mem_usage())
                     )
+                    if hn_margin_meter.count > 0:
+                        logger.info(
+                            "[hn-margin] hn_margin_loss=%.6f pos_score_mean=%.6f hn_score_mean=%.6f "
+                            "train_margin_mean=%.6f p_train_margin_lt_0=%.4f p_train_margin_lt_neg1=%.4f hn_detach_neg=%s",
+                            float(hn_margin_meter.val),
+                            float(pos_score_meter.val),
+                            float(hn_score_meter.val),
+                            float(train_margin_meter.val),
+                            float(p_margin_lt0_meter.val),
+                            float(p_margin_ltneg1_meter.val),
+                            bool(getattr(self.cls_criterion, "hn_detach_neg", False)),
+                        )
                     if self.overfit_one_batch_steps > 0 and self._last_train_debug:
                         dbg = self._last_train_debug
                         ce_stats = dbg.get("ce_logits_stats")
@@ -984,6 +1523,20 @@ class Trainer():
                 + "average train loss: {:.4f}, train_seen_top1: {:.4f}".format(
                     losses.avg, seen_top1_meter.avg
                 ))
+            if hn_margin_meter.count > 0:
+                logger.info(
+                    "Epoch {} HN summary: hn_margin_loss={:.6f}, pos_score_mean={:.6f}, hn_score_mean={:.6f}, "
+                    "train_margin_mean={:.6f}, p_train_margin_lt_0={:.4f}, p_train_margin_lt_neg1={:.4f}, hn_detach_neg={}".format(
+                        epoch + 1,
+                        hn_margin_meter.avg,
+                        pos_score_meter.avg,
+                        hn_score_meter.avg,
+                        train_margin_meter.avg,
+                        p_margin_lt0_meter.avg,
+                        p_margin_ltneg1_meter.avg,
+                        bool(getattr(self.cls_criterion, "hn_detach_neg", False)),
+                    )
+                )
              # update lr, scheduler.step() must be called after optimizer.step() according to the docs: https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate  # noqa
              # 按官方建议：scheduler.step() 应在 optimizer.step() 之后调用
             if self.scheduler is not None:
@@ -1034,6 +1587,9 @@ class Trainer():
             # 让 eval_classifier 内部保存 logits / CLS 特征等缓存，用于后续可视化。
             if test_loader is not None:
                 self.eval_classifier(test_loader, "test", save=improved)
+
+            if self._should_run_monitor(epoch):
+                self._run_monitor_epoch(epoch, train_loader, val_loader, test_loader)
 
             # 原来的代码做的是只保存最后一轮，这样容易受早停的影响
             # if test_loader is not None:                                       # 测试集评测（如提供了 test_loader）
@@ -1133,6 +1689,12 @@ class Trainer():
         # initialize features and target 聚合全量 logits 与 targets，评测结束一次性计算指标
         total_logits = []
         total_targets = []
+        total_sim_true_raw = []
+        total_sim_true_ref = []
+        total_sim_hn_raw = []
+        total_sim_hn_ref = []
+        total_sem_source = []
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
 
         # ========== 遍历整个数据集 ==========
         for idx, input_data in enumerate(data_loader):
@@ -1182,6 +1744,32 @@ class Trainer():
 
             total_logits.append(logits)
 
+            # Optional gain-cache signals for analyze_confusion.
+            r_head = getattr(model_ref, "r_similarity_head", None)
+            if r_head is not None:
+                v = getattr(r_head, "_loss_last_visual", None)
+                s_raw = getattr(r_head, "_loss_last_semantic_raw", None)
+                s_ref = getattr(r_head, "_loss_last_semantic_ref", None)
+                if torch.is_tensor(v) and torch.is_tensor(s_raw) and torch.is_tensor(s_ref):
+                    if v.dim() == 2 and s_raw.dim() == 2 and s_ref.dim() == 2 and v.shape[0] == logits.shape[0]:
+                        with torch.no_grad():
+                            y = targets.to(device=v.device, dtype=torch.long)
+                            sim_raw = v @ s_raw.t()
+                            sim_ref = v @ s_ref.t()
+                            pos_raw = sim_raw.gather(1, y.view(-1, 1)).squeeze(1)
+                            pos_ref = sim_ref.gather(1, y.view(-1, 1)).squeeze(1)
+                            logits_det = logits.detach()
+                            hn = logits_det.clone()
+                            hn.scatter_(1, y.view(-1, 1), -1e9)
+                            hn_idx = hn.argmax(dim=1)
+                            hn_raw = sim_raw.gather(1, hn_idx.view(-1, 1)).squeeze(1)
+                            hn_ref = sim_ref.gather(1, hn_idx.view(-1, 1)).squeeze(1)
+                            total_sim_true_raw.append(pos_raw.detach().cpu())
+                            total_sim_true_ref.append(pos_ref.detach().cpu())
+                            total_sim_hn_raw.append(hn_raw.detach().cpu())
+                            total_sim_hn_ref.append(hn_ref.detach().cpu())
+                            total_sem_source.extend([str(getattr(r_head, "_loss_last_source", "unknown"))] * int(v.shape[0]))
+
         # 整体评测日志
         logger.info(
             f"Inference ({prefix}):"
@@ -1207,6 +1795,18 @@ class Trainer():
         if save and self.cfg.MODEL.SAVE_CKPT:
             # 1) 已有
             out = {"targets": total_targets, "joint_logits": joint_logits}
+            if len(total_sim_true_raw) > 0 and len(total_sim_true_ref) > 0 and len(total_sim_hn_raw) > 0 and len(total_sim_hn_ref) > 0:
+                out["sim_true_raw"] = torch.cat(total_sim_true_raw, dim=0).numpy()
+                out["sim_true_ref"] = torch.cat(total_sim_true_ref, dim=0).numpy()
+                out["sim_hn_raw"] = torch.cat(total_sim_hn_raw, dim=0).numpy()
+                out["sim_hn_ref"] = torch.cat(total_sim_hn_ref, dim=0).numpy()
+                if len(total_sem_source) == len(total_targets):
+                    out["classifier_semantic_source"] = total_sem_source
+            class_names = getattr(data_loader.dataset, "classes", None)
+            if class_names is None:
+                class_names = getattr(data_loader.dataset, "class_names", None)
+            if class_names is not None:
+                out["class_names"] = [str(x) for x in list(class_names)]
             out_path = os.path.join(self.cfg.OUTPUT_DIR, f"{test_name}_logits.pth")
             torch.save(out, out_path)
             logger.info(f"Saved logits and targets for {test_name} at {out_path}")

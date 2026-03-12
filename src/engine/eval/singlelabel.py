@@ -124,11 +124,20 @@ def compute_zsl_gzsl_metrics(
     if (gzsl_seen + gzsl_unseen) > 0:
         gzsl_h = 2 * gzsl_seen * gzsl_unseen / (gzsl_seen + gzsl_unseen + 1e-8)
 
+    # Seen-bias diagnostic under GZSL context:
+    # among samples whose GT is unseen, how often prediction falls into seen set.
+    pred_seen_ratio = float("nan")
+    if unseen_valid.size > 0 and seen_valid.size > 0 and gzsl_preds.size > 0:
+        unseen_mask = np.isin(targets, unseen_valid)
+        if np.any(unseen_mask):
+            pred_seen_ratio = float(np.mean(np.isin(gzsl_preds[unseen_mask], seen_valid)))
+
     return {
         "zsl_unseen": zsl_unseen,
         "gzsl_seen": gzsl_seen,
         "gzsl_unseen": gzsl_unseen,
         "gzsl_h": gzsl_h,
+        "pred_seen_ratio": pred_seen_ratio,
     }
 
 

@@ -347,6 +347,12 @@ class ViT(nn.Module):
             logit_scale_init=self.cfg.MODEL.R_SIMILARITY.LOGIT_SCALE_INIT,  # 鍒濆娓╁害/缂╂斁鍥犲瓙
             visual_proj_enable=self.cfg.MODEL.R_SIMILARITY.VISUAL_PROJ_ENABLE,  # 鏄惁瀵硅瑙変晶鍐嶅仛涓€灞傛姇褰?
             fixed_logit_scale=getattr(self.cfg.MODEL.R_SIMILARITY, "FIXED_LOGIT_SCALE", 0.0),
+            shuffle_prototypes=bool(getattr(getattr(self.cfg.SOLVER, "DIAG", None), "SHUFFLE_PROTOTYPES", False)),
+            semantic_score_source=str(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_SOURCE", "auto")),
+            semantic_score_mode=str(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_MODE", "global_refined")),
+            semantic_score_topk=int(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_TOPK", 5)),
+            semantic_score_alpha=float(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_ALPHA", 1.0)),
+            debug_trace_once=bool(getattr(self.cfg.SOLVER, "DEBUG_TRACE_ONCE", False)),
         ).to(device)                    # 鎶婃暣涓垎绫诲ご绉诲姩鍒颁笌涓绘ā鍨嬬浉鍚岀殑 device 涓婏紝淇濊瘉鍓嶅悜/鍙嶅悜閮藉湪鍚屼竴璁惧鎵ц
 
 
@@ -368,6 +374,10 @@ class ViT(nn.Module):
 
         # 3) 涓诲共缂栫爜鍣ㄨ幏鍙栧叏灞€鐗瑰緛锛堥€氬父鏄?CLS 鎴?GAP 鍚庣殑 embedding锛?
         x = self.enc(x, semantics=semantics)  # batch_size x self.feat_dim
+        feature_norm_mean = None
+        if torch.is_tensor(x) and x.dim() == 2:
+            with torch.no_grad():
+                feature_norm_mean = float(x.float().norm(dim=-1).mean().item())
 
         # 4) 鑻ユ湁 side 鍒嗘敮锛岀敤涓€涓爣閲?alpha锛堢粡 sigmoid 鍚庯級铻嶅悎涓诲共涓?side 鐗瑰緛
         if self.side is not None:
@@ -388,12 +398,19 @@ class ViT(nn.Module):
 
         if self.debug_trace_once and not self._debug_head_route_logged:
             trace_id = getattr(self, "_debug_trace_id", "trace=NA")
+            prompt_noop_info = None
+            transformer = getattr(self.enc, "transformer", None)
+            if transformer is not None:
+                prompt_noop_info = getattr(transformer, "_last_prompt_noop_info", None)
             logger.info(
-                "[trace] %s node=C.vit_models.forward use_r_similarity_head=%s logits_source=%s logits_shape=%s",
+                "[trace] %s node=C.vit_models.forward use_r_similarity_head=%s logits_source=%s logits_shape=%s "
+                "final_cls_or_pooled_feature_norm=%s prompt_noop_info=%s",
                 trace_id,
                 bool(self.r_similarity_head is not None),
                 logits_source,
                 tuple(x.shape) if torch.is_tensor(x) else None,
+                feature_norm_mean,
+                prompt_noop_info if isinstance(prompt_noop_info, dict) else None,
             )
             self._debug_head_route_logged = True
 

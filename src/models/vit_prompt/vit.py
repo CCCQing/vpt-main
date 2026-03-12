@@ -301,6 +301,8 @@ class PromptedTransformer(Transformer):
         # 保存 prompt 配置和 vit 配置
         self.prompt_config = prompt_config
         self.vit_config = config
+        self._monitor_last_raw_semantics = None
+        self._monitor_last_refined_semantics = None
 
         # 若启用了共享概念基模块，则在此构建 SharedConceptAligner
         self.semantic_concept = None
@@ -346,7 +348,9 @@ class PromptedTransformer(Transformer):
         self.detach_prompt_grad = getattr(
             self.prompt_config, "DETACH_PROMPT_GRAD", False)
         self.debug_prompt_flow = getattr(self.prompt_config, "DEBUG_FLOW", False)
+        self.noop_keep_params = bool(getattr(self.prompt_config, "NOOP_KEEP_PARAMS", False))
         self._debug_prompt_flow_logged = False
+        self._last_prompt_noop_info = {}
 
         if self.runtime_prompt_only:
             # 既然说“只靠分布/生成器”，那就必须提供一个 prompt_init_provider
@@ -451,8 +455,14 @@ class PromptedTransformer(Transformer):
             # semantics:    类级属性 S_raw
             # 输出 refined_semantics: S^#，形状 [B, D]
             refined_semantics = self.semantic_concept(patch_tokens, semantics)
+        self._monitor_last_raw_semantics = semantics.detach() if torch.is_tensor(semantics) else None
+        self._monitor_last_refined_semantics = (
+            refined_semantics.detach() if torch.is_tensor(refined_semantics) else None
+        )
 
         # 2) 生成 prompt_tokens
+        provider_used = bool(self.prompt_init_provider is not None)
+        prompt_tokens = None
         if self.prompt_init_provider is not None:
             # 由“提示分布网络”或其他模块，基于 patch_tokens 生成 prompt
             provider_out = self.prompt_init_provider(patch_tokens)
@@ -505,33 +515,59 @@ class PromptedTransformer(Transformer):
                 f"Prompt feature dim {prompt_tokens.shape[-1]} incompatible with hidden_size {self.vit_config.hidden_size}"
             )
         # 3) 重建带 CLS/位置编码的主序列：[CLS|PATCH] + pos
-        x = self.embeddings.add_cls_and_pos(patch_tokens)  # (B, 1 + n_patches, hidden_dim)
+        x_base = self.embeddings.add_cls_and_pos(patch_tokens)  # (B, 1 + n_patches, hidden_dim)
 
-        # 4) 拼接序列：[CLS] + [PROMPT × P] + [PATCH × N]
+        prompt_generated = torch.is_tensor(prompt_tokens)
+        prompt_injected = False
+        prompt_norm = None
+        if prompt_generated:
+            with torch.no_grad():
+                prompt_norm = float(prompt_tokens.float().norm(dim=-1).mean().item())
+
+        # 4) 仅在正常模式下注入 prompt；NOOP 模式下保持参数/模块存在但不改写主 token 序列
+        if self.noop_keep_params:
+            x = x_base
+        else:
+            prompt_tokens = self.prompt_proj(prompt_tokens)
+            x = torch.cat((
+                    x_base[:, :1, :],    # 只取 CLS
+                    self.prompt_dropout(prompt_tokens.expand(B, -1, -1)),
+                    x_base[:, 1:, :]     # 其余 patch token
+                ), dim=1)
+            prompt_injected = True
+
         if self.debug_prompt_flow and not self._debug_prompt_flow_logged:
             trace_id = getattr(self, "_debug_trace_id", "trace=NA")
             logger.info(
-                "[trace] %s node=B.incorporate_prompt provider_used=%s detach_prompt_grad=%s freeze_embeddings=%s "
-                "prompt_requires_grad=%s token_len_before=%d token_len_after=%d prompt_shape=%s refined_semantics=%s",
+                "[trace] %s node=B.incorporate_prompt prompt_noop_keep_params=%s provider_used=%s "
+                "whether_prompt_generated=%s whether_prompt_injected_into_tokens=%s detach_prompt_grad=%s freeze_embeddings=%s "
+                "prompt_requires_grad=%s token_len_before=%d token_len_after=%d prompt_shape=%s "
+                "actual_token_shape_entering_backbone=%s prompt_norm=%s visual_feature_norm=%s refined_semantics=%s",
                 trace_id,
-                bool(self.prompt_init_provider is not None),
+                bool(self.noop_keep_params),
+                provider_used,
+                bool(prompt_generated),
+                bool(prompt_injected),
                 bool(self.detach_prompt_grad),
                 bool(self.freeze_embeddings),
-                bool(getattr(prompt_tokens, "requires_grad", False)),
+                bool(getattr(prompt_tokens, "requires_grad", False)) if prompt_generated else False,
                 int(1 + patch_tokens.shape[1]),
-                int(1 + self.num_tokens + patch_tokens.shape[1]),
-                tuple(prompt_tokens.shape),
+                int(x.shape[1]),
+                tuple(prompt_tokens.shape) if prompt_generated else None,
+                tuple(x.shape),
+                prompt_norm,
+                float(patch_tokens.float().norm(dim=-1).mean().item()),
                 tuple(refined_semantics.shape) if torch.is_tensor(refined_semantics) else None,
             )
             self._debug_prompt_flow_logged = True
-        prompt_tokens = self.prompt_proj(prompt_tokens)
-        x = torch.cat((
-                x[:, :1, :],    # 只取 CLS
-                # 直接使用与 hidden_size 对齐的 prompt，并做 dropout
-                self.prompt_dropout(prompt_tokens.expand(B, -1, -1)),
-                x[:, 1:, :]     # 其余 patch token
-            ), dim=1)
-        # (batch_size, cls_token + n_prompt + n_patches, hidden_dim) 最终形状: (B, 1 + n_prompt + n_patches, hidden_dim)
+        self._last_prompt_noop_info = {
+            "prompt_noop_keep_params": bool(self.noop_keep_params),
+            "whether_prompt_generated": bool(prompt_generated),
+            "whether_prompt_injected_into_tokens": bool(prompt_injected),
+            "actual_token_shape_entering_backbone": tuple(x.shape),
+            "prompt_norm": prompt_norm,
+            "visual_feature_norm": float(patch_tokens.float().norm(dim=-1).mean().item()),
+        }
 
         return x, refined_semantics
 
@@ -684,12 +720,14 @@ class PromptedTransformer(Transformer):
         embedding_output, semantics = self.incorporate_prompt(x, semantics)
 
         # 2) deep prompt（可选）
-        if self.prompt_config.DEEP:
+        # NOOP 模式下不允许 prompt 影响主 token 路径，因此不进入 deep prompt 演化分支。
+        effective_prompt_tokens = 0 if self.noop_keep_params else self.num_tokens
+        if self.prompt_config.DEEP and (not self.noop_keep_params):
             encoded, attn_weights = self.forward_deep_prompt(
                 embedding_output, semantics)
         else:
             # 若不使用 Deep Prompt，则直接将整个序列送入 encoder
-            encoded, attn_weights = self.encoder(embedding_output, semantics, self.num_tokens)
+            encoded, attn_weights = self.encoder(embedding_output, semantics, effective_prompt_tokens)
 
         return encoded, attn_weights
 
@@ -703,13 +741,21 @@ class PromptedTransformer(Transformer):
         """
         embedding_output, semantics = self.incorporate_prompt(x, semantics)
 
-        if self.prompt_config.DEEP:
+        effective_prompt_tokens = 0 if self.noop_keep_params else self.num_tokens
+        effective_affinity_config = affinity_config
+        if self.noop_keep_params and isinstance(affinity_config, dict):
+            # In NOOP mode there is no prompt segment in the sequence.
+            # Force affinity prompt length to 0 to avoid treating first patches as prompt tokens.
+            effective_affinity_config = dict(affinity_config)
+            effective_affinity_config["prompt_length"] = 0
+
+        if self.prompt_config.DEEP and (not self.noop_keep_params):
             encoded, attn_weights, affinities = self.forward_deep_prompt_with_affinity(
-                embedding_output, affinity_config, semantics
+                embedding_output, effective_affinity_config, semantics
             )
         else:
             encoded, attn_weights, affinities = self.encoder.forward_with_affinity(
-                embedding_output, affinity_config, semantics, self.num_tokens
+                embedding_output, effective_affinity_config, semantics, effective_prompt_tokens
             )
 
         return encoded, attn_weights, affinities

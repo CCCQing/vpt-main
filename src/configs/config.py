@@ -93,6 +93,7 @@ _C.MODEL.PROMPT.DETACH_PROMPT_GRAD = False
 _C.MODEL.PROMPT.DISTRIBUTION_ONLY = True  # True: 完全依赖提示分布/运行时 provider，不创建可训练 prompt 参数
 _C.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH = False
 _C.MODEL.PROMPT.DEBUG_FLOW = False
+_C.MODEL.PROMPT.NOOP_KEEP_PARAMS = False  # True: keep prompt modules/params but do not inject prompt tokens into backbone sequence
 # 是否在模型构建后打印可训练参数统计，便于确认冻结策略和提示/语义模块是否参与训练
 _C.MODEL.LOG_TRAINABLE = True
 
@@ -127,6 +128,11 @@ _C.MODEL.R_SIMILARITY.USE_COSINE = True
 _C.MODEL.R_SIMILARITY.LOGIT_SCALE_INIT = 10.0
 # 0.0 means disabled: use learnable exp(logit_scale); >0 means use fixed constant scale.
 _C.MODEL.R_SIMILARITY.FIXED_LOGIT_SCALE = 0.0
+# Semantic scoring controls (minimal ablation hooks; default keeps current behavior).
+_C.MODEL.SEMANTIC_SCORE_SOURCE = "auto"  # auto | raw | refined | fused
+_C.MODEL.SEMANTIC_SCORE_MODE = "global_refined"  # global_raw | global_refined | coarse_to_fine
+_C.MODEL.SEMANTIC_SCORE_TOPK = 5
+_C.MODEL.SEMANTIC_SCORE_ALPHA = 1.0
 # ----------------------------------------------------------------------
 # ===== 动态提示与多层融合设置 ===== 10.27 加入
 # ----------------------------------------------------------------------
@@ -166,6 +172,29 @@ _C.MODEL.ADAPTER.STYLE = "Pfeiffer"
 _C.SOLVER = CfgNode()
 _C.SOLVER.LOSS = "softmax_prompt_align"
 _C.SOLVER.LOSS_ALPHA = 0.01
+_C.SOLVER.LOSS_MARGIN = 0.05
+_C.SOLVER.LOSS_CM_WEIGHT = 0.05
+_C.SOLVER.LOSS_SEM_DIST_WEIGHT = 0.01
+_C.SOLVER.LOSS_SEM_DIST_TYPE = "cosine"  # cosine | kl | jsd
+_C.SOLVER.LOSS_SEM_DIST_TEMP = 1.0
+_C.SOLVER.LOSS_SEM_DIST_START_EPOCH = 10
+_C.SOLVER.LOSS_SEM_ROUTE_WEIGHT = 0.01
+_C.SOLVER.LOSS_SEM_ROUTE_MASK_TYPE = "hard_topk"  # all_ones | hard_topk | soft_topk | confidence_weighted
+_C.SOLVER.LOSS_SEM_ROUTE_TOPK = 8
+_C.SOLVER.LOSS_SEM_ROUTE_GAMMA_IND = 0.0
+_C.SOLVER.LOSS_SEM_ROUTE_GAMMA_DIR = 1.0
+_C.SOLVER.LOSS_SEM_ROUTE_START_EPOCH = 10
+_C.SOLVER.LOSS_HN_MARGIN_ENABLE = False
+_C.SOLVER.LOSS_HN_MARGIN_WEIGHT = 0.05
+_C.SOLVER.LOSS_HN_MARGIN_VALUE = 0.1
+_C.SOLVER.LOSS_HN_MARGIN_START_EPOCH = 0
+_C.SOLVER.LOSS_HN_DETACH_NEG = True
+
+_C.SOLVER.DIAG = CfgNode()
+_C.SOLVER.DIAG.SHUFFLE_RAW_TARGETS = False
+_C.SOLVER.DIAG.SHUFFLE_PROTOTYPES = False
+_C.SOLVER.DIAG.STRICT_CHECKS = False
+_C.SOLVER.DIAG.PRINT_LOSS_WIRING = False
 
 _C.SOLVER.OPTIMIZER = "sgd"  # or "adamw"
 _C.SOLVER.MOMENTUM = 0.9
@@ -191,6 +220,16 @@ _C.SOLVER.DEBUG_GRAD_NORM = False
 _C.SOLVER.DEBUG_TRACE_ONCE = False
 _C.SOLVER.OVERFIT_ONE_BATCH_STEPS = 0
 _C.SOLVER.OVERFIT_DISABLE_PROMPT_SAMPLING = False
+
+# Lightweight geometry/alignment monitoring (epoch-level, not per-iter).
+_C.SOLVER.MONITOR = CfgNode()
+_C.SOLVER.MONITOR.ENABLE = False
+_C.SOLVER.MONITOR.EVERY_EPOCH = 1
+_C.SOLVER.MONITOR.MAX_SAMPLES = 512
+_C.SOLVER.MONITOR.SAVE_JSON = True
+_C.SOLVER.MONITOR.SAVE_CSV = True
+_C.SOLVER.MONITOR.SAVE_HEATMAP = False
+_C.SOLVER.MONITOR.HEATMAP_TOPK = 50
 
 
 _C.SOLVER.DBG_TRAINABLE = False # if True, will print the name of trainable params 若为 True，将打印可训练参数的名称
