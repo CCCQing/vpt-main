@@ -165,3 +165,5 @@ Thumbs.db
 # local packages / dataset blobs
 *.whl
 *.mat
+
+configs/local_paths.yaml

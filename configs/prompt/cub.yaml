@@ -14,9 +14,7 @@ DATA:
   # XLSA_ROOT: 'D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB'
   NUMBER_CLASSES: 200
   MULTILABEL: False
-  XLSA:
-    SPLIT_PATH: "D:\\postgraduate1\\project\\datasets\\xlsa17\\xlsa17\\data\\CUB\\att_splits.mat"
-    # ATTS_KEY: "att"
+
 MODEL:
   TYPE: "vit"
   PROMPT:

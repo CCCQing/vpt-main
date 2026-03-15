@@ -26,7 +26,7 @@ _C.GZSL = False
 
 _C.USE_TRAINVAL = False
 # JSON / XLSA 数据调试相关的开关
-# 这些只是为了让 cub.yaml 中的顶层字段能顺利 merge，不会报 key 不存在。
+# 这些只是为了让 local_path.yaml 中的顶层字段能顺利 merge，不会报 key 不存在。
 _C.MODE = "xlsa"            # "json" / "xlsa"
 _C.SKIP_DUMMY = False
 _C.SPLIT = "train"          # "train" / "val" / "test"
@@ -40,7 +40,7 @@ _C.MODEL.TRANSFER_TYPE = "prompt"  # one of linear, end2end, prompt, adapter, si
 _C.MODEL.WEIGHT_PATH = ""  # if resume from some checkpoint file 如果从某个 checkpoint 文件恢复
 _C.MODEL.SAVE_CKPT = False
 
-_C.MODEL.MODEL_ROOT = "D:/postgraduate1/project/vpt-main/weights/official"  # root folder for pretrained model weights  预训练模型权重的根目录
+_C.MODEL.MODEL_ROOT = "weights/official"  # root folder for pretrained model weights  预训练模型权重的根目录
 
 _C.MODEL.TYPE = "vit"   # 视觉骨干网络
 _C.MODEL.MLP_NUM = 0
@@ -246,7 +246,7 @@ _C.DATA_ROOT = ""
 
 
 _C.DATA.NAME = "CUB_200_2011"
-_C.DATA.DATAPATH = "D:/postgraduate1/project/datasets/CUB/CUB_200_2011"
+_C.DATA.DATAPATH = "datasets/CUB/CUB_200_2011"
 _C.DATA.FEATURE = "sup_vitb16_224"  # e.g. inat2021_supervised
 
 _C.DATA.PERCENTAGE = 1.0
@@ -266,8 +266,8 @@ _C.DATA.PIN_MEMORY = True
 # -------------------------11.15新增：读入语义模态信息---------------------------------
 _C.DATA.XLSA = CfgNode()
 _C.DATA.XLSA.ENABLED = True
-_C.DATA.XLSA.RES101_PATH = "D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB/res101.mat"
-_C.DATA.XLSA.SPLIT_PATH = "D:/postgraduate1/project/datasets/xlsa17/xlsa17/data/CUB/att_splits.mat"
+_C.DATA.XLSA.RES101_PATH = "datasets/xlsa17/xlsa17/data/CUB/res101.mat"
+_C.DATA.XLSA.SPLIT_PATH = "datasets/xlsa17/xlsa17/data/CUB/att_splits.mat"
 _C.DATA.XLSA.TRAIN_KEY = "train_loc"
 _C.DATA.XLSA.VAL_KEY = "val_loc"
 _C.DATA.XLSA.TRAINVAL_KEY = "trainval_loc"

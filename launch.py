@@ -130,8 +130,8 @@ def default_argument_parser():
     - --config-file: 指定 YAML 配置文件路径
     - --train-type : 训练类型（可选，自定义用途）
     - opts         : 以 KEY VALUE 形式在命令行临时覆盖配置项（Detectron 风格）
-    例如：输入python train.py --config-file cub.yaml SEED 1
-    解析后命名空间为：'config_file': 'cub.yaml' 'train_type': '' 'opts': ['SEED', '1']
+    例如：输入python train.py --config-file local_path.yaml SEED 1
+    解析后命名空间为：'config_file': 'local_path.yaml' 'train_type': '' 'opts': ['SEED', '1']
     """
     parser = argparse.ArgumentParser(description="visual-prompt")
     parser.add_argument(

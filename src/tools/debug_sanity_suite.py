@@ -916,7 +916,7 @@ def main():
     ap = argparse.ArgumentParser("debug_sanity_suite")
     ap.add_argument("--mode", choices=["quick", "overfit", "short_train", "analyze_confusion"], required=True)
     ap.add_argument("--repo-root", default=".")
-    ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
+    ap.add_argument("--config-file", default="configs/prompt/local_path.yaml")
     ap.add_argument("--out-root", default="output/diag_suite")
     ap.add_argument("--overfit-steps", type=int, default=200)
     ap.add_argument("--short-epochs", type=int, default=5)
