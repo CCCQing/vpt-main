@@ -696,7 +696,8 @@ class RSimilarityClassifier(nn.Module):
         semantic_score_source: str = "auto",
         semantic_score_mode: str = "global_refined",
         semantic_score_topk: int = 5,
-        semantic_score_alpha: float = 1.0,
+        semantic_score_alpha: float = 0.5,
+        semantic_score_train_include_gt: bool = True,
         debug_trace_once: bool = False,
     ) -> None:
         super().__init__()
@@ -720,10 +721,13 @@ class RSimilarityClassifier(nn.Module):
         self.semantic_score_mode = str(semantic_score_mode).lower()
         self.semantic_score_topk = int(max(1, semantic_score_topk))
         self.semantic_score_alpha = float(semantic_score_alpha)
+        self.semantic_score_train_include_gt = bool(semantic_score_train_include_gt)
         self.debug_trace_once = bool(debug_trace_once)
 
         self._debug_sem_source_logged = False
         self._debug_last_raw_sim = None
+        self._debug_last_raw_sim_raw = None
+        self._debug_last_raw_sim_ref = None
         self._debug_last_scaled_logits = None
         self._loss_last_visual = None
         self._loss_last_semantic = None
@@ -731,6 +735,8 @@ class RSimilarityClassifier(nn.Module):
         self._loss_last_semantic_ref = None
         self._loss_last_scale = None
         self._loss_last_source = "refined"
+        self._runtime_targets = None
+        self._last_score_stats: Dict[str, Any] = {}
 
         if use_cosine:
             self.logit_scale = nn.Parameter(torch.log(torch.tensor(logit_scale_init, dtype=torch.float32)))
@@ -793,33 +799,136 @@ class RSimilarityClassifier(nn.Module):
                 scale = self.logit_scale.exp()
 
             score_mode = self.semantic_score_mode
-            if self.training:
+            if self.training and score_mode != "coarse_to_fine":
                 score_mode = "global_refined" if sem_source == "refined" else ("global_raw" if sem_source == "raw" else "global_refined")
+            coarse_topk_contains_gt = None
 
             if score_mode == "global_raw":
                 logits = raw_sim_raw * scale
                 sem_source = "raw"
+                self._last_score_stats = {
+                    "semantic_score_mode": score_mode,
+                    "semantic_score_topk": int(self.semantic_score_topk),
+                    "semantic_score_alpha": float(self.semantic_score_alpha),
+                    "semantic_score_train_include_gt": bool(self.semantic_score_train_include_gt),
+                }
             elif score_mode == "coarse_to_fine":
                 k = int(min(max(1, self.semantic_score_topk), raw_sim_raw.shape[1]))
                 topk_idx = torch.topk(raw_sim_raw, k=k, dim=1).indices
+                candidate_mask = torch.zeros_like(raw_sim_raw, dtype=torch.bool)
+                candidate_mask.scatter_(1, topk_idx, True)
+
+                coarse_topk_contains_gt = None
+                coarse_recall_at_1 = None
+                coarse_recall_at_3 = None
+                coarse_recall_at_5 = None
+                coarse_recall_at_10 = None
+                coarse_gap_mean = None
+                coarse_gap_median = None
+                candidate_delta_mean = None
+                candidate_delta_gt_mean = None
+                candidate_delta_hn_mean = None
+                candidate_delta_gap = None
+                candidate_delta_gap_available_ratio = None
+                runtime_targets = self._runtime_targets if torch.is_tensor(self._runtime_targets) else None
+                if runtime_targets is not None and runtime_targets.numel() == raw_sim_raw.shape[0]:
+                    t = runtime_targets.to(raw_sim_raw.device, non_blocking=True).long().view(-1)
+                    valid = (t >= 0) & (t < raw_sim_raw.shape[1])
+                    if valid.any():
+                        row = torch.arange(raw_sim_raw.shape[0], device=raw_sim_raw.device)[valid]
+                        topk_mask_pre = candidate_mask.clone()
+                        coarse_topk_contains_gt = float(topk_mask_pre[row, t[valid]].float().mean().item())
+                        # coarse recall@k diagnostics (always pre-union GT)
+                        def _recall_at(kk: int) -> float:
+                            kk = int(min(max(1, kk), raw_sim_raw.shape[1]))
+                            idxk = torch.topk(raw_sim_raw[row], k=kk, dim=1).indices
+                            return float((idxk == t[valid].view(-1, 1)).any(dim=1).float().mean().item())
+                        coarse_recall_at_1 = _recall_at(1)
+                        coarse_recall_at_3 = _recall_at(3)
+                        coarse_recall_at_5 = _recall_at(5)
+                        coarse_recall_at_10 = _recall_at(10)
+                        # coarse gap true - hardest-negative in raw space
+                        pos_raw = raw_sim_raw[row, t[valid]]
+                        neg_raw = raw_sim_raw[row].clone()
+                        neg_raw.scatter_(1, t[valid].view(-1, 1), -1e9)
+                        hn_raw, hn_raw_idx = neg_raw.max(dim=1)
+                        coarse_gap = pos_raw - hn_raw
+                        coarse_gap_mean = float(coarse_gap.mean().item())
+                        coarse_gap_median = float(torch.median(coarse_gap).item())
+                        # candidate delta over pre-union raw_topk candidate set
+                        delta_all = raw_sim_ref[row] - raw_sim_raw[row]
+                        mask_pre = topk_mask_pre[row]
+                        if mask_pre.any():
+                            candidate_delta_mean = float(delta_all[mask_pre].mean().item())
+                        gt_in = mask_pre.gather(1, t[valid].view(-1, 1)).squeeze(1)
+                        if gt_in.any():
+                            candidate_delta_gt_mean = float(
+                                delta_all.gather(1, t[valid].view(-1, 1)).squeeze(1)[gt_in].mean().item()
+                            )
+                        hn_in = mask_pre.gather(1, hn_raw_idx.view(-1, 1)).squeeze(1)
+                        if hn_in.any():
+                            candidate_delta_hn_mean = float(
+                                delta_all.gather(1, hn_raw_idx.view(-1, 1)).squeeze(1)[hn_in].mean().item()
+                            )
+                        both = gt_in & hn_in
+                        candidate_delta_gap_available_ratio = float(both.float().mean().item())
+                        if both.any():
+                            gt_delta = delta_all.gather(1, t[valid].view(-1, 1)).squeeze(1)
+                            hn_delta = delta_all.gather(1, hn_raw_idx.view(-1, 1)).squeeze(1)
+                            candidate_delta_gap = float((gt_delta[both] - hn_delta[both]).mean().item())
+                        if self.training and self.semantic_score_train_include_gt:
+                            candidate_mask[row, t[valid]] = True
+
                 a = float(self.semantic_score_alpha)
-                rerank = a * raw_sim_ref + (1.0 - a) * raw_sim_raw
-                logits = raw_sim_raw.new_full(raw_sim_raw.shape, -1e9)
-                logits.scatter_(1, topk_idx, rerank.gather(1, topk_idx))
-                logits = logits * scale
-                sem_source = "coarse_to_fine(raw->refined)"
+                blended = raw_sim_raw + a * (raw_sim_ref - raw_sim_raw)
+                final_sim = torch.where(candidate_mask, blended, raw_sim_raw)
+                logits = final_sim * scale
+                sem_source = "coarse_to_fine(raw+residual_refined)"
+                self._last_score_stats = {
+                    "semantic_score_mode": score_mode,
+                    "semantic_score_topk": int(self.semantic_score_topk),
+                    "semantic_score_alpha": float(self.semantic_score_alpha),
+                    "semantic_score_train_include_gt": bool(self.semantic_score_train_include_gt),
+                    "coarse_topk_contains_gt_rate": coarse_topk_contains_gt,
+                    "coarse_recall_at_k": coarse_topk_contains_gt,
+                    "coarse_recall_at_1": coarse_recall_at_1,
+                    "coarse_recall_at_3": coarse_recall_at_3,
+                    "coarse_recall_at_5": coarse_recall_at_5,
+                    "coarse_recall_at_10": coarse_recall_at_10,
+                    "coarse_gap_mean": coarse_gap_mean,
+                    "coarse_gap_median": coarse_gap_median,
+                    "candidate_source": "raw_topk",
+                    "candidate_delta_mean": candidate_delta_mean,
+                    "candidate_delta_gt_mean": candidate_delta_gt_mean,
+                    "candidate_delta_hn_mean": candidate_delta_hn_mean,
+                    "candidate_delta_gap": candidate_delta_gap,
+                    "candidate_delta_gap_available_ratio": candidate_delta_gap_available_ratio,
+                }
             else:
                 logits = raw_sim * scale
+                coarse_topk_contains_gt = None
+                self._last_score_stats = {
+                    "semantic_score_mode": score_mode,
+                    "semantic_score_topk": int(self.semantic_score_topk),
+                    "semantic_score_alpha": float(self.semantic_score_alpha),
+                    "semantic_score_train_include_gt": bool(self.semantic_score_train_include_gt),
+                }
 
             if self.debug_trace_once and (not self._debug_sem_source_logged):
                 scale_scalar = float(scale.item()) if torch.is_tensor(scale) else float(scale)
                 fixed_mode = bool(self.fixed_logit_scale > 0)
                 print(
-                    "[trace] node=C.semantic_scoring classifier_semantic_source={} "
+                    "[trace] node=C.semantic_scoring semantic_score_mode={} topk={} alpha={:.4f} train_include_gt={} "
+                    "classifier_semantic_source={} coarse_topk_contains_gt={} "
                     "raw_semantic_shape={} refined_semantic_shape={} classifier_semantic_shape={} "
                     "raw_semantic_norm_mean={:.6f} refined_semantic_norm_mean={:.6f} classifier_semantic_norm_mean={:.6f} "
                     "effective_logit_scale={:.6f} whether_fixed_logit_scale={}".format(
+                        score_mode,
+                        int(self.semantic_score_topk),
+                        float(self.semantic_score_alpha),
+                        bool(self.semantic_score_train_include_gt),
                         sem_source,
+                        "NA" if coarse_topk_contains_gt is None else "{:.4f}".format(float(coarse_topk_contains_gt)),
                         tuple(proto_raw.shape),
                         tuple(proto_ref.shape),
                         tuple(prototypes.shape),
@@ -833,6 +942,8 @@ class RSimilarityClassifier(nn.Module):
                 self._debug_sem_source_logged = True
 
             self._debug_last_raw_sim = raw_sim.detach()
+            self._debug_last_raw_sim_raw = raw_sim_raw.detach()
+            self._debug_last_raw_sim_ref = raw_sim_ref.detach()
             self._debug_last_scaled_logits = logits.detach()
             self._loss_last_visual = visual
             self._loss_last_semantic = semantic

@@ -450,6 +450,11 @@ class Trainer():
                 scale_t = getattr(r_head, "_loss_last_scale", None)
                 if torch.is_tensor(scale_t):
                     self._last_train_debug["effective_logit_scale"] = float(scale_t.detach().mean().item())
+                score_stats = getattr(r_head, "_last_score_stats", None)
+                if isinstance(score_stats, dict) and len(score_stats) > 0:
+                    for k, v in score_stats.items():
+                        if isinstance(v, (int, float, bool, str)) or v is None:
+                            self._last_train_debug[k] = v
             hn_stats = getattr(self.cls_criterion, "_last_hn_stats", None)
             if isinstance(hn_stats, dict) and len(hn_stats) > 0:
                 self._last_train_debug.update(hn_stats)
@@ -1056,6 +1061,10 @@ class Trainer():
             if is_train and self.diag_shuffle_raw_targets and targets.numel() > 1:
                 perm = torch.randperm(targets.shape[0], device=targets.device)
                 effective_targets = targets.index_select(0, perm)
+            model_ref_for_runtime = self.model.module if hasattr(self.model, "module") else self.model
+            r_head_runtime = getattr(model_ref_for_runtime, "r_similarity_head", None)
+            if r_head_runtime is not None:
+                r_head_runtime._runtime_targets = effective_targets.detach() if is_train else None
             if self.use_affinity:
                 if attributes is not None:
                     if self.affinity_vis:
@@ -1083,6 +1092,8 @@ class Trainer():
                     outputs = outputs if not isinstance(outputs, tuple) else outputs[0]
             else:
                 outputs = self.model(inputs, semantics=attributes)
+            if r_head_runtime is not None:
+                r_head_runtime._runtime_targets = None
 
             loss_outputs = outputs
             loss_targets = effective_targets
@@ -1307,7 +1318,8 @@ class Trainer():
                 self.overfit_one_batch_steps,
             )
         best_epoch = -1                                 # 当前最优 epoch
-        best_metric = 0                                 # 最优指标（比如 top1）
+        best_metric = float("-inf")                     # ensure first valid epoch can trigger improved/save
+        logger.info("Best metric initialized to -inf for first-epoch save compatibility.")
         log_interval = self.cfg.SOLVER.LOG_EVERY_N      # 每多少个 batch 打一次日志
 
         # 若干计量器（统计平均损失/时间等，便于打印）
@@ -1442,6 +1454,15 @@ class Trainer():
                             float(p_margin_ltneg1_meter.val),
                             bool(getattr(self.cls_criterion, "hn_detach_neg", False)),
                         )
+                    if isinstance(self._last_train_debug, dict) and self._last_train_debug.get("semantic_score_mode") == "coarse_to_fine":
+                        logger.info(
+                            "[score-debug] mode=%s topk=%s alpha=%s train_include_gt=%s coarse_topk_contains_gt_rate(pre_union)=%.4f",
+                            str(self._last_train_debug.get("semantic_score_mode")),
+                            str(self._last_train_debug.get("semantic_score_topk")),
+                            str(self._last_train_debug.get("semantic_score_alpha")),
+                            str(self._last_train_debug.get("semantic_score_train_include_gt")),
+                            float(self._last_train_debug.get("coarse_topk_contains_gt_rate", float("nan"))),
+                        )
                     if self.overfit_one_batch_steps > 0 and self._last_train_debug:
                         dbg = self._last_train_debug
                         ce_stats = dbg.get("ce_logits_stats")
@@ -1537,6 +1558,17 @@ class Trainer():
                         bool(getattr(self.cls_criterion, "hn_detach_neg", False)),
                     )
                 )
+            if isinstance(self._last_train_debug, dict) and self._last_train_debug.get("semantic_score_mode") == "coarse_to_fine":
+                logger.info(
+                    "Epoch {} score summary: mode={} topk={} alpha={} train_include_gt={} coarse_topk_contains_gt_rate(pre_union)={:.4f}".format(
+                        epoch + 1,
+                        self._last_train_debug.get("semantic_score_mode"),
+                        self._last_train_debug.get("semantic_score_topk"),
+                        self._last_train_debug.get("semantic_score_alpha"),
+                        self._last_train_debug.get("semantic_score_train_include_gt"),
+                        float(self._last_train_debug.get("coarse_topk_contains_gt_rate", float("nan"))),
+                    )
+                )
              # update lr, scheduler.step() must be called after optimizer.step() according to the docs: https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate  # noqa
              # 按官方建议：scheduler.step() 应在 optimizer.step() 之后调用
             if self.scheduler is not None:
@@ -1581,6 +1613,14 @@ class Trainer():
                 continue
 
             improved = curr_acc > best_metric
+            logger.info(
+                "[save-gate] epoch=%d metric=%s curr=%.6f best=%.6f improved=%s",
+                epoch + 1,
+                str(metric_name),
+                float(curr_acc),
+                float(best_metric),
+                bool(improved),
+            )
 
             # -------- 如果提供了 test_loader，则在 test 上也做评测 --------
             # 只有刷新最佳时，才在 test 上触发 save=True
@@ -1694,7 +1734,38 @@ class Trainer():
         total_sim_hn_raw = []
         total_sim_hn_ref = []
         total_sem_source = []
+        total_sim_raw_all = []
+        total_sim_ref_all = []
+        coarse_topk_contains_gt_vals = []
+        coarse_gap_mean_vals = []
+        coarse_gap_median_vals = []
+        coarse_recall_k_vals = []
+        candidate_delta_gap_vals = []
+        candidate_delta_gap_avail_vals = []
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        r_head_eval = getattr(model_ref, "r_similarity_head", None)
+        eval_override = str(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_EVAL_OVERRIDE", "") or "").strip().lower()
+        valid_override = {"global_raw", "global_refined", "coarse_to_fine"}
+        override_applied = False
+        original_score_mode = None
+        if (
+            r_head_eval is not None
+            and prefix in {"val", "test"}
+            and eval_override in valid_override
+            and eval_override != str(getattr(r_head_eval, "semantic_score_mode", "")).lower()
+        ):
+            original_score_mode = str(getattr(r_head_eval, "semantic_score_mode", "global_refined"))
+            r_head_eval.semantic_score_mode = eval_override
+            override_applied = True
+            test_name = f"{test_name}_{eval_override}"
+            logger.info(
+                "[eval-override] split=%s semantic_score_mode: %s -> %s",
+                prefix,
+                original_score_mode,
+                eval_override,
+            )
+        if r_head_eval is not None:
+            r_head_eval._runtime_targets = None
 
         # ========== 遍历整个数据集 ==========
         for idx, input_data in enumerate(data_loader):
@@ -1713,6 +1784,8 @@ class Trainer():
             # 评测阶段：is_train=False → forward_one_batch 只做前向与 loss 计算
             loss, outputs = self.forward_one_batch(X, targets, False, attributes=attributes)
             if loss == -1:                # 出现 inf / NaN 时，直接停止
+                if override_applied and r_head_eval is not None and original_score_mode is not None:
+                    r_head_eval.semantic_score_mode = original_score_mode
                 return
             losses.update(loss, X.shape[0])
 
@@ -1747,6 +1820,31 @@ class Trainer():
             # Optional gain-cache signals for analyze_confusion.
             r_head = getattr(model_ref, "r_similarity_head", None)
             if r_head is not None:
+                sim_raw_all = getattr(r_head, "_debug_last_raw_sim_raw", None)
+                sim_ref_all = getattr(r_head, "_debug_last_raw_sim_ref", None)
+                if torch.is_tensor(sim_raw_all) and torch.is_tensor(sim_ref_all):
+                    total_sim_raw_all.append(sim_raw_all.detach().cpu())
+                    total_sim_ref_all.append(sim_ref_all.detach().cpu())
+                sst = getattr(r_head, "_last_score_stats", None)
+                if isinstance(sst, dict):
+                    c = sst.get("coarse_topk_contains_gt_rate", None)
+                    if c is not None:
+                        coarse_topk_contains_gt_vals.append(float(c))
+                    c = sst.get("coarse_gap_mean", None)
+                    if c is not None:
+                        coarse_gap_mean_vals.append(float(c))
+                    c = sst.get("coarse_gap_median", None)
+                    if c is not None:
+                        coarse_gap_median_vals.append(float(c))
+                    c = sst.get("coarse_recall_at_k", None)
+                    if c is not None:
+                        coarse_recall_k_vals.append(float(c))
+                    c = sst.get("candidate_delta_gap", None)
+                    if c is not None:
+                        candidate_delta_gap_vals.append(float(c))
+                    c = sst.get("candidate_delta_gap_available_ratio", None)
+                    if c is not None:
+                        candidate_delta_gap_avail_vals.append(float(c))
                 v = getattr(r_head, "_loss_last_visual", None)
                 s_raw = getattr(r_head, "_loss_last_semantic_raw", None)
                 s_ref = getattr(r_head, "_loss_last_semantic_ref", None)
@@ -1795,6 +1893,11 @@ class Trainer():
         if save and self.cfg.MODEL.SAVE_CKPT:
             # 1) 已有
             out = {"targets": total_targets, "joint_logits": joint_logits}
+            out["semantic_score_mode"] = str(getattr(getattr(model_ref, "r_similarity_head", None), "semantic_score_mode", "unknown"))
+            out["semantic_score_topk"] = int(getattr(getattr(model_ref, "r_similarity_head", None), "semantic_score_topk", 0))
+            out["semantic_score_alpha"] = float(getattr(getattr(model_ref, "r_similarity_head", None), "semantic_score_alpha", 0.0))
+            out["semantic_score_train_include_gt"] = bool(getattr(getattr(model_ref, "r_similarity_head", None), "semantic_score_train_include_gt", False))
+            out["candidate_source"] = "raw_topk"
             if len(total_sim_true_raw) > 0 and len(total_sim_true_ref) > 0 and len(total_sim_hn_raw) > 0 and len(total_sim_hn_ref) > 0:
                 out["sim_true_raw"] = torch.cat(total_sim_true_raw, dim=0).numpy()
                 out["sim_true_ref"] = torch.cat(total_sim_true_ref, dim=0).numpy()
@@ -1802,6 +1905,21 @@ class Trainer():
                 out["sim_hn_ref"] = torch.cat(total_sim_hn_ref, dim=0).numpy()
                 if len(total_sem_source) == len(total_targets):
                     out["classifier_semantic_source"] = total_sem_source
+            if len(total_sim_raw_all) > 0 and len(total_sim_ref_all) > 0:
+                out["sim_raw_all"] = torch.cat(total_sim_raw_all, dim=0).numpy()
+                out["sim_ref_all"] = torch.cat(total_sim_ref_all, dim=0).numpy()
+            if len(coarse_topk_contains_gt_vals) > 0:
+                out["coarse_topk_contains_gt_rate_preunion_mean"] = float(np.mean(coarse_topk_contains_gt_vals))
+            if len(coarse_recall_k_vals) > 0:
+                out["coarse_recall_at_k_preunion_mean"] = float(np.mean(coarse_recall_k_vals))
+            if len(coarse_gap_mean_vals) > 0:
+                out["coarse_gap_mean_batches"] = float(np.mean(coarse_gap_mean_vals))
+            if len(coarse_gap_median_vals) > 0:
+                out["coarse_gap_median_batches"] = float(np.mean(coarse_gap_median_vals))
+            if len(candidate_delta_gap_vals) > 0:
+                out["candidate_delta_gap_batches"] = float(np.mean(candidate_delta_gap_vals))
+            if len(candidate_delta_gap_avail_vals) > 0:
+                out["candidate_delta_gap_available_ratio_batches"] = float(np.mean(candidate_delta_gap_avail_vals))
             class_names = getattr(data_loader.dataset, "classes", None)
             if class_names is None:
                 class_names = getattr(data_loader.dataset, "class_names", None)
@@ -1829,4 +1947,6 @@ class Trainer():
             )
 
             logger.info(f"[t-SNE cache] saved CLS features to {cache_dir}")
+        if override_applied and r_head_eval is not None and original_score_mode is not None:
+            r_head_eval.semantic_score_mode = original_score_mode
         # === eval_classifier 结束 ===

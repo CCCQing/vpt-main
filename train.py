@@ -271,6 +271,7 @@ def train(cfg, args):
         seen_classes=np.asarray(seen_classes) if seen_classes else None,
         unseen_classes=np.asarray(unseen_classes) if unseen_classes else None,
         task_type=task_type,
+        test_include_seen=bool(getattr(getattr(cfg, "DATA", None), "XLSA", None).TEST_INCLUDE_SEEN) if getattr(getattr(cfg, "DATA", None), "XLSA", None) is not None else False,
     )
     logger.info("Setting up Trainer...")
     trainer = Trainer(cfg, model, evaluator, cur_device)    # Trainer 封装了训练/验证/测试的循环与保存逻辑
@@ -286,7 +287,7 @@ def train(cfg, args):
 
     # ---------- 仅评估模式 ----------
     if cfg.SOLVER.TOTAL_EPOCH == 0:         # 若 TOTAL_EPOCH 设为 0，可跳过训练，直接在 test 上评估一次
-        trainer.eval_classifier(test_loader, "test", 0)
+        trainer.eval_classifier(test_loader, "test", bool(cfg.MODEL.SAVE_CKPT))
     # -----------------------------------
 
 def main(args):

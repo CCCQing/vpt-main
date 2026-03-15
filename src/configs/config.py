@@ -133,6 +133,8 @@ _C.MODEL.SEMANTIC_SCORE_SOURCE = "auto"  # auto | raw | refined | fused
 _C.MODEL.SEMANTIC_SCORE_MODE = "global_refined"  # global_raw | global_refined | coarse_to_fine
 _C.MODEL.SEMANTIC_SCORE_TOPK = 5
 _C.MODEL.SEMANTIC_SCORE_ALPHA = 1.0
+_C.MODEL.SEMANTIC_SCORE_TRAIN_INCLUDE_GT = True
+_C.MODEL.SEMANTIC_SCORE_EVAL_OVERRIDE = ""  # "" | global_raw | global_refined | coarse_to_fine
 # ----------------------------------------------------------------------
 # ===== 动态提示与多层融合设置 ===== 10.27 加入
 # ----------------------------------------------------------------------

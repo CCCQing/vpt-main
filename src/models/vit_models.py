@@ -351,7 +351,8 @@ class ViT(nn.Module):
             semantic_score_source=str(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_SOURCE", "auto")),
             semantic_score_mode=str(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_MODE", "global_refined")),
             semantic_score_topk=int(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_TOPK", 5)),
-            semantic_score_alpha=float(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_ALPHA", 1.0)),
+            semantic_score_alpha=float(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_ALPHA", 0.5)),
+            semantic_score_train_include_gt=bool(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_TRAIN_INCLUDE_GT", True)),
             debug_trace_once=bool(getattr(self.cfg.SOLVER, "DEBUG_TRACE_ONCE", False)),
         ).to(device)                    # 鎶婃暣涓垎绫诲ご绉诲姩鍒颁笌涓绘ā鍨嬬浉鍚岀殑 device 涓婏紝淇濊瘉鍓嶅悜/鍙嶅悜閮藉湪鍚屼竴璁惧鎵ц
 

@@ -36,6 +36,7 @@ class Evaluator():
             seen_classes: np.ndarray = None,
             unseen_classes: np.ndarray = None,
             task_type: str = "standard",
+            test_include_seen: bool = False,
     ) -> None:
         # 用 defaultdict(dict) 便于后续直接按 key 累加子项
         self.results = defaultdict(dict)
@@ -48,6 +49,7 @@ class Evaluator():
         self.task_type = task_type
         self.seen_classes = seen_classes
         self.unseen_classes = unseen_classes
+        self.test_include_seen = bool(test_include_seen)
         self._candidate_trace_logged = set()
 
     @staticmethod
@@ -66,24 +68,38 @@ class Evaluator():
     def _resolve_zsl_candidates(self, scores: np.ndarray, targets: np.ndarray, eval_type: str) -> np.ndarray:
         split = self._split_from_eval_type(eval_type)
         num_classes = int(scores.shape[1])
-        if split == "val":
-            # dev-unseen: use classes present in current val split instead of test-unseen pool
-            candidate_ids = self._sanitize_ids(np.unique(targets), num_classes)
+        seen_ids = self._sanitize_ids(self.seen_classes, num_classes)
+        unseen_ids = self._sanitize_ids(self.unseen_classes, num_classes)
+        if self.task_type == "gzsl":
+            # GZSL: competition candidate set is seen+unseen; still return unseen ids for zsl_unseen metric.
+            candidate_ids = np.unique(np.concatenate([seen_ids, unseen_ids]))
+            candidate_source = "seen_plus_unseen"
+            unseen_eval = unseen_ids
         else:
-            candidate_ids = self._sanitize_ids(self.unseen_classes, num_classes)
-            if split == "test" and candidate_ids.size == 0:
-                raise ValueError("Test ZSL evaluation has empty unseen candidate_ids; refusing unmasked argmax.")
+            # ZSL: unseen-only candidate set.
+            if split == "val":
+                # dev-unseen: use classes present in current val split instead of test-unseen pool
+                candidate_ids = self._sanitize_ids(np.unique(targets), num_classes)
+            else:
+                candidate_ids = unseen_ids
+                if split == "test" and candidate_ids.size == 0:
+                    raise ValueError("Test ZSL evaluation has empty unseen candidate_ids; refusing unmasked argmax.")
+            candidate_source = "unseen_only"
+            unseen_eval = candidate_ids
 
         trace_key = f"{split}:zsl_candidates"
         if trace_key not in self._candidate_trace_logged:
             logger.info(
-                "[eval-candidate] split=%s candidate_count=%d head=%s",
+                "[eval-candidate] split=%s eval_mode=%s test_include_seen=%s candidate_source=%s candidate_count=%d head=%s",
                 split,
+                str(self.task_type),
+                bool(self.test_include_seen),
+                str(candidate_source),
                 int(candidate_ids.size),
                 candidate_ids[:10].tolist() if candidate_ids.size > 0 else [],
             )
             self._candidate_trace_logged.add(trace_key)
-        return candidate_ids
+        return unseen_eval
 
     def update_iteration(self, iteration: int) -> None:
         """update iteration info
