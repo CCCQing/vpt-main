@@ -166,4 +166,4 @@ Thumbs.db
 *.whl
 *.mat
 
-configs/local_paths.yaml
+src/configs/local_path.yaml
