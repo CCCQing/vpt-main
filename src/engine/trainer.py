@@ -12,6 +12,10 @@ import os
 import numpy as np
 import json
 import csv
+import math
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 from fvcore.common.config import CfgNode
 from fvcore.common.checkpoint import Checkpointer
@@ -24,6 +28,18 @@ from ..utils import logging
 from ..utils.train_utils import AverageMeter, gpu_mem_usage
 
 from ..tools.tsne_vis import extract_features, run_tsne, plot_tsne
+from ..utils.vis_pipeline import (
+    ensure_dir,
+    to_uint8_image,
+    resize_map_torch,
+    overlay_heatmap,
+    save_overlay,
+    save_panel,
+    attention_rollout,
+    entropy_lastdim,
+    append_csv_row,
+    save_json,
+)
 
 logger = logging.get_logger("visual_prompt")
 
@@ -141,6 +157,34 @@ class Trainer():
         self.monitor_dir = os.path.join(self.cfg.OUTPUT_DIR, "monitor")
         self._monitor_csv_path = os.path.join(self.monitor_dir, "summary.csv")
         self._monitor_warned_no_refined = False
+        vis_cfg = getattr(cfg.SOLVER, "VIS", None)
+        self.vis_enable = bool(getattr(vis_cfg, "ENABLE", False)) if vis_cfg is not None else False
+        self.vis_every_epoch = max(1, int(getattr(vis_cfg, "EVERY_EPOCH", 1))) if vis_cfg is not None else 1
+        self.vis_splits = list(getattr(vis_cfg, "SPLITS", ["val", "test"])) if vis_cfg is not None else ["val", "test"]
+        self.vis_max_samples = max(1, int(getattr(vis_cfg, "MAX_SAMPLES", 8))) if vis_cfg is not None else 8
+        self.vis_save_raw = bool(getattr(vis_cfg, "SAVE_RAW", True)) if vis_cfg is not None else True
+        self.vis_save_images = bool(getattr(vis_cfg, "SAVE_IMAGES", True)) if vis_cfg is not None else True
+        self.vis_local_control = bool(getattr(vis_cfg, "LOCAL_CONTROL", True)) if vis_cfg is not None else True
+        self.vis_rollout = bool(getattr(vis_cfg, "ROLLOUT", True)) if vis_cfg is not None else True
+        self.vis_gt_hn = bool(getattr(vis_cfg, "GT_HN_COMPARE", True)) if vis_cfg is not None else True
+        self.vis_trends = bool(getattr(vis_cfg, "TRENDS", True)) if vis_cfg is not None else True
+        self.vis_dir = os.path.join(self.cfg.OUTPUT_DIR, "visualization")
+        self._last_attn_weights = None
+        self._vis_trend_buf = None
+        self._vis_processed = 0
+        if self.vis_enable:
+            ensure_dir(self.vis_dir)
+            # rollout needs per-layer attention weights
+            self.affinity_vis = True
+            logger.info(
+                "[vis] enable=%s every_epoch=%d splits=%s max_samples=%d save_raw=%s save_images=%s",
+                bool(self.vis_enable),
+                int(self.vis_every_epoch),
+                self.vis_splits,
+                int(self.vis_max_samples),
+                bool(self.vis_save_raw),
+                bool(self.vis_save_images),
+            )
 
         if self.debug_grad_norm:
             self._log_optimizer_param_groups()
@@ -405,6 +449,294 @@ class Trainer():
             "min": float(t.min().item()),
             "max": float(t.max().item()),
         }
+
+    def _vis_split_enabled(self, split: str) -> bool:
+        if not self.vis_enable:
+            return False
+        if ((self._trace_epoch + 1) % self.vis_every_epoch) != 0:
+            return False
+        allowed = {str(x).lower() for x in self.vis_splits}
+        return str(split).lower() in allowed
+
+    @staticmethod
+    def _infer_grid(num_patches: int) -> int:
+        g = int(round(math.sqrt(max(1, int(num_patches)))))
+        return max(1, g)
+
+    @staticmethod
+    def _entropy_np(x: torch.Tensor) -> float:
+        if (not torch.is_tensor(x)) or x.numel() == 0:
+            return float("nan")
+        return float(entropy_lastdim(x).mean().item())
+
+    def _vis_init_epoch(self, split: str):
+        self._vis_processed = 0
+        self._vis_trend_buf = {
+            "split": str(split),
+            "epoch": int(self._trace_epoch + 1),
+            "layers": {},
+            "token_specialization": [],
+            "token_pairwise_cos": [],
+            "gt_hn_gap": [],
+        }
+
+    def _vis_update_trend(self, affinities, logits, targets, sem_tokens):
+        if not self.vis_trends:
+            return
+        if not isinstance(self._vis_trend_buf, dict):
+            return
+        if isinstance(affinities, list):
+            for li, aff in enumerate(affinities):
+                if not isinstance(aff, dict):
+                    continue
+                aps = aff.get("Aps")
+                avs = aff.get("Avs")
+                if li not in self._vis_trend_buf["layers"]:
+                    self._vis_trend_buf["layers"][li] = {"aps_entropy": [], "avs_entropy": []}
+                if torch.is_tensor(aps) and aps.numel() > 0:
+                    self._vis_trend_buf["layers"][li]["aps_entropy"].append(self._entropy_np(aps.detach().cpu()))
+                if torch.is_tensor(avs) and avs.numel() > 0:
+                    self._vis_trend_buf["layers"][li]["avs_entropy"].append(self._entropy_np(avs.detach().cpu()))
+                    avs2 = avs.detach().float()
+                    if avs2.dim() == 4:
+                        avs2 = avs2.mean(dim=1)  # [B,N,M]
+                    if avs2.dim() == 3 and avs2.numel() > 0:
+                        spec = float(avs2.max(dim=-1).values.mean().item())
+                        self._vis_trend_buf["token_specialization"].append(spec)
+        if torch.is_tensor(sem_tokens) and sem_tokens.dim() == 3 and sem_tokens.shape[1] >= 2:
+            t = torch.nn.functional.normalize(sem_tokens.detach().float(), dim=-1)
+            sim = torch.einsum("bmd,bnd->bmn", t, t)
+            b, m, _ = sim.shape
+            mask = ~torch.eye(m, device=sim.device, dtype=torch.bool).unsqueeze(0).expand(b, -1, -1)
+            if mask.any():
+                self._vis_trend_buf["token_pairwise_cos"].append(float(sim[mask].mean().item()))
+        if torch.is_tensor(logits) and torch.is_tensor(targets):
+            y = targets.to(logits.device, dtype=torch.long)
+            valid = (y >= 0) & (y < logits.shape[1])
+            if valid.any():
+                ridx = torch.arange(logits.shape[0], device=logits.device)[valid]
+                ly = logits[ridx, y[valid]]
+                hn = logits[ridx].clone()
+                hn.scatter_(1, y[valid].view(-1, 1), -1e9)
+                lhn = hn.max(dim=1).values
+                self._vis_trend_buf["gt_hn_gap"].append(float((ly - lhn).mean().item()))
+
+    def _vis_export_trend(self, split: str):
+        if not self.vis_trends or (not isinstance(self._vis_trend_buf, dict)):
+            return
+        epoch = int(self._trace_epoch + 1)
+        split = str(split).lower()
+        trend_dir = os.path.join(self.vis_dir, "trends", split)
+        ensure_dir(trend_dir)
+        layers = self._vis_trend_buf.get("layers", {})
+        layer_ids = sorted(list(layers.keys()))
+        avs_curve = []
+        aps_curve = []
+        for li in layer_ids:
+            aps_vals = [x for x in layers[li]["aps_entropy"] if np.isfinite(x)]
+            avs_vals = [x for x in layers[li]["avs_entropy"] if np.isfinite(x)]
+            aps_curve.append(float(np.mean(aps_vals)) if len(aps_vals) > 0 else float("nan"))
+            avs_curve.append(float(np.mean(avs_vals)) if len(avs_vals) > 0 else float("nan"))
+
+        out_json = {
+            "split": split,
+            "epoch": epoch,
+            "layers": layer_ids,
+            "aps_entropy_curve": aps_curve,
+            "avs_entropy_curve": avs_curve,
+            "token_specialization": float(np.mean(self._vis_trend_buf["token_specialization"])) if len(self._vis_trend_buf["token_specialization"]) > 0 else None,
+            "token_pairwise_cos": float(np.mean(self._vis_trend_buf["token_pairwise_cos"])) if len(self._vis_trend_buf["token_pairwise_cos"]) > 0 else None,
+            "gt_hn_gap": float(np.mean(self._vis_trend_buf["gt_hn_gap"])) if len(self._vis_trend_buf["gt_hn_gap"]) > 0 else None,
+        }
+        save_json(os.path.join(trend_dir, f"epoch_{epoch:03d}_trend.json"), out_json)
+        append_csv_row(
+            os.path.join(trend_dir, "trend_summary.csv"),
+            {
+                "epoch": epoch,
+                "split": split,
+                "token_specialization": out_json["token_specialization"],
+                "token_pairwise_cos": out_json["token_pairwise_cos"],
+                "gt_hn_gap": out_json["gt_hn_gap"],
+                "avs_entropy_mean": float(np.nanmean(avs_curve)) if len(avs_curve) > 0 else None,
+                "aps_entropy_mean": float(np.nanmean(aps_curve)) if len(aps_curve) > 0 else None,
+            },
+            field_order=[
+                "epoch", "split", "token_specialization", "token_pairwise_cos",
+                "gt_hn_gap", "avs_entropy_mean", "aps_entropy_mean"
+            ],
+        )
+        if self.vis_save_images and len(layer_ids) > 0:
+            plt.figure(figsize=(6, 4))
+            plt.plot(layer_ids, avs_curve, marker="o", label="Avs entropy")
+            plt.plot(layer_ids, aps_curve, marker="o", label="Aps entropy")
+            plt.xlabel("Layer")
+            plt.ylabel("Entropy")
+            plt.title(f"{split} epoch {epoch} entropy curves")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(trend_dir, f"epoch_{epoch:03d}_entropy_curve.png"), dpi=160)
+            plt.close()
+
+    def _vis_collect_sample(
+        self,
+        split: str,
+        local_idx: int,
+        sample_idx: int,
+        image_chw: torch.Tensor,
+        logits: torch.Tensor,
+        target: int,
+        model_ref,
+    ):
+        if self._vis_processed >= self.vis_max_samples:
+            return
+        r_head = getattr(model_ref, "r_similarity_head", None)
+        if r_head is None:
+            return
+        affinities = getattr(r_head, "_runtime_affinities", None)
+        token_seq = getattr(r_head, "_runtime_token_sequence", None)
+        sem_state = getattr(r_head, "_runtime_semantic_state", None)
+        if not isinstance(affinities, list):
+            return
+
+        epoch = int(self._trace_epoch + 1)
+        split = str(split).lower()
+        base = os.path.join(self.vis_dir, split, f"epoch_{epoch:03d}")
+        ensure_dir(base)
+        img_u8 = to_uint8_image(image_chw)
+        h, w = img_u8.shape[:2]
+
+        # Group 1: semantic-token local control maps from Avs.
+        if self.vis_local_control:
+            avs_last = None
+            for aff in reversed(affinities):
+                if isinstance(aff, dict) and torch.is_tensor(aff.get("Avs")):
+                    avs_last = aff["Avs"]
+                    break
+            if torch.is_tensor(avs_last):
+                avs = avs_last.detach().cpu()
+                if avs.dim() == 4:
+                    avs = avs.mean(dim=1)  # [B,N,M]
+                if avs.dim() == 3 and local_idx < avs.shape[0]:
+                    am = avs[local_idx]  # [N,M]
+                    n_patch, n_tok = int(am.shape[0]), int(am.shape[1])
+                    g = self._infer_grid(n_patch)
+                    panels = []
+                    titles = []
+                    raw_maps = {}
+                    for k in range(n_tok):
+                        mk = am[:, k].view(g, g).numpy()
+                        mk_up = resize_map_torch(mk, (h, w))
+                        raw_maps[f"token_{k}"] = mk_up
+                        panels.append(overlay_heatmap(img_u8, mk_up))
+                        titles.append(f"semantic token {k}")
+                        if self.vis_save_images:
+                            save_overlay(
+                                os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_local_token{k}.png"),
+                                img_u8,
+                                mk_up,
+                                title=f"{split} ep{epoch} idx{sample_idx} token{k}",
+                            )
+                    if self.vis_save_images and len(panels) > 0:
+                        save_panel(
+                            os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_local_panel.png"),
+                            panels,
+                            titles=titles,
+                            ncols=2,
+                        )
+                    if self.vis_save_raw:
+                        np.savez_compressed(
+                            os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_local_maps.npz"),
+                            maps=raw_maps,
+                        )
+
+        # Group 2: rollout maps (CLS + prompt tokens).
+        if self.vis_rollout and isinstance(self._last_attn_weights, list) and len(self._last_attn_weights) > 0:
+            roll = attention_rollout(self._last_attn_weights)
+            if torch.is_tensor(roll) and local_idx < roll.shape[0]:
+                r = roll[local_idx].detach().cpu()
+                p_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS)
+                if bool(getattr(self.cfg.MODEL.PROMPT, "NOOP_KEEP_PARAMS", False)):
+                    p_len = 0
+                start_patch = 1 + p_len
+                n_patch = int(max(0, r.shape[0] - start_patch))
+                if n_patch > 0:
+                    g = self._infer_grid(n_patch)
+                    cls_map = r[0, start_patch:].view(g, g).numpy()
+                    cls_up = resize_map_torch(cls_map, (h, w))
+                    if self.vis_save_images:
+                        save_overlay(
+                            os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_rollout_cls.png"),
+                            img_u8,
+                            cls_up,
+                            title="CLS rollout",
+                        )
+                    if p_len > 0:
+                        shallow_idx = 1
+                        deep_idx = 1 + max(0, p_len - 1)
+                        for name, sid in [("shallow_prompt", shallow_idx), ("deep_prompt", deep_idx)]:
+                            if sid < r.shape[0]:
+                                pm = r[sid, start_patch:].view(g, g).numpy()
+                                pm_up = resize_map_torch(pm, (h, w))
+                                if self.vis_save_images:
+                                    save_overlay(
+                                        os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_rollout_{name}.png"),
+                                        img_u8,
+                                        pm_up,
+                                        title=f"{name} rollout",
+                                    )
+                    if self.vis_save_raw:
+                        np.savez_compressed(
+                            os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_rollout_maps.npz"),
+                            cls=cls_up,
+                        )
+
+        # Group 3: GT vs hardest-negative semantic comparison.
+        if self.vis_gt_hn and torch.is_tensor(token_seq) and torch.is_tensor(logits):
+            if token_seq.dim() == 3 and local_idx < token_seq.shape[0]:
+                p_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS)
+                if bool(getattr(self.cfg.MODEL.PROMPT, "NOOP_KEEP_PARAMS", False)):
+                    p_len = 0
+                patch_tokens = token_seq[local_idx:local_idx + 1, 1 + p_len:, :]
+                if patch_tokens.numel() > 0:
+                    v_patch = r_head.visual_proj(patch_tokens) if getattr(r_head, "visual_proj", None) is not None else patch_tokens
+                    if bool(getattr(r_head, "use_cosine", True)):
+                        v_patch = torch.nn.functional.normalize(v_patch, dim=-1)
+                    sem = getattr(r_head, "_loss_last_semantic", None)
+                    if torch.is_tensor(sem):
+                        sem = sem.detach()
+                        if bool(getattr(r_head, "use_cosine", True)):
+                            sem = torch.nn.functional.normalize(sem, dim=-1)
+                        score_patch_cls = torch.einsum("bnd,cd->bnc", v_patch, sem)[0]  # [N,C]
+                        y = int(target)
+                        if 0 <= y < logits.shape[1]:
+                            l = logits[local_idx].detach().clone()
+                            l[y] = -1e9
+                            hn = int(l.argmax().item())
+                            n_patch = int(score_patch_cls.shape[0])
+                            g = self._infer_grid(n_patch)
+                            gt_map = score_patch_cls[:, y].view(g, g).cpu().numpy()
+                            hn_map = score_patch_cls[:, hn].view(g, g).cpu().numpy()
+                            gt_up = resize_map_torch(gt_map, (h, w))
+                            hn_up = resize_map_torch(hn_map, (h, w))
+                            diff_up = gt_up - hn_up
+                            if self.vis_save_images:
+                                imgs = [
+                                    overlay_heatmap(img_u8, gt_up),
+                                    overlay_heatmap(img_u8, hn_up),
+                                    overlay_heatmap(img_u8, diff_up),
+                                ]
+                                titles = [f"GT={y}", f"HN={hn}", "GT-HN"]
+                                save_panel(
+                                    os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_gt_hn_compare.png"),
+                                    imgs, titles=titles, ncols=3
+                                )
+                            if self.vis_save_raw:
+                                np.savez_compressed(
+                                    os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_gt_hn_maps.npz"),
+                                    gt=gt_up, hn=hn_up, diff=diff_up, gt_id=y, hn_id=hn
+                                )
+
+        self._vis_processed += 1
 
     def _capture_train_debug(self, loss_outputs, raw_outputs, loss_targets):
         ce_logits = self._extract_logits(loss_outputs)
@@ -1065,11 +1397,13 @@ class Trainer():
             if r_head_runtime is not None:
                 r_head_runtime._runtime_targets = effective_targets.detach() if is_train else None
             if self.use_affinity:
+                self._last_attn_weights = None
                 if attributes is not None:
                     if self.affinity_vis:
                         outputs, attn_weights, affinities = self.model.forward_with_affinity(
                             inputs, self.affinity_cfg, semantics=attributes, vis=True
                         )
+                        self._last_attn_weights = attn_weights
                     else:
                         outputs, affinities = self.model.forward_with_affinity(
                             inputs, self.affinity_cfg, semantics=attributes
@@ -1079,6 +1413,7 @@ class Trainer():
                         outputs, attn_weights, affinities = self.model.forward_with_affinity(
                             inputs, self.affinity_cfg, vis=True
                         )
+                        self._last_attn_weights = attn_weights
                     else:
                         outputs, affinities = self.model.forward_with_affinity(
                             inputs, self.affinity_cfg
@@ -1090,6 +1425,7 @@ class Trainer():
                 else:
                     outputs = outputs if not isinstance(outputs, tuple) else outputs[0]
             else:
+                self._last_attn_weights = None
                 outputs = self.model(inputs, semantics=attributes)
             if r_head_runtime is not None:
                 r_head_runtime._runtime_targets = None
@@ -1779,6 +2115,8 @@ class Trainer():
             )
         if r_head_eval is not None:
             r_head_eval._runtime_targets = None
+        if self._vis_split_enabled(prefix):
+            self._vis_init_epoch(prefix)
 
         # ========== 閬嶅巻鏁翠釜鏁版嵁闆?==========
         for idx, input_data in enumerate(data_loader):
@@ -1829,6 +2167,34 @@ class Trainer():
                 logits = outputs["logits"]
 
             total_logits.append(logits)
+            if self._vis_split_enabled(prefix):
+                sem_tokens = None
+                r_head_vis = getattr(model_ref, "r_similarity_head", None)
+                affinities_vis = getattr(r_head_vis, "_runtime_affinities", None) if r_head_vis is not None else None
+                sem_state_vis = getattr(r_head_vis, "_runtime_semantic_state", None) if r_head_vis is not None else None
+                if isinstance(sem_state_vis, dict):
+                    sem_tokens = sem_state_vis.get("sem_tokens", None)
+                if torch.is_tensor(logits):
+                    self._vis_update_trend(
+                        affinities=affinities_vis,
+                        logits=logits.detach(),
+                        targets=targets,
+                        sem_tokens=sem_tokens,
+                    )
+                    bsz = int(logits.shape[0])
+                    for bi in range(bsz):
+                        if self._vis_processed >= self.vis_max_samples:
+                            break
+                        gidx = int(idx * bsz + bi)
+                        self._vis_collect_sample(
+                            split=prefix,
+                            local_idx=bi,
+                            sample_idx=gidx,
+                            image_chw=X[bi],
+                            logits=logits.detach(),
+                            target=int(targets[bi].item()),
+                            model_ref=model_ref,
+                        )
 
             # Optional gain-cache signals for analyze_confusion.
             r_head = getattr(model_ref, "r_similarity_head", None)
@@ -1987,5 +2353,6 @@ class Trainer():
             logger.info(f"[t-SNE cache] saved CLS features to {cache_dir}")
         if override_applied and r_head_eval is not None and original_score_mode is not None:
             r_head_eval.semantic_score_mode = original_score_mode
+        if self._vis_split_enabled(prefix):
+            self._vis_export_trend(prefix)
         # === eval_classifier 缁撴潫 ===
-

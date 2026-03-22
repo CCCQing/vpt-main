@@ -256,6 +256,21 @@ _C.SOLVER.MONITOR.SAVE_CSV = True
 _C.SOLVER.MONITOR.SAVE_HEATMAP = False
 _C.SOLVER.MONITOR.HEATMAP_TOPK = 50
 
+# -----------------------------------------------------------------------------
+# Visualization pipeline (off by default)
+# -----------------------------------------------------------------------------
+_C.SOLVER.VIS = CfgNode()
+_C.SOLVER.VIS.ENABLE = False
+_C.SOLVER.VIS.EVERY_EPOCH = 1
+_C.SOLVER.VIS.SPLITS = ["val", "test"]
+_C.SOLVER.VIS.MAX_SAMPLES = 8
+_C.SOLVER.VIS.SAVE_RAW = True
+_C.SOLVER.VIS.SAVE_IMAGES = True
+_C.SOLVER.VIS.LOCAL_CONTROL = True
+_C.SOLVER.VIS.ROLLOUT = True
+_C.SOLVER.VIS.GT_HN_COMPARE = True
+_C.SOLVER.VIS.TRENDS = True
+
 _C.SOLVER.DBG_TRAINABLE = False # 鑻ヤ负 True锛屽皢鎵撳嵃鍙缁冨弬鏁扮殑鍚嶇О
 
 # ----------------------------------------------------------------------
@@ -373,6 +388,28 @@ if not hasattr(_monitor, "ENABLE"):
     _monitor.ENABLE = False
 if not hasattr(_monitor, "EVERY_EPOCH"):
     _monitor.EVERY_EPOCH = 1
+
+_vis = _ensure_node(_C.SOLVER, "VIS")
+if not hasattr(_vis, "ENABLE"):
+    _vis.ENABLE = False
+if not hasattr(_vis, "EVERY_EPOCH"):
+    _vis.EVERY_EPOCH = 1
+if not hasattr(_vis, "SPLITS"):
+    _vis.SPLITS = ["val", "test"]
+if not hasattr(_vis, "MAX_SAMPLES"):
+    _vis.MAX_SAMPLES = 8
+if not hasattr(_vis, "SAVE_RAW"):
+    _vis.SAVE_RAW = True
+if not hasattr(_vis, "SAVE_IMAGES"):
+    _vis.SAVE_IMAGES = True
+if not hasattr(_vis, "LOCAL_CONTROL"):
+    _vis.LOCAL_CONTROL = True
+if not hasattr(_vis, "ROLLOUT"):
+    _vis.ROLLOUT = True
+if not hasattr(_vis, "GT_HN_COMPARE"):
+    _vis.GT_HN_COMPARE = True
+if not hasattr(_vis, "TRENDS"):
+    _vis.TRENDS = True
 
 if not hasattr(_C.SOLVER, "LOSS"):
     _C.SOLVER.LOSS = "softmax_prompt_align"

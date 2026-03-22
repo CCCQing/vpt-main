@@ -285,7 +285,10 @@ class LateSemanticSideBranch(nn.Module):
             nn.Linear(hidden_size * 2, hidden_size),
         )
         self.delta_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.readout_token_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.readout_gate = nn.Linear(hidden_size, 1)
         self.readout_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self._last_readout_alpha: Optional[torch.Tensor] = None
 
     def _ensure_anchor_proj(self, semantic_dim: int, device: torch.device):
         if self.anchor_proj is None:
@@ -356,7 +359,14 @@ class LateSemanticSideBranch(nn.Module):
         return sem_next, out_aff, diag
 
     def readout(self, sem_tokens: torch.Tensor) -> torch.Tensor:
-        mu = sem_tokens.mean(dim=1)
+        # sem_tokens: [B, M, D]
+        tokens_n = self.readout_token_norm(sem_tokens)
+        # score: [B, M, 1] -> [B, M]
+        score = self.readout_gate(tokens_n).squeeze(-1)
+        alpha = torch.softmax(score, dim=1)
+        self._last_readout_alpha = alpha.detach()
+        # weighted sum over token dimension
+        mu = torch.sum(alpha.unsqueeze(-1) * sem_tokens, dim=1)
         return self.readout_norm(mu)
 
 class PromptedTransformer(Transformer):
@@ -855,6 +865,7 @@ class PromptedTransformer(Transformer):
             delta_sem = mu_s_final - h_y
             self._last_semantic_side_state = {
                 "h_y": h_y,
+                "sem_tokens": sem_tokens,
                 "mu_s_final": mu_s_final,
                 "delta_sem": delta_sem,
             }
@@ -919,6 +930,7 @@ class PromptedTransformer(Transformer):
             delta_sem = mu_s_final - h_y
             self._last_semantic_side_state = {
                 "h_y": h_y,
+                "sem_tokens": sem_tokens,
                 "mu_s_final": mu_s_final,
                 "delta_sem": delta_sem,
             }
@@ -967,6 +979,7 @@ class PromptedTransformer(Transformer):
                 mu_s_final = self.semantic_side_branch.readout(sem_tokens)
                 self._last_semantic_side_state = {
                     "h_y": h_y,
+                    "sem_tokens": sem_tokens,
                     "mu_s_final": mu_s_final,
                     "delta_sem": mu_s_final - h_y,
                 }
@@ -1019,6 +1032,7 @@ class PromptedTransformer(Transformer):
                 mu_s_final = self.semantic_side_branch.readout(sem_tokens)
                 self._last_semantic_side_state = {
                     "h_y": h_y,
+                    "sem_tokens": sem_tokens,
                     "mu_s_final": mu_s_final,
                     "delta_sem": mu_s_final - h_y,
                 }
