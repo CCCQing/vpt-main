@@ -1,14 +1,9 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 a trainer class
-一个通用的分类训练器（Trainer）
-
-职责概览：
-1) 构建优化器与学习率调度器
-2) （可选）从给定路径加载权重
-3) 以 epoch 为粒度进行训练与评测（val/test）
-4) 记录与打印训练/验证指标，并支持早停（patience）
-"""
+涓€涓€氱敤鐨勫垎绫昏缁冨櫒锛圱rainer锛?
+鑱岃矗姒傝锛?1) 鏋勫缓浼樺寲鍣ㄤ笌瀛︿範鐜囪皟搴﹀櫒
+2) 锛堝彲閫夛級浠庣粰瀹氳矾寰勫姞杞芥潈閲?3) 浠?epoch 涓虹矑搴﹁繘琛岃缁冧笌璇勬祴锛坴al/test锛?4) 璁板綍涓庢墦鍗拌缁?楠岃瘉鎸囨爣锛屽苟鏀寔鏃╁仠锛坧atience锛?"""
 import datetime
 import time
 import torch
@@ -35,38 +30,46 @@ logger = logging.get_logger("visual_prompt")
 
 class Trainer():
     """
-    a trainer with below logics: 训练器（Trainer）主要逻辑：
-
-    1. Build optimizer, scheduler 构建优化器和学习率调度器
-    2. Load checkpoints if provided （可选）加载 checkpoint（用于继续训练或固定初始化）
-    3. Train and eval at each epoch 每个 epoch：训练 → 验证（→ 测试）→ 记录最佳指标 → 早停
+    a trainer with below logics: 璁粌鍣紙Trainer锛変富瑕侀€昏緫锛?
+    1. Build optimizer, scheduler 鏋勫缓浼樺寲鍣ㄥ拰瀛︿範鐜囪皟搴﹀櫒
+    2. Load checkpoints if provided 锛堝彲閫夛級鍔犺浇 checkpoint锛堢敤浜庣户缁缁冩垨鍥哄畾鍒濆鍖栵級
+    3. Train and eval at each epoch 姣忎釜 epoch锛氳缁?鈫?楠岃瘉锛堚啋 娴嬭瘯锛夆啋 璁板綍鏈€浣虫寚鏍?鈫?鏃╁仠
     """
     def __init__(
         self,
-        cfg: CfgNode,           # 全局配置（SOLVER / DATA / MODEL 等）
-        model: nn.Module,       # 待训练模型（已由外部 build 完成）
-        evaluator: Evaluator,   # 评测器（负责聚合并打印指标）
-        device: torch.device,   # 训练设备（cuda / cpu）
+        cfg: CfgNode,
+        model: nn.Module,
+        evaluator: Evaluator,
+        device: torch.device,
     ) -> None:
         self.cfg = cfg
         self.model = model
         self.device = device
 
-        # prompt 对齐损失是否启用（仅在选择 softmax_prompt_align 且 alpha>0 时开启，对应 L_avg 正则）
+        # prompt 对齐损失是否启用（legacy）
         self.align_loss_enabled = (
                 cfg.SOLVER.LOSS == "softmax_prompt_align" and getattr(cfg.SOLVER, "LOSS_ALPHA", 0.0) > 0
         )
+        # Affinity aux may be needed by multiple new losses/modes.
+        self.affinity_aux_needed = bool(
+            self.align_loss_enabled
+            or float(getattr(cfg.SOLVER, "LOSS_SEM_ROUTE_WEIGHT", 0.0)) > 0
+            or float(getattr(cfg.SOLVER, "LOSS_ROLE_EARLY_WEIGHT", 0.0)) > 0
+            or float(getattr(cfg.SOLVER, "LOSS_ROLE_LATE_WEIGHT", 0.0)) > 0
+            or float(getattr(cfg.SOLVER, "LOSS_AVS_ENT_WEIGHT", 0.0)) > 0
+            or str(getattr(cfg.MODEL, "SEMANTIC_SCORE_MODE", "global_refined")).lower() in {"affinity_role_migration", "agr_c2f"}
+        )
 
-        # affinity branch configuration：按需走 forward_with_affinity 分支
-        self.use_affinity = cfg.MODEL.AFFINITY.ENABLE or self.align_loss_enabled
+        # affinity branch configuration锛氭寜闇€璧?forward_with_affinity 鍒嗘敮
+        self.use_affinity = cfg.MODEL.AFFINITY.ENABLE or self.affinity_aux_needed
         if self.use_affinity:
             prompt_length = cfg.MODEL.AFFINITY.PROMPT_LENGTH
             if prompt_length <= 0:
                 prompt_length = cfg.MODEL.PROMPT.NUM_TOKENS
             self.affinity_cfg = {
                 "prompt_length": prompt_length,
-                # 对齐损失需要 prompt→patch 亲和，确保 return_cross 打开
-                "return_cross": cfg.MODEL.AFFINITY.RETURN_CROSS or self.align_loss_enabled,
+                # 瀵归綈鎹熷け闇€瑕?prompt鈫抪atch 浜插拰锛岀‘淇?return_cross 鎵撳紑
+                "return_cross": cfg.MODEL.AFFINITY.RETURN_CROSS or self.affinity_aux_needed,
                 "normalize": cfg.MODEL.AFFINITY.NORMALIZE,
                 "detach": cfg.MODEL.AFFINITY.DETACH,
             }
@@ -76,25 +79,23 @@ class Trainer():
             self.affinity_vis = False
 
         # solver related
-        # ================== 优化器 / 学习率调度器 / 损失函数 ==================
+        # ================== 浼樺寲鍣?/ 瀛︿範鐜囪皟搴﹀櫒 / 鎹熷け鍑芥暟 ==================
         logger.info("\tSetting up the optimizer...")
-        # 这里传入 [self.model] 是为了兼容“多模型联合优化”的情况
+        # 杩欓噷浼犲叆 [self.model] 鏄负浜嗗吋瀹光€滃妯″瀷鑱斿悎浼樺寲鈥濈殑鎯呭喌
         self.optimizer = make_optimizer([self.model], cfg.SOLVER)
         self.scheduler = make_scheduler(self.optimizer, cfg.SOLVER)
-        # 根据 cfg.SOLVER.LOSS 构建分类损失（默认 softmax cross-entropy）
         self.cls_criterion = build_loss(self.cfg)
 
-        # ================== Checkpointer：统一管理保存/加载 ==================
-        # Checkpointer 会自动处理 state_dict 的保存与加载
+        # ================== Checkpointer锛氱粺涓€绠＄悊淇濆瓨/鍔犺浇 ==================
+        # Checkpointer 浼氳嚜鍔ㄥ鐞?state_dict 鐨勪繚瀛樹笌鍔犺浇
         self.checkpointer = Checkpointer(
             self.model,
-            save_dir=cfg.OUTPUT_DIR,    # checkpoint 的保存路径
+            save_dir=cfg.OUTPUT_DIR,
             save_to_disk=True
         )
-        # 若指定了 MODEL.WEIGHT_PATH，则先加载指定权重
-        # 注：这里排除了分类头最后一层（head.last_layer.*），常用于“线性探针/下游任务”场景
+        # Optional pretrained checkpoint load.
         if len(cfg.MODEL.WEIGHT_PATH) > 0:
-            # only use this for vtab in-domain experiments 仅用于 VTAB in-domain 实验
+            # only use this for vtab in-domain experiments 浠呯敤浜?VTAB in-domain 瀹為獙
             checkpointables = [key for key in self.checkpointer.checkpointables if key not in ["head.last_layer.bias",  "head.last_layer.weight"]]
             self.checkpointer.load(cfg.MODEL.WEIGHT_PATH, checkpointables)
             logger.info(f"Model weight loaded from {cfg.MODEL.WEIGHT_PATH}")
@@ -455,6 +456,10 @@ class Trainer():
                     for k, v in score_stats.items():
                         if isinstance(v, (int, float, bool, str)) or v is None:
                             self._last_train_debug[k] = v
+                        elif isinstance(v, dict):
+                            for kk, vv in v.items():
+                                if isinstance(vv, (int, float, bool, str)) or vv is None:
+                                    self._last_train_debug[f"{k}.{kk}"] = vv
             hn_stats = getattr(self.cls_criterion, "_last_hn_stats", None)
             if isinstance(hn_stats, dict) and len(hn_stats) > 0:
                 self._last_train_debug.update(hn_stats)
@@ -1029,19 +1034,13 @@ class Trainer():
 
     def forward_one_batch(self, inputs, targets, is_train, attributes=None):
         """Train a single (full) epoch on the model using the given data loader.
-        对一个 batch 做前向（可选反向）计算。
+        瀵逛竴涓?batch 鍋氬墠鍚戯紙鍙€夊弽鍚戯級璁＄畻銆?
+        鍙傛暟锛?            inputs: 杈撳叆寮犻噺锛堜竴鑸舰鐘朵负 [B, C, H, W] 鎴?[B, D]锛?            targets: 鏍囩寮犻噺锛堜竴鑸舰鐘朵负 [B]锛?            is_train: bool锛岃缁冮樁娈典负 True锛岄獙璇?娴嬭瘯闃舵涓?False
 
-        参数：
-            inputs: 输入张量（一般形状为 [B, C, H, W] 或 [B, D]）
-            targets: 标签张量（一般形状为 [B]）
-            is_train: bool，训练阶段为 True，验证/测试阶段为 False
-
-        返回：
-            loss: 标量损失（训练阶段）或占位损失（某些特殊情况）
-            outputs: 模型输出 logits，形状 [B, num_classes]
+        杩斿洖锛?            loss: 鏍囬噺鎹熷け锛堣缁冮樁娈碉級鎴栧崰浣嶆崯澶憋紙鏌愪簺鐗规畩鎯呭喌锛?            outputs: 妯″瀷杈撳嚭 logits锛屽舰鐘?[B, num_classes]
         """
 
-        # ========== 1. 把数据搬到指定设备 ==========
+        # ========== 1. 鎶婃暟鎹惉鍒版寚瀹氳澶?==========
         inputs = inputs.to(self.device, non_blocking=True)    # (batchsize, 2048)
         targets = targets.to(self.device, non_blocking=True)  # (batchsize, )
         if attributes is not None:
@@ -1054,7 +1053,7 @@ class Trainer():
         trace_id = self._make_trace_id()
         self._set_model_trace_context(trace_id)
 
-        # ========== 2. 前向推理（训练时开启梯度，验证/测试禁用梯度） ==========
+        # ========== 2. 鍓嶅悜鎺ㄧ悊锛堣缁冩椂寮€鍚搴︼紝楠岃瘉/娴嬭瘯绂佺敤姊害锛?==========
         debug_logits = None
         with torch.set_grad_enabled(is_train):
             effective_targets = targets
@@ -1085,8 +1084,8 @@ class Trainer():
                             inputs, self.affinity_cfg
                         )
 
-                if self.align_loss_enabled: # forward_with_affinity 返回逐层亲和矩阵，按层提取对齐损失所需的 attn_pv/attn_vs
-                    aux = self._extract_alignment_aux(affinities) # 取亲和并做头平均
+                if self.affinity_aux_needed: # forward_with_affinity 杩斿洖閫愬眰浜插拰鐭╅樀锛屾寜灞傛彁鍙栧榻愭崯澶辨墍闇€鐨?attn_pv/attn_vs
+                    aux = self._extract_alignment_aux(affinities) # 鍙栦翰鍜屽苟鍋氬ご骞冲潎
                     outputs = (outputs if not isinstance(outputs, tuple) else outputs[0], aux)
                 else:
                     outputs = outputs if not isinstance(outputs, tuple) else outputs[0]
@@ -1135,9 +1134,7 @@ class Trainer():
                     "shape of model output: {}, targets: {}".format(
                         _logits.shape, targets.shape))
 
-            # ================== 3. 计算损失 ==================
-            # 一些“局部损失”（is_local=True）需要拿到 model / inputs 参与计算
-            # 例如某些正则或提示学习的约束，且为了稳定会在 eval() 下运行
+            # ================== 3. compute loss ==================
             model_ref = self.model.module if hasattr(self.model, "module") else self.model
             loss_kwargs = {
                 "model": model_ref,
@@ -1147,22 +1144,19 @@ class Trainer():
             if self.train_seen_ids_tensor is not None:
                 loss_kwargs["seen_ids"] = self.train_seen_ids_tensor
             if self.cls_criterion.is_local() and is_train:
-                # 把模型暂时切到 eval，避免 BN/Dropout 带来随机性
                 self.model.eval()
                 loss = self.cls_criterion(
                     outputs, targets, self.cls_weights,
                     self.model, inputs
                 )
             elif self.cls_criterion.is_local():
-                # 评测阶段且是“局部损失”时，当前实现直接返回一个占位 loss（值=1）
-                # 这里只是为了接口统一，真正评测时一般只关心 logits。
                 return torch.tensor(1), outputs
             else:
-                # 常规分类损失（如 SoftmaxLoss），只需要 outputs / targets / class_weights
+                # 甯歌鍒嗙被鎹熷け锛堝 SoftmaxLoss锛夛紝鍙渶瑕?outputs / targets / class_weights
                 loss = self.cls_criterion(
                     loss_outputs, loss_targets, loss_weights, kwargs=loss_kwargs)
 
-            # ========== 4. 检查损失是否异常（inf 或 NaN） ==========
+            # ========== 4. 妫€鏌ユ崯澶辨槸鍚﹀紓甯革紙inf 鎴?NaN锛?==========
             if loss == float('inf'):
                 logger.info(
                     "encountered infinite loss, skip gradient updating for this batch!"
@@ -1175,7 +1169,7 @@ class Trainer():
                 return -1, -1
 
         # =======backward and optim step only if in training phase... =========
-        # ========== 5. 若处于训练阶段，则执行反向与参数更新 ==========
+        # ========== 5. 鑻ュ浜庤缁冮樁娈碉紝鍒欐墽琛屽弽鍚戜笌鍙傛暟鏇存柊 ==========
         if is_train:
             self.optimizer.zero_grad()
             loss.backward()
@@ -1194,8 +1188,7 @@ class Trainer():
 
     def _extract_alignment_aux(self, affinities):
         """
-        从 forward_with_affinity 的亲和列表中提取对齐损失需要的 attn_pv / attn_vs。
-        兼容多层：构造 {layer_idx: tensor} 的字典，缺失时返回 None。（模型前向返回所有层的亲和矩阵，方便在 loss 侧灵活选择使用哪一层或多层。）
+        浠?forward_with_affinity 鐨勪翰鍜屽垪琛ㄤ腑鎻愬彇瀵归綈鎹熷け闇€瑕佺殑 attn_pv / attn_vs銆?        鍏煎澶氬眰锛氭瀯閫?{layer_idx: tensor} 鐨勫瓧鍏革紝缂哄け鏃惰繑鍥?None銆傦紙妯″瀷鍓嶅悜杩斿洖鎵€鏈夊眰鐨勪翰鍜岀煩闃碉紝鏂逛究鍦?loss 渚х伒娲婚€夋嫨浣跨敤鍝竴灞傛垨澶氬眰銆傦級
         """
         if affinities is None:
             return None
@@ -1235,26 +1228,55 @@ class Trainer():
         out = {"attn_pv": attn_pv, "attn_vs": attn_vs}
         if attn_ps:
             out["attn_ps"] = attn_ps
+
+        # Role-migration diagnostics (lightweight scalar summaries).
+        role_cfg = getattr(getattr(self.cfg.MODEL, "ROLE_MIGRATION", None), "ENABLE", False)
+        if bool(role_cfg):
+            def _energy(x):
+                return float(x.float().abs().mean().item())
+            def _entropy(x):
+                p = x.float().clamp_min(1e-8)
+                return float((-(p * p.log()).sum(dim=-1).mean()).item())
+
+            layer_ids = sorted(set(attn_pv.keys()) | set(attn_vs.keys()) | set(attn_ps.keys()))
+            early_end = int(getattr(getattr(self.cfg.MODEL, "ROLE_MIGRATION", None), "EARLY_END", 3))
+            late_start = int(getattr(getattr(self.cfg.MODEL, "ROLE_MIGRATION", None), "LATE_START", 9))
+            early_layers = [l for l in layer_ids if l <= early_end]
+            late_layers = [l for l in layer_ids if l >= late_start]
+            if len(late_layers) == 0 and len(layer_ids) > 0:
+                late_layers = [layer_ids[-1]]
+
+            def _mean(vals):
+                return float(sum(vals) / max(1, len(vals))) if len(vals) > 0 else None
+
+            out["role_summary"] = {
+                "layer_ids": layer_ids,
+                "early_layers": early_layers,
+                "late_layers": late_layers,
+                "early_apv_energy": _mean([_energy(attn_pv[l]) for l in early_layers if l in attn_pv]),
+                "early_aps_energy": _mean([_energy(attn_ps[l]) for l in early_layers if l in attn_ps]),
+                "early_avs_energy": _mean([_energy(attn_vs[l]) for l in early_layers if l in attn_vs]),
+                "late_apv_energy": _mean([_energy(attn_pv[l]) for l in late_layers if l in attn_pv]),
+                "late_aps_energy": _mean([_energy(attn_ps[l]) for l in late_layers if l in attn_ps]),
+                "late_avs_energy": _mean([_energy(attn_vs[l]) for l in late_layers if l in attn_vs]),
+                "late_apv_entropy": _mean([_entropy(attn_pv[l]) for l in late_layers if l in attn_pv]),
+            }
         return out
 
     def get_input(self, data):
         """
-        从 DataLoader 返回的 data 字典中提取输入与标签。
+        浠?DataLoader 杩斿洖鐨?data 瀛楀吀涓彁鍙栬緭鍏ヤ笌鏍囩銆?
+        棰勬湡 data 鐨勭粨鏋勶細
+            data["image"]: np.ndarray 鎴?torch.Tensor
+            data["label"]: np.ndarray 鎴?torch.Tensor
 
-        预期 data 的结构：
-            data["image"]: np.ndarray 或 torch.Tensor
-            data["label"]: np.ndarray 或 torch.Tensor
-
-        返回：
-            inputs: float32 的图像张量
-            labels: 标签张量（通常为 long 类型）
-        """
-        # 如果 dataloader 返回的是 numpy，则统一转成 torch.Tensor
+        杩斿洖锛?            inputs: float32 鐨勫浘鍍忓紶閲?            labels: 鏍囩寮犻噺锛堥€氬父涓?long 绫诲瀷锛?        """
+        # 濡傛灉 dataloader 杩斿洖鐨勬槸 numpy锛屽垯缁熶竴杞垚 torch.Tensor
         if not isinstance(data["image"], torch.Tensor):
             for k, v in data.items():
                 data[k] = torch.from_numpy(v)
 
-        inputs = data["image"].float()  # 保证 float（模型一般期望 float）
+        inputs = data["image"].float()  # 淇濊瘉 float锛堟ā鍨嬩竴鑸湡鏈?float锛?
         labels = data["label"]
 
         attributes = data.get("attribute") if isinstance(data, dict) else None
@@ -1290,23 +1312,19 @@ class Trainer():
 
     def train_classifier(self, train_loader, val_loader, test_loader):
         """
-        以 epoch 为单位训练分类器，并在每个 epoch 后进行验证和（可选）测试。
+        浠?epoch 涓哄崟浣嶈缁冨垎绫诲櫒锛屽苟鍦ㄦ瘡涓?epoch 鍚庤繘琛岄獙璇佸拰锛堝彲閫夛級娴嬭瘯銆?
+        鍙傛暟锛?            train_loader: 璁粌闆?DataLoader
+            val_loader:   楠岃瘉闆?DataLoader
+            test_loader:  娴嬭瘯闆?DataLoader锛堝彲涓?None锛?        """
 
-        参数：
-            train_loader: 训练集 DataLoader
-            val_loader:   验证集 DataLoader
-            test_loader:  测试集 DataLoader（可为 None）
-        """
-
-        # ================== 0. 在训练开始前可选地保存一次 prompt（VPT） ==================
-        # save the model prompt if required before training 如需保存 “prompt embedding”，在训练开始前保存一次“epoch 0 前”的状态
+        # ================== 0. optional prompt snapshot before training ==================
         self.model.eval()
         self.save_prompt(0)
 
-        # ================== 1. 一些训练超参数与状态变量 ==================
+        # ================== 1. 涓€浜涜缁冭秴鍙傛暟涓庣姸鎬佸彉閲?==================
         # setup training epoch params
-        total_epoch = self.cfg.SOLVER.TOTAL_EPOCH       # 总 epoch 数
-        total_data = len(train_loader)                  # 每个 epoch 的 batch 数
+        total_epoch = self.cfg.SOLVER.TOTAL_EPOCH
+        total_data = len(train_loader)
         effective_total_epoch = total_epoch
         if self.overfit_one_batch_steps > 0:
             effective_total_epoch = 1
@@ -1317,24 +1335,23 @@ class Trainer():
                 "[debug] OVERFIT_ONE_BATCH_STEPS enabled: repeat one batch for %d steps",
                 self.overfit_one_batch_steps,
             )
-        best_epoch = -1                                 # 当前最优 epoch
+        best_epoch = -1                                 # 褰撳墠鏈€浼?epoch
         best_metric = float("-inf")                     # ensure first valid epoch can trigger improved/save
         logger.info("Best metric initialized to -inf for first-epoch save compatibility.")
-        log_interval = self.cfg.SOLVER.LOG_EVERY_N      # 每多少个 batch 打一次日志
-
-        # 若干计量器（统计平均损失/时间等，便于打印）
-        losses = AverageMeter('Loss', ':.4e')           # - losses: 每个 epoch 内的平均训练损失
-        seen_top1_meter = AverageMeter('SeenTop1', ':.4e')  # - seen_top1_meter: 训练口径 top1
+        log_interval = self.cfg.SOLVER.LOG_EVERY_N      # 姣忓灏戜釜 batch 鎵撲竴娆℃棩蹇?
+        # meters for per-epoch logging
+        losses = AverageMeter('Loss', ':.4e')
+        seen_top1_meter = AverageMeter('SeenTop1', ':.4e')
         hn_margin_meter = AverageMeter('HNMargin', ':.4e')
         pos_score_meter = AverageMeter('PosScore', ':.4e')
         hn_score_meter = AverageMeter('HNScore', ':.4e')
         train_margin_meter = AverageMeter('TrainMargin', ':.4e')
         p_margin_lt0_meter = AverageMeter('PMarginLT0', ':.4e')
         p_margin_ltneg1_meter = AverageMeter('PMarginLTNeg1', ':.4e')
-        batch_time = AverageMeter('Time', ':6.3f')      # - batch_time: 每个 batch 的时间
-        data_time = AverageMeter('Data', ':6.3f')       # - data_time: 数据加载时间
+        batch_time = AverageMeter('Time', ':6.3f')
+        data_time = AverageMeter('Data', ':6.3f')
 
-        # 从训练集 Dataset 获取类别权重，传给损失函数（应对类分布不平衡）
+        # class weights from dataset
         self.cls_weights = train_loader.dataset.get_class_weights(
             self.cfg.DATA.CLASS_WEIGHTS_TYPE)
         self._configure_seen_only_train_ce(train_loader)
@@ -1342,12 +1359,10 @@ class Trainer():
             self._set_prompt_sampling_mode(self.overfit_disable_prompt_sampling)
         # logger.info(f"class weights: {self.cls_weights}")
 
-        # 早停用 patience：若验证集 metric 连续若干次不提升就停止
-        patience = 0  # if > self.cfg.SOLVER.PATIENCE, stop training 早停计数器；若超过 cfg.SOLVER.PATIENCE 则停止训练
-
-        # ================== 2. 主训练循环（按 epoch） ==================
+        patience = 0
+        # ================== 2. 涓昏缁冨惊鐜紙鎸?epoch锛?==================
         for epoch in range(effective_total_epoch):
-            # reset averagemeters to measure per-epoch results 每个 epoch 开始前，重置统计量
+            # reset averagemeters to measure per-epoch results 姣忎釜 epoch 寮€濮嬪墠锛岄噸缃粺璁￠噺
             losses.reset()
             seen_top1_meter.reset()
             hn_margin_meter.reset()
@@ -1359,7 +1374,6 @@ class Trainer():
             batch_time.reset()
             data_time.reset()
 
-            # 当前学习率（假设 scheduler 里第一组 lr 代表全局 lr）
             lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
             logger.info(
                 "Training {} / {} epoch, with learning rate {}".format(
@@ -1367,12 +1381,12 @@ class Trainer():
                 )
             )
 
-            # Enable training mode 切换到训练模式（启用 Dropout / 更新 BN 统计等）
+            # Enable training mode 鍒囨崲鍒拌缁冩ā寮忥紙鍚敤 Dropout / 鏇存柊 BN 缁熻绛夛級
             self.model.train()
 
             end = time.time()
 
-            # ---------- 遍历一个 epoch 的所有 batch ----------
+            # ---------- 閬嶅巻涓€涓?epoch 鐨勬墍鏈?batch ----------
             if self.overfit_one_batch_steps > 0:
                 batch_iter = ((i, self._overfit_cached_batch) for i in range(self.overfit_one_batch_steps))
             else:
@@ -1384,24 +1398,21 @@ class Trainer():
                 self._trace_iter = int(idx)
                 self._trace_global_step += 1
                 if self.cfg.DBG and idx == 20:
-                    # if debugging, only need to see the first few iterations # 调试模式：仅跑前 20 个 batch 以加速
                     break
                 
                 X, targets, attributes = self.get_input(input_data)
                 # logger.info(X.shape)
                 # logger.info(targets.shape)
                 # measure data loading time
-                # 统计数据加载时间
+                # 缁熻鏁版嵁鍔犺浇鏃堕棿
                 data_time.update(time.time() - end)
 
-                # 前向 + （若 is_train=True）反向与优化
+                # 鍓嶅悜 + 锛堣嫢 is_train=True锛夊弽鍚戜笌浼樺寲
                 train_loss, _ = self.forward_one_batch(X, targets, True, attributes=attributes)
 
-                # 若 forward 返回 -1，说明出现 inf / NaN，直接停止训练
                 if train_loss == -1:
                     return None
 
-                # 更新本 epoch 的平均损失
                 losses.update(train_loss.item(), X.shape[0])
                 if isinstance(self._last_train_debug, dict) and "seen_only_top1" in self._last_train_debug:
                     seen_top1_meter.update(float(self._last_train_debug["seen_only_top1"]), X.shape[0])
@@ -1419,16 +1430,19 @@ class Trainer():
                     if "p_train_margin_lt_neg1" in self._last_train_debug:
                         p_margin_ltneg1_meter.update(float(self._last_train_debug["p_train_margin_lt_neg1"]), X.shape[0])
 
-                # measure elapsed time 统计 batch 处理时间
+                # measure elapsed time 缁熻 batch 澶勭悊鏃堕棿
                 batch_time.update(time.time() - end)
                 end = time.time()
 
-                # log during one batch 每隔 log_interval 个 batch 打印一次训练日志
+                # log during one batch
                 if (idx + 1) % log_interval == 0:
                     seconds_per_batch = batch_time.val
-                    # 估算剩余时间（本 epoch 剩余 + 后续 epoch）
-                    eta = datetime.timedelta(seconds=int(
-                        seconds_per_batch * (total_data - idx - 1) + seconds_per_batch*total_data*(effective_total_epoch-epoch-1)))
+                    eta = datetime.timedelta(
+                        seconds=int(
+                            seconds_per_batch * (total_data - idx - 1)
+                            + seconds_per_batch * total_data * (effective_total_epoch - epoch - 1)
+                        )
+                    )
                     logger.info(
                         "\tTraining {}/{}. train loss: {:.4f},".format(
                             idx + 1,
@@ -1454,14 +1468,21 @@ class Trainer():
                             float(p_margin_ltneg1_meter.val),
                             bool(getattr(self.cls_criterion, "hn_detach_neg", False)),
                         )
-                    if isinstance(self._last_train_debug, dict) and self._last_train_debug.get("semantic_score_mode") == "coarse_to_fine":
+                    if isinstance(self._last_train_debug, dict) and self._last_train_debug.get("semantic_score_mode") in {"coarse_to_fine", "affinity_role_migration"}:
                         logger.info(
-                            "[score-debug] mode=%s topk=%s alpha=%s train_include_gt=%s coarse_topk_contains_gt_rate(pre_union)=%.4f",
+                            "[score-debug] mode=%s topk=%s alpha=%s train_include_gt=%s "
+                            "coarse_topk_contains_gt_rate(pre_union)=%.4f coarse_topk_contains_gt_rate(post_union)=%s "
+                            "agr_delta_norm=%s early_apv=%s late_aps=%s late_avs=%s",
                             str(self._last_train_debug.get("semantic_score_mode")),
                             str(self._last_train_debug.get("semantic_score_topk")),
                             str(self._last_train_debug.get("semantic_score_alpha")),
                             str(self._last_train_debug.get("semantic_score_train_include_gt")),
                             float(self._last_train_debug.get("coarse_topk_contains_gt_rate", float("nan"))),
+                            str(self._last_train_debug.get("coarse_topk_contains_gt_rate_postunion")),
+                            str(self._last_train_debug.get("agr_delta_norm_mean")),
+                            str(self._last_train_debug.get("affinity_early_apv_energy")),
+                            str(self._last_train_debug.get("affinity_late_aps_energy")),
+                            str(self._last_train_debug.get("affinity_late_avs_energy")),
                         )
                     if self.overfit_one_batch_steps > 0 and self._last_train_debug:
                         dbg = self._last_train_debug
@@ -1536,7 +1557,7 @@ class Trainer():
                                     bool(ce_from_scaled),
                                     bool(self.use_seen_only_train_ce),
                                 )
-            # 一个 epoch 的汇总日志
+            # One-epoch summary
             logger.info(
                 "Epoch {} / {}: ".format(epoch + 1, effective_total_epoch)
                 + "avg data time: {:.2e}, avg batch time: {:.4f}, ".format(
@@ -1558,39 +1579,39 @@ class Trainer():
                         bool(getattr(self.cls_criterion, "hn_detach_neg", False)),
                     )
                 )
-            if isinstance(self._last_train_debug, dict) and self._last_train_debug.get("semantic_score_mode") == "coarse_to_fine":
+            if isinstance(self._last_train_debug, dict) and self._last_train_debug.get("semantic_score_mode") in {"coarse_to_fine", "affinity_role_migration"}:
                 logger.info(
-                    "Epoch {} score summary: mode={} topk={} alpha={} train_include_gt={} coarse_topk_contains_gt_rate(pre_union)={:.4f}".format(
+                    "Epoch {} score summary: mode={} topk={} alpha={} train_include_gt={} "
+                    "coarse_topk_contains_gt_rate(pre_union)={:.4f} coarse_topk_contains_gt_rate(post_union)={} agr_delta_norm={}".format(
                         epoch + 1,
                         self._last_train_debug.get("semantic_score_mode"),
                         self._last_train_debug.get("semantic_score_topk"),
                         self._last_train_debug.get("semantic_score_alpha"),
                         self._last_train_debug.get("semantic_score_train_include_gt"),
                         float(self._last_train_debug.get("coarse_topk_contains_gt_rate", float("nan"))),
+                        self._last_train_debug.get("coarse_topk_contains_gt_rate_postunion"),
+                        self._last_train_debug.get("agr_delta_norm_mean"),
                     )
                 )
              # update lr, scheduler.step() must be called after optimizer.step() according to the docs: https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate  # noqa
-             # 按官方建议：scheduler.step() 应在 optimizer.step() 之后调用
+             # 鎸夊畼鏂瑰缓璁細scheduler.step() 搴斿湪 optimizer.step() 涔嬪悗璋冪敤
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            # ================== 3. 验证 / 测试阶段 ==================
-            # 切换到 eval 模式
+            # ================== 3. 楠岃瘉 / 娴嬭瘯闃舵 ==================
+            # 鍒囨崲鍒?eval 妯″紡
             self.model.eval()
-            # 保存当下 epoch 的 prompt embeddings（如需求与配置指定）
             self.save_prompt(epoch + 1)
 
-            # eval at each epoch for single gpu training # 更新 evaluator 的 epoch 号，评测时用于结果归档到 epoch_k 下
-            # self.evaluator.update_iteration(epoch)
-            # self.eval_classifier(val_loader, "val", epoch == total_epoch - 1) # 验证集评测（prefix="val"）
-
-            # 20250902改动：可视化实现，确保拿到最佳 checkpoint 的图
-            # -------- 先在 val 上评测 --------
+            # eval at each epoch for single gpu training # 鏇存柊 evaluator 鐨?epoch 鍙凤紝璇勬祴鏃剁敤浜庣粨鏋滃綊妗ｅ埌 epoch_k 涓?            # self.evaluator.update_iteration(epoch)
+            # self.eval_classifier(val_loader, "val", epoch == total_epoch - 1) # 楠岃瘉闆嗚瘎娴嬶紙prefix="val"锛?
+            # 20250902鏀瑰姩锛氬彲瑙嗗寲瀹炵幇锛岀‘淇濇嬁鍒版渶浣?checkpoint 鐨勫浘
+            # -------- 鍏堝湪 val 涓婅瘎娴?--------
             self.evaluator.update_iteration(epoch)
-            # save=False：验证阶段不需要立即保存 logits
+            # save=False锛氶獙璇侀樁娈典笉闇€瑕佺珛鍗充繚瀛?logits
             self.eval_classifier(val_loader, "val", save=False)
 
-            # 读取本轮 val 的主指标（standard: top1; zsl: zsl_unseen; gzsl: gzsl_h）
+            # 璇诲彇鏈疆 val 鐨勪富鎸囨爣锛坰tandard: top1; zsl: zsl_unseen; gzsl: gzsl_h锛?
             t_name = "val_" + val_loader.dataset.name
             metrics_this_epoch = (
                 self.evaluator.results
@@ -1622,28 +1643,26 @@ class Trainer():
                 bool(improved),
             )
 
-            # -------- 如果提供了 test_loader，则在 test 上也做评测 --------
-            # 只有刷新最佳时，才在 test 上触发 save=True
-            # 让 eval_classifier 内部保存 logits / CLS 特征等缓存，用于后续可视化。
+            # -------- 濡傛灉鎻愪緵浜?test_loader锛屽垯鍦?test 涓婁篃鍋氳瘎娴?--------
+            # 鍙湁鍒锋柊鏈€浣虫椂锛屾墠鍦?test 涓婅Е鍙?save=True
+            # 璁?eval_classifier 鍐呴儴淇濆瓨 logits / CLS 鐗瑰緛绛夌紦瀛橈紝鐢ㄤ簬鍚庣画鍙鍖栥€?
             if test_loader is not None:
                 self.eval_classifier(test_loader, "test", save=improved)
 
             if self._should_run_monitor(epoch):
                 self._run_monitor_epoch(epoch, train_loader, val_loader, test_loader)
 
-            # 原来的代码做的是只保存最后一轮，这样容易受早停的影响
-            # if test_loader is not None:                                       # 测试集评测（如提供了 test_loader）
-            #     self.eval_classifier(test_loader, "test", epoch == total_epoch - 1)
+            # 鍘熸潵鐨勪唬鐮佸仛鐨勬槸鍙繚瀛樻渶鍚庝竴杞紝杩欐牱瀹规槗鍙楁棭鍋滅殑褰卞搷
+            # if test_loader is not None:                                       # 娴嬭瘯闆嗚瘎娴嬶紙濡傛彁渚涗簡 test_loader锛?            #     self.eval_classifier(test_loader, "test", epoch == total_epoch - 1)
 
-            # check the patience ---------- 早停逻辑：根据验证集 top1 ----------
+            # check the patience ---------- 鏃╁仠閫昏緫锛氭牴鎹獙璇侀泦 top1 ----------
             # t_name = "val_" + val_loader.dataset.name
             # try:
             #     curr_acc = self.evaluator.results[f"epoch_{epoch}"]["classification"][t_name]["top1"]
-            # except KeyError: # 若评测指标缺失（例如数据/流程问题），则直接返回
-            #     return
-            # --- 早停与最佳记录（保持你的原逻辑不变，但只用刚刚那一次 curr_acc）---
+            # except KeyError: # 鑻ヨ瘎娴嬫寚鏍囩己澶憋紙渚嬪鏁版嵁/娴佺▼闂锛夛紝鍒欑洿鎺ヨ繑鍥?            #     return
+            # --- 鏃╁仠涓庢渶浣宠褰曪紙淇濇寔浣犵殑鍘熼€昏緫涓嶅彉锛屼絾鍙敤鍒氬垰閭ｄ竴娆?curr_acc锛?--
 
-            # ================== 4. 早停逻辑（基于验证集 top1） ==================
+            # ================== 4. 鏃╁仠閫昏緫锛堝熀浜庨獙璇侀泦 top1锛?==================
             if improved:
                 best_metric = curr_acc
                 best_epoch = epoch + 1
@@ -1660,8 +1679,7 @@ class Trainer():
                 logger.info("No improvement. Breaking out of loop.")
                 break
 
-        # save the last checkpoints                 可选：保存最后模型
-        # if self.cfg.MODEL.SAVE_CKPT:
+        # save the last checkpoints                 鍙€夛細淇濆瓨鏈€鍚庢ā鍨?        # if self.cfg.MODEL.SAVE_CKPT:
         #     Checkpointer(
         #         self.model,
         #         save_dir=self.cfg.OUTPUT_DIR,
@@ -1671,18 +1689,14 @@ class Trainer():
     @torch.no_grad()
     def save_prompt(self, epoch):
         """
-        将当前模型中的 prompt embeddings 保存到磁盘（只在使用 ViT + prompt 时生效）。
-
-        条件：
-            - cfg.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH 为 True
+        灏嗗綋鍓嶆ā鍨嬩腑鐨?prompt embeddings 淇濆瓨鍒扮鐩橈紙鍙湪浣跨敤 ViT + prompt 鏃剁敓鏁堬級銆?
+        鏉′欢锛?            - cfg.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH 涓?True
             - cfg.MODEL.TYPE == "vit"
-            - "prompt" in cfg.MODEL.TRANSFER_TYPE（即启用了 prompt tuning）
+            - "prompt" in cfg.MODEL.TRANSFER_TYPE锛堝嵆鍚敤浜?prompt tuning锛?
+        淇濆瓨鍐呭锛?            - "shallow_prompt": 娴呭眰 prompt锛堝墠缃?prompt锛夛紝褰㈢姸 [1, P, D 鎴?d]
+            - "deep_prompt": 鑻?PROMPT.DEEP=True锛屽垯鍐嶄繚瀛樻瘡灞?deep prompt锛屽舰鐘?[L-1, P, D 鎴?d]
 
-        保存内容：
-            - "shallow_prompt": 浅层 prompt（前置 prompt），形状 [1, P, D 或 d]
-            - "deep_prompt": 若 PROMPT.DEEP=True，则再保存每层 deep prompt，形状 [L-1, P, D 或 d]
-
-        文件名：
+        鏂囦欢鍚嶏細
             OUTPUT_DIR/prompt_ep{epoch}.pth
         """
         # only save the prompt embed if below conditions are satisfied
@@ -1710,14 +1724,8 @@ class Trainer():
     @torch.no_grad()
     def eval_classifier(self, data_loader, prefix, save=False):
         """
-        在给定 data_loader（验证/测试集）上评估分类性能。
-
-        参数：
-            data_loader: DataLoader（val 或 test）
-            prefix: 字符串前缀，用于标识当前评测类型（"val" 或 "test"）
-            save: 若 True 且 cfg.MODEL.SAVE_CKPT=True，则保存 logits 与 targets，
-                  并在 test 阶段额外缓存 CLS 特征用于 t-SNE 可视化。
-        """
+        鍦ㄧ粰瀹?data_loader锛堥獙璇?娴嬭瘯闆嗭級涓婅瘎浼板垎绫绘€ц兘銆?
+        鍙傛暟锛?            data_loader: DataLoader锛坴al 鎴?test锛?            prefix: 瀛楃涓插墠缂€锛岀敤浜庢爣璇嗗綋鍓嶈瘎娴嬬被鍨嬶紙"val" 鎴?"test"锛?            save: 鑻?True 涓?cfg.MODEL.SAVE_CKPT=True锛屽垯淇濆瓨 logits 涓?targets锛?                  骞跺湪 test 闃舵棰濆缂撳瓨 CLS 鐗瑰緛鐢ㄤ簬 t-SNE 鍙鍖栥€?        """
         batch_time = AverageMeter('Time', ':6.3f')
         data_time = AverageMeter('Data', ':6.3f')
         losses = AverageMeter('Loss', ':.4e')
@@ -1726,7 +1734,7 @@ class Trainer():
         test_name = prefix + "_" + data_loader.dataset.name
         total = len(data_loader)
 
-        # initialize features and target 聚合全量 logits 与 targets，评测结束一次性计算指标
+        # initialize features and target 鑱氬悎鍏ㄩ噺 logits 涓?targets锛岃瘎娴嬬粨鏉熶竴娆℃€ц绠楁寚鏍?
         total_logits = []
         total_targets = []
         total_sim_true_raw = []
@@ -1742,10 +1750,15 @@ class Trainer():
         coarse_recall_k_vals = []
         candidate_delta_gap_vals = []
         candidate_delta_gap_avail_vals = []
+        coarse_topk_contains_gt_post_vals = []
+        agr_delta_norm_vals = []
+        affinity_early_apv_vals = []
+        affinity_late_aps_vals = []
+        affinity_late_avs_vals = []
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
         r_head_eval = getattr(model_ref, "r_similarity_head", None)
         eval_override = str(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_EVAL_OVERRIDE", "") or "").strip().lower()
-        valid_override = {"global_raw", "global_refined", "coarse_to_fine"}
+        valid_override = {"global_raw", "global_refined", "coarse_to_fine", "affinity_role_migration"}
         override_applied = False
         original_score_mode = None
         if (
@@ -1767,7 +1780,7 @@ class Trainer():
         if r_head_eval is not None:
             r_head_eval._runtime_targets = None
 
-        # ========== 遍历整个数据集 ==========
+        # ========== 閬嶅巻鏁翠釜鏁版嵁闆?==========
         for idx, input_data in enumerate(data_loader):
             self._trace_stage = f"eval_{prefix}"
             self._trace_iter = int(idx)
@@ -1775,24 +1788,24 @@ class Trainer():
             end = time.time()
             X, targets, attributes = self.get_input(input_data)
 
-            # 统计数据加载时间
+            # 缁熻鏁版嵁鍔犺浇鏃堕棿
             data_time.update(time.time() - end)
 
             if self.cfg.DBG:
                 logger.info("during eval: {}".format(X.shape))
 
-            # 评测阶段：is_train=False → forward_one_batch 只做前向与 loss 计算
+            # 璇勬祴闃舵锛歩s_train=False 鈫?forward_one_batch 鍙仛鍓嶅悜涓?loss 璁＄畻
             loss, outputs = self.forward_one_batch(X, targets, False, attributes=attributes)
-            if loss == -1:                # 出现 inf / NaN 时，直接停止
+            if loss == -1:                # 鍑虹幇 inf / NaN 鏃讹紝鐩存帴鍋滄
                 if override_applied and r_head_eval is not None and original_score_mode is not None:
                     r_head_eval.semantic_score_mode = original_score_mode
                 return
             losses.update(loss, X.shape[0])
 
-            # 统计 batch 时间
+            # 缁熻 batch 鏃堕棿
             batch_time.update(time.time() - end)
 
-            # 周期性打印测试过程日志
+            # periodic eval log
             if (idx + 1) % log_interval == 0:
                 logger.info(
                     "\tTest {}/{}. loss: {:.3f}, {:.4f} s / batch. (data: {:.2e})".format(  # noqa
@@ -1804,11 +1817,11 @@ class Trainer():
                     ) + "max mem: {:.5f} GB ".format(gpu_mem_usage())
                 )
 
-            # targets: Tensor → Python list[int]
+            # targets: Tensor 鈫?Python list[int]
             total_targets.extend(list(targets.numpy()))
-            # outputs: logits Tensor，先收集，最后再 cat
-            # outputs 可能为 logits Tensor / (logits, aux) / {"logits": ...}
-            # 统一提取 logits 以便后续 cat
+            # outputs: logits Tensor锛屽厛鏀堕泦锛屾渶鍚庡啀 cat
+            # outputs 鍙兘涓?logits Tensor / (logits, aux) / {"logits": ...}
+            # 缁熶竴鎻愬彇 logits 浠ヤ究鍚庣画 cat
             logits = outputs
             if isinstance(outputs, (list, tuple)) and len(outputs) > 0:
                 logits = outputs[0]
@@ -1845,6 +1858,21 @@ class Trainer():
                     c = sst.get("candidate_delta_gap_available_ratio", None)
                     if c is not None:
                         candidate_delta_gap_avail_vals.append(float(c))
+                    c = sst.get("coarse_topk_contains_gt_rate_postunion", None)
+                    if c is not None:
+                        coarse_topk_contains_gt_post_vals.append(float(c))
+                    c = sst.get("agr_delta_norm_mean", None)
+                    if c is not None:
+                        agr_delta_norm_vals.append(float(c))
+                    c = sst.get("affinity_early_apv_energy", None)
+                    if c is not None:
+                        affinity_early_apv_vals.append(float(c))
+                    c = sst.get("affinity_late_aps_energy", None)
+                    if c is not None:
+                        affinity_late_aps_vals.append(float(c))
+                    c = sst.get("affinity_late_avs_energy", None)
+                    if c is not None:
+                        affinity_late_avs_vals.append(float(c))
                 v = getattr(r_head, "_loss_last_visual", None)
                 s_raw = getattr(r_head, "_loss_last_semantic_raw", None)
                 s_ref = getattr(r_head, "_loss_last_semantic_ref", None)
@@ -1868,30 +1896,30 @@ class Trainer():
                             total_sim_hn_ref.append(hn_ref.detach().cpu())
                             total_sem_source.extend([str(getattr(r_head, "_loss_last_source", "unknown"))] * int(v.shape[0]))
 
-        # 整体评测日志
+        # 鏁翠綋璇勬祴鏃ュ織
         logger.info(
             f"Inference ({prefix}):"
             + "avg data time: {:.2e}, avg batch time: {:.4f}, ".format(
                 data_time.avg, batch_time.avg)
             + "average loss: {:.4f}".format(losses.avg))
 
-        # 若模型使用了 side-tuning 分支，额外打印融合系数 alpha
+        # 鑻ユā鍨嬩娇鐢ㄤ簡 side-tuning 鍒嗘敮锛岄澶栨墦鍗拌瀺鍚堢郴鏁?alpha
         if self.model.side is not None:
             logger.info(
                 "--> side tuning alpha = {:.4f}".format(self.model.side_alpha))
 
-        # 拼接得到 (num_samples, num_classes) 的 logits 矩阵
+        # 鎷兼帴寰楀埌 (num_samples, num_classes) 鐨?logits 鐭╅樀
         joint_logits = torch.cat(total_logits, dim=0).cpu().numpy()
 
-        # 调用 evaluator 计算分类指标（内部会根据 DATA.MULTILABEL 处理单/多标签场景）
+        # 璋冪敤 evaluator 璁＄畻鍒嗙被鎸囨爣锛堝唴閮ㄤ細鏍规嵁 DATA.MULTILABEL 澶勭悊鍗?澶氭爣绛惧満鏅級
         self.evaluator.classify(
             joint_logits, total_targets,
             test_name, self.cfg.DATA.MULTILABEL,
         )
 
-        # ========== 若需要，则保存 logits 与 targets 到文件中 ==========
+        # ========== 鑻ラ渶瑕侊紝鍒欎繚瀛?logits 涓?targets 鍒版枃浠朵腑 ==========
         if save and self.cfg.MODEL.SAVE_CKPT:
-            # 1) 已有
+            # 1) 宸叉湁
             out = {"targets": total_targets, "joint_logits": joint_logits}
             out["semantic_score_mode"] = str(getattr(getattr(model_ref, "r_similarity_head", None), "semantic_score_mode", "unknown"))
             out["semantic_score_topk"] = int(getattr(getattr(model_ref, "r_similarity_head", None), "semantic_score_topk", 0))
@@ -1910,6 +1938,8 @@ class Trainer():
                 out["sim_ref_all"] = torch.cat(total_sim_ref_all, dim=0).numpy()
             if len(coarse_topk_contains_gt_vals) > 0:
                 out["coarse_topk_contains_gt_rate_preunion_mean"] = float(np.mean(coarse_topk_contains_gt_vals))
+            if len(coarse_topk_contains_gt_post_vals) > 0:
+                out["coarse_topk_contains_gt_rate_postunion_mean"] = float(np.mean(coarse_topk_contains_gt_post_vals))
             if len(coarse_recall_k_vals) > 0:
                 out["coarse_recall_at_k_preunion_mean"] = float(np.mean(coarse_recall_k_vals))
             if len(coarse_gap_mean_vals) > 0:
@@ -1920,6 +1950,14 @@ class Trainer():
                 out["candidate_delta_gap_batches"] = float(np.mean(candidate_delta_gap_vals))
             if len(candidate_delta_gap_avail_vals) > 0:
                 out["candidate_delta_gap_available_ratio_batches"] = float(np.mean(candidate_delta_gap_avail_vals))
+            if len(agr_delta_norm_vals) > 0:
+                out["agr_delta_norm_batches"] = float(np.mean(agr_delta_norm_vals))
+            if len(affinity_early_apv_vals) > 0:
+                out["affinity_early_apv_energy_batches"] = float(np.mean(affinity_early_apv_vals))
+            if len(affinity_late_aps_vals) > 0:
+                out["affinity_late_aps_energy_batches"] = float(np.mean(affinity_late_aps_vals))
+            if len(affinity_late_avs_vals) > 0:
+                out["affinity_late_avs_energy_batches"] = float(np.mean(affinity_late_avs_vals))
             class_names = getattr(data_loader.dataset, "classes", None)
             if class_names is None:
                 class_names = getattr(data_loader.dataset, "class_names", None)
@@ -1929,24 +1967,25 @@ class Trainer():
             torch.save(out, out_path)
             logger.info(f"Saved logits and targets for {test_name} at {out_path}")
 
-        # ========== 若是 test 阶段且 save=True，则额外缓存 CLS 特征用于 t-SNE ==========
+        # ========== 鑻ユ槸 test 闃舵涓?save=True锛屽垯棰濆缂撳瓨 CLS 鐗瑰緛鐢ㄤ簬 t-SNE ==========
         if save and prefix == "test":
             os.makedirs(os.path.join(self.cfg.OUTPUT_DIR, "cache"), exist_ok=True)
             cache_dir = os.path.join(self.cfg.OUTPUT_DIR, "cache")
 
-            # 1) 提取 CLS 特征（每类最多取 100 个样本，以免太大）
+            # 1) extract CLS features (up to 100 per class)
             X_cls, y = extract_features(
                 self.model, data_loader, self.device,
                 feat_type="cls", max_per_class=100
             )
             np.savez_compressed(
                 os.path.join(cache_dir, f"{test_name}_cls.npz"),
-                X=X_cls.astype("float32"),      # CLS 特征
-                y=y,                            # 对应标签
-                meta=dict(type="cls")           # 元信息
+                X=X_cls.astype("float32"),      # CLS 鐗瑰緛
+                y=y,                            # 瀵瑰簲鏍囩
+                meta=dict(type="cls")           # 鍏冧俊鎭?
             )
 
             logger.info(f"[t-SNE cache] saved CLS features to {cache_dir}")
         if override_applied and r_head_eval is not None and original_score_mode is not None:
             r_head_eval.semantic_score_mode = original_score_mode
-        # === eval_classifier 结束 ===
+        # === eval_classifier 缁撴潫 ===
+

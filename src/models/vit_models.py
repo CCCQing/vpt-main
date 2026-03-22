@@ -54,7 +54,27 @@ class ViT(nn.Module):
 
         # 濡傛灉 TRANSFER_TYPE 閲屽寘鍚?"prompt"锛屽垯闇€瑕佷紶鍏?prompt 閰嶇疆锛涘惁鍒欎笉浣跨敤 prompt
         if "prompt" in cfg.MODEL.TRANSFER_TYPE:
-            prompt_cfg = cfg.MODEL.PROMPT
+            prompt_cfg = cfg.MODEL.PROMPT.clone()
+            prompt_cfg.defrost()
+            # Keep top-level semantic module switches and prompt config consistent.
+            sem_cross = bool(getattr(getattr(cfg.MODEL, "SEMANTIC_CROSS_ATTN", None), "ENABLE", False))
+            shared_concept = bool(getattr(getattr(cfg.MODEL, "SHARED_CONCEPT", None), "ENABLE", False))
+            shared_aligner = bool(getattr(getattr(cfg.MODEL, "SHARED_ALIGNER", None), "ENABLE", False))
+            prompt_cfg.SEMANTIC_CROSS_ATTN_ENABLE = sem_cross
+            prompt_cfg.SHARED_CONCEPT_ENABLE = shared_concept
+            prompt_cfg.SHARED_ALIGNER_ENABLE = shared_aligner
+            sem_branch_cfg = getattr(cfg.MODEL, "SEMANTIC_BRANCH", None)
+            if sem_branch_cfg is not None:
+                if not hasattr(prompt_cfg, "SEMANTIC_BRANCH"):
+                    from ..configs.config_node import CfgNode  # local import to avoid circular issues
+                    prompt_cfg.SEMANTIC_BRANCH = CfgNode()
+                prompt_cfg.SEMANTIC_BRANCH.ENABLE = bool(getattr(sem_branch_cfg, "ENABLE", True))
+                prompt_cfg.SEMANTIC_BRANCH.NUM_TOKENS = int(getattr(sem_branch_cfg, "NUM_TOKENS", 4))
+                prompt_cfg.SEMANTIC_BRANCH.START_LAYER = int(getattr(sem_branch_cfg, "START_LAYER", 0))
+                prompt_cfg.SEMANTIC_BRANCH.END_LAYER = int(getattr(sem_branch_cfg, "END_LAYER", -1))
+                prompt_cfg.SEMANTIC_BRANCH.GAMMA_MIN = float(getattr(sem_branch_cfg, "GAMMA_MIN", 0.05))
+                prompt_cfg.SEMANTIC_BRANCH.GAMMA_MAX = float(getattr(sem_branch_cfg, "GAMMA_MAX", 1.0))
+            prompt_cfg.freeze()
         else:
             prompt_cfg = None
 
@@ -314,11 +334,8 @@ class ViT(nn.Module):
         #    - self.enc 閫氬父鏄?VisionTransformer 鎴?PromptedVisionTransformer
         #    - 鍏跺唴閮ㄧ殑 transformer 閲岃嫢鍚敤浜?SharedConceptAligner锛屽垯浼氭寕鍦?semantic_concept 涓?
         #    - getattr(getattr(...)) 鐨勫啓娉曟槸锛氳嫢涓棿浠绘剰涓€灞備笉瀛樺湪锛屽搴旇繑鍥?None 鑰屼笉鏄姤閿?
-        concept = getattr(getattr(self.enc, "transformer", None), "semantic_concept", None)
-        if concept is None:
-            # 鑻ユ湭鎵惧埌 semantic_concept锛岃鏄庝綘娌℃湁鍦?backbone 涓惎鐢ㄥ叡浜蹇靛熀锛?
-            # 姝ゆ椂鏋勫缓 R-similarity 澶存病鏈夋剰涔夛紝鐩存帴鎶ラ敊鎻愮ず閰嶇疆涓嶄竴鑷淬€?
-            raise ValueError("R-similarity head requires semantic concept aligner to be enabled")
+        # New mainline: legacy shared semantic concept is bypassed by default.
+        concept = None
 
         # 3) 妫€鏌ュ苟瑙勮寖绫诲睘鎬х煩闃碉細
         #    - 璁粌 R-similarity 澶村繀椤绘湁绫荤骇璇箟灞炴€э紝鍚﹀垯鏃犳硶鏋勯€犺涔夊師鍨?
@@ -347,12 +364,24 @@ class ViT(nn.Module):
             logit_scale_init=self.cfg.MODEL.R_SIMILARITY.LOGIT_SCALE_INIT,  # 鍒濆娓╁害/缂╂斁鍥犲瓙
             visual_proj_enable=self.cfg.MODEL.R_SIMILARITY.VISUAL_PROJ_ENABLE,  # 鏄惁瀵硅瑙変晶鍐嶅仛涓€灞傛姇褰?
             fixed_logit_scale=getattr(self.cfg.MODEL.R_SIMILARITY, "FIXED_LOGIT_SCALE", 0.0),
+            use_proto_per_sample=bool(getattr(self.cfg.MODEL.R_SIMILARITY, "USE_PROTO_PER_SAMPLE", False)),
             shuffle_prototypes=bool(getattr(getattr(self.cfg.SOLVER, "DIAG", None), "SHUFFLE_PROTOTYPES", False)),
             semantic_score_source=str(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_SOURCE", "auto")),
             semantic_score_mode=str(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_MODE", "global_refined")),
             semantic_score_topk=int(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_TOPK", 5)),
             semantic_score_alpha=float(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_ALPHA", 0.5)),
             semantic_score_train_include_gt=bool(getattr(self.cfg.MODEL, "SEMANTIC_SCORE_TRAIN_INCLUDE_GT", True)),
+            role_migration_enable=bool(getattr(getattr(self.cfg.MODEL, "ROLE_MIGRATION", None), "ENABLE", False)),
+            role_migration_early_end=int(getattr(getattr(self.cfg.MODEL, "ROLE_MIGRATION", None), "EARLY_END", 3)),
+            role_migration_late_start=int(getattr(getattr(self.cfg.MODEL, "ROLE_MIGRATION", None), "LATE_START", 9)),
+            agr_enable=bool(getattr(getattr(self.cfg.MODEL, "AGR", None), "ENABLE", False)),
+            agr_topk=int(getattr(getattr(self.cfg.MODEL, "AGR", None), "TOPK", getattr(self.cfg.MODEL, "SEMANTIC_SCORE_TOPK", 5))),
+            agr_alpha=float(getattr(getattr(self.cfg.MODEL, "AGR", None), "ALPHA", 0.2)),
+            agr_fuse_alpha=float(getattr(getattr(self.cfg.MODEL, "AGR", None), "FUSE_ALPHA", getattr(self.cfg.MODEL, "SEMANTIC_SCORE_ALPHA", 0.5))),
+            agr_train_include_gt=bool(getattr(getattr(self.cfg.MODEL, "AGR", None), "TRAIN_INCLUDE_GT", True)),
+            consistency_enable=bool(getattr(getattr(self.cfg.MODEL, "CONSISTENCY", None), "ENABLE", False)),
+            consistency_proj=str(getattr(getattr(self.cfg.MODEL, "CONSISTENCY", None), "PROJ", "linear")),
+            consistency_dist=str(getattr(getattr(self.cfg.MODEL, "CONSISTENCY", None), "DIST", "cosine")),
             debug_trace_once=bool(getattr(self.cfg.SOLVER, "DEBUG_TRACE_ONCE", False)),
         ).to(device)                    # 鎶婃暣涓垎绫诲ご绉诲姩鍒颁笌涓绘ā鍨嬬浉鍚岀殑 device 涓婏紝淇濊瘉鍓嶅悜/鍙嶅悜閮藉湪鍚屼竴璁惧鎵ц
 
@@ -391,6 +420,13 @@ class ViT(nn.Module):
 
         # 6) 閫氳繃 MLP 鎴?R-similarity 澶磋緭鍑?logits
         if self.r_similarity_head is not None:
+            # Non-affinity path: clear runtime token/affinity caches to avoid stale state.
+            self.r_similarity_head._runtime_token_sequence = None
+            self.r_similarity_head._runtime_affinities = None
+            transformer = getattr(self.enc, "transformer", None)
+            self.r_similarity_head._runtime_semantic_state = (
+                getattr(transformer, "_last_semantic_side_state", None) if transformer is not None else None
+            )
             x = self.r_similarity_head(x)
             logits_source = "r_similarity_head"
         else:
@@ -400,18 +436,21 @@ class ViT(nn.Module):
         if self.debug_trace_once and not self._debug_head_route_logged:
             trace_id = getattr(self, "_debug_trace_id", "trace=NA")
             prompt_noop_info = None
+            prompt_role_stats = None
             transformer = getattr(self.enc, "transformer", None)
             if transformer is not None:
                 prompt_noop_info = getattr(transformer, "_last_prompt_noop_info", None)
+                prompt_role_stats = getattr(transformer, "_last_prompt_role_stats", None)
             logger.info(
                 "[trace] %s node=C.vit_models.forward use_r_similarity_head=%s logits_source=%s logits_shape=%s "
-                "final_cls_or_pooled_feature_norm=%s prompt_noop_info=%s",
+                "final_cls_or_pooled_feature_norm=%s prompt_noop_info=%s prompt_role_stats=%s",
                 trace_id,
                 bool(self.r_similarity_head is not None),
                 logits_source,
                 tuple(x.shape) if torch.is_tensor(x) else None,
                 feature_norm_mean,
                 prompt_noop_info if isinstance(prompt_noop_info, dict) else None,
+                prompt_role_stats if isinstance(prompt_role_stats, dict) else None,
             )
             self._debug_head_route_logged = True
 
@@ -450,6 +489,16 @@ class ViT(nn.Module):
                 x, affinity_config, semantics=semantics
             )
             attn_weights = None
+
+        # Cache token-level runtime context for scoring heads that need late visual tokens / affinities.
+        r_head = self.r_similarity_head if self.r_similarity_head is not None else None
+        if r_head is not None:
+            r_head._runtime_token_sequence = feats.detach() if torch.is_tensor(feats) else None
+            r_head._runtime_affinities = affinities
+            transformer = getattr(self.enc, "transformer", None)
+            r_head._runtime_semantic_state = (
+                getattr(transformer, "_last_semantic_side_state", None) if transformer is not None else None
+            )
 
         # 涓?forward 瀵归綈锛歟nc 杈撳嚭鍙兘鏄?[B, 1+N, D] 鎴?[B, D]锛屽彇 CLS 鍚庢帴澶撮儴
         feats = feats[:, 0] if feats.dim() == 3 else feats

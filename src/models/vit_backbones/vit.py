@@ -476,7 +476,7 @@ class Block(nn.Module):
     段1：LN → MHSA → 残差
     段2：LN → MLP  → 残差
     """
-    def __init__(self, config, vis, semantic_dim=None):
+    def __init__(self, config, vis, semantic_dim=None, semantic_cross_attn_enable: bool = True):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size   # hidden_size=D：每个 token 的通道维度
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)   # 段1的 LayerNorm
@@ -484,7 +484,8 @@ class Block(nn.Module):
         self.ffn = Mlp(config)                  # 段2的两层 MLP（D→H→D，通常 H≈4D），完成通道内的非线性变换
         self.attn = Attention(config, vis)      # 段1的多头自注意力
         self.semantic_norm = LayerNorm(config.hidden_size, eps=1e-6)
-        self.semantic_attn = None if semantic_dim is None else SemanticCrossAttention(
+        self.semantic_cross_attn_enable = bool(semantic_cross_attn_enable)
+        self.semantic_attn = None if (semantic_dim is None or not self.semantic_cross_attn_enable) else SemanticCrossAttention(
             config.hidden_size,
             semantic_dim,
             config.transformer["num_heads"],
@@ -499,6 +500,8 @@ class Block(nn.Module):
           则在第一次调用时根据 semantics.size(-1) 实例化 SemanticCrossAttention。
         - 同时把新建的 semantic_attn 移到当前 device，避免参数留在 CPU。
         """
+        if not self.semantic_cross_attn_enable:
+            return
         if self.semantic_attn is None and semantics is not None:
             # 根据当前语义张量的最后一维确定 semantic_dim
             self._semantic_dim = semantics.size(-1)
@@ -574,7 +577,7 @@ class Block(nn.Module):
         x = x + h                   # 残差相加
 
         # 语义交叉注意力（可选）
-        if semantics is not None:
+        if semantics is not None and self.semantic_cross_attn_enable:
             self._ensure_semantic_attn(semantics, device=x.device)
             if self.semantic_attn is not None:
                 # 仅更新语义分支：遵循 VSPCN 式适配器，视觉序列保持由 ViT+prompt 控制
@@ -629,7 +632,7 @@ class Block(nn.Module):
         x = x + h
 
         # 语义交叉注意力（可选）
-        if semantics is not None:
+        if semantics is not None and self.semantic_cross_attn_enable:
             self._ensure_semantic_attn(semantics, device=x.device)
             if self.semantic_attn is not None:
                 x_norm = self.semantic_norm(x)
@@ -705,13 +708,13 @@ class Block(nn.Module):
 
 class Encoder(nn.Module):
     """堆叠多个 Transformer Block，并在末尾加一层 LayerNorm。"""
-    def __init__(self, config, vis, semantic_dim: int = None):
+    def __init__(self, config, vis, semantic_dim: int = None, semantic_cross_attn_enable: bool = True):
         super(Encoder, self).__init__()
         self.vis = vis
         self.layer = nn.ModuleList()    # 保存有序的多层子模块
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6) # 在所有 block 之后再做一次 LayerNorm
         for _ in range(config.transformer["num_layers"]):
-            layer = Block(config, vis, semantic_dim)  # 每层都是同结构的 Transformer Block（内部是 LN→MHSA→残差；LN→MLP→残差）
+            layer = Block(config, vis, semantic_dim, semantic_cross_attn_enable=semantic_cross_attn_enable)  # 每层都是同结构的 Transformer Block（内部是 LN→MHSA→残差；LN→MLP→残差）
             self.layer.append(copy.deepcopy(layer))
         # 本实现的 Block 属于 Pre-LN（在每个子层前 LN），额外的末端 LN（有些论文称 final LN）有助于稳定训练并改善表征
     def forward(self, hidden_states, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
@@ -790,10 +793,10 @@ class Transformer(nn.Module):
     """
     完整的 Transformer：Embeddings（CLS+patch+pos）+ Encoder（多层 Block）
     """
-    def __init__(self, config, img_size, vis, semantic_dim: int = None):
+    def __init__(self, config, img_size, vis, semantic_dim: int = None, semantic_cross_attn_enable: bool = True):
         super(Transformer, self).__init__()
         self.embeddings = Embeddings(config, img_size=img_size)
-        self.encoder = Encoder(config, vis, semantic_dim)
+        self.encoder = Encoder(config, vis, semantic_dim, semantic_cross_attn_enable=semantic_cross_attn_enable)
 
     def forward(self, input_ids, semantics: torch.Tensor = None):
         """标准前向：返回编码后的序列与注意力权重。"""
@@ -1126,4 +1129,3 @@ class ResNetV2(nn.Module):
         x = self.root(x)
         x = self.body(x)
         return x
-

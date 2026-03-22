@@ -3,11 +3,12 @@
 鎹熷け鍑芥暟瀹氫箟鏂囦欢锛?- 鍩虹鍒嗙被鎹熷け锛歋oftmaxLoss锛堟爣鍑嗗绫讳氦鍙夌喌锛?- 鍒嗙被 + 鎻愮ず瀵归綈缁勫悎鎹熷け锛歋oftmaxWithPromptAlignLoss锛圕E + L_avg锛?- RSimilarityClassifier锛氬熀浜庡叡浜蹇靛熀 R 鐨勭浉浼煎害鍒嗙被澶达紙涓嶆槸鎹熷け锛岃€屾槸涓€涓?head锛?"""
 
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ..models.vit_prompt.vit import SharedConceptAligner
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Tuple
 
 
 # ===========================
@@ -200,6 +201,98 @@ def _compute_cm_loss_from_rhead_cache(
     v_n = F.normalize(visual, dim=-1)
     s_n = F.normalize(s_pos, dim=-1)
     return ((v_n - s_n) ** 2).sum(dim=-1).mean()
+
+
+def _compute_role_migration_terms(
+    aux: Optional[Dict[str, Any]],
+    early_end: int,
+    late_start: int,
+) -> Dict[str, Optional[torch.Tensor]]:
+    """
+    Lightweight affinity-driven role losses from layer-wise aux:
+      - early: encourage A_pv energy > A_ps energy
+      - late:  encourage (A_ps + A_vs) > A_pv
+      - avs_entropy: encourage sharper late A_vs
+    """
+    out: Dict[str, Optional[torch.Tensor]] = {
+        "role_early": None,
+        "role_late": None,
+        "avs_entropy": None,
+    }
+    if aux is None or (not isinstance(aux, Dict)):
+        return out
+    attn_pv = aux.get("attn_pv")
+    attn_vs = aux.get("attn_vs")
+    attn_ps = aux.get("attn_ps")
+    if not isinstance(attn_pv, Dict) or not isinstance(attn_vs, Dict):
+        return out
+
+    layers = sorted(set(attn_pv.keys()) & set(attn_vs.keys()))
+    if len(layers) == 0:
+        return out
+    if isinstance(attn_ps, Dict):
+        layers_ps = set(attn_ps.keys())
+    else:
+        layers_ps = set()
+
+    early_layers = [l for l in layers if int(l) <= int(early_end)]
+    late_layers = [l for l in layers if int(l) >= int(late_start)]
+    if len(late_layers) == 0:
+        late_layers = [layers[-1]]
+
+    # Energy proxy: mean absolute attention value.
+    def _energy(x: torch.Tensor) -> torch.Tensor:
+        return x.float().abs().mean()
+
+    if early_layers and len(layers_ps) > 0:
+        e_pv = torch.stack([_energy(attn_pv[l]) for l in early_layers]).mean()
+        e_ps = torch.stack([_energy(attn_ps[l]) for l in early_layers if l in attn_ps]).mean()
+        out["role_early"] = F.relu(e_ps - e_pv)
+
+    if late_layers and len(layers_ps) > 0:
+        l_pv = torch.stack([_energy(attn_pv[l]) for l in late_layers]).mean()
+        l_ps = torch.stack([_energy(attn_ps[l]) for l in late_layers if l in attn_ps]).mean()
+        l_vs = torch.stack([_energy(attn_vs[l]) for l in late_layers]).mean()
+        out["role_late"] = F.relu(l_pv - 0.5 * (l_ps + l_vs))
+
+    # Late A_vs entropy (lower is sharper)
+    if late_layers:
+        ent = []
+        for l in late_layers:
+            x = attn_vs[l].float().clamp_min(1e-8)
+            ent.append((-(x * x.log()).sum(dim=-1)).mean())
+        out["avs_entropy"] = torch.stack(ent).mean()
+    return out
+
+
+def _compute_consistency_loss_from_rhead_cache(
+    model: Optional[nn.Module],
+    dist_type: str = "cosine",
+) -> Optional[torch.Tensor]:
+    if model is None:
+        return None
+    r_head = getattr(model, "r_similarity_head", None)
+    if r_head is None:
+        return None
+    mu_s_final = getattr(r_head, "_loss_last_mu_s_final", None)
+    h_y = getattr(r_head, "_loss_last_h_y", None)
+    if torch.is_tensor(mu_s_final) and torch.is_tensor(h_y) and mu_s_final.shape == h_y.shape:
+        delta_sem = mu_s_final - h_y
+    else:
+        delta_sem = getattr(r_head, "_loss_last_delta_sem", None)
+    target = getattr(r_head, "_loss_last_cons_target", None)
+    if (not torch.is_tensor(delta_sem)) or (not torch.is_tensor(target)):
+        return None
+    if delta_sem.numel() == 0 or target.numel() == 0:
+        return None
+    if delta_sem.shape != target.shape:
+        return None
+    if str(dist_type).lower() == "l2":
+        return ((delta_sem - target) ** 2).sum(dim=-1).mean()
+    # cosine (default)
+    d = F.normalize(delta_sem, dim=-1)
+    t = F.normalize(target, dim=-1)
+    return (1.0 - (d * t).sum(dim=-1)).mean()
 
 
 def _semantic_dist_from_attn(attn_pv: torch.Tensor, attn_vs: torch.Tensor, attn_ps: torch.Tensor, eps: float = 1e-6):
@@ -502,7 +595,8 @@ class SoftmaxWithPromptAlignLoss(nn.Module):
         # 鍩虹 CE 鍒嗙被鎹熷け
         base = self.cls_loss.loss(logits, targets, per_cls_weights, kwargs)
 
-        # 瀵归綈姝ｅ垯椤?        align = self._compute_align_loss(aux)
+        # 瀵归綈姝ｅ垯椤?
+        align = self._compute_align_loss(aux)
 
         if align is None:
             return base
@@ -542,6 +636,16 @@ class SoftmaxMarginCMLoss(nn.Module):
         self.hn_margin_value = float(getattr(cfg.SOLVER, "LOSS_HN_MARGIN_VALUE", 0.1)) if cfg is not None else 0.1
         self.hn_margin_start_epoch = int(getattr(cfg.SOLVER, "LOSS_HN_MARGIN_START_EPOCH", 0)) if cfg is not None else 0
         self.hn_detach_neg = bool(getattr(cfg.SOLVER, "LOSS_HN_DETACH_NEG", True)) if cfg is not None else True
+        self.role_early_weight = float(getattr(cfg.SOLVER, "LOSS_ROLE_EARLY_WEIGHT", 0.0)) if cfg is not None else 0.0
+        self.role_late_weight = float(getattr(cfg.SOLVER, "LOSS_ROLE_LATE_WEIGHT", 0.0)) if cfg is not None else 0.0
+        self.agr_res_weight = float(getattr(cfg.SOLVER, "LOSS_AGR_RES_WEIGHT", 0.0)) if cfg is not None else 0.0
+        self.avs_ent_weight = float(getattr(cfg.SOLVER, "LOSS_AVS_ENT_WEIGHT", 0.0)) if cfg is not None else 0.0
+        self.cons_weight = float(getattr(cfg.SOLVER, "LOSS_CONS_WEIGHT", 0.0)) if cfg is not None else 0.0
+        role_cfg = getattr(cfg.MODEL, "ROLE_MIGRATION", None) if cfg is not None else None
+        self.role_early_end = int(getattr(role_cfg, "EARLY_END", 3)) if role_cfg is not None else 3
+        self.role_late_start = int(getattr(role_cfg, "LATE_START", 9)) if role_cfg is not None else 9
+        cons_cfg = getattr(cfg.MODEL, "CONSISTENCY", None) if cfg is not None else None
+        self.consistency_dist = str(getattr(cons_cfg, "DIST", "cosine")).lower() if cons_cfg is not None else "cosine"
         diag_cfg = getattr(cfg.SOLVER, "DIAG", None) if cfg is not None else None
         self.diag_strict = bool(getattr(diag_cfg, "STRICT_CHECKS", False)) if diag_cfg is not None else False
         self.diag_print_wiring = bool(getattr(diag_cfg, "PRINT_LOSS_WIRING", False)) if diag_cfg is not None else False
@@ -611,6 +715,41 @@ class SoftmaxMarginCMLoss(nn.Module):
                 total = total + self.sem_route_weight * sem_route
             elif self.diag_strict:
                 raise RuntimeError("SemRoute enabled but sem-route term is unavailable (missing attn_ps/aux).")
+
+        role_terms = _compute_role_migration_terms(
+            aux=aux,
+            early_end=self.role_early_end,
+            late_start=self.role_late_start,
+        )
+        if self.role_early_weight > 0 and role_terms["role_early"] is not None:
+            total = total + self.role_early_weight * role_terms["role_early"]
+        if self.role_late_weight > 0 and role_terms["role_late"] is not None:
+            total = total + self.role_late_weight * role_terms["role_late"]
+        if self.avs_ent_weight > 0 and role_terms["avs_entropy"] is not None:
+            total = total + self.avs_ent_weight * role_terms["avs_entropy"]
+
+        # AGR residual norm regularizer: keep semantic delta small.
+        if self.agr_res_weight > 0 and model is not None:
+            r_head = getattr(model, "r_similarity_head", None)
+            delta_sem = getattr(r_head, "_loss_last_delta_sem", None) if r_head is not None else None
+            if torch.is_tensor(delta_sem) and delta_sem.numel() > 0:
+                agr_res = (delta_sem ** 2).sum(dim=-1).mean()
+                total = total + self.agr_res_weight * agr_res
+                self._last_hn_stats["agr_res_loss"] = float(agr_res.detach().item())
+
+        # AENet-style lightweight consistency on semantic increment only.
+        if self.cons_weight > 0:
+            cons = _compute_consistency_loss_from_rhead_cache(model=model, dist_type=self.consistency_dist)
+            if cons is not None:
+                total = total + self.cons_weight * cons
+                self._last_hn_stats["consistency_loss"] = float(cons.detach().item())
+
+        if role_terms["role_early"] is not None:
+            self._last_hn_stats["role_early_loss"] = float(role_terms["role_early"].detach().item())
+        if role_terms["role_late"] is not None:
+            self._last_hn_stats["role_late_loss"] = float(role_terms["role_late"].detach().item())
+        if role_terms["avs_entropy"] is not None:
+            self._last_hn_stats["avs_entropy"] = float(role_terms["avs_entropy"].detach().item())
 
         if self.diag_print_wiring and (not self._diag_printed):
             print(
@@ -684,7 +823,7 @@ class RSimilarityClassifier(nn.Module):
 
     def __init__(
         self,
-        semantic_concept: SharedConceptAligner,
+        semantic_concept: Optional[SharedConceptAligner],
         class_attr: torch.Tensor,
         hidden_size: int,
         proj_dim: int = None,
@@ -692,12 +831,24 @@ class RSimilarityClassifier(nn.Module):
         logit_scale_init: float = 10.0,
         visual_proj_enable: bool = False,
         fixed_logit_scale: float = 0.0,
+        use_proto_per_sample: bool = False,
         shuffle_prototypes: bool = False,
         semantic_score_source: str = "auto",
         semantic_score_mode: str = "global_refined",
         semantic_score_topk: int = 5,
         semantic_score_alpha: float = 0.5,
         semantic_score_train_include_gt: bool = True,
+        role_migration_enable: bool = False,
+        role_migration_early_end: int = 3,
+        role_migration_late_start: int = 9,
+        agr_enable: bool = False,
+        agr_topk: int = 5,
+        agr_alpha: float = 0.2,
+        agr_fuse_alpha: float = 0.5,
+        agr_train_include_gt: bool = True,
+        consistency_enable: bool = False,
+        consistency_proj: str = "linear",
+        consistency_dist: str = "cosine",
         debug_trace_once: bool = False,
     ) -> None:
         super().__init__()
@@ -707,14 +858,19 @@ class RSimilarityClassifier(nn.Module):
         self.semantic_concept = semantic_concept
         self.register_buffer("class_attr", class_attr.float())
         self.num_classes = class_attr.shape[0]
+        self.attr_dim = int(class_attr.shape[-1])
+        self.hidden_size = int(hidden_size)
 
         self.visual_proj_enabled = visual_proj_enable
         out_dim = proj_dim if self.visual_proj_enabled else hidden_size
         self.visual_proj = nn.Linear(hidden_size, out_dim) if self.visual_proj_enabled else None
         self.semantic_proj = nn.Linear(hidden_size, out_dim)
+        # Stable semantic anchor: h_c = Linear(s_raw_c)
+        self.semantic_anchor = nn.Linear(self.attr_dim, hidden_size)
 
         self.use_cosine = use_cosine
         self.fixed_logit_scale = float(fixed_logit_scale)
+        self.use_proto_per_sample = bool(use_proto_per_sample)
         self.shuffle_prototypes = bool(shuffle_prototypes)
 
         self.semantic_score_source = str(semantic_score_source).lower()
@@ -722,6 +878,28 @@ class RSimilarityClassifier(nn.Module):
         self.semantic_score_topk = int(max(1, semantic_score_topk))
         self.semantic_score_alpha = float(semantic_score_alpha)
         self.semantic_score_train_include_gt = bool(semantic_score_train_include_gt)
+        self.role_migration_enable = bool(role_migration_enable)
+        self.role_migration_early_end = int(role_migration_early_end)
+        self.role_migration_late_start = int(role_migration_late_start)
+        self.agr_enable = bool(agr_enable)
+        self.agr_topk = int(max(1, agr_topk))
+        self.agr_alpha = float(agr_alpha)
+        self.agr_fuse_alpha = float(agr_fuse_alpha)
+        self.agr_train_include_gt = bool(agr_train_include_gt)
+        self.consistency_enable = bool(consistency_enable)
+        self.consistency_proj = str(consistency_proj).lower()
+        self.consistency_dist = str(consistency_dist).lower()
+        if self.consistency_enable:
+            if self.consistency_proj == "mlp":
+                self.consistency_head = nn.Sequential(
+                    nn.Linear(self.attr_dim, hidden_size),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(hidden_size, out_dim),
+                )
+            else:
+                self.consistency_head = nn.Linear(self.attr_dim, out_dim)
+        else:
+            self.consistency_head = None
         self.debug_trace_once = bool(debug_trace_once)
 
         self._debug_sem_source_logged = False
@@ -735,7 +913,15 @@ class RSimilarityClassifier(nn.Module):
         self._loss_last_semantic_ref = None
         self._loss_last_scale = None
         self._loss_last_source = "refined"
+        self._loss_last_delta_sem = None
+        self._loss_last_cons_target = None
+        self._loss_last_delta_sem_norm = None
+        self._loss_last_mu_s_final = None
+        self._loss_last_h_y = None
         self._runtime_targets = None
+        self._runtime_token_sequence = None
+        self._runtime_affinities = None
+        self._runtime_semantic_state = None
         self._last_score_stats: Dict[str, Any] = {}
 
         if use_cosine:
@@ -744,22 +930,145 @@ class RSimilarityClassifier(nn.Module):
             self.logit_scale = None
 
     def _class_prototypes_raw(self) -> torch.Tensor:
-        attr = self.class_attr.to(self.semantic_concept.concept_slots.device)
-        if attr.dim() == 2:
-            attr = attr.unsqueeze(1)
-        self.semantic_concept._build_semantic_proj(attr.size(-1), device=attr.device)
-        semantic_tokens = self.semantic_concept.semantic_proj(attr)
-        semantic_tokens = self.semantic_concept.semantic_proj_norm(semantic_tokens)
-        return semantic_tokens.squeeze(1)
+        attr = self.class_attr
+        return self.semantic_anchor(attr)
 
     def _class_prototypes_refined(self) -> torch.Tensor:
-        attr = self.class_attr.to(self.semantic_concept.concept_slots.device)
+        # In role-migration mode, refinement is handled by late-stage AGR.
+        if self.role_migration_enable:
+            return self._class_prototypes_raw()
+        # Keep legacy refinement path for backward compatibility.
+        if self.semantic_concept is None:
+            return self._class_prototypes_raw()
+        attr = self.class_attr.to(next(self.semantic_concept.parameters()).device)
         return self.semantic_concept.encode_semantics_only(attr)
 
+    def _collect_role_summary_from_affinity(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        affinities = self._runtime_affinities if isinstance(self._runtime_affinities, list) else None
+        if not affinities:
+            return out
+
+        def _entropy(x: torch.Tensor) -> torch.Tensor:
+            p = x.clamp_min(1e-8)
+            return -(p * p.log()).sum(dim=-1).mean()
+
+        apv_energy: List[float] = []
+        aps_energy: List[float] = []
+        avs_energy: List[float] = []
+        apv_entropy: List[float] = []
+        per_layer: Dict[int, Dict[str, float]] = {}
+        for li, aff in enumerate(affinities):
+            if not isinstance(aff, dict):
+                continue
+            st: Dict[str, float] = {}
+            apv = aff.get("Apv")
+            aps = aff.get("Aps")
+            avs = aff.get("Avs")
+            if torch.is_tensor(apv):
+                x = apv.float()
+                e = float(x.abs().mean().item())
+                h = float(_entropy(x).item())
+                apv_energy.append(e)
+                apv_entropy.append(h)
+                st["apv_energy"] = e
+                st["apv_entropy"] = h
+            if torch.is_tensor(aps):
+                e = float(aps.float().abs().mean().item())
+                aps_energy.append(e)
+                st["aps_energy"] = e
+            if torch.is_tensor(avs):
+                e = float(avs.float().abs().mean().item())
+                avs_energy.append(e)
+                st["avs_energy"] = e
+            if st:
+                per_layer[int(li)] = st
+
+        if len(per_layer) == 0:
+            return out
+        out["affinity_per_layer"] = per_layer
+        out["affinity_apv_energy_mean"] = float(sum(apv_energy) / max(1, len(apv_energy)))
+        out["affinity_aps_energy_mean"] = float(sum(aps_energy) / max(1, len(aps_energy)))
+        out["affinity_avs_energy_mean"] = float(sum(avs_energy) / max(1, len(avs_energy)))
+        out["affinity_apv_entropy_mean"] = float(sum(apv_entropy) / max(1, len(apv_entropy)))
+
+        max_layer = max(per_layer.keys())
+        early_ids = [i for i in per_layer.keys() if i <= min(self.role_migration_early_end, max_layer)]
+        late_ids = [i for i in per_layer.keys() if i >= min(self.role_migration_late_start, max_layer)]
+
+        def _mean_for(layer_ids: List[int], key: str) -> Optional[float]:
+            vals = [float(per_layer[i][key]) for i in layer_ids if key in per_layer[i]]
+            if len(vals) == 0:
+                return None
+            return float(sum(vals) / len(vals))
+
+        if early_ids:
+            out["affinity_early_apv_energy"] = _mean_for(early_ids, "apv_energy")
+            out["affinity_early_aps_energy"] = _mean_for(early_ids, "aps_energy")
+            out["affinity_early_avs_energy"] = _mean_for(early_ids, "avs_energy")
+        if late_ids:
+            out["affinity_late_apv_energy"] = _mean_for(late_ids, "apv_energy")
+            out["affinity_late_aps_energy"] = _mean_for(late_ids, "aps_energy")
+            out["affinity_late_avs_energy"] = _mean_for(late_ids, "avs_energy")
+            out["affinity_late_apv_entropy"] = _mean_for(late_ids, "apv_entropy")
+        return out
+
+    def _agr_refine_candidates(
+        self,
+        visual_tokens: torch.Tensor,
+        raw_sim_raw: torch.Tensor,
+        raw_proto: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[float], Optional[float], Optional[float]]:
+        """
+        Late-stage AGR:
+          - coarse retrieval on raw scores
+          - top-k candidates get refined prototype via Avs-weighted residual
+          - non-candidates keep raw score
+        """
+        bsz, n_cls = raw_sim_raw.shape
+        k = int(min(max(1, self.agr_topk), n_cls))
+        topk_idx = torch.topk(raw_sim_raw, k=k, dim=1).indices
+        candidate_mask = torch.zeros_like(raw_sim_raw, dtype=torch.bool)
+        candidate_mask.scatter_(1, topk_idx, True)
+        pre_union_mask = candidate_mask.clone()
+        coarse_contains_gt = None
+        post_union_contains_gt = None
+        runtime_targets = self._runtime_targets if torch.is_tensor(self._runtime_targets) else None
+        if runtime_targets is not None and runtime_targets.numel() == bsz:
+            t = runtime_targets.to(raw_sim_raw.device, non_blocking=True).long().view(-1)
+            valid = (t >= 0) & (t < n_cls)
+            if valid.any():
+                row = torch.arange(bsz, device=raw_sim_raw.device)[valid]
+                coarse_contains_gt = float(pre_union_mask[row, t[valid]].float().mean().item())
+                if self.training and self.agr_train_include_gt:
+                    candidate_mask[row, t[valid]] = True
+                post_union_contains_gt = float(candidate_mask[row, t[valid]].float().mean().item())
+
+        # Avs from last layer (if available), fallback: uniform over patches.
+        avs_last = None
+        if isinstance(self._runtime_affinities, list):
+            for aff in reversed(self._runtime_affinities):
+                if isinstance(aff, dict) and torch.is_tensor(aff.get("Avs")):
+                    avs_last = aff["Avs"]
+                    break
+        if torch.is_tensor(avs_last) and avs_last.dim() == 4:
+            avs_last = avs_last.mean(dim=1)  # [B, N, M]
+        if torch.is_tensor(avs_last) and avs_last.dim() == 3 and avs_last.shape[2] == n_cls:
+            avs_cls_patch = avs_last.transpose(1, 2).contiguous()  # [B, C, N]
+        else:
+            # uniform fallback when affinity unavailable
+            avs_cls_patch = visual_tokens.new_full((bsz, n_cls, visual_tokens.shape[1]), 1.0 / max(1, visual_tokens.shape[1]))
+
+        delta = torch.bmm(avs_cls_patch, visual_tokens)  # [B, C, D]
+        mu_s_final = raw_proto.unsqueeze(0) + float(self.agr_alpha) * delta
+        return mu_s_final, candidate_mask, coarse_contains_gt, post_union_contains_gt, float(delta.norm(dim=-1).mean().item())
+
     def _select_classifier_prototypes(self, raw_proto: torch.Tensor, ref_proto: torch.Tensor):
+        if self.role_migration_enable:
+            return raw_proto, "raw_anchor"
         source = self.semantic_score_source
         if source == "auto":
-            source = "refined"
+            source = "raw"
         if source == "raw":
             return raw_proto, "raw"
         if source == "fused":
@@ -799,9 +1108,12 @@ class RSimilarityClassifier(nn.Module):
                 scale = self.logit_scale.exp()
 
             score_mode = self.semantic_score_mode
-            if self.training and score_mode != "coarse_to_fine":
+            if self.role_migration_enable and score_mode != "global_raw":
+                score_mode = "affinity_role_migration"
+            if self.training and score_mode not in {"coarse_to_fine", "affinity_role_migration", "agr_c2f"}:
                 score_mode = "global_refined" if sem_source == "refined" else ("global_raw" if sem_source == "raw" else "global_refined")
             coarse_topk_contains_gt = None
+            coarse_topk_contains_gt_postunion = None
 
             if score_mode == "global_raw":
                 logits = raw_sim_raw * scale
@@ -812,6 +1124,86 @@ class RSimilarityClassifier(nn.Module):
                     "semantic_score_alpha": float(self.semantic_score_alpha),
                     "semantic_score_train_include_gt": bool(self.semantic_score_train_include_gt),
                 }
+            elif score_mode == "global_refined":
+                logits = raw_sim_ref * scale
+                sem_source = "refined"
+                self._last_score_stats = {
+                    "semantic_score_mode": score_mode,
+                    "semantic_score_topk": int(self.semantic_score_topk),
+                    "semantic_score_alpha": float(self.semantic_score_alpha),
+                    "semantic_score_train_include_gt": bool(self.semantic_score_train_include_gt),
+                }
+            elif score_mode in {"affinity_role_migration", "agr_c2f"}:
+                # New path: raw anchors as coarse retrieval + late-stage AGR candidate refinement.
+                token_seq = self._runtime_token_sequence if torch.is_tensor(self._runtime_token_sequence) else None
+                if token_seq is not None and token_seq.dim() == 3:
+                    patch_tokens = token_seq[:, 1:, :] if token_seq.shape[1] > 1 else token_seq
+                else:
+                    patch_tokens = cls_feat.unsqueeze(1)
+                if self.visual_proj is not None:
+                    patch_tokens = self.visual_proj(patch_tokens)
+                patch_tokens = F.normalize(patch_tokens, dim=-1)
+
+                mu_s_final_all, candidate_mask, coarse_topk_contains_gt, coarse_topk_contains_gt_postunion, delta_norm = self._agr_refine_candidates(
+                    visual_tokens=patch_tokens,
+                    raw_sim_raw=raw_sim_raw,
+                    raw_proto=semantic_raw,
+                )
+                if self.use_proto_per_sample:
+                    # Legacy ablation path: build per-sample mixed bank (raw + candidate refined).
+                    proto_per_sample = semantic_raw.unsqueeze(0).expand_as(mu_s_final_all).clone()
+                    proto_per_sample[candidate_mask] = mu_s_final_all[candidate_mask]
+                    refined_bank = proto_per_sample
+                else:
+                    # Default path: mu_s_final is the only image-conditioned semantic object.
+                    refined_bank = mu_s_final_all
+                refined_sim = torch.einsum("bd,bcd->bc", visual, F.normalize(refined_bank, dim=-1))
+                a = float(self.agr_fuse_alpha)
+                blended = raw_sim_raw + a * (refined_sim - raw_sim_raw)
+                final_sim = torch.where(candidate_mask, blended, raw_sim_raw)
+                logits = final_sim * scale
+                sem_source = "affinity_role_migration(anchor+agr)"
+
+                with torch.no_grad():
+                    role_stats = self._collect_role_summary_from_affinity()
+                    self._last_score_stats = {
+                        "semantic_score_mode": "affinity_role_migration",
+                        "semantic_score_topk": int(self.agr_topk),
+                        "semantic_score_alpha": float(self.agr_fuse_alpha),
+                        "semantic_score_train_include_gt": bool(self.agr_train_include_gt),
+                        "use_proto_per_sample": bool(self.use_proto_per_sample),
+                        "coarse_topk_contains_gt_rate": coarse_topk_contains_gt,
+                        "coarse_topk_contains_gt_rate_postunion": coarse_topk_contains_gt_postunion,
+                        "candidate_source": "raw_topk",
+                        "agr_alpha": float(self.agr_alpha),
+                        "agr_delta_norm_mean": float(delta_norm) if delta_norm is not None else None,
+                    }
+                    self._last_score_stats.update(role_stats)
+
+                # Cache per-sample semantic delta for consistency loss on GT only.
+                self._loss_last_delta_sem = None
+                self._loss_last_cons_target = None
+                self._loss_last_delta_sem_norm = None
+                self._loss_last_mu_s_final = None
+                self._loss_last_h_y = None
+                runtime_targets = self._runtime_targets if torch.is_tensor(self._runtime_targets) else None
+                if runtime_targets is not None and runtime_targets.numel() == logits.shape[0]:
+                    t = runtime_targets.to(logits.device).long().view(-1)
+                    valid = (t >= 0) & (t < proto_raw.shape[0])
+                    if valid.any():
+                        ridx = torch.arange(logits.shape[0], device=logits.device)[valid]
+                        raw_y = semantic_raw.index_select(0, t[valid])
+                        fin_y = mu_s_final_all[ridx, t[valid]]
+                        self._loss_last_h_y = raw_y
+                        self._loss_last_mu_s_final = fin_y
+                        delta_sem = fin_y - raw_y
+                        self._loss_last_delta_sem = delta_sem
+                        self._loss_last_delta_sem_norm = float(delta_sem.norm(dim=-1).mean().item())
+                        if self.consistency_head is not None:
+                            attr_y = self.class_attr.index_select(0, t[valid]).to(delta_sem.device)
+                            target = self.consistency_head(attr_y)
+                            target = F.normalize(target, dim=-1) if self.use_cosine else target
+                            self._loss_last_cons_target = target
             elif score_mode == "coarse_to_fine":
                 k = int(min(max(1, self.semantic_score_topk), raw_sim_raw.shape[1]))
                 topk_idx = torch.topk(raw_sim_raw, k=k, dim=1).indices
@@ -878,6 +1270,7 @@ class RSimilarityClassifier(nn.Module):
                             candidate_delta_gap = float((gt_delta[both] - hn_delta[both]).mean().item())
                         if self.training and self.semantic_score_train_include_gt:
                             candidate_mask[row, t[valid]] = True
+                            coarse_topk_contains_gt_postunion = float(candidate_mask[row, t[valid]].float().mean().item())
 
                 a = float(self.semantic_score_alpha)
                 blended = raw_sim_raw + a * (raw_sim_ref - raw_sim_raw)
@@ -890,6 +1283,7 @@ class RSimilarityClassifier(nn.Module):
                     "semantic_score_alpha": float(self.semantic_score_alpha),
                     "semantic_score_train_include_gt": bool(self.semantic_score_train_include_gt),
                     "coarse_topk_contains_gt_rate": coarse_topk_contains_gt,
+                    "coarse_topk_contains_gt_rate_postunion": coarse_topk_contains_gt_postunion,
                     "coarse_recall_at_k": coarse_topk_contains_gt,
                     "coarse_recall_at_1": coarse_recall_at_1,
                     "coarse_recall_at_3": coarse_recall_at_3,
@@ -913,13 +1307,18 @@ class RSimilarityClassifier(nn.Module):
                     "semantic_score_alpha": float(self.semantic_score_alpha),
                     "semantic_score_train_include_gt": bool(self.semantic_score_train_include_gt),
                 }
+                self._loss_last_delta_sem = None
+                self._loss_last_cons_target = None
+                self._loss_last_delta_sem_norm = None
+                self._loss_last_mu_s_final = None
+                self._loss_last_h_y = None
 
             if self.debug_trace_once and (not self._debug_sem_source_logged):
                 scale_scalar = float(scale.item()) if torch.is_tensor(scale) else float(scale)
                 fixed_mode = bool(self.fixed_logit_scale > 0)
                 print(
                     "[trace] node=C.semantic_scoring semantic_score_mode={} topk={} alpha={:.4f} train_include_gt={} "
-                    "classifier_semantic_source={} coarse_topk_contains_gt={} "
+                    "classifier_semantic_source={} coarse_topk_contains_gt(pre_union)={} coarse_topk_contains_gt(post_union)={} "
                     "raw_semantic_shape={} refined_semantic_shape={} classifier_semantic_shape={} "
                     "raw_semantic_norm_mean={:.6f} refined_semantic_norm_mean={:.6f} classifier_semantic_norm_mean={:.6f} "
                     "effective_logit_scale={:.6f} whether_fixed_logit_scale={}".format(
@@ -929,12 +1328,13 @@ class RSimilarityClassifier(nn.Module):
                         bool(self.semantic_score_train_include_gt),
                         sem_source,
                         "NA" if coarse_topk_contains_gt is None else "{:.4f}".format(float(coarse_topk_contains_gt)),
+                        "NA" if coarse_topk_contains_gt_postunion is None else "{:.4f}".format(float(coarse_topk_contains_gt_postunion)),
                         tuple(proto_raw.shape),
                         tuple(proto_ref.shape),
-                        tuple(prototypes.shape),
+                        tuple(proto_raw.shape),
                         float(proto_raw.float().norm(dim=-1).mean().item()),
                         float(proto_ref.float().norm(dim=-1).mean().item()),
-                        float(prototypes.float().norm(dim=-1).mean().item()),
+                        float(proto_raw.float().norm(dim=-1).mean().item()),
                         scale_scalar,
                         fixed_mode,
                     )
@@ -946,21 +1346,70 @@ class RSimilarityClassifier(nn.Module):
             self._debug_last_raw_sim_ref = raw_sim_ref.detach()
             self._debug_last_scaled_logits = logits.detach()
             self._loss_last_visual = visual
-            self._loss_last_semantic = semantic
+            # Main classifier bank for losses/monitor stays on raw anchors for seen/unseen symmetry.
+            self._loss_last_semantic = semantic_raw
             self._loss_last_semantic_raw = semantic_raw
             self._loss_last_semantic_ref = semantic_ref
             self._loss_last_scale = scale
             self._loss_last_source = sem_source
+            sem_state = self._runtime_semantic_state if isinstance(self._runtime_semantic_state, dict) else None
+            if sem_state is not None:
+                mu_s_final = sem_state.get("mu_s_final")
+                h_y = sem_state.get("h_y")
+                delta_sem = sem_state.get("delta_sem")
+                if torch.is_tensor(mu_s_final) and torch.is_tensor(h_y):
+                    if (delta_sem is None) or (not torch.is_tensor(delta_sem)):
+                        delta_sem = mu_s_final - h_y
+                    self._loss_last_mu_s_final = mu_s_final
+                    self._loss_last_h_y = h_y
+                    self._loss_last_delta_sem = delta_sem
+                    self._loss_last_delta_sem_norm = float(delta_sem.norm(dim=-1).mean().item())
+                    self._loss_last_cons_target = None
+                    runtime_targets = self._runtime_targets if torch.is_tensor(self._runtime_targets) else None
+                    if self.consistency_head is not None and runtime_targets is not None and runtime_targets.numel() == delta_sem.shape[0]:
+                        t = runtime_targets.to(delta_sem.device).long().view(-1)
+                        valid = (t >= 0) & (t < self.class_attr.shape[0])
+                        if valid.any():
+                            attr_y = self.class_attr.index_select(0, t[valid]).to(delta_sem.device)
+                            target = self.consistency_head(attr_y)
+                            target = F.normalize(target, dim=-1) if self.use_cosine else target
+                            self._loss_last_cons_target = target
+            if self._loss_last_delta_sem is None and (not self.role_migration_enable):
+                # Fallback for non-AGR modes: use refined-vs-raw delta for GT if available.
+                runtime_targets = self._runtime_targets if torch.is_tensor(self._runtime_targets) else None
+                if runtime_targets is not None and runtime_targets.numel() == logits.shape[0]:
+                    t = runtime_targets.to(logits.device).long().view(-1)
+                    valid = (t >= 0) & (t < semantic_raw.shape[0])
+                    if valid.any():
+                        y = t[valid]
+                        d = semantic_ref.index_select(0, y) - semantic_raw.index_select(0, y)
+                        self._loss_last_h_y = semantic_raw.index_select(0, y)
+                        self._loss_last_mu_s_final = semantic_ref.index_select(0, y)
+                        self._loss_last_delta_sem = d
+                        self._loss_last_delta_sem_norm = float(d.norm(dim=-1).mean().item())
+                        if self.consistency_head is not None:
+                            attr_y = self.class_attr.index_select(0, y).to(d.device)
+                            target = self.consistency_head(attr_y)
+                            target = F.normalize(target, dim=-1) if self.use_cosine else target
+                            self._loss_last_cons_target = target
+            if self._loss_last_delta_sem is None:
+                self._loss_last_mu_s_final = None
+                self._loss_last_h_y = None
         else:
             logits = visual @ semantic.t()
             self._debug_last_raw_sim = logits.detach()
             self._debug_last_scaled_logits = logits.detach()
             self._loss_last_visual = visual
-            self._loss_last_semantic = semantic
+            self._loss_last_semantic = semantic_raw
             self._loss_last_semantic_raw = semantic_raw
             self._loss_last_semantic_ref = semantic_ref
             self._loss_last_scale = logits.new_tensor(1.0)
             self._loss_last_source = sem_source
+            self._loss_last_delta_sem = None
+            self._loss_last_cons_target = None
+            self._loss_last_delta_sem_norm = None
+            self._loss_last_mu_s_final = None
+            self._loss_last_h_y = None
 
         return logits
 
