@@ -77,6 +77,9 @@ def _classify_group(name: str) -> str:
     if "semantic_attn" in lower or "semantic_norm" in lower:
         return "semantic_cross_attn"
 
+    if "semantic_side_branch" in lower:
+        return "semantic_side_branch"
+
     if any(k in lower for k in ["affinity", "a_vs", "a_pv", "a_ps", "triple", "consistency"]):
         return "affinity_branch"
 
@@ -120,6 +123,7 @@ def log_trainable_parameters(
         "backbone_pretrained",
         "prompt_tokens",
         "prompt_distribution",
+        "semantic_side_branch",
         "shared_concept_R",
         "semantic_cross_attn",
         "affinity_branch",

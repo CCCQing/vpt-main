@@ -226,11 +226,16 @@ class ViT(nn.Module):
 
         # ---------- prompt锛氬彧璁粌 prompt 妯″潡 ----------
         elif transfer_type == "prompt":
-            # 浠呰缁?prompt 鐩稿叧鍙傛暟锛堝鍓嶇疆/涓棿鎻掑叆鐨勮櫄鎷?token锛?
-            # 鈿狅笍 鏈」鐩繕瀛樺湪璇箟姒傚康妲?璺ㄦā鎬佹敞鎰忕瓑鍙涔犳ā鍧楋紝鍙傛暟鍚嶉€氬父鍖呭惈
-            #    "semantic" / "concept" / "semantic_attn"锛岄渶瑕侀殢鎻愮ず涓€璧疯В鍐伙紱
-            #    鍚﹀垯瀹冧滑浼氳璇喕浣忥紝姊害鏃犳硶钀藉埌鍏变韩姒傚康鍩烘垨浜插拰璋冨埗涓娿€?
-            trainable_keys = ("prompt", "semantic", "concept", "semantic_attn")
+            # Strict freeze for pretrained ViT backbone in prompt mode:
+            # only prompt-specific modules and the lightweight semantic side branch are trainable.
+            trainable_keys = (
+                "prompt_embeddings",
+                "deep_prompt_embeddings",
+                "prompt_proj",
+                "prompt_update_layers",
+                "prompt_init_provider",
+                "semantic_side_branch",
+            )
             for k, p in self.enc.named_parameters():
                 if not any(key in k for key in trainable_keys):
                     p.requires_grad = False
