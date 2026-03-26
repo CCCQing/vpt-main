@@ -72,6 +72,7 @@ _C.MODEL.PROMPT.DISTRIBUTION_ONLY = True
 
 _C.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH = False    # 鏄惁姣忎釜 epoch 淇濆瓨 prompt
 _C.MODEL.PROMPT.DEBUG_FLOW = False             # 鏄惁鎵撳嵃 prompt 鍓嶅悜璋冭瘯淇℃伅
+_C.MODEL.PROMPT.DEBUG_SHAPES = False
 _C.MODEL.PROMPT.NOOP_KEEP_PARAMS = False
 # True: 淇濈暀 prompt 妯″潡鍜屽弬鏁帮紝浣嗕笉灏?prompt token 鐪熸娉ㄥ叆 backbone 搴忓垪
 _C.MODEL.LOG_TRAINABLE = True                  # 鏋勫缓妯″瀷鍚庢墦鍗板彲璁粌鍙傛暟缁熻
@@ -147,6 +148,12 @@ _C.MODEL.AGR.TRAIN_INCLUDE_GT = True       # 璁粌鏃舵槸鍚﹀己鍒舵�
 _C.MODEL.SEMANTIC_BRANCH = CfgNode()
 _C.MODEL.SEMANTIC_BRANCH.ENABLE = True
 _C.MODEL.SEMANTIC_BRANCH.NUM_TOKENS = 4
+_C.MODEL.SEMANTIC_BRANCH.USE_ANCHOR_FREE = False
+_C.MODEL.SEMANTIC_BRANCH.ANCHOR_TOKENS = 8
+_C.MODEL.SEMANTIC_BRANCH.FREE_TOKENS = 2
+_C.MODEL.SEMANTIC_BRANCH.FREE_COMPETE_LAMBDA = 0.5
+_C.MODEL.SEMANTIC_BRANCH.GAMMA_ANCHOR_SCALE = 1.0
+_C.MODEL.SEMANTIC_BRANCH.GAMMA_FREE_SCALE = 1.0
 _C.MODEL.SEMANTIC_BRANCH.START_LAYER = 0
 _C.MODEL.SEMANTIC_BRANCH.END_LAYER = -1
 _C.MODEL.SEMANTIC_BRANCH.GAMMA_MIN = 0.05
@@ -219,6 +226,8 @@ _C.SOLVER.LOSS_HN_DETACH_NEG = True
 _C.SOLVER.LOSS_ROLE_LATE_WEIGHT = 0.0      # 娣卞眰瑙掕壊杩佺Щ鎹熷け鏉冮噸
 _C.SOLVER.LOSS_AGR_RES_WEIGHT = 0.0        # AGR 娈嬪樊鑼冩暟绾︽潫鏉冮噸
 _C.SOLVER.LOSS_AVS_ENT_WEIGHT = 0.0        # A_vs 鐔?灏栭攼搴︾害鏉熸潈閲?_C.SOLVER.LOSS_CONS_WEIGHT = 0.0           # 涓€鑷存€ф崯澶辨潈閲?
+_C.SOLVER.LOSS_ANCHOR_CONS_WEIGHT = 0.0
+_C.SOLVER.LOSS_FREE_KD_WEIGHT = 0.0
 _C.SOLVER.DIAG = CfgNode()
 _C.SOLVER.DIAG.SHUFFLE_RAW_TARGETS = False
 _C.SOLVER.DIAG.SHUFFLE_PROTOTYPES = False
@@ -241,6 +250,7 @@ _C.SOLVER.LOG_EVERY_N = 1000
 # 璋冭瘯璁粌琛屼负
 _C.SOLVER.DEBUG_GRAD_NORM = False
 _C.SOLVER.DEBUG_TRACE_ONCE = False
+_C.SOLVER.DEBUG_SHAPES = False
 _C.SOLVER.OVERFIT_ONE_BATCH_STEPS = 0
 _C.SOLVER.OVERFIT_DISABLE_PROMPT_SAMPLING = False
 
@@ -262,6 +272,8 @@ _C.SOLVER.MONITOR.HEATMAP_TOPK = 50
 _C.SOLVER.VIS = CfgNode()
 _C.SOLVER.VIS.ENABLE = False
 _C.SOLVER.VIS.EVERY_EPOCH = 1
+# If non-empty, use explicit 1-based epoch list and ignore EVERY_EPOCH.
+_C.SOLVER.VIS.EPOCH_LIST = []
 _C.SOLVER.VIS.SPLITS = ["val", "test"]
 _C.SOLVER.VIS.MAX_SAMPLES = 8
 _C.SOLVER.VIS.SAVE_RAW = True
@@ -443,6 +455,14 @@ if not hasattr(_C.SOLVER, "LOSS_AVS_ENT_WEIGHT"):
     _C.SOLVER.LOSS_AVS_ENT_WEIGHT = 0.0
 if not hasattr(_C.SOLVER, "LOSS_CONS_WEIGHT"):
     _C.SOLVER.LOSS_CONS_WEIGHT = 0.0
+if not hasattr(_C.SOLVER, "LOSS_ANCHOR_CONS_WEIGHT"):
+    _C.SOLVER.LOSS_ANCHOR_CONS_WEIGHT = 0.0
+if not hasattr(_C.SOLVER, "LOSS_FREE_KD_WEIGHT"):
+    _C.SOLVER.LOSS_FREE_KD_WEIGHT = 0.0
+if not hasattr(_C.SOLVER, "DEBUG_SHAPES"):
+    _C.SOLVER.DEBUG_SHAPES = False
+if hasattr(_C.SOLVER, "VIS") and (not hasattr(_C.SOLVER.VIS, "EPOCH_LIST")):
+    _C.SOLVER.VIS.EPOCH_LIST = []
 if not hasattr(_C.SOLVER, "OPTIMIZER"):
     _C.SOLVER.OPTIMIZER = "sgd"
 if not hasattr(_C.SOLVER, "BASE_LR"):
@@ -499,6 +519,18 @@ if not hasattr(_sem_branch, "ENABLE"):
     _sem_branch.ENABLE = True
 if not hasattr(_sem_branch, "NUM_TOKENS"):
     _sem_branch.NUM_TOKENS = 4
+if not hasattr(_sem_branch, "USE_ANCHOR_FREE"):
+    _sem_branch.USE_ANCHOR_FREE = False
+if not hasattr(_sem_branch, "ANCHOR_TOKENS"):
+    _sem_branch.ANCHOR_TOKENS = 8
+if not hasattr(_sem_branch, "FREE_TOKENS"):
+    _sem_branch.FREE_TOKENS = 2
+if not hasattr(_sem_branch, "FREE_COMPETE_LAMBDA"):
+    _sem_branch.FREE_COMPETE_LAMBDA = 0.5
+if not hasattr(_sem_branch, "GAMMA_ANCHOR_SCALE"):
+    _sem_branch.GAMMA_ANCHOR_SCALE = 1.0
+if not hasattr(_sem_branch, "GAMMA_FREE_SCALE"):
+    _sem_branch.GAMMA_FREE_SCALE = 1.0
 if not hasattr(_sem_branch, "START_LAYER"):
     _sem_branch.START_LAYER = 0
 if not hasattr(_sem_branch, "END_LAYER"):
@@ -529,6 +561,18 @@ if not hasattr(_prompt_sem_branch, "ENABLE"):
     _prompt_sem_branch.ENABLE = bool(_sem_branch.ENABLE)
 if not hasattr(_prompt_sem_branch, "NUM_TOKENS"):
     _prompt_sem_branch.NUM_TOKENS = int(_sem_branch.NUM_TOKENS)
+if not hasattr(_prompt_sem_branch, "USE_ANCHOR_FREE"):
+    _prompt_sem_branch.USE_ANCHOR_FREE = bool(_sem_branch.USE_ANCHOR_FREE)
+if not hasattr(_prompt_sem_branch, "ANCHOR_TOKENS"):
+    _prompt_sem_branch.ANCHOR_TOKENS = int(_sem_branch.ANCHOR_TOKENS)
+if not hasattr(_prompt_sem_branch, "FREE_TOKENS"):
+    _prompt_sem_branch.FREE_TOKENS = int(_sem_branch.FREE_TOKENS)
+if not hasattr(_prompt_sem_branch, "FREE_COMPETE_LAMBDA"):
+    _prompt_sem_branch.FREE_COMPETE_LAMBDA = float(_sem_branch.FREE_COMPETE_LAMBDA)
+if not hasattr(_prompt_sem_branch, "GAMMA_ANCHOR_SCALE"):
+    _prompt_sem_branch.GAMMA_ANCHOR_SCALE = float(_sem_branch.GAMMA_ANCHOR_SCALE)
+if not hasattr(_prompt_sem_branch, "GAMMA_FREE_SCALE"):
+    _prompt_sem_branch.GAMMA_FREE_SCALE = float(_sem_branch.GAMMA_FREE_SCALE)
 if not hasattr(_prompt_sem_branch, "START_LAYER"):
     _prompt_sem_branch.START_LAYER = int(_sem_branch.START_LAYER)
 if not hasattr(_prompt_sem_branch, "END_LAYER"):

@@ -63,6 +63,7 @@ class ViT(nn.Module):
             prompt_cfg.SEMANTIC_CROSS_ATTN_ENABLE = sem_cross
             prompt_cfg.SHARED_CONCEPT_ENABLE = shared_concept
             prompt_cfg.SHARED_ALIGNER_ENABLE = shared_aligner
+            prompt_cfg.DEBUG_SHAPES = bool(getattr(cfg.SOLVER, "DEBUG_SHAPES", False))
             sem_branch_cfg = getattr(cfg.MODEL, "SEMANTIC_BRANCH", None)
             if sem_branch_cfg is not None:
                 if not hasattr(prompt_cfg, "SEMANTIC_BRANCH"):
@@ -70,6 +71,12 @@ class ViT(nn.Module):
                     prompt_cfg.SEMANTIC_BRANCH = CfgNode()
                 prompt_cfg.SEMANTIC_BRANCH.ENABLE = bool(getattr(sem_branch_cfg, "ENABLE", True))
                 prompt_cfg.SEMANTIC_BRANCH.NUM_TOKENS = int(getattr(sem_branch_cfg, "NUM_TOKENS", 4))
+                prompt_cfg.SEMANTIC_BRANCH.USE_ANCHOR_FREE = bool(getattr(sem_branch_cfg, "USE_ANCHOR_FREE", False))
+                prompt_cfg.SEMANTIC_BRANCH.ANCHOR_TOKENS = int(getattr(sem_branch_cfg, "ANCHOR_TOKENS", 8))
+                prompt_cfg.SEMANTIC_BRANCH.FREE_TOKENS = int(getattr(sem_branch_cfg, "FREE_TOKENS", 2))
+                prompt_cfg.SEMANTIC_BRANCH.FREE_COMPETE_LAMBDA = float(getattr(sem_branch_cfg, "FREE_COMPETE_LAMBDA", 0.5))
+                prompt_cfg.SEMANTIC_BRANCH.GAMMA_ANCHOR_SCALE = float(getattr(sem_branch_cfg, "GAMMA_ANCHOR_SCALE", 1.0))
+                prompt_cfg.SEMANTIC_BRANCH.GAMMA_FREE_SCALE = float(getattr(sem_branch_cfg, "GAMMA_FREE_SCALE", 1.0))
                 prompt_cfg.SEMANTIC_BRANCH.START_LAYER = int(getattr(sem_branch_cfg, "START_LAYER", 0))
                 prompt_cfg.SEMANTIC_BRANCH.END_LAYER = int(getattr(sem_branch_cfg, "END_LAYER", -1))
                 prompt_cfg.SEMANTIC_BRANCH.GAMMA_MIN = float(getattr(sem_branch_cfg, "GAMMA_MIN", 0.05))
@@ -388,6 +395,7 @@ class ViT(nn.Module):
             consistency_proj=str(getattr(getattr(self.cfg.MODEL, "CONSISTENCY", None), "PROJ", "linear")),
             consistency_dist=str(getattr(getattr(self.cfg.MODEL, "CONSISTENCY", None), "DIST", "cosine")),
             debug_trace_once=bool(getattr(self.cfg.SOLVER, "DEBUG_TRACE_ONCE", False)),
+            debug_shapes=bool(getattr(self.cfg.SOLVER, "DEBUG_SHAPES", False)),
         ).to(device)                    # 鎶婃暣涓垎绫诲ご绉诲姩鍒颁笌涓绘ā鍨嬬浉鍚岀殑 device 涓婏紝淇濊瘉鍓嶅悜/鍙嶅悜閮藉湪鍚屼竴璁惧鎵ц
 
 

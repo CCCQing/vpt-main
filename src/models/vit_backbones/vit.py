@@ -100,6 +100,8 @@ class Attention(nn.Module):
         self.proj_dropout = Dropout(config.transformer["attention_dropout_rate"])
 
         self.softmax = Softmax(dim=-1)
+        self.debug_shapes = False
+        self._shape_debug_forward_proj_logged = False
 
     def transpose_for_scores(self, x):
         """将张量从 [B, N, D] 变形为 [B, h, N, d_k] 以便做多头注意力。"""
@@ -197,6 +199,15 @@ class Attention(nn.Module):
         """
         query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
         attention_output, weights = self._scaled_attention(query_layer, key_layer, value_layer)
+        if self.debug_shapes and (not self._shape_debug_forward_proj_logged):
+            print(
+                "[SHAPE-DEBUG] Attention.forward_with_projections q_proj={} k_proj={} v_proj={}".format(
+                    tuple(query_layer.shape),
+                    tuple(key_layer.shape),
+                    tuple(value_layer.shape),
+                )
+            )
+            self._shape_debug_forward_proj_logged = True
         return attention_output, weights, query_layer, key_layer
 
     def compute_affinity(self, query_layer, key_layer, prompt_length, mode="qq", *,
@@ -276,6 +287,8 @@ class SemanticCrossAttention(nn.Module):
     def __init__(self, hidden_size: int, semantic_dim: int, num_heads: int, dropout: float = 0.0):
         super().__init__()
         self.num_heads = num_heads
+        self.debug_shapes = False
+        self._shape_debug_transpose_logged = False
         self.head_dim = hidden_size // num_heads
         self.all_head_size = self.head_dim * num_heads
 
@@ -295,9 +308,19 @@ class SemanticCrossAttention(nn.Module):
         将 [B, L, D_all] reshape 成多头格式 [B, h, L, d]。
         用于 patch/semantic 两侧的 Q/K/V 统一处理。
         """
+        x_in_shape = tuple(x.shape)
         new_x_shape = x.size()[:-1] + (self.num_heads, self.head_dim)
         x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
+        out = x.permute(0, 2, 1, 3)
+        if self.debug_shapes and (not self._shape_debug_transpose_logged):
+            print(
+                "[SHAPE-DEBUG] SemanticCrossAttention._transpose_for_scores in={} out={}".format(
+                    x_in_shape,
+                    tuple(out.shape),
+                )
+            )
+            self._shape_debug_transpose_logged = True
+        return out
 
     def forward(self, hidden_states: torch.Tensor, semantics: torch.Tensor, num_prompt_tokens: int = 0):
         """
@@ -485,6 +508,8 @@ class Block(nn.Module):
         self.attn = Attention(config, vis)      # 段1的多头自注意力
         self.semantic_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.semantic_cross_attn_enable = bool(semantic_cross_attn_enable)
+        self.debug_shapes = False
+        self._shape_debug_sem_aff_logged = False
         self.semantic_attn = None if (semantic_dim is None or not self.semantic_cross_attn_enable) else SemanticCrossAttention(
             config.hidden_size,
             semantic_dim,
@@ -566,6 +591,21 @@ class Block(nn.Module):
         if prompt_query.numel() > 0:
             aps_logits = torch.matmul(prompt_query, sem_key.transpose(-1, -2)) * scale
             sem_aff["Aps"] = F.softmax(aps_logits, dim=-1) if normalize else aps_logits
+
+        if self.debug_shapes and (not self._shape_debug_sem_aff_logged):
+            print(
+                "[SHAPE-DEBUG] Block._compute_semantic_affinity semantics={} semantics_seq={} sem_key={} "
+                "prompt_query={} patch_query={} Aps={} Avs={}".format(
+                    tuple(semantics.shape) if torch.is_tensor(semantics) else None,
+                    tuple(semantics_seq.shape),
+                    tuple(sem_key.shape),
+                    tuple(prompt_query.shape),
+                    tuple(patch_query.shape),
+                    tuple(sem_aff["Aps"].shape) if "Aps" in sem_aff else None,
+                    tuple(sem_aff["Avs"].shape) if "Avs" in sem_aff else None,
+                )
+            )
+            self._shape_debug_sem_aff_logged = True
 
         return sem_aff
 

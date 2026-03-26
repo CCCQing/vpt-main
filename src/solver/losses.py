@@ -499,9 +499,11 @@ class SoftmaxLoss(nn.Module):
         # 鎶?python list 杞垚鏀惧湪鍚屼竴璁惧涓婄殑 tensor
         weight = torch.tensor(per_cls_weights, device=logits.device)
 
-        # reduction="none"锛氬厛寰楀埌 [B]锛屾柟渚夸互鍚庡仛鑷畾涔夎仛鍚?        loss = F.cross_entropy(logits, targets, weight, reduction="none")
+        # reduction="none": keep per-sample losses first.
+        loss = F.cross_entropy(logits, targets, weight, reduction="none")
 
-        # 杩欓噷閫夋嫨瀵?batch 鍋氱畝鍗曞钩鍧?        return torch.sum(loss) / targets.shape[0]
+        # Batch mean.
+        return torch.sum(loss) / targets.shape[0]
 
     def forward(self, pred_logits, targets, per_cls_weights, kwargs=None):
         return self.loss(pred_logits, targets, per_cls_weights, kwargs)
@@ -522,8 +524,10 @@ class SoftmaxWithPromptAlignLoss(nn.Module):
 
     def __init__(self, cfg=None):
         super().__init__()
-        # 鏉ヨ嚜閰嶇疆鐨勫榻愭崯澶辨潈閲?alpha锛堥粯璁や负 0 琛ㄧず鍙敤 CE锛?        self.alpha = getattr(cfg.SOLVER, "LOSS_ALPHA", 0.0) if cfg is not None else 0.0
-        # 澶嶇敤宸叉湁鐨?SoftmaxLoss 瀹炵幇锛屼繚璇佹帴鍙ｄ竴鑷?        self.cls_loss = SoftmaxLoss(cfg)
+        # Align loss weight alpha (0 means CE only).
+        self.alpha = getattr(cfg.SOLVER, "LOSS_ALPHA", 0.0) if cfg is not None else 0.0
+        # Reuse existing SoftmaxLoss implementation.
+        self.cls_loss = SoftmaxLoss(cfg)
 
     def is_single(self):
         return True
@@ -641,6 +645,8 @@ class SoftmaxMarginCMLoss(nn.Module):
         self.agr_res_weight = float(getattr(cfg.SOLVER, "LOSS_AGR_RES_WEIGHT", 0.0)) if cfg is not None else 0.0
         self.avs_ent_weight = float(getattr(cfg.SOLVER, "LOSS_AVS_ENT_WEIGHT", 0.0)) if cfg is not None else 0.0
         self.cons_weight = float(getattr(cfg.SOLVER, "LOSS_CONS_WEIGHT", 0.0)) if cfg is not None else 0.0
+        self.anchor_cons_weight = float(getattr(cfg.SOLVER, "LOSS_ANCHOR_CONS_WEIGHT", 0.0)) if cfg is not None else 0.0
+        self.free_kd_weight = float(getattr(cfg.SOLVER, "LOSS_FREE_KD_WEIGHT", 0.0)) if cfg is not None else 0.0
         role_cfg = getattr(cfg.MODEL, "ROLE_MIGRATION", None) if cfg is not None else None
         self.role_early_end = int(getattr(role_cfg, "EARLY_END", 3)) if role_cfg is not None else 3
         self.role_late_start = int(getattr(role_cfg, "LATE_START", 9)) if role_cfg is not None else 9
@@ -743,6 +749,34 @@ class SoftmaxMarginCMLoss(nn.Module):
             if cons is not None:
                 total = total + self.cons_weight * cons
                 self._last_hn_stats["consistency_loss"] = float(cons.detach().item())
+
+        # Optional ablation 1: anchor-token consistency to class anchor h_y.
+        if self.anchor_cons_weight > 0 and model is not None:
+            r_head = getattr(model, "r_similarity_head", None)
+            sem_state = getattr(r_head, "_runtime_semantic_state", None) if r_head is not None else None
+            if isinstance(sem_state, dict):
+                a_tok = sem_state.get("anchor_tokens")
+                h_y = sem_state.get("h_y")
+                if torch.is_tensor(a_tok) and torch.is_tensor(h_y) and a_tok.dim() == 3 and h_y.dim() == 2 and a_tok.shape[0] == h_y.shape[0]:
+                    h = F.normalize(h_y, dim=-1).unsqueeze(1).expand_as(a_tok)
+                    a = F.normalize(a_tok, dim=-1)
+                    anchor_cons = (1.0 - (a * h).sum(dim=-1)).mean()
+                    total = total + self.anchor_cons_weight * anchor_cons
+                    self._last_hn_stats["anchor_cons_loss"] = float(anchor_cons.detach().item())
+
+        # Optional ablation 2: free-token KD to semantic increment direction.
+        if self.free_kd_weight > 0 and model is not None:
+            r_head = getattr(model, "r_similarity_head", None)
+            sem_state = getattr(r_head, "_runtime_semantic_state", None) if r_head is not None else None
+            if isinstance(sem_state, dict):
+                f_tok = sem_state.get("free_tokens")
+                delta_sem = sem_state.get("delta_sem")
+                if torch.is_tensor(f_tok) and torch.is_tensor(delta_sem) and f_tok.dim() == 3 and delta_sem.dim() == 2 and f_tok.shape[0] == delta_sem.shape[0] and f_tok.shape[1] > 0:
+                    t = F.normalize(delta_sem.detach(), dim=-1).unsqueeze(1).expand_as(f_tok)
+                    f = F.normalize(f_tok, dim=-1)
+                    free_kd = (1.0 - (f * t).sum(dim=-1)).mean()
+                    total = total + self.free_kd_weight * free_kd
+                    self._last_hn_stats["free_kd_loss"] = float(free_kd.detach().item())
 
         if role_terms["role_early"] is not None:
             self._last_hn_stats["role_early_loss"] = float(role_terms["role_early"].detach().item())
@@ -850,6 +884,7 @@ class RSimilarityClassifier(nn.Module):
         consistency_proj: str = "linear",
         consistency_dist: str = "cosine",
         debug_trace_once: bool = False,
+        debug_shapes: bool = False,
     ) -> None:
         super().__init__()
         if proj_dim is None or proj_dim <= 0:
@@ -901,8 +936,10 @@ class RSimilarityClassifier(nn.Module):
         else:
             self.consistency_head = None
         self.debug_trace_once = bool(debug_trace_once)
+        self.debug_shapes = bool(debug_shapes)
 
         self._debug_sem_source_logged = False
+        self._shape_debug_logged = False
         self._debug_last_raw_sim = None
         self._debug_last_raw_sim_raw = None
         self._debug_last_raw_sim_ref = None
@@ -1091,6 +1128,19 @@ class RSimilarityClassifier(nn.Module):
         semantic = self.semantic_proj(prototypes)
         semantic_raw = self.semantic_proj(proto_raw)
         semantic_ref = self.semantic_proj(proto_ref)
+
+        if self.debug_shapes and (not self._shape_debug_logged):
+            print(
+                "[SHAPE-DEBUG] RSimilarityClassifier.forward visual_feature={} semantic_prototype={} "
+                "visual_proj={} semantic_proj={} logits={}".format(
+                    tuple(cls_feat.shape) if torch.is_tensor(cls_feat) else None,
+                    tuple(prototypes.shape) if torch.is_tensor(prototypes) else None,
+                    tuple(visual.shape) if torch.is_tensor(visual) else None,
+                    tuple(semantic.shape) if torch.is_tensor(semantic) else None,
+                    (int(visual.shape[0]), int(semantic.shape[0])) if (torch.is_tensor(visual) and torch.is_tensor(semantic)) else None,
+                )
+            )
+            self._shape_debug_logged = True
 
         if self.use_cosine:
             visual = F.normalize(visual, dim=-1)

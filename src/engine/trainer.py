@@ -13,6 +13,7 @@ import numpy as np
 import json
 import csv
 import math
+import ast
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -120,12 +121,15 @@ class Trainer():
         self.cpu_device = torch.device("cpu")
         self.debug_grad_norm = bool(getattr(cfg.SOLVER, "DEBUG_GRAD_NORM", False))
         self.debug_trace_once = bool(getattr(cfg.SOLVER, "DEBUG_TRACE_ONCE", False))
+        self.debug_shapes = bool(getattr(cfg.SOLVER, "DEBUG_SHAPES", False))
         self.overfit_one_batch_steps = int(getattr(cfg.SOLVER, "OVERFIT_ONE_BATCH_STEPS", 0))
         self._debug_batch_stats_logged = False
         self._debug_grad_logged = False
         self._debug_step_logged = False
         self._debug_forward_trace_logged = False
         self._debug_semantic_param_names_logged = False
+        self._shape_debug_aux_logged = False
+        self._shape_debug_loss_aux_logged = False
         self._overfit_cached_batch = None
         self._named_param_cache = None
         self.use_seen_only_train_ce = False
@@ -160,6 +164,7 @@ class Trainer():
         vis_cfg = getattr(cfg.SOLVER, "VIS", None)
         self.vis_enable = bool(getattr(vis_cfg, "ENABLE", False)) if vis_cfg is not None else False
         self.vis_every_epoch = max(1, int(getattr(vis_cfg, "EVERY_EPOCH", 1))) if vis_cfg is not None else 1
+        self.vis_epoch_list = self._parse_vis_epoch_list(getattr(vis_cfg, "EPOCH_LIST", [])) if vis_cfg is not None else []
         self.vis_splits = list(getattr(vis_cfg, "SPLITS", ["val", "test"])) if vis_cfg is not None else ["val", "test"]
         self.vis_max_samples = max(1, int(getattr(vis_cfg, "MAX_SAMPLES", 8))) if vis_cfg is not None else 8
         self.vis_save_raw = bool(getattr(vis_cfg, "SAVE_RAW", True)) if vis_cfg is not None else True
@@ -177,9 +182,10 @@ class Trainer():
             # rollout needs per-layer attention weights
             self.affinity_vis = True
             logger.info(
-                "[vis] enable=%s every_epoch=%d splits=%s max_samples=%d save_raw=%s save_images=%s",
+                "[vis] enable=%s every_epoch=%d epoch_list=%s splits=%s max_samples=%d save_raw=%s save_images=%s",
                 bool(self.vis_enable),
                 int(self.vis_every_epoch),
+                self.vis_epoch_list,
                 self.vis_splits,
                 int(self.vis_max_samples),
                 bool(self.vis_save_raw),
@@ -220,6 +226,19 @@ class Trainer():
             return tuple(t.shape)
         return None
 
+    @staticmethod
+    def _extract_logits_and_aux_for_debug(pred_logits):
+        aux = None
+        logits = pred_logits
+        if isinstance(pred_logits, (list, tuple)) and len(pred_logits) > 0:
+            logits = pred_logits[0]
+            if len(pred_logits) > 1 and isinstance(pred_logits[1], dict):
+                aux = pred_logits[1]
+        elif isinstance(pred_logits, dict):
+            logits = pred_logits.get("logits", pred_logits)
+            aux = pred_logits
+        return logits, aux
+
     def _make_trace_id(self):
         return "stage={}|rank={}|epoch={}|iter={}|gstep={}".format(
             self._trace_stage,
@@ -232,13 +251,17 @@ class Trainer():
     def _set_model_trace_context(self, trace_id):
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
         setattr(model_ref, "_debug_trace_id", trace_id)
+        setattr(model_ref, "_debug_shapes", bool(self.debug_shapes))
         enc = getattr(model_ref, "enc", None)
         if enc is not None:
             setattr(enc, "_debug_trace_id", trace_id)
+            setattr(enc, "_debug_shapes", bool(self.debug_shapes))
             transformer = getattr(enc, "transformer", None)
             if transformer is not None:
                 setattr(transformer, "_debug_trace_id", trace_id)
+                setattr(transformer, "_debug_shapes", bool(self.debug_shapes))
         setattr(self.model, "_debug_trace_id", trace_id)
+        setattr(self.model, "_debug_shapes", bool(self.debug_shapes))
 
     def _named_params(self):
         if self._named_param_cache is None:
@@ -453,10 +476,45 @@ class Trainer():
     def _vis_split_enabled(self, split: str) -> bool:
         if not self.vis_enable:
             return False
-        if ((self._trace_epoch + 1) % self.vis_every_epoch) != 0:
-            return False
+        epoch_1based = int(self._trace_epoch + 1)
+        if len(self.vis_epoch_list) > 0:
+            if epoch_1based not in self.vis_epoch_list:
+                return False
+        else:
+            if (epoch_1based % self.vis_every_epoch) != 0:
+                return False
         allowed = {str(x).lower() for x in self.vis_splits}
         return str(split).lower() in allowed
+
+    @staticmethod
+    def _parse_vis_epoch_list(v) -> list:
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple)):
+            out = []
+            for x in v:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    continue
+            return sorted(set([x for x in out if x > 0]))
+        if isinstance(v, str):
+            s = v.strip()
+            if len(s) == 0:
+                return []
+            try:
+                parsed = ast.literal_eval(s)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, (list, tuple)):
+                out = []
+                for x in parsed:
+                    try:
+                        out.append(int(x))
+                    except Exception:
+                        continue
+                return sorted(set([x for x in out if x > 0]))
+        return []
 
     @staticmethod
     def _infer_grid(num_patches: int) -> int:
@@ -478,9 +536,37 @@ class Trainer():
             "token_specialization": [],
             "token_pairwise_cos": [],
             "gt_hn_gap": [],
+            "token_norm_mean": [],
+            "token_norm_std": [],
+            "token_norm_max": [],
+            "token_norm_p95": [],
+            "token_norm_p99": [],
+            "token_norm_outlier_ratio": [],
+            "token_usage_gini": [],
+            "token_monopoly_index": [],
+            "anchor_usage_gini": [],
+            "free_usage_gini": [],
+            "anchor_monopoly": [],
+            "free_monopoly": [],
         }
 
-    def _vis_update_trend(self, affinities, logits, targets, sem_tokens):
+    @staticmethod
+    def _gini_np(x: np.ndarray) -> float:
+        arr = np.asarray(x, dtype=np.float64).reshape(-1)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return float("nan")
+        arr = np.maximum(arr, 0.0)
+        s = float(arr.sum())
+        if s <= 0:
+            return float("nan")
+        arr = np.sort(arr)
+        n = arr.size
+        idx = np.arange(1, n + 1, dtype=np.float64)
+        g = (2.0 * np.sum(idx * arr) / (n * s)) - (n + 1.0) / n
+        return float(g)
+
+    def _vis_update_trend(self, affinities, logits, targets, sem_tokens, visual_tokens=None, sem_state=None):
         if not self.vis_trends:
             return
         if not isinstance(self._vis_trend_buf, dict):
@@ -503,6 +589,56 @@ class Trainer():
                     if avs2.dim() == 3 and avs2.numel() > 0:
                         spec = float(avs2.max(dim=-1).values.mean().item())
                         self._vis_trend_buf["token_specialization"].append(spec)
+                        usage = avs2.sum(dim=1)  # [B, M]
+                        usage_np = usage.detach().cpu().numpy()
+                        if usage_np.size > 0:
+                            g_all = np.array([self._gini_np(u) for u in usage_np], dtype=np.float64)
+                            mono_all = usage_np.max(axis=1) / np.clip(usage_np.sum(axis=1), 1e-12, None)
+                            g_all = g_all[np.isfinite(g_all)]
+                            mono_all = mono_all[np.isfinite(mono_all)]
+                            if g_all.size > 0:
+                                self._vis_trend_buf["token_usage_gini"].append(float(np.mean(g_all)))
+                            if mono_all.size > 0:
+                                self._vis_trend_buf["token_monopoly_index"].append(float(np.mean(mono_all)))
+                            if isinstance(sem_state, dict):
+                                a_tok = sem_state.get("anchor_tokens")
+                                f_tok = sem_state.get("free_tokens")
+                                a_n = int(a_tok.shape[1]) if torch.is_tensor(a_tok) and a_tok.dim() == 3 else 0
+                                f_n = int(f_tok.shape[1]) if torch.is_tensor(f_tok) and f_tok.dim() == 3 else 0
+                                m_tot = int(usage_np.shape[1])
+                                if a_n > 0 and (a_n + f_n) <= m_tot:
+                                    a_usage = usage_np[:, :a_n]
+                                    a_g = np.array([self._gini_np(u) for u in a_usage], dtype=np.float64)
+                                    a_m = a_usage.max(axis=1) / np.clip(a_usage.sum(axis=1), 1e-12, None)
+                                    a_g = a_g[np.isfinite(a_g)]
+                                    a_m = a_m[np.isfinite(a_m)]
+                                    if a_g.size > 0:
+                                        self._vis_trend_buf["anchor_usage_gini"].append(float(np.mean(a_g)))
+                                    if a_m.size > 0:
+                                        self._vis_trend_buf["anchor_monopoly"].append(float(np.mean(a_m)))
+                                if f_n > 0 and (a_n + f_n) <= m_tot:
+                                    f_usage = usage_np[:, a_n:a_n + f_n]
+                                    f_g = np.array([self._gini_np(u) for u in f_usage], dtype=np.float64)
+                                    f_m = f_usage.max(axis=1) / np.clip(f_usage.sum(axis=1), 1e-12, None)
+                                    f_g = f_g[np.isfinite(f_g)]
+                                    f_m = f_m[np.isfinite(f_m)]
+                                    if f_g.size > 0:
+                                        self._vis_trend_buf["free_usage_gini"].append(float(np.mean(f_g)))
+                                    if f_m.size > 0:
+                                        self._vis_trend_buf["free_monopoly"].append(float(np.mean(f_m)))
+        if torch.is_tensor(visual_tokens) and visual_tokens.dim() == 3 and visual_tokens.numel() > 0:
+            nrm = visual_tokens.detach().float().norm(dim=-1).reshape(-1)
+            if nrm.numel() > 0:
+                nrm_np = nrm.cpu().numpy()
+                mu = float(np.mean(nrm_np))
+                sd = float(np.std(nrm_np))
+                self._vis_trend_buf["token_norm_mean"].append(mu)
+                self._vis_trend_buf["token_norm_std"].append(sd)
+                self._vis_trend_buf["token_norm_max"].append(float(np.max(nrm_np)))
+                self._vis_trend_buf["token_norm_p95"].append(float(np.percentile(nrm_np, 95)))
+                self._vis_trend_buf["token_norm_p99"].append(float(np.percentile(nrm_np, 99)))
+                thr = mu + 2.0 * sd
+                self._vis_trend_buf["token_norm_outlier_ratio"].append(float(np.mean(nrm_np > thr)))
         if torch.is_tensor(sem_tokens) and sem_tokens.dim() == 3 and sem_tokens.shape[1] >= 2:
             t = torch.nn.functional.normalize(sem_tokens.detach().float(), dim=-1)
             sim = torch.einsum("bmd,bnd->bmn", t, t)
@@ -547,6 +683,18 @@ class Trainer():
             "token_specialization": float(np.mean(self._vis_trend_buf["token_specialization"])) if len(self._vis_trend_buf["token_specialization"]) > 0 else None,
             "token_pairwise_cos": float(np.mean(self._vis_trend_buf["token_pairwise_cos"])) if len(self._vis_trend_buf["token_pairwise_cos"]) > 0 else None,
             "gt_hn_gap": float(np.mean(self._vis_trend_buf["gt_hn_gap"])) if len(self._vis_trend_buf["gt_hn_gap"]) > 0 else None,
+            "token_norm_mean": float(np.mean(self._vis_trend_buf["token_norm_mean"])) if len(self._vis_trend_buf["token_norm_mean"]) > 0 else None,
+            "token_norm_std": float(np.mean(self._vis_trend_buf["token_norm_std"])) if len(self._vis_trend_buf["token_norm_std"]) > 0 else None,
+            "token_norm_max": float(np.mean(self._vis_trend_buf["token_norm_max"])) if len(self._vis_trend_buf["token_norm_max"]) > 0 else None,
+            "token_norm_p95": float(np.mean(self._vis_trend_buf["token_norm_p95"])) if len(self._vis_trend_buf["token_norm_p95"]) > 0 else None,
+            "token_norm_p99": float(np.mean(self._vis_trend_buf["token_norm_p99"])) if len(self._vis_trend_buf["token_norm_p99"]) > 0 else None,
+            "token_norm_outlier_ratio": float(np.mean(self._vis_trend_buf["token_norm_outlier_ratio"])) if len(self._vis_trend_buf["token_norm_outlier_ratio"]) > 0 else None,
+            "token_usage_gini": float(np.mean(self._vis_trend_buf["token_usage_gini"])) if len(self._vis_trend_buf["token_usage_gini"]) > 0 else None,
+            "token_monopoly_index": float(np.mean(self._vis_trend_buf["token_monopoly_index"])) if len(self._vis_trend_buf["token_monopoly_index"]) > 0 else None,
+            "anchor_usage_gini": float(np.mean(self._vis_trend_buf["anchor_usage_gini"])) if len(self._vis_trend_buf["anchor_usage_gini"]) > 0 else None,
+            "free_usage_gini": float(np.mean(self._vis_trend_buf["free_usage_gini"])) if len(self._vis_trend_buf["free_usage_gini"]) > 0 else None,
+            "anchor_monopoly": float(np.mean(self._vis_trend_buf["anchor_monopoly"])) if len(self._vis_trend_buf["anchor_monopoly"]) > 0 else None,
+            "free_monopoly": float(np.mean(self._vis_trend_buf["free_monopoly"])) if len(self._vis_trend_buf["free_monopoly"]) > 0 else None,
         }
         save_json(os.path.join(trend_dir, f"epoch_{epoch:03d}_trend.json"), out_json)
         append_csv_row(
@@ -559,11 +707,37 @@ class Trainer():
                 "gt_hn_gap": out_json["gt_hn_gap"],
                 "avs_entropy_mean": float(np.nanmean(avs_curve)) if len(avs_curve) > 0 else None,
                 "aps_entropy_mean": float(np.nanmean(aps_curve)) if len(aps_curve) > 0 else None,
+                "token_norm_mean": out_json["token_norm_mean"],
+                "token_norm_std": out_json["token_norm_std"],
+                "token_norm_max": out_json["token_norm_max"],
+                "token_norm_p95": out_json["token_norm_p95"],
+                "token_norm_p99": out_json["token_norm_p99"],
+                "token_norm_outlier_ratio": out_json["token_norm_outlier_ratio"],
+                "token_usage_gini": out_json["token_usage_gini"],
+                "token_monopoly_index": out_json["token_monopoly_index"],
+                "anchor_usage_gini": out_json["anchor_usage_gini"],
+                "free_usage_gini": out_json["free_usage_gini"],
+                "anchor_monopoly": out_json["anchor_monopoly"],
+                "free_monopoly": out_json["free_monopoly"],
             },
             field_order=[
                 "epoch", "split", "token_specialization", "token_pairwise_cos",
-                "gt_hn_gap", "avs_entropy_mean", "aps_entropy_mean"
+                "gt_hn_gap", "avs_entropy_mean", "aps_entropy_mean",
+                "token_norm_mean", "token_norm_std", "token_norm_max",
+                "token_norm_p95", "token_norm_p99", "token_norm_outlier_ratio",
+                "token_usage_gini", "token_monopoly_index",
+                "anchor_usage_gini", "free_usage_gini",
+                "anchor_monopoly", "free_monopoly",
             ],
+        )
+        logger.info(
+            "[vis-trend] split=%s epoch=%d token_norm_mean=%.4f token_norm_p95=%.4f gini=%.4f monopoly=%.4f",
+            split,
+            epoch,
+            float(out_json["token_norm_mean"]) if out_json["token_norm_mean"] is not None else float("nan"),
+            float(out_json["token_norm_p95"]) if out_json["token_norm_p95"] is not None else float("nan"),
+            float(out_json["token_usage_gini"]) if out_json["token_usage_gini"] is not None else float("nan"),
+            float(out_json["token_monopoly_index"]) if out_json["token_monopoly_index"] is not None else float("nan"),
         )
         if self.vis_save_images and len(layer_ids) > 0:
             plt.figure(figsize=(6, 4))
@@ -1470,6 +1644,25 @@ class Trainer():
                     "shape of model output: {}, targets: {}".format(
                         _logits.shape, targets.shape))
 
+            if self.debug_shapes and (not self._shape_debug_loss_aux_logged):
+                _, aux_dbg = self._extract_logits_and_aux_for_debug(loss_outputs)
+                if isinstance(aux_dbg, dict):
+                    attn_pv_dbg = aux_dbg.get("attn_pv")
+                    attn_vs_dbg = aux_dbg.get("attn_vs")
+                    attn_ps_dbg = aux_dbg.get("attn_ps")
+                    sample_layer = None
+                    if isinstance(attn_pv_dbg, dict) and len(attn_pv_dbg) > 0:
+                        sample_layer = sorted(attn_pv_dbg.keys())[0]
+                    print(
+                        "[SHAPE-DEBUG] trainer.loss_inputs attn_pv={} attn_vs={} attn_ps={} layer={}".format(
+                            tuple(attn_pv_dbg[sample_layer].shape) if isinstance(attn_pv_dbg, dict) and sample_layer in attn_pv_dbg else (tuple(attn_pv_dbg.shape) if torch.is_tensor(attn_pv_dbg) else None),
+                            tuple(attn_vs_dbg[sample_layer].shape) if isinstance(attn_vs_dbg, dict) and sample_layer in attn_vs_dbg else (tuple(attn_vs_dbg.shape) if torch.is_tensor(attn_vs_dbg) else None),
+                            tuple(attn_ps_dbg[sample_layer].shape) if isinstance(attn_ps_dbg, dict) and sample_layer in attn_ps_dbg else (tuple(attn_ps_dbg.shape) if torch.is_tensor(attn_ps_dbg) else None),
+                            sample_layer,
+                        )
+                    )
+                    self._shape_debug_loss_aux_logged = True
+
             # ================== 3. compute loss ==================
             model_ref = self.model.module if hasattr(self.model, "module") else self.model
             loss_kwargs = {
@@ -1533,12 +1726,18 @@ class Trainer():
         attn_vs = {}
         attn_ps = {}
 
+        raw_apv_shape = None
+        raw_avs_shape = None
+        raw_aps_shape = None
+
         for idx, affinity in enumerate(affinities):
             if not isinstance(affinity, dict):
                 continue
 
             apv = affinity.get("Apv")
             if apv is not None:
+                if raw_apv_shape is None and torch.is_tensor(apv):
+                    raw_apv_shape = tuple(apv.shape)
                 if apv.dim() == 4:
                     attn_pv[idx] = apv.mean(dim=1)
                 elif apv.dim() == 3:
@@ -1546,6 +1745,8 @@ class Trainer():
 
             avs = affinity.get("Avs")
             if avs is not None:
+                if raw_avs_shape is None and torch.is_tensor(avs):
+                    raw_avs_shape = tuple(avs.shape)
                 if avs.dim() == 4:
                     attn_vs[idx] = avs.mean(dim=1)
                 elif avs.dim() == 3:
@@ -1553,6 +1754,8 @@ class Trainer():
 
             aps = affinity.get("Aps")
             if aps is not None:
+                if raw_aps_shape is None and torch.is_tensor(aps):
+                    raw_aps_shape = tuple(aps.shape)
                 if aps.dim() == 4:
                     attn_ps[idx] = aps.mean(dim=1)
                 elif aps.dim() == 3:
@@ -1564,6 +1767,25 @@ class Trainer():
         out = {"attn_pv": attn_pv, "attn_vs": attn_vs}
         if attn_ps:
             out["attn_ps"] = attn_ps
+
+        if self.debug_shapes and (not self._shape_debug_aux_logged):
+            sample_layer = sorted(attn_pv.keys())[0] if len(attn_pv) > 0 else None
+            apv_after = tuple(attn_pv[sample_layer].shape) if sample_layer is not None else None
+            avs_after = tuple(attn_vs[sample_layer].shape) if sample_layer is not None and sample_layer in attn_vs else None
+            aps_after = tuple(attn_ps[sample_layer].shape) if sample_layer is not None and sample_layer in attn_ps else None
+            print(
+                "[SHAPE-DEBUG] trainer._extract_alignment_aux affinity_raw Apv={} Avs={} Aps={} "
+                "head_avg Apv={} Avs={} Aps={} layer={}".format(
+                    raw_apv_shape,
+                    raw_avs_shape,
+                    raw_aps_shape,
+                    apv_after,
+                    avs_after,
+                    aps_after,
+                    sample_layer,
+                )
+            )
+            self._shape_debug_aux_logged = True
 
         # Role-migration diagnostics (lightweight scalar summaries).
         role_cfg = getattr(getattr(self.cfg.MODEL, "ROLE_MIGRATION", None), "ENABLE", False)
@@ -2169,17 +2391,25 @@ class Trainer():
             total_logits.append(logits)
             if self._vis_split_enabled(prefix):
                 sem_tokens = None
+                vis_tokens = None
                 r_head_vis = getattr(model_ref, "r_similarity_head", None)
                 affinities_vis = getattr(r_head_vis, "_runtime_affinities", None) if r_head_vis is not None else None
                 sem_state_vis = getattr(r_head_vis, "_runtime_semantic_state", None) if r_head_vis is not None else None
                 if isinstance(sem_state_vis, dict):
                     sem_tokens = sem_state_vis.get("sem_tokens", None)
+                token_seq_vis = getattr(r_head_vis, "_runtime_token_sequence", None) if r_head_vis is not None else None
+                if torch.is_tensor(token_seq_vis) and token_seq_vis.dim() == 3:
+                    p_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS)
+                    p_eff = p_len if token_seq_vis.shape[1] > (1 + p_len) else 0
+                    vis_tokens = token_seq_vis[:, 1 + p_eff:, :]
                 if torch.is_tensor(logits):
                     self._vis_update_trend(
                         affinities=affinities_vis,
                         logits=logits.detach(),
                         targets=targets,
                         sem_tokens=sem_tokens,
+                        visual_tokens=vis_tokens,
+                        sem_state=sem_state_vis,
                     )
                     bsz = int(logits.shape[0])
                     for bi in range(bsz):

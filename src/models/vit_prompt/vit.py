@@ -264,6 +264,12 @@ class LateSemanticSideBranch(nn.Module):
         self,
         hidden_size: int,
         num_tokens: int = 4,
+        use_anchor_free: bool = False,
+        anchor_tokens: int = 8,
+        free_tokens: int = 2,
+        free_compete_lambda: float = 0.5,
+        gamma_anchor_scale: float = 1.0,
+        gamma_free_scale: float = 1.0,
         gamma_min: float = 0.05,
         gamma_max: float = 1.0,
         start_layer: int = 0,
@@ -271,7 +277,13 @@ class LateSemanticSideBranch(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = int(hidden_size)
-        self.num_tokens = int(max(1, num_tokens))
+        self.use_anchor_free = bool(use_anchor_free)
+        self.anchor_tokens = int(max(1, anchor_tokens))
+        self.free_tokens = int(max(0, free_tokens))
+        self.num_tokens = int(max(1, self.anchor_tokens + self.free_tokens)) if self.use_anchor_free else int(max(1, num_tokens))
+        self.free_compete_lambda = float(free_compete_lambda)
+        self.gamma_anchor_scale = float(gamma_anchor_scale)
+        self.gamma_free_scale = float(gamma_free_scale)
         self.gamma_min = float(gamma_min)
         self.gamma_max = float(gamma_max)
         self.start_layer = int(start_layer)
@@ -279,6 +291,10 @@ class LateSemanticSideBranch(nn.Module):
 
         self.anchor_proj: Optional[nn.Linear] = None
         self.token_init = nn.Linear(hidden_size, self.num_tokens * hidden_size)
+        self.anchor_token_init = nn.Linear(hidden_size, self.anchor_tokens * hidden_size) if self.use_anchor_free else None
+        self.free_token_init = nn.Linear(hidden_size, max(1, self.free_tokens) * hidden_size) if (self.use_anchor_free and self.free_tokens > 0) else None
+        self.anchor_slot_embed = nn.Parameter(torch.zeros(1, self.anchor_tokens, hidden_size)) if self.use_anchor_free else None
+        self.free_slot_embed = nn.Parameter(torch.zeros(1, self.free_tokens, hidden_size)) if (self.use_anchor_free and self.free_tokens > 0) else None
         self.delta_mlp = nn.Sequential(
             nn.Linear(hidden_size * 3, hidden_size * 2),
             nn.GELU(),
@@ -289,6 +305,14 @@ class LateSemanticSideBranch(nn.Module):
         self.readout_gate = nn.Linear(hidden_size, 1)
         self.readout_norm = nn.LayerNorm(hidden_size, eps=1e-6)
         self._last_readout_alpha: Optional[torch.Tensor] = None
+        self.debug_shapes = False
+        self._shape_debug_step_logged = False
+        self._shape_debug_readout_logged = False
+        self._shape_debug_init_logged = False
+        if self.anchor_slot_embed is not None:
+            nn.init.normal_(self.anchor_slot_embed, mean=0.0, std=0.02)
+        if self.free_slot_embed is not None:
+            nn.init.normal_(self.free_slot_embed, mean=0.0, std=0.02)
 
     def _ensure_anchor_proj(self, semantic_dim: int, device: torch.device):
         if self.anchor_proj is None:
@@ -311,8 +335,29 @@ class LateSemanticSideBranch(nn.Module):
             raise ValueError(f"LateSemanticSideBranch expects [B, S] or [B,1,S], got {tuple(semantics.shape)}")
         self._ensure_anchor_proj(semantics.shape[-1], device=device)
         h_y = self.anchor_proj(semantics.to(device))
-        sem_tokens = self.token_init(h_y).view(h_y.shape[0], self.num_tokens, self.hidden_size)
+        if self.use_anchor_free:
+            anchor_tokens = self.anchor_token_init(h_y).view(h_y.shape[0], self.anchor_tokens, self.hidden_size)
+            if self.anchor_slot_embed is not None:
+                anchor_tokens = anchor_tokens + self.anchor_slot_embed.expand(h_y.shape[0], -1, -1)
+            if self.free_tokens > 0:
+                free_tokens = self.free_token_init(h_y).view(h_y.shape[0], self.free_tokens, self.hidden_size)
+                if self.free_slot_embed is not None:
+                    free_tokens = free_tokens + self.free_slot_embed.expand(h_y.shape[0], -1, -1)
+                sem_tokens = torch.cat([anchor_tokens, free_tokens], dim=1)
+            else:
+                sem_tokens = anchor_tokens
+        else:
+            sem_tokens = self.token_init(h_y).view(h_y.shape[0], self.num_tokens, self.hidden_size)
         sem_tokens = self.delta_norm(sem_tokens)
+        if self.debug_shapes and (not self._shape_debug_init_logged):
+            print(
+                "[SHAPE-DEBUG] LateSemanticSideBranch.init_state semantics={} h_y={} sem_tokens={}".format(
+                    tuple(semantics.shape),
+                    tuple(h_y.shape),
+                    tuple(sem_tokens.shape),
+                )
+            )
+            self._shape_debug_init_logged = True
         return sem_tokens, h_y
 
     def step(
@@ -327,6 +372,7 @@ class LateSemanticSideBranch(nn.Module):
         sem_n = torch.nn.functional.normalize(sem_tokens.float(), dim=-1)
 
         aps = None
+        aps_logits = None
         if torch.is_tensor(prompt_tokens) and prompt_tokens.numel() > 0:
             p_n = torch.nn.functional.normalize(prompt_tokens.float(), dim=-1)
             aps_logits = torch.einsum("bpd,bmd->bpm", p_n, sem_n)
@@ -335,6 +381,7 @@ class LateSemanticSideBranch(nn.Module):
         else:
             ctx_p = sem_tokens.new_zeros(sem_tokens.shape)
 
+        avs_logits = None
         if torch.is_tensor(visual_tokens) and visual_tokens.numel() > 0:
             v_n = torch.nn.functional.normalize(visual_tokens.float(), dim=-1)
             avs_logits = torch.einsum("bnd,bmd->bnm", v_n, sem_n)
@@ -344,8 +391,41 @@ class LateSemanticSideBranch(nn.Module):
             avs = sem_tokens.new_zeros((sem_tokens.shape[0], 0, sem_tokens.shape[1]))
             ctx_v = sem_tokens.new_zeros(sem_tokens.shape)
 
-        delta = self.delta_mlp(torch.cat([sem_tokens, ctx_p, ctx_v], dim=-1))
-        sem_next = self.delta_norm(sem_tokens + gamma * delta)
+        free_patch_score = None
+        anchor_logits_adj = None
+        anchor_attn = None
+        free_logits = None
+        free_attn = None
+        anchor_delta = None
+        free_delta = None
+        if self.use_anchor_free and torch.is_tensor(visual_tokens) and visual_tokens.numel() > 0 and self.anchor_tokens > 0:
+            a = sem_tokens[:, :self.anchor_tokens, :]
+            f = sem_tokens[:, self.anchor_tokens:, :] if self.free_tokens > 0 else sem_tokens[:, :0, :]
+            a_n = torch.nn.functional.normalize(a.float(), dim=-1)
+            v_n = torch.nn.functional.normalize(visual_tokens.float(), dim=-1)
+            anchor_logits = torch.einsum("bad,bnd->ban", a_n, v_n)
+            if self.free_tokens > 0 and f.numel() > 0:
+                f_n = torch.nn.functional.normalize(f.float(), dim=-1)
+                free_logits = torch.einsum("bfd,bnd->bfn", f_n, v_n)
+                free_patch_score = free_logits.max(dim=1, keepdim=True).values
+                anchor_logits_adj = anchor_logits - self.free_compete_lambda * free_patch_score.detach()
+                free_attn = torch.softmax(free_logits, dim=-1)
+            else:
+                anchor_logits_adj = anchor_logits
+            anchor_attn = torch.softmax(anchor_logits_adj, dim=-1)
+            anchor_delta = torch.matmul(anchor_attn, visual_tokens)
+            anchor_next = a + (gamma * self.gamma_anchor_scale) * anchor_delta
+            if self.free_tokens > 0 and f.numel() > 0 and free_attn is not None:
+                free_delta = torch.matmul(free_attn, visual_tokens)
+                free_next = f + (gamma * self.gamma_free_scale) * free_delta
+                sem_next = torch.cat([anchor_next, free_next], dim=1)
+            else:
+                sem_next = anchor_next
+            sem_next = self.delta_norm(sem_next)
+        else:
+            delta = self.delta_mlp(torch.cat([sem_tokens, ctx_p, ctx_v], dim=-1))
+            sem_next = self.delta_norm(sem_tokens + gamma * delta)
+            anchor_delta = delta
 
         out_aff = {
             "Aps": aps.unsqueeze(1) if aps is not None else sem_tokens.new_zeros((sem_tokens.shape[0], 1, 0, sem_tokens.shape[1])),
@@ -356,18 +436,54 @@ class LateSemanticSideBranch(nn.Module):
             "aps_energy": float(out_aff["Aps"].float().abs().mean().item()) if out_aff["Aps"].numel() > 0 else 0.0,
             "avs_energy": float(out_aff["Avs"].float().abs().mean().item()) if out_aff["Avs"].numel() > 0 else 0.0,
         }
+        if self.debug_shapes and (not self._shape_debug_step_logged):
+            print(
+                "[SHAPE-DEBUG] LateSemanticSideBranch.step sem_tokens={} prompt_tokens={} visual_tokens={} "
+                "aps_logits={} avs_logits={} aps={} avs={} anchor_logits_adj={} free_patch_score={} "
+                "anchor_attn={} free_attn={} ctx_p={} ctx_v={} delta={} sem_next={}".format(
+                    tuple(sem_tokens.shape),
+                    tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None,
+                    tuple(visual_tokens.shape) if torch.is_tensor(visual_tokens) else None,
+                    tuple(aps_logits.shape) if torch.is_tensor(aps_logits) else None,
+                    tuple(avs_logits.shape) if torch.is_tensor(avs_logits) else None,
+                    tuple(aps.shape) if torch.is_tensor(aps) else None,
+                    tuple(avs.shape) if torch.is_tensor(avs) else None,
+                    tuple(anchor_logits_adj.shape) if torch.is_tensor(anchor_logits_adj) else None,
+                    tuple(free_patch_score.shape) if torch.is_tensor(free_patch_score) else None,
+                    tuple(anchor_attn.shape) if torch.is_tensor(anchor_attn) else None,
+                    tuple(free_attn.shape) if torch.is_tensor(free_attn) else None,
+                    tuple(ctx_p.shape),
+                    tuple(ctx_v.shape),
+                    tuple(anchor_delta.shape) if torch.is_tensor(anchor_delta) else None,
+                    tuple(sem_next.shape),
+                )
+            )
+            self._shape_debug_step_logged = True
         return sem_next, out_aff, diag
 
     def readout(self, sem_tokens: torch.Tensor) -> torch.Tensor:
         # sem_tokens: [B, M, D]
-        tokens_n = self.readout_token_norm(sem_tokens)
+        read_tokens = sem_tokens[:, :self.anchor_tokens, :] if self.use_anchor_free else sem_tokens
+        tokens_n = self.readout_token_norm(read_tokens)
         # score: [B, M, 1] -> [B, M]
         score = self.readout_gate(tokens_n).squeeze(-1)
         alpha = torch.softmax(score, dim=1)
         self._last_readout_alpha = alpha.detach()
         # weighted sum over token dimension
-        mu = torch.sum(alpha.unsqueeze(-1) * sem_tokens, dim=1)
-        return self.readout_norm(mu)
+        mu = torch.sum(alpha.unsqueeze(-1) * read_tokens, dim=1)
+        out = self.readout_norm(mu)
+        if self.debug_shapes and (not self._shape_debug_readout_logged):
+            print(
+                "[SHAPE-DEBUG] LateSemanticSideBranch.readout sem_tokens={} score={} alpha={} mu={} out={}".format(
+                    tuple(sem_tokens.shape),
+                    tuple(score.shape),
+                    tuple(alpha.shape),
+                    tuple(mu.shape),
+                    tuple(out.shape),
+                )
+            )
+            self._shape_debug_readout_logged = True
+        return out
 
 class PromptedTransformer(Transformer):
     """
@@ -451,6 +567,12 @@ class PromptedTransformer(Transformer):
             self.semantic_side_branch = LateSemanticSideBranch(
                 hidden_size=int(config.hidden_size),
                 num_tokens=int(getattr(self.semantic_branch_cfg, "NUM_TOKENS", 4)),
+                use_anchor_free=bool(getattr(self.semantic_branch_cfg, "USE_ANCHOR_FREE", False)),
+                anchor_tokens=int(getattr(self.semantic_branch_cfg, "ANCHOR_TOKENS", 8)),
+                free_tokens=int(getattr(self.semantic_branch_cfg, "FREE_TOKENS", 2)),
+                free_compete_lambda=float(getattr(self.semantic_branch_cfg, "FREE_COMPETE_LAMBDA", 0.5)),
+                gamma_anchor_scale=float(getattr(self.semantic_branch_cfg, "GAMMA_ANCHOR_SCALE", 1.0)),
+                gamma_free_scale=float(getattr(self.semantic_branch_cfg, "GAMMA_FREE_SCALE", 1.0)),
                 gamma_min=float(getattr(self.semantic_branch_cfg, "GAMMA_MIN", 0.05)),
                 gamma_max=float(getattr(self.semantic_branch_cfg, "GAMMA_MAX", 1.0)),
                 start_layer=start_layer,
@@ -503,8 +625,10 @@ class PromptedTransformer(Transformer):
         self.detach_prompt_grad = getattr(
             self.prompt_config, "DETACH_PROMPT_GRAD", False)
         self.debug_prompt_flow = getattr(self.prompt_config, "DEBUG_FLOW", False)
+        self.debug_shapes = bool(getattr(self.prompt_config, "DEBUG_SHAPES", False))
         self.noop_keep_params = bool(getattr(self.prompt_config, "NOOP_KEEP_PARAMS", False))
         self._debug_prompt_flow_logged = False
+        self._shape_debug_incorporate_logged = False
         self._last_prompt_noop_info = {}
 
         if self.runtime_prompt_only:
@@ -560,6 +684,15 @@ class PromptedTransformer(Transformer):
         # [CLS] + [ PROMPT 脳 P ] + [ PATCH 脳 N ]   鈫? (B, 1+P+N, D)
         else:
             raise ValueError("Other initiation scheme is not supported")
+
+        if self.semantic_side_branch is not None:
+            self.semantic_side_branch.debug_shapes = bool(self.debug_shapes)
+        for layer_block in getattr(self.encoder, "layer", []):
+            setattr(layer_block, "debug_shapes", bool(self.debug_shapes))
+            if hasattr(layer_block, "attn"):
+                setattr(layer_block.attn, "debug_shapes", bool(self.debug_shapes))
+            if hasattr(layer_block, "semantic_attn") and layer_block.semantic_attn is not None:
+                setattr(layer_block.semantic_attn, "debug_shapes", bool(self.debug_shapes))
 
         # 鏄惁鍐荤粨鍘熷 prompt 宓屽叆鍙傛暟锛屼娇姊害涓昏钀藉湪鍒嗗竷缃戠粶绛夊叾浠栨敮璺笂
         self.freeze_embeddings = getattr(self.prompt_config, "FREEZE_EMBEDDINGS", True)
@@ -687,6 +820,18 @@ class PromptedTransformer(Transformer):
                 ), dim=1)
             prompt_injected = True
 
+        if self.debug_shapes and (not self._shape_debug_incorporate_logged):
+            print(
+                "[SHAPE-DEBUG] PromptedTransformer.incorporate_prompt patch_tokens={} prompt_tokens={} x_base={} x={} semantics={}".format(
+                    tuple(patch_tokens.shape),
+                    tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None,
+                    tuple(x_base.shape),
+                    tuple(x.shape),
+                    tuple(semantics.shape) if torch.is_tensor(semantics) else None,
+                )
+            )
+            self._shape_debug_incorporate_logged = True
+
         if self.debug_prompt_flow and not self._debug_prompt_flow_logged:
             trace_id = getattr(self, "_debug_trace_id", "trace=NA")
             logger.info(
@@ -772,6 +917,9 @@ class PromptedTransformer(Transformer):
         self._last_prompt_role_stats = {
             "semantic_branch_enable": True,
             "semantic_branch_num_tokens": int(self.semantic_side_branch.num_tokens),
+            "semantic_branch_use_anchor_free": bool(getattr(self.semantic_side_branch, "use_anchor_free", False)),
+            "semantic_branch_anchor_tokens": int(getattr(self.semantic_side_branch, "anchor_tokens", self.semantic_side_branch.num_tokens)),
+            "semantic_branch_free_tokens": int(getattr(self.semantic_side_branch, "free_tokens", 0)),
             "semantic_branch_start_layer": int(self.semantic_side_branch.start_layer),
             "semantic_branch_end_layer": int(self.semantic_side_branch.end_layer),
             "semantic_branch_num_layers": int(num_layers),
@@ -868,6 +1016,8 @@ class PromptedTransformer(Transformer):
                 "sem_tokens": sem_tokens,
                 "mu_s_final": mu_s_final,
                 "delta_sem": delta_sem,
+                "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
+                "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
             }
             self._monitor_last_refined_semantics = mu_s_final.detach()
         return encoded, attn_weights
@@ -933,6 +1083,8 @@ class PromptedTransformer(Transformer):
                 "sem_tokens": sem_tokens,
                 "mu_s_final": mu_s_final,
                 "delta_sem": delta_sem,
+                "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
+                "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
             }
             self._monitor_last_refined_semantics = mu_s_final.detach()
         return encoded, attn_weights, affinities
@@ -982,6 +1134,8 @@ class PromptedTransformer(Transformer):
                     "sem_tokens": sem_tokens,
                     "mu_s_final": mu_s_final,
                     "delta_sem": mu_s_final - h_y,
+                    "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
+                    "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
                 }
                 self._monitor_last_refined_semantics = mu_s_final.detach()
 
@@ -1035,6 +1189,8 @@ class PromptedTransformer(Transformer):
                     "sem_tokens": sem_tokens,
                     "mu_s_final": mu_s_final,
                     "delta_sem": mu_s_final - h_y,
+                    "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
+                    "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
                 }
                 self._monitor_last_refined_semantics = mu_s_final.detach()
 
