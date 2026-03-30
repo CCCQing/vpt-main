@@ -298,7 +298,8 @@ _C.SOLVER.DEBUG_SHAPES = False
 _C.SOLVER.OVERFIT_ONE_BATCH_STEPS = 0
 _C.SOLVER.OVERFIT_DISABLE_PROMPT_SAMPLING = False
 
-# 闆舵牱鏈瘎浼版ā寮?_C.SOLVER.EVAL_MODE = "zsl"
+# 闆舵牱鏈瘎浼版ā寮?
+_C.SOLVER.EVAL_MODE = "zsl"
 _C.SOLVER.GZSL = True  # 鏃х増鍏煎寮€鍏筹紝寤鸿瀹為檯浠?EVAL_MODE 涓哄噯
 
 _C.SOLVER.MONITOR = CfgNode()
@@ -333,7 +334,8 @@ _C.SOLVER.DBG_TRAINABLE = False # 鑻ヤ负 True锛屽皢鎵撳嵃鍙缁�
 # Dataset options 鏁版嵁闆嗛€夐」
 # ----------------------------------------------------------------------
 _C.DATA = CfgNode()
-_C.DATA_ROOT = ""                          # 椤跺眰鏁版嵁鏍圭洰褰曪紙渚?demo / 澶栭儴 loader 浣跨敤锛?_C.DATA.NAME = "CUB_200_2011"
+_C.DATA_ROOT = ""                          # 椤跺眰鏁版嵁鏍圭洰褰曪紙渚?demo / 澶栭儴 loader 浣跨敤锛?
+_C.DATA.NAME = "CUB_200_2011"
 _C.DATA.DATAPATH = "datasets/CUB/CUB_200_2011"
 _C.DATA.FEATURE = "sup_vitb16_224"         # 棰勬彁鍙栫壒寰佸悕绉版垨 backbone 鏍囪瘑
 

@@ -42,16 +42,25 @@ MODEL:
     ENABLE: True
     USE_COSINE: True
     LOGIT_SCALE_INIT: 10.0
+
+  SEMANTIC_SCORE_MODE: "global_raw"
+  SEMANTIC_SCORE_SOURCE: "raw"
+  SEMANTIC_SCORE_TRAIN_INCLUDE_GT: false
+  SEMANTIC_SCORE_EVAL_OVERRIDE: "global_raw"
+
+  AGR:
+    TRAIN_INCLUDE_GT: false
+
 SOLVER:
   EVAL_MODE: "gzsl"    # switch to "gzsl" (and/or set GZSL: true) for generalized ZSL
   BASE_LR: 0.0005           # 0.1
   WEIGHT_DECAY: 0.0001     # 0.01
   WARMUP_EPOCH: 3
-  TOTAL_EPOCH: 20
+  TOTAL_EPOCH: 1
   LOSS: "softmax_margin_cm"
   LOSS_CM_WEIGHT: 0.05
   LOSS_CONS_WEIGHT: 0.02
-  LOSS_ANCHOR_CONS_WEIGHT: 0.01
+  LOSS_ANCHOR_CONS_WEIGHT: 0.0
   LOSS_FREE_KD_WEIGHT: 0.0
   OPTIMIZER: "adamw"
   SCHEDULER: "cosine"
