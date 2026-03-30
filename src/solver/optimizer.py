@@ -9,6 +9,7 @@ https://github.com/huggingface/transformers/blob/master/transformers/optimizatio
 import math
 
 import torch
+import torch.nn as nn
 from fvcore.common.config import CfgNode
 from torch.optim import Optimizer
 import torch.optim as optim
@@ -16,6 +17,103 @@ from typing import Any, Callable, Iterable, List, Tuple, Optional
 
 from ..utils import logging
 logger = logging.get_logger("visual_prompt")
+
+
+def _build_adamw_param_groups(
+    params: List[Tuple[str, torch.nn.Parameter]],
+    models: List[Any],
+    train_params: CfgNode,
+) -> List[dict]:
+    no_decay_keywords = (
+        "prompt_embeddings",
+        "deep_prompt_embeddings",
+        "concept_slots",
+        "cls_token",
+        "position_embeddings",
+        "pos_embed",
+        "positional_embedding",
+        "anchor_slot_embed",
+        "free_slot_embed",
+    )
+
+    norm_classes = (
+        nn.LayerNorm,
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.GroupNorm,
+        nn.InstanceNorm1d,
+        nn.InstanceNorm2d,
+        nn.InstanceNorm3d,
+    )
+    if hasattr(nn, "RMSNorm"):
+        norm_classes = norm_classes + (nn.RMSNorm,)
+
+    norm_param_names = set()
+    for model in models:
+        for module_name, module in model.named_modules():
+            if isinstance(module, norm_classes):
+                for param_name, _ in module.named_parameters(recurse=False):
+                    full_name = f"{module_name}.{param_name}" if module_name else param_name
+                    norm_param_names.add(full_name)
+
+    decay_params = []
+    no_decay_params = []
+    decay_names = []
+    no_decay_names = []
+    seen_ids = set()
+
+    for name, param in params:
+        if id(param) in seen_ids:
+            continue
+        seen_ids.add(id(param))
+
+        is_no_decay = (
+            any(k in name for k in no_decay_keywords)
+            or name.endswith(".bias")
+            or (name in norm_param_names)
+            or (".norm." in name)
+        )
+
+        if is_no_decay:
+            no_decay_params.append(param)
+            no_decay_names.append(name)
+        else:
+            decay_params.append(param)
+            decay_names.append(name)
+
+    total_grouped = len(decay_params) + len(no_decay_params)
+    if total_grouped != len(seen_ids):
+        raise RuntimeError(
+            f"AdamW param grouping mismatch: grouped={total_grouped}, unique={len(seen_ids)}"
+        )
+
+    if train_params.DBG_TRAINABLE:
+        preview_n = 12
+        logger.info(
+            "[adamw-groups] decay=%d no_decay=%d total=%d",
+            len(decay_params), len(no_decay_params), total_grouped
+        )
+        logger.info("[adamw-groups] decay sample: %s", decay_names[:preview_n])
+        logger.info("[adamw-groups] no_decay sample: %s", no_decay_names[:preview_n])
+
+    base_lr = train_params.BASE_LR
+    # Keep compatibility: when BIAS_MULTIPLIER == 1.0, no lr difference for bias.
+    # AdamW uses two groups only (decay/no_decay), so no per-bias standalone lr group here.
+    no_decay_lr = base_lr
+
+    return [
+        {
+            "params": decay_params,
+            "weight_decay": train_params.WEIGHT_DECAY,
+            "lr": base_lr,
+        },
+        {
+            "params": no_decay_params,
+            "weight_decay": 0.0,
+            "lr": no_decay_lr,
+        },
+    ]
 
 
 def make_optimizer(
@@ -35,22 +133,18 @@ def make_optimizer(
                     logger.info("\t{}, {}, {}".format(key, value.numel(), value.shape))
                 params.append((key, value))
 
-    if train_params.WEIGHT_DECAY > 0:
-        if train_params.OPTIMIZER == 'adamw':
+    if train_params.OPTIMIZER == 'adamw':
+        optimizer_grouped_parameters = _build_adamw_param_groups(
+            params=params, models=models, train_params=train_params
+        )
+        optimizer = AdamW(
+            optimizer_grouped_parameters,
+            lr=train_params.BASE_LR,
+        )
+        return optimizer
 
-            no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-            optimizer_grouped_parameters = [
-                {'params': [p for n, p in params
-                            if not any(nd in n for nd in no_decay)],
-                 'weight_decay': 0.01},
-                {'params': [p for n, p in params
-                            if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-            ]
-            optimizer = AdamW(
-                optimizer_grouped_parameters,
-                lr=train_params.BASE_LR,
-            )
-        else:
+    if train_params.WEIGHT_DECAY > 0:
+        if train_params.OPTIMIZER != 'adamw':
             _params = []
             for p in params:
                 key, value = p
@@ -98,7 +192,7 @@ def make_optimizer(
                     momentum=train_params.MOMENTUM,
                     weight_decay=train_params.WEIGHT_DECAY
                 )
-        return optimizer
+            return optimizer
     else:
         if train_params.OPTIMIZER == 'adam':
             optimizer = optim.Adam(

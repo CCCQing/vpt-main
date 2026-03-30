@@ -708,13 +708,33 @@ class PromptedTransformer(Transformer):
         self.prompt_update_layers = nn.ModuleList([
             Linear(hidden_size, hidden_size) for _ in range(num_layers - 1)
         ])
-        # 杩戜技鎭掔瓑鍒濆鍖栵紝纭繚鍒濆琛屼负绋冲畾
+        # Transfer-learning motivation:
+        # optionally use zero init to minimize initial perturbation and protect frozen backbone.
+        evolve_mode = str(getattr(self.prompt_config, "EVOLVE_INIT_MODE", "identity")).lower()
+        if evolve_mode not in {"identity", "zero"}:
+            evolve_mode = "zero" if bool(getattr(self.prompt_config, "EVOLVE_ZERO_INIT", False)) else "identity"
+        self.evolve_init_mode = evolve_mode
+        # Layer-wise prompt evolution init: legacy identity vs optional zero.
         with torch.no_grad():
             for layer in self.prompt_update_layers:
-                eye = torch.eye(hidden_size, device=layer.weight.device, dtype=layer.weight.dtype)
-                layer.weight.copy_(eye)
+                if self.evolve_init_mode == "zero":
+                    layer.weight.zero_()
+                else:
+                    eye = torch.eye(hidden_size, device=layer.weight.device, dtype=layer.weight.dtype)
+                    layer.weight.copy_(eye)
                 if layer.bias is not None:
                     layer.bias.zero_()
+        if len(self.prompt_update_layers) > 0:
+            w0 = self.prompt_update_layers[0].weight.detach().float()
+            b0 = self.prompt_update_layers[0].bias.detach().float() if self.prompt_update_layers[0].bias is not None else None
+            logger.info(
+                "[prompt-evolve-init] mode=%s zero_flag=%s layer0_w_mean=%.6e layer0_w_norm=%.6e layer0_b_mean=%s",
+                self.evolve_init_mode,
+                bool(getattr(self.prompt_config, "EVOLVE_ZERO_INIT", False)),
+                float(w0.mean().item()),
+                float(w0.norm().item()),
+                "{:.6e}".format(float(b0.mean().item())) if b0 is not None else "None",
+            )
 
     def incorporate_prompt(self, x, semantics=None):
         """

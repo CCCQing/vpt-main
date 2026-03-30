@@ -1,7 +1,7 @@
 # _BASE_: "../TEST/run_json_dataset_demo.yaml"
 # Consolidated dataset/demo settings (migrated from TEST/run_json_dataset_demo.yaml)
 #  DATA_ROOT: 'D:/postgraduate1/project/datasets/CUB/CUB_200_2011'
-GZSL: false         # true -> include seen split when evaluating
+GZSL: true          # true -> include seen split when evaluating
 MODE: xlsa          # "json" -> JSON annotations + dummy data
 SKIP_DUMMY: false   # skip dummy data generation when using JSON mode
 SPLIT: train        # "train" / "val" / "test"
@@ -31,17 +31,37 @@ MODEL:
       SEMANTIC_DIM: 312
       SEMANTIC_PROJ_DIM: 256
 
-    SEMANTIC_CONCEPT:
-      ENABLE: True
-      NUM_SLOTS: 8
-      NUM_HEADS: 8
-      DROPOUT: 0.0
-      LAMBDA_INIT: 1.0
-      USE_LAYER_NORM: True
-      PROJ_NORM: True
-SOLVER:
-  EVAL_MODE: "zsl"    # switch to "gzsl" (and/or set GZSL: true) for generalized ZSL
-  GZSL: false
-  BASE_LR: 0.25           # 0.1
-  WEIGHT_DECAY: 0.001     # 0.01
+  SEMANTIC_BRANCH:
+    USE_ANCHOR_FREE: True
+    NUM_TOKENS: 6
+    ANCHOR_TOKENS: 4
+    FREE_TOKENS: 2
+    FREE_COMPETE_LAMBDA: 0.5
 
+  R_SIMILARITY:
+    ENABLE: True
+    USE_COSINE: True
+    LOGIT_SCALE_INIT: 10.0
+SOLVER:
+  EVAL_MODE: "gzsl"    # switch to "gzsl" (and/or set GZSL: true) for generalized ZSL
+  BASE_LR: 0.0005           # 0.1
+  WEIGHT_DECAY: 0.0001     # 0.01
+  WARMUP_EPOCH: 3
+  TOTAL_EPOCH: 20
+  LOSS: "softmax_margin_cm"
+  LOSS_CM_WEIGHT: 0.05
+  LOSS_CONS_WEIGHT: 0.02
+  LOSS_ANCHOR_CONS_WEIGHT: 0.01
+  LOSS_FREE_KD_WEIGHT: 0.0
+  OPTIMIZER: "adamw"
+  SCHEDULER: "cosine"
+  BIAS_MULTIPLIER: 1.0
+  VIS:
+    ENABLE: true
+    EPOCH_LIST: [1, 2, 3, 5, 8, 10, 15, 20, 30, 40, 50]
+    SPLITS: ["val", "test"]
+    MAX_SAMPLES: 8
+    LOCAL_CONTROL: true
+    ROLLOUT: true
+    GT_HN_COMPARE: true
+    TRENDS: true
