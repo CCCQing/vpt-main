@@ -28,230 +28,6 @@ from ...utils import logging
 
 logger = logging.get_logger("visual_prompt")
 
-class SharedConceptAligner(nn.Module):
-    """
-    SharedConceptAligner锛氬叡浜蹇靛熀瀵归綈妯″潡
-
-    浣滅敤锛堝搴斾綘鍐欑殑閭ｉ儴鍒嗗叕寮忥級锛?
-    1锛夊皢绫荤骇璇箟 S_raw锛堝睘鎬у悜閲?绫诲師鍨嬶級鎶曞奖鍒颁笌 ViT hidden_size 涓€鑷寸殑绌洪棿锛?
-    2锛夊紩鍏?K 涓€滃叡浜蹇垫Ы鈥?R 鈭?R^{K脳D}锛屽璇箟鍜岃瑙夊垎鍒仛娉ㄦ剰鍔涳細
-        - 璇箟鈫扲锛氬緱鍒版蹇靛寲璇箟 R_S锛?
-        - 瑙嗚鈫扲锛氬緱鍒版蹇靛寲瑙嗚 R_V锛?
-    3锛夊啀鐢?R_S 浣滀负 Query锛孯_V 浣滀负 Key/Value 鍋氫竴娆′氦鍙夋敞鎰忓姏锛屽緱鍒颁笌褰撳墠鏍锋湰鐩稿叧鐨?
-       瑙嗚琛ュ厖淇℃伅 v_hat锛?
-    4锛夐€氳繃 MLP + 娈嬪樊闂ㄦ帶 位 寰楀埌铻嶅悎鍚庣殑璇箟 S^#锛屽悗缁綔涓烘瘡灞?patch鈫抯emantic cross-attention 鐨勮涔夎緭鍏ャ€?
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,      # ViT 鐨?hidden_size锛屽搴?R銆佽涔夈€佽瑙夌殑缁熶竴缁村害 D
-        num_slots: int,        # 鍏变韩姒傚康妲戒釜鏁?K
-        num_heads: int,        # 澶氬ご娉ㄦ剰鍔?head 鏁帮紝瑕佹眰 hidden_size 鑳芥暣闄?num_heads
-        dropout: float = 0.0,  # 娉ㄦ剰鍔?MLP 鐨?dropout
-        lambda_init: float = 1.0,  # 位 鐨勫垵濮嬪€硷紙铻嶅悎娈嬪樊鐨勭缉鏀惧洜瀛愶級
-        use_layer_norm: bool = True,  # 鏄惁瀵硅緭鍑哄仛 LayerNorm
-        proj_norm: bool = True,       # 鏄惁瀵?semantic_proj 涔嬪悗鐨勮涔夊仛 LayerNorm
-    ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        # 姣忎釜 head 鐨勭淮搴?d = D / H
-        self.head_dim = hidden_size // num_heads
-        # 娉ㄦ剰鍔涚缉鏀惧洜瀛?1/sqrt(d)
-        self.scale = self.head_dim ** -0.5
-
-        # 鍏变韩姒傚康妲?R锛氬舰鐘?[K, D]锛屽湪鎵€鏈夋牱鏈棿鍏变韩鐨勪竴缁勨€滄蹇靛師鍨嬧€?
-        # 鍒濆鍖栨椂鐢?N(0, 1/鈭欴) 杩欐牱鐨勫昂搴︼紝閬垮厤鏁板€艰繃澶?
-        self.concept_slots = nn.Parameter(
-            torch.randn(num_slots, hidden_size) * (hidden_size ** -0.5)
-        )
-
-        # 璇箟鎶曞奖灞傦細灏嗚緭鍏ヨ涔?dim_s 鈫?hidden_size
-        # 浣跨敤 lazy 鏋勫缓鐨勬柟寮忥紝鏄洜涓轰笉鍚屾暟鎹泦璇箟缁村害鍙兘涓嶅悓锛圓wA2 85, CUB 312 绛夛級
-        self.semantic_proj: Optional[nn.Linear] = None
-        # 璇箟鎶曞奖鍚庣殑褰掍竴鍖栵細璁╀笉鍚岀被/鏍锋湰鐨勮涔夊垎甯冩洿绋冲畾
-        self.semantic_proj_norm = LayerNorm(hidden_size, eps=1e-6) if proj_norm else nn.Identity()
-
-        # 鈥斺€?绗?1 闃舵锛氳涔?/ 瑙嗚 鈫?妲?R 鐨勬敞鎰忓姏 鈥斺€?#
-        # 璇箟渚?Query锛歈_s
-        self.query_semantic = Linear(hidden_size, hidden_size)
-        # 瑙嗚渚?Query锛歈_v
-        self.query_visual = Linear(hidden_size, hidden_size)
-        # 妲?R 鐨?Key/Value锛欿_R, V_R锛堝 R 鍋氱嚎鎬у彉鎹級
-        self.key_slots = Linear(hidden_size, hidden_size)
-        self.value_slots = Linear(hidden_size, hidden_size)
-
-        # 鈥斺€?绗?2 闃舵锛歊_S 鈫?R_V 鐨勪氦鍙夋敞鎰忓姏 鈥斺€?#
-        # 杩欓噷浠?R_S 涓?Query锛孯_V 涓?Key/Value
-        self.cross_query = Linear(hidden_size, hidden_size)
-        self.cross_key = Linear(hidden_size, hidden_size)
-        self.cross_value = Linear(hidden_size, hidden_size)
-
-        # 娈嬪樊 MLP锛氳緭鍏ユ槸 [r_s || v_hat]锛堟嫾鎺ワ紝缁村害 2D锛夛紝杈撳嚭 D 缁村閲?螖
-        hidden_mlp = hidden_size * 2
-        self.delta_mlp = nn.Sequential(
-            Linear(hidden_size * 2, hidden_mlp),
-            nn.GELU(),
-            Dropout(dropout),
-            Linear(hidden_mlp, hidden_size),
-            Dropout(dropout),
-        )
-        # U s_1锛氬鍩哄噯璇箟鍋氱嚎鎬ф槧灏勶紝鐢ㄤ簬 螖 = MLP([r_s||v_hat]) - U r_s
-        self.skip_proj = Linear(hidden_size, hidden_size)
-        # 閫氶亾缁村害鐨?位 闂ㄦ帶鍚戦噺锛氬舰鐘?[D]锛岄€愮淮缂╂斁 螖
-        self.lambda_gate = nn.Parameter(torch.full((hidden_size,), lambda_init))
-        # 杈撳嚭灞傚綊涓€鍖栵細瀵瑰簲 S^# = LN(s_1 + 位 鈭?螖)
-        self.out_norm = LayerNorm(hidden_size, eps=1e-6) if use_layer_norm else nn.Identity()
-
-        # 娉ㄦ剰鍔涙潈閲嶇殑 dropout
-        self.attn_dropout = Dropout(dropout)
-
-    def _build_semantic_proj(self, semantic_dim: int, device: torch.device):
-        """
-        Lazy 鏋勯€犺涔夋姇褰卞眰锛?
-        - 绗竴娆?forward 鏃讹紝鏍规嵁璇箟缁村害 semantic_dim 鍒涘缓 Linear(semantic_dim, hidden_size)
-        - 涔嬪悗澶嶇敤鍚屼竴灞傦紝鍏煎涓嶅悓鏁版嵁闆嗙殑灞炴€х淮搴?
-        """
-        if self.semantic_proj is None:
-            self.semantic_proj = Linear(semantic_dim, self.hidden_size)
-            self.semantic_proj = self.semantic_proj.to(device)
-
-    def _transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        灏嗚緭鍏?[B, L, D] reshape 鎴愬澶存敞鎰忓姏鏍煎紡 [B, H, L, d]锛?
-        - 鍏?view 鎴?[B, L, H, d]
-        - 鍐?permute 鍒?[B, H, L, d]
-        """
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_dim)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
-    def _attention(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        """
-        鏍囧噯澶氬ご娉ㄦ剰鍔涜绠楋細
-        杈撳叆锛?
-          query: [B, H, L_q, d]
-          key:   [B, H, L_k, d]
-          value: [B, H, L_k, d]
-        杈撳嚭锛?
-          context: [B, L_q, D]锛屽嵆灏嗗澶寸粨鏋滄嫾鍥?D 缁?
-        """
-        # [B, H, L_q, L_k]
-        attn_scores = torch.matmul(query, key.transpose(-1, -2)) * self.scale
-        # softmax + dropout 寰楀埌娉ㄦ剰鍔涙潈閲?
-        attn_probs = self.attn_dropout(torch.softmax(attn_scores, dim=-1))
-        # [B, H, L_q, d]
-        context = torch.matmul(attn_probs, value)
-        # 杩樺師鍥?[B, L_q, D]锛氬厛鎹㈠洖 [B, L_q, H, d] 鍐?view
-        context = context.permute(0, 2, 1, 3).contiguous()
-        new_shape = context.size()[:-2] + (self.hidden_size,)
-        return context.view(*new_shape)
-
-    def encode_semantics_only(self, semantics: torch.Tensor) -> torch.Tensor:
-        """
-        浠呯敤浜庘€滅被璇箟 鈫?R 绌洪棿绫诲師鍨嬧€濈殑缂栫爜锛堢粰鍒嗙被澶寸敤锛夈€?
-        涓嶄緷璧栧叿浣撳浘鍍忥紝鍙緷璧栧睘鎬у悜閲忋€?
-        杈撳叆锛氭墍鏈夌被鐨勫睘鎬х煩闃?semantics锛岀淮搴﹀ぇ姒傛槸 [C, d_s]锛屾瘮濡?CUB 灏辨槸 [200, 312]锛?
-        杈撳嚭锛氭墍鏈夌被鍦?R 绌洪棿涓嬬殑琛ㄨ揪锛岀淮搴?[C, D]锛屾瘮濡?ViT-B/16 鏄?[200, 768]
-
-        Args:
-            semantics: [C, d_s] 鎴?[C, 1, d_s]锛孋 涓虹被鍒暟
-
-        Returns:
-            [C, D]锛屾瘡涓被鍒湪 R 绌洪棿涓嬬殑绫诲師鍨嬪悜閲?s_c
-        """
-        # 缁熶竴鎴?[C, 1, d_s]
-        if semantics.dim() == 1:
-            semantics = semantics.unsqueeze(0)
-        if semantics.dim() == 2:
-            semantics = semantics.unsqueeze(1)
-
-        device = self.concept_slots.device
-        semantics = semantics.to(device)
-        self._build_semantic_proj(semantics.size(-1), device=device)
-        # 灞炴€ф姇褰卞埌 D 缁村苟鍋?LN
-        semantic_tokens = self.semantic_proj(semantics)
-        semantic_tokens = self.semantic_proj_norm(semantic_tokens)
-
-        num_classes = semantic_tokens.size(0)
-        # 妲?R 鎵╁睍鍒?batch 缁达細[C, K, D]
-        slots = self.concept_slots.unsqueeze(0).expand(num_classes, -1, -1)
-        # 妲界殑 K/V锛歔C, H, K, d]
-        slot_keys = self._transpose_for_scores(self.key_slots(slots))
-        slot_values = self._transpose_for_scores(self.value_slots(slots))
-
-        # 璇箟 Query锛歔C, H, 1, d]
-        sem_query = self._transpose_for_scores(self.query_semantic(semantic_tokens))
-        # r_s: [C, 1, D] 鈫?squeeze 鎴?[C, D]
-        r_s = self._attention(sem_query, slot_keys, slot_values)
-
-        return r_s.squeeze(1)
-
-    def forward(self, patch_tokens: torch.Tensor, semantics: torch.Tensor) -> torch.Tensor:
-        """
-        杈撳叆锛?
-          patch_tokens: [B, N, D]锛屾潵鑷?embeddings.forward_patches 鐨勮瑙?patch tokens
-          semantics:    [B, d_s] / [B, 1, d_s] / [d_s]锛岀被绾у睘鎬ф垨璇箟鍘熷瀷
-
-        杈撳嚭锛?
-          fused: [B, D]锛岃瀺鍚堣瑙変俊鎭悗鐨勫叡浜涔?S^#
-        """
-        # 缁熶竴璇箟鐨勫舰鐘讹細纭繚涓?[B, 1, d_s]
-        if semantics.dim() == 1:
-            # 鍗曟牱鏈?[d_s] 鈫?[1, d_s]
-            semantics = semantics.unsqueeze(0)
-        if semantics.dim() == 2:
-            # [B, d_s] 鈫?[B, 1, d_s]
-            semantics = semantics.unsqueeze(1)  # [B, 1, d_s]
-
-        # 鏋勫缓璇箟鎶曞奖灞傦紙绗竴娆¤皟鐢ㄦ椂锛?
-        self._build_semantic_proj(semantics.size(-1), device=patch_tokens.device)
-        # 璇箟鎶曞奖鍒?D 缁村苟褰掍竴鍖栵細S_raw 鈫?S虄_raw
-        semantic_tokens = self.semantic_proj(semantics)
-        semantic_tokens = self.semantic_proj_norm(semantic_tokens)
-
-        # ====== 闃舵 1锛氳涔?瑙嗚 鈫?妲?R 鐨勬敞鎰忓姏锛屽緱鍒?R_S, R_V ======
-        # 鎵瑰ぇ灏?B锛岀敤浜庡皢鍏变韩妲?R 鎵╁睍鍒?batch 缁村害.  姝ゅ鍋氱殑鏄瀯閫燫 鐨?batch 瑙嗗浘
-        B, _, _ = patch_tokens.shape
-        # slots: [B, K, D]锛屾墍鏈夋牱鏈叡浜弬鏁帮紝浣嗗湪 batch 缁村害鍋氫簡 expand
-        slots = self.concept_slots.unsqueeze(0).expand(B, -1, -1)  # [batch鏁? R妲芥暟num_slots, hidden_size 768 D]
-
-        # 妲界殑 Key/Value锛欿_R, V_R 褰㈢姸 [B, H, K, d]
-        slot_keys = self._transpose_for_scores(self.key_slots(slots))
-        slot_values = self._transpose_for_scores(self.value_slots(slots))
-
-        # 鈥斺€?璇箟鈫扲锛歊_S 鈥斺€?#
-        # Q_s: [B, H, 1, d]     D = 768锛歏iT hidden size ;H = 8锛氭敞鎰忓姏澶存暟 ;d = D / H = 96锛氭瘡涓?head 鐨勭淮搴?
-        sem_query = self._transpose_for_scores(self.query_semantic(semantic_tokens))
-        # 璁＄畻r_s: [B, 1, D]锛屾瘡涓牱鏈殑鈥滄蹇靛寲璇箟鈥?
-        r_s = self._attention(sem_query, slot_keys, slot_values)  # [B, 1, D]
-
-        # 鈥斺€?瑙嗚鈫扲锛歊_V 鈥斺€?#
-        # Q_v: [B, H, N, d]
-        vis_query = self._transpose_for_scores(self.query_visual(patch_tokens))
-        # 璁＄畻r_v: [B, N, D]锛屾瘡涓?patch 缁?R 閲嶆柊琛ㄨ揪鍚庣殑鈥滄蹇靛寲瑙嗚 token鈥?
-        r_v = self._attention(vis_query, slot_keys, slot_values)  # [B, N, D]
-
-        # ====== 闃舵 2锛歊_S 鈫?R_V 浜ゅ弶娉ㄦ剰鍔涳紝寰楀埌瑙嗚琛ュ厖 v_hat ======
-        # 浠?r_s 涓?Query锛宺_v 涓?Key/Value
-        cross_q = self._transpose_for_scores(self.cross_query(r_s))
-        cross_k = self._transpose_for_scores(self.cross_key(r_v))
-        cross_v = self._transpose_for_scores(self.cross_value(r_v))
-        # v_hat: [B, 1, D]锛岃〃绀衡€滀笌褰撳墠璇箟鐩稿叧鐨勯偅閮ㄥ垎瑙嗚淇℃伅鈥?
-        v_hat = self._attention(cross_q, cross_k, cross_v)  # [B, 1, D]
-
-        # ====== 闃舵 3锛氭畫宸瀺鍚堬紝寰楀埌 S^# ======
-        # 浠ユ蹇靛寲璇箟 R_S 浣滀负娈嬪樊鍩哄噯锛岃€岄潪鍘熷璇箟 S_raw
-        base_semantics = r_s
-        # 鎷兼帴 r_s 涓?v_hat锛歔B, 1, 2D] 鈫?[B, 1, D]锛屽啀鍑忓幓 U r_s
-        delta = self.delta_mlp(torch.cat([base_semantics, v_hat], dim=-1)) - self.skip_proj(base_semantics)
-        # 閫氶亾闂ㄦ帶 位锛氶€愮淮缂╂斁 螖锛屽緱鍒?R_S + 位 鈭?螖锛堜笉鐩存帴鍥炶惤鍒板師濮嬭涔夛級
-        fused = base_semantics + self.lambda_gate * delta
-        # 鏈€缁堝綊涓€鍖栵紝寰楀埌 S^#锛堝幓鎺夐暱搴?1 缁村害锛岃緭鍑?[B, D]锛?
-        fused = self.out_norm(fused)
-        return fused.squeeze(1)
-
-
 class LateSemanticSideBranch(nn.Module):
     """
     Lightweight semantic side branch:
@@ -521,34 +297,19 @@ class PromptedTransformer(Transformer):
         # 閫氬父绛変簬鏁版嵁闆嗙殑灞炴€х淮搴︼紙濡?312锛夈€?
         semantic_dim = getattr(prompt_config, "SEMANTIC_DIM", None)
 
-        # 璇诲彇鍏变韩姒傚康鍩虹浉鍏抽厤缃紙SEMANTIC_CONCEPT 瀛愯妭鐐癸級
-        concept_cfg = getattr(prompt_config, "SEMANTIC_CONCEPT", None)
         self.semantic_branch_cfg = getattr(prompt_config, "SEMANTIC_BRANCH", None)
         self.semantic_branch_enable = bool(
             self.semantic_branch_cfg is not None and getattr(self.semantic_branch_cfg, "ENABLE", True)
         )
-        self.semantic_cross_attn_enable = bool(getattr(prompt_config, "SEMANTIC_CROSS_ATTN_ENABLE", False)) and (not self.semantic_branch_enable)
-        self.shared_concept_enable = bool(getattr(prompt_config, "SHARED_CONCEPT_ENABLE", False))
-        self.shared_aligner_enable = bool(getattr(prompt_config, "SHARED_ALIGNER_ENABLE", False))
-        concept_enabled = bool(concept_cfg is not None and getattr(concept_cfg, "ENABLE", False))
-        use_shared_semantic_module = bool(
-            (not self.semantic_branch_enable)
-            and concept_enabled
-            and self.shared_concept_enable
-            and self.shared_aligner_enable
-        )
-        if use_shared_semantic_module:
-            # 鑻ュ惎鐢ㄥ叡浜蹇靛熀妯″潡锛屽垯寮哄埗 semantic_dim = hidden_size
-            # 杩欐牱 encoder 灞傞噷鐨勮涔夊悜閲忓氨鐩存帴鐢?S^#锛堝凡鏄?D 缁达級锛屾棤闇€棰濆鏄犲皠
-            semantic_dim = config.hidden_size
+        self.semantic_cross_attn_enable = False
 
         # 璋冪敤鐖剁被 Transformer 鐨勫垵濮嬪寲锛屽苟鍛婄煡 semantic_dim锛堜究浜庡叾鍐呴儴鍒涘缓璇箟鐩稿叧鎶曞奖锛?
         super(PromptedTransformer, self).__init__(
             config,
             img_size,
             vis,
-            semantic_dim=semantic_dim if self.semantic_cross_attn_enable else None,
-            semantic_cross_attn_enable=self.semantic_cross_attn_enable,
+            semantic_dim=None,
+            semantic_cross_attn_enable=False,
         )
 
         # 淇濆瓨 prompt 閰嶇疆鍜?vit 閰嶇疆
@@ -580,19 +341,6 @@ class PromptedTransformer(Transformer):
             )
         else:
             self.semantic_side_branch = None
-
-        # 鑻ュ惎鐢ㄤ簡鍏变韩姒傚康鍩烘ā鍧楋紝鍒欏湪姝ゆ瀯寤?SharedConceptAligner
-        self.semantic_concept = None
-        if use_shared_semantic_module:
-            self.semantic_concept = SharedConceptAligner(
-                hidden_size=config.hidden_size,
-                num_slots=concept_cfg.NUM_SLOTS,
-                num_heads=concept_cfg.NUM_HEADS,
-                dropout=concept_cfg.DROPOUT,
-                lambda_init=concept_cfg.LAMBDA_INIT,
-                use_layer_norm=concept_cfg.USE_LAYER_NORM,
-                proj_norm=concept_cfg.PROJ_NORM,
-            )
 
         # 瑙勮寖杈撳叆灏哄 & 鍙栧嚭 patch 澶у皬锛岀粺涓€灏嗗昂瀵歌浆鎴愪簩鍏冪粍锛圚, W锛?
         img_size = _pair(img_size)
@@ -642,7 +390,11 @@ class PromptedTransformer(Transformer):
                 raise ValueError(
                     "prompt_init cannot be provided when DISTRIBUTION_ONLY=True"
                 )
-        self.use_learned_prompt_params = not self.runtime_prompt_only
+        if self.prompt_init_provider is None:
+            raise ValueError(
+                "Prompt static embeddings have been removed. "
+                "Please enable and provide MODEL.PROMPT.DISTRIBUTOR/prompt_init_provider."
+            )
 
         # ====== 鍒濆鍖栨彁绀?token 鍙傛暟 ======
         if self.prompt_config.INITIATION == "random":
@@ -654,33 +406,11 @@ class PromptedTransformer(Transformer):
             # 鍒濆鍖栧尯闂?[-0.079, 0.079]銆傚鏋?PROJECT < 0 鐩存帴鐢?D=768 鍋?prompt_dim锛屽垯 val = sqrt(6/(768+768)) 鈮?0.0625
             val = math.sqrt(6. / float(3 * reduce(mul, patch_size, 1) + prompt_dim))  # noqa
 
-            if self.use_learned_prompt_params:
-                # -------- 鍓嶇疆 prompt锛堢 0 灞備娇鐢級 --------
-                # 褰㈢姸锛歔1, P, prompt_dim]锛屽墠鍚戞椂浼氭墿灞曞埌 [B, P, prompt_dim]
-                self.prompt_embeddings = nn.Parameter(
-                    torch.zeros(1, num_tokens, prompt_dim))
-
-                # 鑻ユ湭鎻愪緵澶栭儴 prompt_init锛屽垯閲囩敤鍧囧寑鍒嗗竷闅忔満鍒濆鍖?
-                if prompt_init is None:
-                    nn.init.uniform_(self.prompt_embeddings.data, -val, val)
-                else:
-                    # 鑻ユ彁渚涗簡澶栭儴 prompt_init 寮犻噺锛屽垯鐢ㄥ叾鍒濆鍖栵紙甯歌浜庤縼绉?寰皟鏃讹級
-                    self._seed_prompt(prompt_init, prompt_dim)
-            else:
-                # 瀹屽叏涓嶄娇鐢ㄥ涔犲弬鏁?prompt_embeddings锛岃€屾槸鍏ㄩ儴鐢?prompt_init_provider 鎻愪緵锛堟彁绀哄垎甯冿級
-                self.prompt_embeddings = None
+            if prompt_init is not None:
+                logger.warning("prompt_init is ignored: static prompt embeddings are removed.")
 
             # -------- Deep Prompt锛堜腑闂村眰浣跨敤锛?--------
-            # 鑻ュ紑鍚?Deep Prompt锛氬湪姣忎釜涓棿灞傦紙闄ょ 0 灞傦級鍓嶆彃鍏ヤ竴娈佃灞備笓灞?prompt
-            if self.prompt_config.DEEP:  # noqa (淇濇寔鍘熼鏍?
-                # 鎬荤殑涓棿灞傛暟 = 鎬诲眰鏁?- 1锛堢 0 灞傚彧鐢ㄥ墠缃?prompt锛屼笉绠?deep锛?
-                total_d_layer = config.transformer["num_layers"]-1  # 涓嶅惈绗?0 灞傦紙涓庤鏂囪瀹氫竴鑷达級
-                # deep_prompt_embeddings: [L-1, P, prompt_dim]
-                # 鍏朵腑绗?i-1 浠藉搴?encoder 绗?i 灞傦紙i 浠?1 鍒?L-1锛?
-                self.deep_prompt_embeddings = nn.Parameter(torch.zeros(
-                    total_d_layer, num_tokens, prompt_dim))
-                # 鍧囧寑鍒嗗竷鍒濆鍖?deep prompt
-                nn.init.uniform_(self.deep_prompt_embeddings.data, -val, val)
+            # Deep Prompt embeddings are removed; deep behavior is implemented via prompt_update_layers.
         # [CLS] + [ PROMPT 脳 P ] + [ PATCH 脳 N ]   鈫? (B, 1+P+N, D)
         else:
             raise ValueError("Other initiation scheme is not supported")
@@ -696,11 +426,6 @@ class PromptedTransformer(Transformer):
 
         # 鏄惁鍐荤粨鍘熷 prompt 宓屽叆鍙傛暟锛屼娇姊害涓昏钀藉湪鍒嗗竷缃戠粶绛夊叾浠栨敮璺笂
         self.freeze_embeddings = getattr(self.prompt_config, "FREEZE_EMBEDDINGS", True)
-        if self.freeze_embeddings:
-            if self.prompt_embeddings is not None:
-                self.prompt_embeddings.requires_grad = False
-            if hasattr(self, "deep_prompt_embeddings"):
-                self.deep_prompt_embeddings.requires_grad = False
 
         # 鈥斺€?Layer-wise prompt evolution锛氱 1鈥-1 灞傞€氳繃绾挎€у眰鏇存柊涓婁竴灞傜殑 prompt 鈥斺€?#
         num_layers = config.transformer["num_layers"]
@@ -743,9 +468,7 @@ class PromptedTransformer(Transformer):
           x: 鍘熷鍥惧儚寮犻噺 (B, C, H, W)
         涓昏姝ラ锛?
           1) 浣跨敤 embeddings.forward_patches 鎻愬彇绾?patch tokens锛歏_raw锛屽舰鐘?[B, N, D]
-          2) 鐢熸垚 prompt_tokens锛?
-             - 鑻ユ彁渚?prompt_init_provider锛屽垯鍩轰簬 V_raw 鍔ㄦ€佺敓鎴愶紱
-             - 鍚﹀垯浣跨敤鍥哄畾鐨?self.prompt_embeddings銆?
+          2) 鐢熸垚 prompt_tokens锛氬繀椤讳粠 prompt_init_provider 鍔ㄦ€佺敓鎴?
           3) 璋冪敤 embeddings.add_cls_and_pos(V_raw) 閲嶆柊鏋勯€?[CLS|PATCH] + pos 缂栫爜锛?
           4) 鍦?CLS 涔嬪悗鎻掑叆 prompt_tokens锛堝厛鎶曞奖鍐?dropout锛夛紝寰楀埌锛?
              [CLS] + [PROMPT 脳 P] + [PATCH 脳 N]锛屽舰鐘?[B, 1+P+N, D]
@@ -802,18 +525,10 @@ class PromptedTransformer(Transformer):
                     f"prompt_init_provider batch {prompt_tokens.shape[0]} incompatible with input batch {B}"
                 )
         else:
-            # 鑻ユ病鏈?provider锛屽垯蹇呴』浣跨敤瀛︿範鍙傛暟 prompt_embeddings
-            if self.prompt_embeddings is None:
-                raise RuntimeError(
-                    "Prompt embeddings are disabled but no prompt_init_provider "
-                    "is available. Set PROMPT.DISTRIBUTION_ONLY=False or "
-                    "supply a provider."
-                )
-            prompt_tokens = self.prompt_embeddings
-            if self.detach_prompt_grad or self.freeze_embeddings:
-                prompt_tokens = prompt_tokens.detach()# 鍏朵綑鍚勫眰
-                # 鍐荤粨 prompt 鍙傛暟琛紝鍙缁冩槧灏勫眰锛坧rompt_proj锛夊強鍚庣画妯″潡
-                prompt_tokens = prompt_tokens.detach()
+            raise RuntimeError(
+                "Static prompt parameters were removed. "
+                "prompt_init_provider is required to generate prompt tokens."
+            )
         if prompt_tokens.shape[-1] != self.vit_config.hidden_size:
             raise ValueError(
                 f"Prompt feature dim {prompt_tokens.shape[-1]} incompatible with hidden_size {self.vit_config.hidden_size}"
@@ -880,8 +595,6 @@ class PromptedTransformer(Transformer):
             "prompt_noop_keep_params": bool(self.noop_keep_params),
             "semantic_branch_enable": bool(self.semantic_branch_enable),
             "semantic_cross_attn_enable": bool(self.semantic_cross_attn_enable),
-            "shared_concept_enable": bool(self.shared_concept_enable),
-            "shared_aligner_enable": bool(self.shared_aligner_enable),
             "whether_prompt_generated": bool(prompt_generated),
             "whether_prompt_injected_into_tokens": bool(prompt_injected),
             "actual_token_shape_entering_backbone": tuple(x.shape),
@@ -972,9 +685,8 @@ class PromptedTransformer(Transformer):
     def forward_deep_prompt(self, embedding_output, semantics=None):
         """
         Deep Prompt 妯″紡涓嬬殑鍓嶅悜浼犳挱銆?
-        - 鑻ユ湭鍚敤鍏变韩姒傚康鍩烘ā鍧楋紝鍒欎负鍘熷璇箟鎶曞奖锛堜緥濡?Linear(att_dim鈫扗) 鍚庣殑缁撴灉锛夛紱
-        - 鑻ュ惎鐢ㄤ簡 SharedConceptAligner锛屽垯涓?S^#锛堣瀺鍚堣瑙夊悗鐨勫叡浜涔夛級锛?
-          浼氬湪姣忓眰 encoder.layer[i](..., semantics, ...) 鍐呴儴琚敤浜?patch鈫抯emantic cross-attention銆?
+        - 褰撳墠涓昏矾寰勪负 semantic side-branch锛孲^#/mu_s_final 鐢辫交閲忓 token 璇箟鍒嗘敮閫愬眰鏇存柊寰楀埌锛?
+          涓嶅啀浣跨敤 legacy shared-concept cross-attention 鍒嗘敮銆?
 
         杈撳叆锛?
           - embedding_output: 缁忚繃 incorporate_prompt 鐨勫簭鍒?(B, 1+P+N, D)
@@ -1112,10 +824,8 @@ class PromptedTransformer(Transformer):
         """
         鏍囧噯鍓嶅悜锛?
         - 杈撳叆 semantics 涓?batch 鐨勭被绾ц涔夛紙灞炴€у悜閲忥級锛屽舰鐘朵竴鑸负 [B, att_dim]锛?
-        - 鍦?incorporate_prompt 涓細
-            * 鍏堜粠 x 鎻愬彇 patch_tokens锛?
-            * 鑻ュ惎鐢?SharedConceptAligner锛屽垯灏?(patch_tokens, semantics) 鏄犲皠涓?refined_semantics=S^#锛?
-        - 鍚庣画 encoder / forward_deep_prompt 浣跨敤鐨?semantics 瀹為檯涓婂氨鏄?refined_semantics銆?
+        - incorporate_prompt 鍏堟彁鍙?patch tokens 鍜?provider prompt锛?
+        - 鍚庣画 forward_deep_prompt/forward_with_affinity 鍐呴儴閫愬眰鏇存柊 semantic side-branch锛屾渶缁堣鍑?mu_s_final銆?
         娴佺▼锛?
           1) 璋冪敤 incorporate_prompt(x) 灏?prompt 鍚堝叆杈撳叆搴忓垪锛?
           2) 鑻ュ惎鐢?Deep Prompt锛屽垯璋冪敤 forward_deep_prompt 鍋氬灞傛繁搴︽彁绀猴紱
@@ -1215,28 +925,6 @@ class PromptedTransformer(Transformer):
                 self._monitor_last_refined_semantics = mu_s_final.detach()
 
         return encoded, attn_weights, affinities
-
-    def _seed_prompt(self, prompt_init, prompt_dim):
-        """
-        浣跨敤澶栭儴鎻愪緵鐨?prompt_init 寮犻噺瀵?prompt_embeddings 杩涜鍒濆鍖栥€?
-
-        瑕佹眰锛?
-        - prompt_init 鑷冲皯涓?2 缁达紙P, d锛夋垨 3 缁达紙1, P, d锛夛紱
-        - 鍏朵腑 P 蹇呴』绛変簬 self.num_tokens锛宒 蹇呴』绛変簬 prompt_dim銆?
-        """
-        init = prompt_init.detach()
-        if init.dim() == 2:
-            init = init.unsqueeze(0)
-        if init.shape[1:] != (self.num_tokens, prompt_dim):
-            raise ValueError(
-                f"prompt_init has shape {init.shape}, expected (1, {self.num_tokens}, {prompt_dim})"
-            )
-
-        # 鐩存帴鎷疯礉鍒板彲瀛︿範鍙傛暟涓?
-        with torch.no_grad():
-            self.prompt_embeddings.copy_(init)
-
-
 
 class PromptedVisionTransformer(VisionTransformer):
     """

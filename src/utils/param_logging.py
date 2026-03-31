@@ -2,9 +2,9 @@
 """Utilities for inspecting and logging trainable parameters.
 
 This helper categorizes parameters according to the project's conceptual
-decomposition (prompt tokens, prompt distribution, shared concept basis R,
-semantic cross-attention, affinity alignment, classification head, and
-backbone), then reports how gradients are distributed across these groups.
+decomposition (prompt path, semantic side branch, affinity alignment,
+classification head, and backbone), then reports how gradients are
+distributed across these groups.
 """
 
 from __future__ import annotations
@@ -24,9 +24,9 @@ def _init_stats(groups: List[str]) -> Dict[str, Dict[str, object]]:
             "examples": [],
         }
     stats["prompt_tokens"]["subtypes"] = {
-        "prompt_embeddings": {"total": 0, "train": 0},
         "prompt_proj": {"total": 0, "train": 0},
         "prompt_dropout": {"total": 0, "train": 0},
+        "prompt_other": {"total": 0, "train": 0},
     }
     return stats
 
@@ -37,7 +37,7 @@ def _classify_prompt_subtype(name: str) -> str:
         return "prompt_proj"
     if "dropout" in lower and "prompt" in lower:
         return "prompt_dropout"
-    return "prompt_embeddings"
+    return "prompt_other"
 
 
 def _classify_group(name: str) -> str:
@@ -60,22 +60,8 @@ def _classify_group(name: str) -> str:
     if any(k in lower for k in prompt_dist_keys):
         return "prompt_distribution"
 
-    if any(
-        k in lower
-        for k in [
-            "semantic_concept",
-            "shared_concept",
-            "sharedconceptaligner",
-            "concept_slots",
-            "shared_r",
-            "semantic_r",
-            "r_",
-        ]
-    ):
-        return "shared_concept_R"
-
-    if "semantic_attn" in lower or "semantic_norm" in lower:
-        return "semantic_cross_attn"
+    if "anchor_slot_embed" in lower:
+        return "semantic_branch_anchor_params"
 
     if "semantic_side_branch" in lower:
         return "semantic_side_branch"
@@ -124,8 +110,7 @@ def log_trainable_parameters(
         "prompt_tokens",
         "prompt_distribution",
         "semantic_side_branch",
-        "shared_concept_R",
-        "semantic_cross_attn",
+        "semantic_branch_anchor_params",
         "affinity_branch",
         "cls_head",
         "other",
@@ -173,9 +158,9 @@ def log_trainable_parameters(
             sub = group_stats["subtypes"]
             logger.info(
                 "[visual_prompt]:   prompt_tokens details: "
-                f"embeddings: {sub['prompt_embeddings']['train']} train / {sub['prompt_embeddings']['total']} total, "
                 f"proj: {sub['prompt_proj']['train']} train / {sub['prompt_proj']['total']} total, "
-                f"dropout: {sub['prompt_dropout']['train']} train / {sub['prompt_dropout']['total']} total"
+                f"dropout: {sub['prompt_dropout']['train']} train / {sub['prompt_dropout']['total']} total, "
+                f"other: {sub['prompt_other']['train']} train / {sub['prompt_other']['total']} total"
             )
 
         if group_stats["examples"]:

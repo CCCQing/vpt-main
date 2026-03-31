@@ -102,14 +102,6 @@ _C.MODEL.PROMPT.FREEZE_EMBEDDINGS = True       # 鏄惁鍐荤粨鍘熷 emb
 #   濡傛灉鍚庣画瀹屽叏鍒囧埌 AGR / affinity role migration锛岃繖鍧楀彲浠ラ€愭寮卞寲銆?
 # -----------------------------------------------------------------------------
 
-_C.MODEL.PROMPT.SEMANTIC_CONCEPT = CfgNode()
-_C.MODEL.PROMPT.SEMANTIC_CONCEPT.ENABLE = False
-_C.MODEL.PROMPT.SEMANTIC_CONCEPT.NUM_SLOTS = 4        # 姒傚康妲芥暟閲?K
-_C.MODEL.PROMPT.SEMANTIC_CONCEPT.NUM_HEADS = 4        # 澶氬ご娉ㄦ剰鍔涘ご鏁?
-_C.MODEL.PROMPT.SEMANTIC_CONCEPT.DROPOUT = 0.0
-_C.MODEL.PROMPT.SEMANTIC_CONCEPT.LAMBDA_INIT = 1.0    # 璇箟娈嬪樊铻嶅悎鍒濆缂╂斁绯绘暟
-_C.MODEL.PROMPT.SEMANTIC_CONCEPT.USE_LAYER_NORM = True
-_C.MODEL.PROMPT.SEMANTIC_CONCEPT.PROJ_NORM = True
 
 # -----------------------------------------------------------------------------
 # Prompt distributor锛圥re-ViT prompt distribution generator锛?
@@ -380,33 +372,6 @@ _C.DIST_INIT_FILE = ""
 # Defensive repair for accidentally merged comment+assignment lines.
 # Keeps backward compatibility when some keys were not actually created.
 # ----------------------------------------------------------------------
-def _ensure_node(parent, name):
-    if not hasattr(parent, name):
-        setattr(parent, name, CfgNode())
-    return getattr(parent, name)
-
-
-
-
-_sem_cross = _ensure_node(_C.MODEL, "SEMANTIC_CROSS_ATTN")
-if not hasattr(_sem_cross, "ENABLE"):
-    _sem_cross.ENABLE = False
-_shared_concept = _ensure_node(_C.MODEL, "SHARED_CONCEPT")
-if not hasattr(_shared_concept, "ENABLE"):
-    _shared_concept.ENABLE = False
-_shared_aligner = _ensure_node(_C.MODEL, "SHARED_ALIGNER")
-if not hasattr(_shared_aligner, "ENABLE"):
-    _shared_aligner.ENABLE = False
-
-if not hasattr(_C.MODEL.PROMPT, "SEMANTIC_CROSS_ATTN_ENABLE"):
-    _C.MODEL.PROMPT.SEMANTIC_CROSS_ATTN_ENABLE = bool(_sem_cross.ENABLE)
-if not hasattr(_C.MODEL.PROMPT, "SHARED_CONCEPT_ENABLE"):
-    _C.MODEL.PROMPT.SHARED_CONCEPT_ENABLE = bool(_shared_concept.ENABLE)
-if not hasattr(_C.MODEL.PROMPT, "SHARED_ALIGNER_ENABLE"):
-    _C.MODEL.PROMPT.SHARED_ALIGNER_ENABLE = bool(_shared_aligner.ENABLE)
-
-
-
 # Default mainline cleanup: old semantic branches disabled by default.
 _C.SOLVER.LOSS = "softmax_margin_cm"
 _C.SOLVER.LOSS_ALPHA = 0.0
@@ -419,6 +384,5 @@ def get_cfg():
     """
     Get a copy of the default config. 鑾峰彇榛樿閰嶇疆鐨勫壇鏈€?    """
     return _C.clone()
-
 
 

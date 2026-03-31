@@ -302,15 +302,11 @@ class Trainer():
         refs["r_head.logit_scale"] = self._find_param_by_name_contains(
             ["r_similarity_head.logit_scale"]
         )
-        refs["semantic_concept"] = self._find_param_by_name_contains(
-            ["semantic_concept.concept_slots", "semantic_cross_attn", "semantic_concept"]
+        refs["semantic_branch.anchor_slot"] = self._find_param_by_name_contains(
+            ["semantic_side_branch.anchor_slot_embed", "semantic_side_branch.anchor_token_init"]
         )
-        refs["semantic_concept.proj"] = self._find_param_by_name_contains(
-            [
-                "semantic_concept.query_semantic.weight",
-                "semantic_concept.semantic_proj.weight",
-                "semantic_concept.key_slots.weight",
-            ]
+        refs["semantic_branch.readout"] = self._find_param_by_name_contains(
+            ["semantic_side_branch.readout_gate.weight", "semantic_side_branch.readout_norm.weight"]
         )
         # Track layer-wise prompt evolution with first/middle/last layers.
         prompt_layers = [
@@ -342,9 +338,9 @@ class Trainer():
     def _log_semantic_param_names_once(self):
         if self._debug_semantic_param_names_logged:
             return
-        names = [n for n, _ in self.model.named_parameters() if "semantic_concept" in n]
+        names = [n for n, _ in self.model.named_parameters() if "semantic_side_branch" in n]
         logger.info(
-            "[trace] semantic_concept param names (%d): %s",
+            "[trace] semantic_side_branch param names (%d): %s",
             len(names),
             names if len(names) <= 40 else names[:40] + ["..."],
         )
@@ -367,7 +363,7 @@ class Trainer():
                 any("r_similarity_head" in n for n in names),
                 any("prompt_init_provider" in n for n in names),
                 any("prompt_update_layers" in n for n in names),
-                any(("semantic_concept" in n) or ("semantic_cross_attn" in n) for n in names),
+                any(("semantic_side_branch" in n) or ("semantic_anchor" in n) for n in names),
             )
 
     def _log_batch_stats_once(self, logits, targets):
@@ -1227,14 +1223,12 @@ class Trainer():
             "refined_proj": None,
         }
 
-        concept = getattr(r_head, "semantic_concept", None) if r_head is not None else None
-        if concept is not None and getattr(concept, "semantic_proj", None) is not None:
-            raw_embed = concept.semantic_proj(raw_attr_cand.unsqueeze(1))
-            raw_embed = concept.semantic_proj_norm(raw_embed).squeeze(1)
+        if r_head is not None and getattr(r_head, "semantic_anchor", None) is not None:
+            raw_embed = r_head.semantic_anchor(raw_attr_cand)
             bank["orig_proj"] = r_head.semantic_proj(raw_embed)
 
         if r_head is not None:
-            refined_all = r_head._class_prototypes()
+            refined_all = r_head._class_prototypes_refined()
             refined_cand = refined_all.index_select(0, cids)
             bank["refined_proj"] = r_head.semantic_proj(refined_cand)
 
@@ -1381,10 +1375,8 @@ class Trainer():
 
         # Layer 3: S^# specific monitoring.
         if torch.is_tensor(refined_sem_batch):
-            concept = getattr(r_head, "semantic_concept", None)
-            if (raw_sem_batch is not None) and (concept is not None) and (getattr(concept, "semantic_proj", None) is not None):
-                raw_map = concept.semantic_proj(raw_sem_batch.unsqueeze(1))
-                raw_map = concept.semantic_proj_norm(raw_map).squeeze(1)
+            if (raw_sem_batch is not None) and (getattr(r_head, "semantic_anchor", None) is not None):
+                raw_map = r_head.semantic_anchor(raw_sem_batch)
                 faith = torch.nn.functional.cosine_similarity(
                     torch.nn.functional.normalize(refined_sem_batch.float(), dim=-1),
                     torch.nn.functional.normalize(raw_map.float(), dim=-1),
@@ -2260,24 +2252,10 @@ class Trainer():
         # only save the prompt embed if below conditions are satisfied
         if self.cfg.MODEL.PROMPT.SAVE_FOR_EACH_EPOCH:
             if self.cfg.MODEL.TYPE == "vit" and "prompt" in self.cfg.MODEL.TRANSFER_TYPE:
-                prompt_module = self.model.enc.transformer
-                out = {}
-
-                prompt_embds = getattr(prompt_module, "prompt_embeddings", None)
-                if prompt_embds is not None:
-                    out["shallow_prompt"] = prompt_embds.cpu().numpy()
-
-                if self.cfg.MODEL.PROMPT.DEEP and hasattr(prompt_module, "deep_prompt_embeddings"):
-                    deep_embds = prompt_module.deep_prompt_embeddings
-                    if deep_embds is not None:
-                        out["deep_prompt"] = deep_embds.cpu().numpy()
-
-                if not out:
-                    logger.warning("No prompt parameters to save for this epoch; skipping dump.")
-                    return
-
-                torch.save(out, os.path.join(
-                    self.cfg.OUTPUT_DIR, f"prompt_ep{epoch}.pth"))
+                logger.warning(
+                    "save_prompt skipped: static prompt embeddings were removed; "
+                    "current prompt path is provider-driven."
+                )
 
     @torch.no_grad()
     def eval_classifier(self, data_loader, prefix, save=False):

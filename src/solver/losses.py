@@ -7,7 +7,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ..models.vit_prompt.vit import SharedConceptAligner
 from typing import Any, Dict, Optional, List, Tuple
 
 
@@ -857,7 +856,6 @@ class RSimilarityClassifier(nn.Module):
 
     def __init__(
         self,
-        semantic_concept: Optional[SharedConceptAligner],
         class_attr: torch.Tensor,
         hidden_size: int,
         proj_dim: int = None,
@@ -890,7 +888,6 @@ class RSimilarityClassifier(nn.Module):
         if proj_dim is None or proj_dim <= 0:
             proj_dim = hidden_size
 
-        self.semantic_concept = semantic_concept
         self.register_buffer("class_attr", class_attr.float())
         self.num_classes = class_attr.shape[0]
         self.attr_dim = int(class_attr.shape[-1])
@@ -971,14 +968,9 @@ class RSimilarityClassifier(nn.Module):
         return self.semantic_anchor(attr)
 
     def _class_prototypes_refined(self) -> torch.Tensor:
-        # In role-migration mode, refinement is handled by late-stage AGR.
-        if self.role_migration_enable:
-            return self._class_prototypes_raw()
-        # Keep legacy refinement path for backward compatibility.
-        if self.semantic_concept is None:
-            return self._class_prototypes_raw()
-        attr = self.class_attr.to(next(self.semantic_concept.parameters()).device)
-        return self.semantic_concept.encode_semantics_only(attr)
+        # Legacy shared semantic concept branch was removed.
+        # Refined behavior is handled by side-branch/runtime states and AGR scoring.
+        return self._class_prototypes_raw()
 
     def _collect_role_summary_from_affinity(self) -> Dict[str, float]:
         out: Dict[str, float] = {}

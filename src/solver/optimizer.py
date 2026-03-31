@@ -25,8 +25,6 @@ def _build_adamw_param_groups(
     train_params: CfgNode,
 ) -> List[dict]:
     no_decay_keywords = (
-        "prompt_embeddings",
-        "deep_prompt_embeddings",
         "concept_slots",
         "cls_token",
         "position_embeddings",

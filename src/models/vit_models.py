@@ -56,13 +56,6 @@ class ViT(nn.Module):
         if "prompt" in cfg.MODEL.TRANSFER_TYPE:
             prompt_cfg = cfg.MODEL.PROMPT.clone()
             prompt_cfg.defrost()
-            # Keep top-level semantic module switches and prompt config consistent.
-            sem_cross = bool(getattr(getattr(cfg.MODEL, "SEMANTIC_CROSS_ATTN", None), "ENABLE", False))
-            shared_concept = bool(getattr(getattr(cfg.MODEL, "SHARED_CONCEPT", None), "ENABLE", False))
-            shared_aligner = bool(getattr(getattr(cfg.MODEL, "SHARED_ALIGNER", None), "ENABLE", False))
-            prompt_cfg.SEMANTIC_CROSS_ATTN_ENABLE = sem_cross
-            prompt_cfg.SHARED_CONCEPT_ENABLE = shared_concept
-            prompt_cfg.SHARED_ALIGNER_ENABLE = shared_aligner
             prompt_cfg.DEBUG_SHAPES = bool(getattr(cfg.SOLVER, "DEBUG_SHAPES", False))
             sem_branch_cfg = getattr(cfg.MODEL, "SEMANTIC_BRANCH", None)
             if sem_branch_cfg is not None:
@@ -236,8 +229,6 @@ class ViT(nn.Module):
             # Strict freeze for pretrained ViT backbone in prompt mode:
             # only prompt-specific modules and the lightweight semantic side branch are trainable.
             trainable_keys = (
-                "prompt_embeddings",
-                "deep_prompt_embeddings",
                 "prompt_proj",
                 "prompt_update_layers",
                 "prompt_init_provider",
@@ -342,13 +333,6 @@ class ViT(nn.Module):
         if not self.cfg.MODEL.R_SIMILARITY.ENABLE:
             return
 
-        # 2) 浠庣紪鐮佸櫒涓彇鍑哄叡浜蹇靛熀妯″潡锛?
-        #    - self.enc 閫氬父鏄?VisionTransformer 鎴?PromptedVisionTransformer
-        #    - 鍏跺唴閮ㄧ殑 transformer 閲岃嫢鍚敤浜?SharedConceptAligner锛屽垯浼氭寕鍦?semantic_concept 涓?
-        #    - getattr(getattr(...)) 鐨勫啓娉曟槸锛氳嫢涓棿浠绘剰涓€灞備笉瀛樺湪锛屽搴旇繑鍥?None 鑰屼笉鏄姤閿?
-        # New mainline: legacy shared semantic concept is bypassed by default.
-        concept = None
-
         # 3) 妫€鏌ュ苟瑙勮寖绫诲睘鎬х煩闃碉細
         #    - 璁粌 R-similarity 澶村繀椤绘湁绫荤骇璇箟灞炴€э紝鍚﹀垯鏃犳硶鏋勯€犺涔夊師鍨?
         if class_attributes is None:
@@ -368,7 +352,6 @@ class ViT(nn.Module):
         #    - proj_dim: 璇箟/瑙嗚鍦?R 绌洪棿涓殑瀵归綈缁村害锛堣嫢涓?None/<=0锛屽垯鍐呴儴浼氶€€鍖栦负 hidden_size锛?
         proj_dim = self.cfg.MODEL.R_SIMILARITY.PROJ_DIM
         self.r_similarity_head = RSimilarityClassifier(
-            concept,                                            # 鍏变韩姒傚康鍩烘ā鍧楋紙鐢ㄤ簬鎶婅涔夋槧灏勫埌 R 绌洪棿锛?
             class_attributes,                                   # 绫荤骇璇箟灞炴€х煩闃?[C, d_s]
             hidden_size=self.feat_dim,                          # ViT 杈撳嚭鐨勭壒寰佺淮搴︼紙閫氬父绛変簬 hidden_size锛?
             proj_dim=proj_dim,                                  # R 绌洪棿涓娇鐢ㄧ殑缁村害
