@@ -67,7 +67,7 @@ SOLVER:
   BIAS_MULTIPLIER: 1.0
   VIS:
     ENABLE: true
-    EPOCH_LIST: [1, 3, 5, 7, 10, 15, 20, 30, 40, 50]
+    EPOCH_LIST: [1, 3, 5, 7, 10, 15, 20]
     SPLITS: ["val", "test"]
     MAX_SAMPLES: 8
     LOCAL_CONTROL: true
