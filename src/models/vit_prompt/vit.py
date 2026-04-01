@@ -200,6 +200,7 @@ class LateSemanticSideBranch(nn.Module):
         anchor_delta = None
         free_delta = None
         patch_compete_usage = None
+        patch_compete_map = None
         patch_compete_balance = None
         patch_compete_on = self._patch_compete_on_layer(layer_idx, num_layers)
         if self.use_anchor_free and torch.is_tensor(visual_tokens) and visual_tokens.numel() > 0 and self.anchor_tokens > 0:
@@ -216,6 +217,7 @@ class LateSemanticSideBranch(nn.Module):
                 if patch_compete_on and self.patch_compete_mode == "token_softmax":
                     logits_all = torch.cat([anchor_logits_adj, free_logits], dim=1) / self.patch_compete_temperature
                     attn_all = torch.softmax(logits_all, dim=1)  # patch-wise token competition
+                    patch_compete_map = attn_all
                     anchor_attn = attn_all[:, :self.anchor_tokens, :]
                     free_attn = attn_all[:, self.anchor_tokens:, :]
                     patch_compete_usage = attn_all.sum(dim=-1)  # [B,T]
@@ -227,10 +229,12 @@ class LateSemanticSideBranch(nn.Module):
                 anchor_attn = torch.softmax(anchor_logits_adj, dim=-1)
                 if patch_compete_on and self.patch_compete_mode == "token_softmax":
                     patch_compete_usage = anchor_attn.sum(dim=-1)
-            anchor_delta = torch.matmul(anchor_attn, visual_tokens)
+            anchor_denom = anchor_attn.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            anchor_delta = torch.matmul(anchor_attn, visual_tokens) / anchor_denom
             anchor_next = a + (gamma * self.gamma_anchor_scale) * anchor_delta
             if self.free_tokens > 0 and f.numel() > 0 and free_attn is not None:
-                free_delta = torch.matmul(free_attn, visual_tokens)
+                free_denom = free_attn.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                free_delta = torch.matmul(free_attn, visual_tokens) / free_denom
                 free_next = f + (gamma * self.gamma_free_scale) * free_delta
                 sem_next = torch.cat([anchor_next, free_next], dim=1)
             else:
@@ -252,6 +256,8 @@ class LateSemanticSideBranch(nn.Module):
         }
         if torch.is_tensor(patch_compete_usage):
             out_aff["PatchCompeteUsage"] = patch_compete_usage
+        if torch.is_tensor(patch_compete_map):
+            out_aff["PatchCompeteMap"] = patch_compete_map
         if torch.is_tensor(patch_compete_balance):
             out_aff["PatchCompeteBalance"] = patch_compete_balance
         diag = {

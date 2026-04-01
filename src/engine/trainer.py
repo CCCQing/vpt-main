@@ -165,6 +165,12 @@ class Trainer():
         self.token_patch_toprho = float(getattr(mon_cfg, "TOKEN_PATCH_TOPRHO", 0.2)) if mon_cfg is not None else 0.2
         self.token_patch_save_maps = bool(getattr(mon_cfg, "TOKEN_PATCH_SAVE_MAPS", False)) if mon_cfg is not None else False
         self.token_patch_max_samples = max(1, int(getattr(mon_cfg, "TOKEN_PATCH_MAX_SAMPLES", 8))) if mon_cfg is not None else 8
+        self.affinity_summary_enable = bool(getattr(mon_cfg, "AFFINITY_SUMMARY_ENABLE", True)) if mon_cfg is not None else True
+        self.affinity_save_raw_dump = bool(getattr(mon_cfg, "AFFINITY_SAVE_RAW_DUMP", False)) if mon_cfg is not None else False
+        self.affinity_keynode_viz_enable = bool(getattr(mon_cfg, "AFFINITY_KEYNODE_VIZ_ENABLE", True)) if mon_cfg is not None else True
+        self.affinity_keynode_splits = [str(x).lower() for x in list(getattr(mon_cfg, "AFFINITY_KEYNODE_SPLITS", ["test"]))] if mon_cfg is not None else ["test"]
+        self.affinity_keynode_max_figs = max(0, int(getattr(mon_cfg, "AFFINITY_KEYNODE_MAX_FIGS", 1))) if mon_cfg is not None else 1
+        self.affinity_keynode_layer_policy = str(getattr(mon_cfg, "AFFINITY_KEYNODE_LAYER_POLICY", "first_middle_last")).lower() if mon_cfg is not None else "first_middle_last"
         self.monitor_dir = os.path.join(self.cfg.OUTPUT_DIR, "monitor")
         self._monitor_csv_path = os.path.join(self.monitor_dir, "summary.csv")
         self._monitor_warned_no_refined = False
@@ -222,6 +228,15 @@ class Trainer():
                 float(self.token_patch_toprho),
                 bool(self.token_patch_save_maps),
                 int(self.token_patch_max_samples),
+            )
+            logger.info(
+                "[monitor-affinity] summary=%s raw_dump=%s keynode_viz=%s keynode_splits=%s keynode_max_figs=%d keynode_layer_policy=%s",
+                bool(self.affinity_summary_enable),
+                bool(self.affinity_save_raw_dump),
+                bool(self.affinity_keynode_viz_enable),
+                self.affinity_keynode_splits,
+                int(self.affinity_keynode_max_figs),
+                self.affinity_keynode_layer_policy,
             )
 
     @staticmethod
@@ -560,7 +575,9 @@ class Trainer():
             "free_usage_gini": [],
             "anchor_monopoly": [],
             "free_monopoly": [],
+            "affinity_rows": [],
         }
+        self._affinity_keynode_saved = 0
 
     @staticmethod
     def _gini_np(x: np.ndarray) -> float:
@@ -578,6 +595,112 @@ class Trainer():
         g = (2.0 * np.sum(idx * arr) / (n * s)) - (n + 1.0) / n
         return float(g)
 
+    @staticmethod
+    def _matrix_head_mean(x: torch.Tensor) -> torch.Tensor:
+        if (not torch.is_tensor(x)) or x.numel() == 0:
+            return None
+        t = x.detach().float()
+        if t.dim() == 4:
+            t = t.mean(dim=1)  # [B,Q,K]
+        if t.dim() != 3:
+            return None
+        return t
+
+    @staticmethod
+    def _matrix_stats_from_bqk(a: torch.Tensor) -> dict:
+        if (not torch.is_tensor(a)) or a.dim() != 3 or a.numel() == 0:
+            return {}
+        out = {}
+        b, q, k = a.shape
+        x = a.detach().float()
+        flat = x.reshape(-1)
+        out["n_samples"] = int(b)
+        out["q_len"] = int(q)
+        out["k_len"] = int(k)
+        out["mean"] = float(flat.mean().item())
+        out["std"] = float(flat.std().item())
+        out["min"] = float(flat.min().item())
+        out["max"] = float(flat.max().item())
+
+        # Row-wise distribution stats after safe renorm.
+        p = x.clamp_min(0.0)
+        p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        row_ent = (-(p.clamp_min(1e-12) * p.clamp_min(1e-12).log()).sum(dim=-1)).reshape(-1).cpu().numpy()
+        if row_ent.size > 0:
+            out["row_entropy_mean"] = float(np.mean(row_ent))
+            out["row_entropy_p50"] = float(np.percentile(row_ent, 50))
+            out["row_entropy_p90"] = float(np.percentile(row_ent, 90))
+
+        row_mon = p.max(dim=-1).values.reshape(-1).cpu().numpy()
+        if row_mon.size > 0:
+            out["row_monopoly_mean"] = float(np.mean(row_mon))
+            out["row_monopoly_p50"] = float(np.percentile(row_mon, 50))
+            out["row_monopoly_p90"] = float(np.percentile(row_mon, 90))
+
+        row_g = []
+        p_np = p.cpu().numpy().reshape(-1, k)
+        for r in p_np:
+            g = Trainer._gini_np(r)
+            if np.isfinite(g):
+                row_g.append(g)
+        if len(row_g) > 0:
+            g_arr = np.asarray(row_g, dtype=np.float64)
+            out["row_gini_mean"] = float(np.mean(g_arr))
+            out["row_gini_p50"] = float(np.percentile(g_arr, 50))
+            out["row_gini_p90"] = float(np.percentile(g_arr, 90))
+
+        # Effective rank / singular spectrum (batch mean).
+        er_vals, c1_vals, c2_vals, c3_vals = [], [], [], []
+        for bi in range(min(int(b), 8)):  # cap for speed
+            try:
+                s = torch.linalg.svdvals(p[bi])
+            except Exception:
+                continue
+            if s.numel() == 0:
+                continue
+            ps = s / s.sum().clamp_min(1e-12)
+            er = torch.exp(-(ps * ps.clamp_min(1e-12).log()).sum())
+            er_vals.append(float(er.item()))
+            c1_vals.append(float(ps[:1].sum().item()))
+            c2_vals.append(float(ps[:2].sum().item()))
+            c3_vals.append(float(ps[:3].sum().item()))
+        if len(er_vals) > 0:
+            out["effective_rank_mean"] = float(np.mean(er_vals))
+            out["sv_top1_cum_mean"] = float(np.mean(c1_vals))
+            out["sv_top2_cum_mean"] = float(np.mean(c2_vals))
+            out["sv_top3_cum_mean"] = float(np.mean(c3_vals))
+        return out
+
+    @staticmethod
+    def _matrix_sources_meta() -> dict:
+        return {
+            "vv": {
+                "raw_key": "Avv",
+                "source_path_or_source_name": "vit_backbones.vit.Attention.compute_affinity",
+                "softmax_dim_name": "key_patch(last_dim)",
+            },
+            "pp": {
+                "raw_key": "App",
+                "source_path_or_source_name": "vit_backbones.vit.Attention.compute_affinity",
+                "softmax_dim_name": "key_prompt(last_dim)",
+            },
+            "pv": {
+                "raw_key": "Apv",
+                "source_path_or_source_name": "vit_backbones.vit.Attention.compute_affinity",
+                "softmax_dim_name": "key_patch(last_dim)",
+            },
+            "vs": {
+                "raw_key": "Avs",
+                "source_path_or_source_name": "vit_backbones.vit.Block._compute_semantic_affinity",
+                "softmax_dim_name": "key_semantic(last_dim)",
+            },
+            "ps": {
+                "raw_key": "Aps",
+                "source_path_or_source_name": "vit_backbones.vit.Block._compute_semantic_affinity",
+                "softmax_dim_name": "key_semantic(last_dim)",
+            },
+        }
+
     def _token_patch_from_affinity(self, aff: dict) -> torch.Tensor:
         if not isinstance(aff, dict):
             return None
@@ -585,6 +708,13 @@ class Trainer():
         x = None
         if source == "avs":
             x = aff.get("Avs")
+        elif source in {"patch_compete", "compete", "patch_compete_map"}:
+            x = aff.get("PatchCompeteMap")
+            if torch.is_tensor(x) and x.dim() == 3:
+                a = x.detach().float()  # already [B,T,P]
+                a = a.clamp_min(0.0)
+                a = a / a.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                return a
         if not torch.is_tensor(x) or x.numel() == 0:
             return None
         a = x.detach().float()
@@ -789,6 +919,64 @@ class Trainer():
                                         self._vis_trend_buf["free_usage_gini"].append(float(np.mean(f_g)))
                                     if f_m.size > 0:
                                         self._vis_trend_buf["free_monopoly"].append(float(np.mean(f_m)))
+                if self.affinity_summary_enable:
+                    meta = self._matrix_sources_meta()
+                    for mname, mmeta in meta.items():
+                        raw_key = mmeta["raw_key"]
+                        x = aff.get(raw_key) if isinstance(aff, dict) else None
+                        if torch.is_tensor(x):
+                            a = self._matrix_head_mean(x)
+                            st = self._matrix_stats_from_bqk(a) if torch.is_tensor(a) else {}
+                            row = {
+                                "epoch": int(self._trace_epoch + 1),
+                                "split": str(self._vis_trend_buf.get("split", "unknown")),
+                                "layer": int(li),
+                                "matrix_name": str(mname),
+                                "exists_flag": 1,
+                                "source_path_or_source_name": mmeta["source_path_or_source_name"],
+                                "q_len": int(st.get("q_len", a.shape[1] if torch.is_tensor(a) else -1)),
+                                "k_len": int(st.get("k_len", a.shape[2] if torch.is_tensor(a) else -1)),
+                                "softmax_dim_name": mmeta["softmax_dim_name"],
+                            }
+                            for k in [
+                                "n_samples", "mean", "std", "min", "max",
+                                "row_entropy_mean", "row_entropy_p50", "row_entropy_p90",
+                                "row_gini_mean", "row_gini_p50", "row_gini_p90",
+                                "row_monopoly_mean", "row_monopoly_p50", "row_monopoly_p90",
+                                "effective_rank_mean", "sv_top1_cum_mean", "sv_top2_cum_mean", "sv_top3_cum_mean",
+                            ]:
+                                row[k] = st.get(k, None)
+                            self._vis_trend_buf["affinity_rows"].append(row)
+                        else:
+                            self._vis_trend_buf["affinity_rows"].append({
+                                "epoch": int(self._trace_epoch + 1),
+                                "split": str(self._vis_trend_buf.get("split", "unknown")),
+                                "layer": int(li),
+                                "matrix_name": str(mname),
+                                "exists_flag": 0,
+                                "source_path_or_source_name": mmeta["source_path_or_source_name"],
+                                "q_len": None,
+                                "k_len": None,
+                                "softmax_dim_name": mmeta["softmax_dim_name"],
+                                "n_samples": 0,
+                                "mean": None,
+                                "std": None,
+                                "min": None,
+                                "max": None,
+                                "row_entropy_mean": None,
+                                "row_entropy_p50": None,
+                                "row_entropy_p90": None,
+                                "row_gini_mean": None,
+                                "row_gini_p50": None,
+                                "row_gini_p90": None,
+                                "row_monopoly_mean": None,
+                                "row_monopoly_p50": None,
+                                "row_monopoly_p90": None,
+                                "effective_rank_mean": None,
+                                "sv_top1_cum_mean": None,
+                                "sv_top2_cum_mean": None,
+                                "sv_top3_cum_mean": None,
+                            })
                 if self.token_patch_stats_enable:
                     a_t_p = self._token_patch_from_affinity(aff)
                     stats = self._token_patch_batch_stats(a_t_p) if torch.is_tensor(a_t_p) else {}
@@ -870,6 +1058,64 @@ class Trainer():
             "free_monopoly": float(np.mean(self._vis_trend_buf["free_monopoly"])) if len(self._vis_trend_buf["free_monopoly"]) > 0 else None,
         }
         save_json(os.path.join(trend_dir, f"epoch_{epoch:03d}_trend.json"), out_json)
+
+        # Affinity matrix summaries for vv/pp/pv/vs/ps.
+        if self.affinity_summary_enable:
+            rows = self._vis_trend_buf.get("affinity_rows", [])
+            grouped = {}
+            for r in rows:
+                key = (r.get("epoch"), r.get("split"), r.get("layer"), r.get("matrix_name"))
+                grouped.setdefault(key, []).append(r)
+            agg_rows = []
+            numeric_keys = [
+                "n_samples", "mean", "std", "min", "max",
+                "row_entropy_mean", "row_entropy_p50", "row_entropy_p90",
+                "row_gini_mean", "row_gini_p50", "row_gini_p90",
+                "row_monopoly_mean", "row_monopoly_p50", "row_monopoly_p90",
+                "effective_rank_mean", "sv_top1_cum_mean", "sv_top2_cum_mean", "sv_top3_cum_mean",
+            ]
+            for key, items in grouped.items():
+                base = {
+                    "epoch": int(key[0]),
+                    "split": str(key[1]),
+                    "layer": int(key[2]),
+                    "matrix_name": str(key[3]),
+                    "exists_flag": int(max(int(x.get("exists_flag", 0)) for x in items)),
+                    "source_path_or_source_name": str(items[0].get("source_path_or_source_name", "")),
+                    "q_len": items[0].get("q_len", None),
+                    "k_len": items[0].get("k_len", None),
+                    "softmax_dim_name": str(items[0].get("softmax_dim_name", "")),
+                }
+                for nk in numeric_keys:
+                    vals = [x.get(nk, None) for x in items]
+                    vals = [float(v) for v in vals if v is not None and np.isfinite(v)]
+                    if nk == "n_samples":
+                        base[nk] = int(np.sum(vals)) if len(vals) > 0 else 0
+                    else:
+                        base[nk] = float(np.mean(vals)) if len(vals) > 0 else None
+                agg_rows.append(base)
+
+            agg_rows = sorted(agg_rows, key=lambda x: (x["layer"], x["matrix_name"]))
+            save_json(
+                os.path.join(trend_dir, f"epoch_{epoch:03d}_affinity_epoch_summary.json"),
+                {"rows": agg_rows},
+            )
+            save_json(
+                os.path.join(trend_dir, "affinity_epoch_summary.json"),
+                {"epoch": int(epoch), "split": str(split), "rows": agg_rows},
+            )
+            field_order = [
+                "epoch", "split", "layer", "matrix_name", "exists_flag",
+                "source_path_or_source_name", "q_len", "k_len", "softmax_dim_name",
+                "n_samples", "mean", "std", "min", "max",
+                "row_entropy_mean", "row_entropy_p50", "row_entropy_p90",
+                "row_gini_mean", "row_gini_p50", "row_gini_p90",
+                "row_monopoly_mean", "row_monopoly_p50", "row_monopoly_p90",
+                "effective_rank_mean", "sv_top1_cum_mean", "sv_top2_cum_mean", "sv_top3_cum_mean",
+            ]
+            for row in agg_rows:
+                append_csv_row(os.path.join(trend_dir, "affinity_epoch_summary.csv"), row, field_order=field_order)
+                append_csv_row(os.path.join(trend_dir, "affinity_trend_summary.csv"), row, field_order=field_order)
 
         # token-patch per-layer summaries (A[T,P]-based diagnostics)
         if self.token_patch_stats_enable and len(layer_ids) > 0:
@@ -1016,6 +1262,97 @@ class Trainer():
             plt.savefig(os.path.join(trend_dir, f"epoch_{epoch:03d}_entropy_curve.png"), dpi=160)
             plt.close()
 
+    def _select_key_layers(self, n_layers: int) -> list:
+        if n_layers <= 0:
+            return []
+        if self.affinity_keynode_layer_policy == "all":
+            return list(range(n_layers))
+        # default: first / middle / last
+        ids = [0, n_layers // 2, n_layers - 1]
+        return sorted(set([int(x) for x in ids if 0 <= int(x) < n_layers]))
+
+    @staticmethod
+    def _key_nodes_for_matrix(m: np.ndarray, matrix_name: str) -> dict:
+        if m.ndim != 2 or m.size == 0:
+            return {}
+        eps = 1e-12
+        p = np.clip(m, 0.0, None)
+        p = p / np.clip(np.sum(p, axis=1, keepdims=True), eps, None)
+        row_ent = -np.sum(p * np.log(np.clip(p, eps, None)), axis=1)
+        out = {}
+        if matrix_name in {"vv", "pp"}:
+            col_sum = np.sum(np.clip(m, 0.0, None), axis=0)
+            out["sink_like_node"] = int(np.argmax(col_sum))
+            out["focused_node"] = int(np.argmin(row_ent))
+            out["diffuse_node"] = int(np.argmax(row_ent))
+        elif matrix_name in {"pv", "ps"}:
+            out["focused_prompt"] = int(np.argmin(row_ent))
+            out["diffuse_prompt"] = int(np.argmax(row_ent))
+        elif matrix_name == "vs":
+            out["confident_patch"] = int(np.argmin(row_ent))
+            out["ambiguous_patch"] = int(np.argmax(row_ent))
+        return out
+
+    def _maybe_export_affinity_keynodes(self, split: str, epoch: int, sample_idx: int, affinities: list, base: str):
+        if (not self.affinity_keynode_viz_enable) or (str(split).lower() not in set(self.affinity_keynode_splits)):
+            return
+        if self._affinity_keynode_saved >= self.affinity_keynode_max_figs:
+            return
+        if (not isinstance(affinities, list)) or len(affinities) == 0:
+            return
+
+        key_layers = self._select_key_layers(len(affinities))
+        matrix_map = [("vv", "Avv"), ("pp", "App"), ("pv", "Apv"), ("vs", "Avs"), ("ps", "Aps")]
+        rows = []
+        fig_rows = len(key_layers)
+        fig_cols = len(matrix_map)
+        fig, axes = plt.subplots(fig_rows, fig_cols, figsize=(3.0 * fig_cols, 2.5 * max(1, fig_rows)), squeeze=False)
+
+        for r_i, li in enumerate(key_layers):
+            aff = affinities[li] if (0 <= li < len(affinities) and isinstance(affinities[li], dict)) else {}
+            for c_i, (mname, raw_key) in enumerate(matrix_map):
+                ax = axes[r_i][c_i]
+                x = aff.get(raw_key, None) if isinstance(aff, dict) else None
+                if not torch.is_tensor(x):
+                    ax.set_axis_off()
+                    ax.set_title(f"L{li} {mname} (missing)")
+                    rows.append({
+                        "epoch": int(epoch), "split": str(split), "sample_idx": int(sample_idx),
+                        "layer": int(li), "matrix_name": mname, "exists_flag": 0,
+                    })
+                    continue
+                a = self._matrix_head_mean(x)
+                if (not torch.is_tensor(a)) or a.dim() != 3 or a.shape[0] <= 0:
+                    ax.set_axis_off()
+                    ax.set_title(f"L{li} {mname} (invalid)")
+                    continue
+                m = a[0].detach().cpu().numpy()
+                knd = self._key_nodes_for_matrix(m, mname)
+                im = ax.imshow(m, aspect="auto", cmap="viridis")
+                ax.set_title(f"L{li} {mname}")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                # draw key rows when row-like node is selected
+                for kk in ["focused_node", "diffuse_node", "focused_prompt", "diffuse_prompt", "confident_patch", "ambiguous_patch"]:
+                    if kk in knd:
+                        y = int(knd[kk])
+                        ax.axhline(y=y, color="w", linewidth=0.5, alpha=0.8)
+                rows.append({
+                    "epoch": int(epoch), "split": str(split), "sample_idx": int(sample_idx),
+                    "layer": int(li), "matrix_name": mname, "exists_flag": 1,
+                    **knd,
+                })
+
+        plt.tight_layout()
+        fig_path = os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_affinity_keynodes.png")
+        fig.savefig(fig_path, dpi=140)
+        plt.close(fig)
+        save_json(
+            os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_affinity_keynodes.json"),
+            {"rows": rows, "layer_policy": self.affinity_keynode_layer_policy},
+        )
+        self._affinity_keynode_saved += 1
+
     def _vis_collect_sample(
         self,
         split: str,
@@ -1044,7 +1381,15 @@ class Trainer():
         img_u8 = to_uint8_image(image_chw)
         h, w = img_u8.shape[:2]
 
-        # Group 1: token-patch diagnostics from A[T,P] (default source: Avs).
+        self._maybe_export_affinity_keynodes(
+            split=split,
+            epoch=epoch,
+            sample_idx=sample_idx,
+            affinities=affinities,
+            base=base,
+        )
+
+        # Group 1: token-patch diagnostics from A[T,P] (summary-first, raw dump optional).
         if self.vis_local_control:
             if self._vis_processed < int(self.token_patch_max_samples):
                 for li, aff in enumerate(affinities):
@@ -1103,17 +1448,17 @@ class Trainer():
                         "residual_max_abs": max_abs.tolist(),
                         "residual_l2": l2.tolist(),
                     }
-                    if self.vis_save_raw:
+                    save_json(
+                        os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_tokenpatch_summary.json"),
+                        stats_obj,
+                    )
+                    if self.affinity_save_raw_dump and self.vis_save_raw:
                         np.save(os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_a_bar.npy"), a_bar)
                         np.save(os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_residual.npy"), residual)
                         np.save(os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_overlap_cos.npy"), ov_cos)
                         np.save(os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_overlap_iou.npy"), ov_iou)
                         np.save(os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_sv.npy"), sv)
-                        save_json(
-                            os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_tokenpatch.json"),
-                            stats_obj,
-                        )
-                    # Only one total map overlay; do not export per-token small maps.
+                    # Only one total map overlay; no per-token small maps.
                     if self.token_patch_save_maps and self.vis_save_images:
                         bar_up = resize_map_torch(a_bar.reshape(g, g), (h, w))
                         save_overlay(
@@ -1158,7 +1503,7 @@ class Trainer():
                                         pm_up,
                                         title=f"{name} rollout",
                                     )
-                    if self.vis_save_raw:
+                    if self.affinity_save_raw_dump and self.vis_save_raw:
                         np.savez_compressed(
                             os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_rollout_maps.npz"),
                             cls=cls_up,
@@ -2000,6 +2345,31 @@ class Trainer():
                 )
                 return -1, -1
             elif torch.isnan(loss).any():
+                try:
+                    logits_dbg = debug_logits if torch.is_tensor(debug_logits) else self._extract_logits(loss_outputs)
+                except Exception:
+                    logits_dbg = None
+                if torch.is_tensor(logits_dbg):
+                    finite_ratio = float(torch.isfinite(logits_dbg).float().mean().item())
+                    logit_min = float(torch.nan_to_num(logits_dbg, nan=0.0, posinf=0.0, neginf=0.0).min().item())
+                    logit_max = float(torch.nan_to_num(logits_dbg, nan=0.0, posinf=0.0, neginf=0.0).max().item())
+                else:
+                    finite_ratio = float("nan")
+                    logit_min = float("nan")
+                    logit_max = float("nan")
+                scale_dbg = None
+                model_ref_dbg = self.model.module if hasattr(self.model, "module") else self.model
+                r_head_dbg = getattr(model_ref_dbg, "r_similarity_head", None)
+                if r_head_dbg is not None:
+                    scale_dbg = getattr(r_head_dbg, "_loss_last_scale", None)
+                logger.info(
+                    "[nan-debug] loss=NaN logits_finite_ratio=%.6f logits[min,max]=[%.6f, %.6f] scale=%s last_train_debug=%s",
+                    finite_ratio,
+                    logit_min,
+                    logit_max,
+                    float(scale_dbg.detach().item()) if torch.is_tensor(scale_dbg) and scale_dbg.numel() == 1 else str(scale_dbg),
+                    self._last_train_debug if isinstance(self._last_train_debug, dict) else {},
+                )
                 logger.info(
                     "encountered nan loss, skip gradient updating for this batch!"
                 )

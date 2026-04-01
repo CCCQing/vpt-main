@@ -309,21 +309,27 @@ _C.SOLVER.MONITOR.SAVE_CSV = True
 _C.SOLVER.MONITOR.SAVE_HEATMAP = False
 _C.SOLVER.MONITOR.HEATMAP_TOPK = 50
 _C.SOLVER.MONITOR.TOKEN_PATCH_STATS_ENABLE = True
-_C.SOLVER.MONITOR.TOKEN_PATCH_SOURCE = "avs"        # avs
+_C.SOLVER.MONITOR.TOKEN_PATCH_SOURCE = "patch_compete"        # avs | patch_compete
 _C.SOLVER.MONITOR.TOKEN_PATCH_HEAD_MODE = "head_avg"  # head_avg | head0
 _C.SOLVER.MONITOR.TOKEN_PATCH_TOPRHO = 0.2
 _C.SOLVER.MONITOR.TOKEN_PATCH_SAVE_MAPS = False
 _C.SOLVER.MONITOR.TOKEN_PATCH_MAX_SAMPLES = 8
+_C.SOLVER.MONITOR.AFFINITY_SUMMARY_ENABLE = True
+_C.SOLVER.MONITOR.AFFINITY_SAVE_RAW_DUMP = False
+_C.SOLVER.MONITOR.AFFINITY_KEYNODE_VIZ_ENABLE = True
+_C.SOLVER.MONITOR.AFFINITY_KEYNODE_SPLITS = ["test"]
+_C.SOLVER.MONITOR.AFFINITY_KEYNODE_MAX_FIGS = 1
+_C.SOLVER.MONITOR.AFFINITY_KEYNODE_LAYER_POLICY = "first_middle_last"  # first_middle_last | all
 
 # -----------------------------------------------------------------------------
 # Visualization pipeline (off by default)
 # -----------------------------------------------------------------------------
 _C.SOLVER.VIS = CfgNode()
-_C.SOLVER.VIS.ENABLE = False
+_C.SOLVER.VIS.ENABLE = True
 _C.SOLVER.VIS.EVERY_EPOCH = 1
 # If non-empty, use explicit 1-based epoch list and ignore EVERY_EPOCH.
 _C.SOLVER.VIS.EPOCH_LIST = []
-_C.SOLVER.VIS.SPLITS = ["val", "test"]
+_C.SOLVER.VIS.SPLITS = ["test"]
 _C.SOLVER.VIS.MAX_SAMPLES = 8
 _C.SOLVER.VIS.SAVE_RAW = True
 _C.SOLVER.VIS.SAVE_IMAGES = True
