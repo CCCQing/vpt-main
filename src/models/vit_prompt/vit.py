@@ -50,6 +50,12 @@ class LateSemanticSideBranch(nn.Module):
         gamma_max: float = 1.0,
         start_layer: int = 0,
         end_layer: int = -1,
+        patch_compete_enable: bool = False,
+        patch_compete_layers: Optional[List[int]] = None,
+        patch_compete_temperature: float = 1.0,
+        patch_compete_mode: str = "token_softmax",
+        patch_compete_balance_weight: float = 0.0,
+        patch_compete_use_null_token: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = int(hidden_size)
@@ -64,6 +70,12 @@ class LateSemanticSideBranch(nn.Module):
         self.gamma_max = float(gamma_max)
         self.start_layer = int(start_layer)
         self.end_layer = int(end_layer)
+        self.patch_compete_enable = bool(patch_compete_enable)
+        self.patch_compete_layers = [int(x) for x in (patch_compete_layers or [-1])]
+        self.patch_compete_temperature = float(max(1e-6, patch_compete_temperature))
+        self.patch_compete_mode = str(patch_compete_mode).lower()
+        self.patch_compete_balance_weight = float(max(0.0, patch_compete_balance_weight))
+        self.patch_compete_use_null_token = bool(patch_compete_use_null_token)
 
         self.anchor_proj: Optional[nn.Linear] = None
         self.token_init = nn.Linear(hidden_size, self.num_tokens * hidden_size)
@@ -103,6 +115,19 @@ class LateSemanticSideBranch(nn.Module):
         span = max(1, end_layer - self.start_layer)
         t = float(layer_idx - self.start_layer) / float(span)
         return self.gamma_min + (self.gamma_max - self.gamma_min) * t
+
+    def _patch_compete_on_layer(self, layer_idx: int, num_layers: int) -> bool:
+        if not self.patch_compete_enable:
+            return False
+        if len(self.patch_compete_layers) == 0:
+            return False
+        enabled_ids = set()
+        for li in self.patch_compete_layers:
+            if li < 0:
+                enabled_ids.add(int(num_layers + li))
+            else:
+                enabled_ids.add(int(li))
+        return int(layer_idx) in enabled_ids
 
     def init_state(self, semantics: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         if semantics.dim() == 3 and semantics.shape[1] == 1:
@@ -174,6 +199,9 @@ class LateSemanticSideBranch(nn.Module):
         free_attn = None
         anchor_delta = None
         free_delta = None
+        patch_compete_usage = None
+        patch_compete_balance = None
+        patch_compete_on = self._patch_compete_on_layer(layer_idx, num_layers)
         if self.use_anchor_free and torch.is_tensor(visual_tokens) and visual_tokens.numel() > 0 and self.anchor_tokens > 0:
             a = sem_tokens[:, :self.anchor_tokens, :]
             f = sem_tokens[:, self.anchor_tokens:, :] if self.free_tokens > 0 else sem_tokens[:, :0, :]
@@ -185,10 +213,20 @@ class LateSemanticSideBranch(nn.Module):
                 free_logits = torch.einsum("bfd,bnd->bfn", f_n, v_n)
                 free_patch_score = free_logits.max(dim=1, keepdim=True).values
                 anchor_logits_adj = anchor_logits - self.free_compete_lambda * free_patch_score.detach()
-                free_attn = torch.softmax(free_logits, dim=-1)
+                if patch_compete_on and self.patch_compete_mode == "token_softmax":
+                    logits_all = torch.cat([anchor_logits_adj, free_logits], dim=1) / self.patch_compete_temperature
+                    attn_all = torch.softmax(logits_all, dim=1)  # patch-wise token competition
+                    anchor_attn = attn_all[:, :self.anchor_tokens, :]
+                    free_attn = attn_all[:, self.anchor_tokens:, :]
+                    patch_compete_usage = attn_all.sum(dim=-1)  # [B,T]
+                else:
+                    free_attn = torch.softmax(free_logits, dim=-1)
             else:
                 anchor_logits_adj = anchor_logits
-            anchor_attn = torch.softmax(anchor_logits_adj, dim=-1)
+            if anchor_attn is None:
+                anchor_attn = torch.softmax(anchor_logits_adj, dim=-1)
+                if patch_compete_on and self.patch_compete_mode == "token_softmax":
+                    patch_compete_usage = anchor_attn.sum(dim=-1)
             anchor_delta = torch.matmul(anchor_attn, visual_tokens)
             anchor_next = a + (gamma * self.gamma_anchor_scale) * anchor_delta
             if self.free_tokens > 0 and f.numel() > 0 and free_attn is not None:
@@ -203,20 +241,38 @@ class LateSemanticSideBranch(nn.Module):
             sem_next = self.delta_norm(sem_tokens + gamma * delta)
             anchor_delta = delta
 
+        if torch.is_tensor(patch_compete_usage) and patch_compete_usage.numel() > 0:
+            u = patch_compete_usage.float()
+            u_mean = u.mean(dim=1, keepdim=True).clamp_min(1e-12)
+            patch_compete_balance = ((u - u_mean) ** 2 / (u_mean ** 2)).mean()
+
         out_aff = {
             "Aps": aps.unsqueeze(1) if aps is not None else sem_tokens.new_zeros((sem_tokens.shape[0], 1, 0, sem_tokens.shape[1])),
             "Avs": avs.unsqueeze(1),
         }
+        if torch.is_tensor(patch_compete_usage):
+            out_aff["PatchCompeteUsage"] = patch_compete_usage
+        if torch.is_tensor(patch_compete_balance):
+            out_aff["PatchCompeteBalance"] = patch_compete_balance
         diag = {
             "gamma": gamma,
             "aps_energy": float(out_aff["Aps"].float().abs().mean().item()) if out_aff["Aps"].numel() > 0 else 0.0,
             "avs_energy": float(out_aff["Avs"].float().abs().mean().item()) if out_aff["Avs"].numel() > 0 else 0.0,
+            "patch_compete_on": bool(patch_compete_on),
         }
+        if torch.is_tensor(patch_compete_usage):
+            u = patch_compete_usage.detach().float()
+            diag["patch_compete_usage_mean"] = float(u.mean().item())
+            diag["patch_compete_usage_std"] = float(u.std().item())
+            diag["patch_compete_usage_min"] = float(u.min().item())
+            diag["patch_compete_usage_max"] = float(u.max().item())
+        if torch.is_tensor(patch_compete_balance):
+            diag["patch_compete_balance_loss"] = float(patch_compete_balance.detach().item())
         if self.debug_shapes and (not self._shape_debug_step_logged):
             print(
                 "[SHAPE-DEBUG] LateSemanticSideBranch.step sem_tokens={} prompt_tokens={} visual_tokens={} "
                 "aps_logits={} avs_logits={} aps={} avs={} anchor_logits_adj={} free_patch_score={} "
-                "anchor_attn={} free_attn={} ctx_p={} ctx_v={} delta={} sem_next={}".format(
+                "anchor_attn={} free_attn={} ctx_p={} ctx_v={} delta={} sem_next={} patch_compete_on={} usage={}".format(
                     tuple(sem_tokens.shape),
                     tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None,
                     tuple(visual_tokens.shape) if torch.is_tensor(visual_tokens) else None,
@@ -232,6 +288,8 @@ class LateSemanticSideBranch(nn.Module):
                     tuple(ctx_v.shape),
                     tuple(anchor_delta.shape) if torch.is_tensor(anchor_delta) else None,
                     tuple(sem_next.shape),
+                    bool(patch_compete_on),
+                    tuple(patch_compete_usage.shape) if torch.is_tensor(patch_compete_usage) else None,
                 )
             )
             self._shape_debug_step_logged = True
@@ -325,6 +383,7 @@ class PromptedTransformer(Transformer):
             start_layer = int(getattr(self.semantic_branch_cfg, "START_LAYER", 0))
             end_layer_cfg = int(getattr(self.semantic_branch_cfg, "END_LAYER", -1))
             end_layer = (num_layers - 1) if end_layer_cfg < 0 else end_layer_cfg
+            affinity_cfg = getattr(prompt_config, "AFFINITY", None)
             self.semantic_side_branch = LateSemanticSideBranch(
                 hidden_size=int(config.hidden_size),
                 num_tokens=int(getattr(self.semantic_branch_cfg, "NUM_TOKENS", 4)),
@@ -338,6 +397,12 @@ class PromptedTransformer(Transformer):
                 gamma_max=float(getattr(self.semantic_branch_cfg, "GAMMA_MAX", 1.0)),
                 start_layer=start_layer,
                 end_layer=end_layer,
+                patch_compete_enable=bool(getattr(affinity_cfg, "PATCH_COMPETE_ENABLE", False)) if affinity_cfg is not None else False,
+                patch_compete_layers=list(getattr(affinity_cfg, "PATCH_COMPETE_LAYERS", [-1])) if affinity_cfg is not None else [-1],
+                patch_compete_temperature=float(getattr(affinity_cfg, "PATCH_COMPETE_TEMPERATURE", 1.0)) if affinity_cfg is not None else 1.0,
+                patch_compete_mode=str(getattr(affinity_cfg, "PATCH_COMPETE_MODE", "token_softmax")) if affinity_cfg is not None else "token_softmax",
+                patch_compete_balance_weight=float(getattr(affinity_cfg, "PATCH_COMPETE_BALANCE_WEIGHT", 0.0)) if affinity_cfg is not None else 0.0,
+                patch_compete_use_null_token=bool(getattr(affinity_cfg, "PATCH_COMPETE_USE_NULL_TOKEN", False)) if affinity_cfg is not None else False,
             )
         else:
             self.semantic_side_branch = None
@@ -703,6 +768,7 @@ class PromptedTransformer(Transformer):
         weights = None
         num_layers = self.vit_config.transformer["num_layers"]
         sem_tokens, h_y = self._init_semantic_side_state(semantics, num_layers)
+        patch_compete_balance_accum = None
 
         for i in range(num_layers):
             if i == 0:
@@ -728,12 +794,16 @@ class PromptedTransformer(Transformer):
                 # 4) 缁忚繃绗?i 灞?Transformer block锛堜粛鏀寔璇箟 cross-attn锛?
                 hidden_states, weights, _ = self.encoder.layer[i](hidden_states, None, self.num_tokens)
 
-            sem_tokens, _, _ = self._update_semantic_side_branch(
+            sem_tokens, sem_aff, _ = self._update_semantic_side_branch(
                 sem_tokens=sem_tokens,
                 hidden_states=hidden_states,
                 layer_idx=i,
                 num_layers=num_layers,
             )
+            if isinstance(sem_aff, dict):
+                b_loss = sem_aff.get("PatchCompeteBalance")
+                if torch.is_tensor(b_loss):
+                    patch_compete_balance_accum = b_loss if patch_compete_balance_accum is None else (patch_compete_balance_accum + b_loss)
 
             if self.encoder.vis:
                 attn_weights.append(weights)
@@ -748,6 +818,7 @@ class PromptedTransformer(Transformer):
                 "sem_tokens": sem_tokens,
                 "mu_s_final": mu_s_final,
                 "delta_sem": delta_sem,
+                "patch_compete_balance_loss": patch_compete_balance_accum,
                 "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
                 "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
             }
@@ -774,6 +845,7 @@ class PromptedTransformer(Transformer):
         weights = None
         num_layers = self.vit_config.transformer["num_layers"]
         sem_tokens, h_y = self._init_semantic_side_state(semantics, num_layers)
+        patch_compete_balance_accum = None
 
         for i in range(num_layers):
             if i == 0:
@@ -799,6 +871,10 @@ class PromptedTransformer(Transformer):
                 layer_idx=i,
                 num_layers=num_layers,
             )
+            if isinstance(sem_aff, dict):
+                b_loss = sem_aff.get("PatchCompeteBalance")
+                if torch.is_tensor(b_loss):
+                    patch_compete_balance_accum = b_loss if patch_compete_balance_accum is None else (patch_compete_balance_accum + b_loss)
             if isinstance(affinity, dict) and isinstance(sem_aff, dict):
                 affinity.update(sem_aff)
 
@@ -815,6 +891,7 @@ class PromptedTransformer(Transformer):
                 "sem_tokens": sem_tokens,
                 "mu_s_final": mu_s_final,
                 "delta_sem": delta_sem,
+                "patch_compete_balance_loss": patch_compete_balance_accum,
                 "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
                 "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
             }
@@ -864,6 +941,7 @@ class PromptedTransformer(Transformer):
                     "sem_tokens": sem_tokens,
                     "mu_s_final": mu_s_final,
                     "delta_sem": mu_s_final - h_y,
+                    "patch_compete_balance_loss": None,
                     "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
                     "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
                 }
@@ -919,6 +997,7 @@ class PromptedTransformer(Transformer):
                     "sem_tokens": sem_tokens,
                     "mu_s_final": mu_s_final,
                     "delta_sem": mu_s_final - h_y,
+                    "patch_compete_balance_loss": sem_aff.get("PatchCompeteBalance") if isinstance(sem_aff, dict) else None,
                     "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
                     "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
                 }

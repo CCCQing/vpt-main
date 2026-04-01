@@ -74,6 +74,17 @@ class ViT(nn.Module):
                 prompt_cfg.SEMANTIC_BRANCH.END_LAYER = int(getattr(sem_branch_cfg, "END_LAYER", -1))
                 prompt_cfg.SEMANTIC_BRANCH.GAMMA_MIN = float(getattr(sem_branch_cfg, "GAMMA_MIN", 0.05))
                 prompt_cfg.SEMANTIC_BRANCH.GAMMA_MAX = float(getattr(sem_branch_cfg, "GAMMA_MAX", 1.0))
+            affinity_cfg = getattr(cfg.MODEL, "AFFINITY", None)
+            if affinity_cfg is not None:
+                if not hasattr(prompt_cfg, "AFFINITY"):
+                    from ..configs.config_node import CfgNode  # local import to avoid circular issues
+                    prompt_cfg.AFFINITY = CfgNode()
+                prompt_cfg.AFFINITY.PATCH_COMPETE_ENABLE = bool(getattr(affinity_cfg, "PATCH_COMPETE_ENABLE", False))
+                prompt_cfg.AFFINITY.PATCH_COMPETE_LAYERS = list(getattr(affinity_cfg, "PATCH_COMPETE_LAYERS", [-1]))
+                prompt_cfg.AFFINITY.PATCH_COMPETE_TEMPERATURE = float(getattr(affinity_cfg, "PATCH_COMPETE_TEMPERATURE", 1.0))
+                prompt_cfg.AFFINITY.PATCH_COMPETE_MODE = str(getattr(affinity_cfg, "PATCH_COMPETE_MODE", "token_softmax"))
+                prompt_cfg.AFFINITY.PATCH_COMPETE_BALANCE_WEIGHT = float(getattr(affinity_cfg, "PATCH_COMPETE_BALANCE_WEIGHT", 0.0))
+                prompt_cfg.AFFINITY.PATCH_COMPETE_USE_NULL_TOKEN = bool(getattr(affinity_cfg, "PATCH_COMPETE_USE_NULL_TOKEN", False))
             prompt_cfg.freeze()
         else:
             prompt_cfg = None

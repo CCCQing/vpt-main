@@ -140,6 +140,7 @@ class Trainer():
         self._last_train_debug = {}
         self._last_ce_logits = None
         self._last_raw_logits = None
+        self.patch_compete_balance_weight = float(getattr(cfg.MODEL.AFFINITY, "PATCH_COMPETE_BALANCE_WEIGHT", 0.0))
         self.overfit_disable_prompt_sampling = bool(
             getattr(cfg.SOLVER, "OVERFIT_DISABLE_PROMPT_SAMPLING", False)
         )
@@ -158,6 +159,12 @@ class Trainer():
         self.monitor_save_csv = bool(getattr(mon_cfg, "SAVE_CSV", True)) if mon_cfg is not None else True
         self.monitor_save_heatmap = bool(getattr(mon_cfg, "SAVE_HEATMAP", False)) if mon_cfg is not None else False
         self.monitor_heatmap_topk = max(1, int(getattr(mon_cfg, "HEATMAP_TOPK", 50))) if mon_cfg is not None else 50
+        self.token_patch_stats_enable = bool(getattr(mon_cfg, "TOKEN_PATCH_STATS_ENABLE", False)) if mon_cfg is not None else False
+        self.token_patch_source = str(getattr(mon_cfg, "TOKEN_PATCH_SOURCE", "avs")).lower() if mon_cfg is not None else "avs"
+        self.token_patch_head_mode = str(getattr(mon_cfg, "TOKEN_PATCH_HEAD_MODE", "head_avg")).lower() if mon_cfg is not None else "head_avg"
+        self.token_patch_toprho = float(getattr(mon_cfg, "TOKEN_PATCH_TOPRHO", 0.2)) if mon_cfg is not None else 0.2
+        self.token_patch_save_maps = bool(getattr(mon_cfg, "TOKEN_PATCH_SAVE_MAPS", False)) if mon_cfg is not None else False
+        self.token_patch_max_samples = max(1, int(getattr(mon_cfg, "TOKEN_PATCH_MAX_SAMPLES", 8))) if mon_cfg is not None else 8
         self.monitor_dir = os.path.join(self.cfg.OUTPUT_DIR, "monitor")
         self._monitor_csv_path = os.path.join(self.monitor_dir, "summary.csv")
         self._monitor_warned_no_refined = False
@@ -206,6 +213,15 @@ class Trainer():
                 bool(self.monitor_save_json),
                 bool(self.monitor_save_csv),
                 bool(self.monitor_save_heatmap),
+            )
+            logger.info(
+                "[monitor-token-patch] enable=%s source=%s head_mode=%s toprho=%.3f save_maps=%s max_samples=%d",
+                bool(self.token_patch_stats_enable),
+                self.token_patch_source,
+                self.token_patch_head_mode,
+                float(self.token_patch_toprho),
+                bool(self.token_patch_save_maps),
+                int(self.token_patch_max_samples),
             )
 
     @staticmethod
@@ -562,6 +578,133 @@ class Trainer():
         g = (2.0 * np.sum(idx * arr) / (n * s)) - (n + 1.0) / n
         return float(g)
 
+    def _token_patch_from_affinity(self, aff: dict) -> torch.Tensor:
+        if not isinstance(aff, dict):
+            return None
+        source = str(self.token_patch_source).lower()
+        x = None
+        if source == "avs":
+            x = aff.get("Avs")
+        if not torch.is_tensor(x) or x.numel() == 0:
+            return None
+        a = x.detach().float()
+        # [B,H,N,T] or [B,N,T] -> [B,T,P]
+        if a.dim() == 4:
+            if self.token_patch_head_mode == "head0":
+                a = a[:, 0, :, :]
+            else:
+                a = a.mean(dim=1)
+        if a.dim() != 3:
+            return None
+        a = a.transpose(1, 2).contiguous()  # [B,T,P]
+        a = a.clamp_min(0.0)
+        a = a / a.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        return a
+
+    @staticmethod
+    def _upper_tri_values(x: torch.Tensor) -> torch.Tensor:
+        if (not torch.is_tensor(x)) or x.dim() < 2 or x.shape[-1] < 2:
+            return None
+        n = x.shape[-1]
+        idx = torch.triu_indices(n, n, offset=1, device=x.device)
+        if x.dim() == 2:
+            return x[idx[0], idx[1]]
+        if x.dim() == 3:
+            return x[:, idx[0], idx[1]].reshape(-1)
+        return None
+
+    def _token_patch_batch_stats(self, a_t_p: torch.Tensor) -> dict:
+        if (not torch.is_tensor(a_t_p)) or a_t_p.dim() != 3 or a_t_p.numel() == 0:
+            return {}
+        out = {}
+        b, t, p = a_t_p.shape
+        p_float = float(max(p, 1))
+
+        # per-token patch-distribution stats
+        ent = (-(a_t_p.clamp_min(1e-12) * a_t_p.clamp_min(1e-12).log()).sum(dim=-1))  # [B,T]
+        mon = a_t_p.max(dim=-1).values  # [B,T]
+
+        def _summ(v: torch.Tensor, prefix: str):
+            if (not torch.is_tensor(v)) or v.numel() == 0:
+                return
+            out[f"{prefix}_mean"] = float(v.mean().item())
+            out[f"{prefix}_std"] = float(v.std().item())
+            out[f"{prefix}_min"] = float(v.min().item())
+            out[f"{prefix}_max"] = float(v.max().item())
+
+        _summ(ent, "patchdist_entropy")
+        _summ(mon, "patchdist_monopoly")
+
+        g_vals = []
+        a_np = a_t_p.detach().cpu().numpy().reshape(-1, p)
+        for row in a_np:
+            g = self._gini_np(row)
+            if np.isfinite(g):
+                g_vals.append(g)
+        if len(g_vals) > 0:
+            g_arr = np.asarray(g_vals, dtype=np.float64)
+            out["patchdist_gini_mean"] = float(np.mean(g_arr))
+            out["patchdist_gini_std"] = float(np.std(g_arr))
+            out["patchdist_gini_min"] = float(np.min(g_arr))
+            out["patchdist_gini_max"] = float(np.max(g_arr))
+
+        # overlap: cosine
+        a_n = torch.nn.functional.normalize(a_t_p, dim=-1)
+        cos = torch.einsum("btp,bup->btu", a_n, a_n)
+        ut_cos = self._upper_tri_values(cos)
+        if torch.is_tensor(ut_cos) and ut_cos.numel() > 0:
+            out["patchdist_overlap_cos_mean"] = float(ut_cos.mean().item())
+            out["patchdist_overlap_cos_max"] = float(ut_cos.max().item())
+
+        # overlap: top-rho IoU
+        k = max(1, int(round(float(self.token_patch_toprho) * p_float)))
+        topk_idx = torch.topk(a_t_p, k=k, dim=-1).indices
+        mask = torch.zeros_like(a_t_p, dtype=torch.float32)
+        mask.scatter_(dim=-1, index=topk_idx, value=1.0)
+        inter = torch.einsum("btp,bup->btu", mask, mask)
+        msum = mask.sum(dim=-1, keepdim=True)
+        union = msum + msum.transpose(1, 2) - inter
+        iou = inter / union.clamp_min(1e-12)
+        ut_iou = self._upper_tri_values(iou)
+        if torch.is_tensor(ut_iou) and ut_iou.numel() > 0:
+            out["patchdist_overlap_iou_mean"] = float(ut_iou.mean().item())
+            out["patchdist_overlap_iou_max"] = float(ut_iou.max().item())
+
+        # effective rank + singular spectrum
+        er_vals = []
+        c1_vals = []
+        c2_vals = []
+        c3_vals = []
+        sv_list = []
+        for bi in range(b):
+            try:
+                s = torch.linalg.svdvals(a_t_p[bi])  # [min(T,P)]
+            except Exception:
+                continue
+            if s.numel() == 0:
+                continue
+            sv_list.append(s.detach().cpu())
+            ps = s / s.sum().clamp_min(1e-12)
+            er = torch.exp(-(ps * ps.clamp_min(1e-12).log()).sum())
+            er_vals.append(float(er.item()))
+            c1_vals.append(float(ps[:1].sum().item()))
+            c2_vals.append(float(ps[:2].sum().item()))
+            c3_vals.append(float(ps[:3].sum().item()))
+        if len(er_vals) > 0:
+            out["patchdist_effective_rank_mean"] = float(np.mean(er_vals))
+            out["patchdist_sv_top1_cum_mean"] = float(np.mean(c1_vals))
+            out["patchdist_sv_top2_cum_mean"] = float(np.mean(c2_vals))
+            out["patchdist_sv_top3_cum_mean"] = float(np.mean(c3_vals))
+        if len(sv_list) > 0:
+            max_r = max(int(x.numel()) for x in sv_list)
+            sv_mat = np.full((len(sv_list), max_r), np.nan, dtype=np.float64)
+            for i, s in enumerate(sv_list):
+                n = int(s.numel())
+                sv_mat[i, :n] = s.numpy()
+            out["patchdist_sv_mean"] = np.nanmean(sv_mat, axis=0).tolist()
+
+        return out
+
     def _vis_update_trend(self, affinities, logits, targets, sem_tokens, visual_tokens=None, sem_state=None):
         if not self.vis_trends:
             return
@@ -574,7 +717,31 @@ class Trainer():
                 aps = aff.get("Aps")
                 avs = aff.get("Avs")
                 if li not in self._vis_trend_buf["layers"]:
-                    self._vis_trend_buf["layers"][li] = {"aps_entropy": [], "avs_entropy": []}
+                    self._vis_trend_buf["layers"][li] = {
+                        "aps_entropy": [],
+                        "avs_entropy": [],
+                        "patchdist_entropy_mean": [],
+                        "patchdist_entropy_std": [],
+                        "patchdist_entropy_min": [],
+                        "patchdist_entropy_max": [],
+                        "patchdist_gini_mean": [],
+                        "patchdist_gini_std": [],
+                        "patchdist_gini_min": [],
+                        "patchdist_gini_max": [],
+                        "patchdist_monopoly_mean": [],
+                        "patchdist_monopoly_std": [],
+                        "patchdist_monopoly_min": [],
+                        "patchdist_monopoly_max": [],
+                        "patchdist_overlap_cos_mean": [],
+                        "patchdist_overlap_cos_max": [],
+                        "patchdist_overlap_iou_mean": [],
+                        "patchdist_overlap_iou_max": [],
+                        "patchdist_effective_rank_mean": [],
+                        "patchdist_sv_top1_cum_mean": [],
+                        "patchdist_sv_top2_cum_mean": [],
+                        "patchdist_sv_top3_cum_mean": [],
+                        "patchdist_sv_mean": [],
+                    }
                 if torch.is_tensor(aps) and aps.numel() > 0:
                     self._vis_trend_buf["layers"][li]["aps_entropy"].append(self._entropy_np(aps.detach().cpu()))
                 if torch.is_tensor(avs) and avs.numel() > 0:
@@ -622,6 +789,16 @@ class Trainer():
                                         self._vis_trend_buf["free_usage_gini"].append(float(np.mean(f_g)))
                                     if f_m.size > 0:
                                         self._vis_trend_buf["free_monopoly"].append(float(np.mean(f_m)))
+                if self.token_patch_stats_enable:
+                    a_t_p = self._token_patch_from_affinity(aff)
+                    stats = self._token_patch_batch_stats(a_t_p) if torch.is_tensor(a_t_p) else {}
+                    if isinstance(stats, dict) and len(stats) > 0:
+                        for k, v in stats.items():
+                            if k == "patchdist_sv_mean":
+                                if isinstance(v, list) and len(v) > 0:
+                                    self._vis_trend_buf["layers"][li]["patchdist_sv_mean"].append(v)
+                            elif k in self._vis_trend_buf["layers"][li] and isinstance(v, (float, int)) and np.isfinite(v):
+                                self._vis_trend_buf["layers"][li][k].append(float(v))
         if torch.is_tensor(visual_tokens) and visual_tokens.dim() == 3 and visual_tokens.numel() > 0:
             nrm = visual_tokens.detach().float().norm(dim=-1).reshape(-1)
             if nrm.numel() > 0:
@@ -693,6 +870,77 @@ class Trainer():
             "free_monopoly": float(np.mean(self._vis_trend_buf["free_monopoly"])) if len(self._vis_trend_buf["free_monopoly"]) > 0 else None,
         }
         save_json(os.path.join(trend_dir, f"epoch_{epoch:03d}_trend.json"), out_json)
+
+        # token-patch per-layer summaries (A[T,P]-based diagnostics)
+        if self.token_patch_stats_enable and len(layer_ids) > 0:
+            tp_rows = []
+            sv_rows = []
+            for li in layer_ids:
+                lbuf = layers.get(li, {})
+                row = {"epoch": epoch, "split": split, "layer": int(li)}
+                metric_keys = [
+                    "patchdist_entropy_mean", "patchdist_entropy_std", "patchdist_entropy_min", "patchdist_entropy_max",
+                    "patchdist_gini_mean", "patchdist_gini_std", "patchdist_gini_min", "patchdist_gini_max",
+                    "patchdist_monopoly_mean", "patchdist_monopoly_std", "patchdist_monopoly_min", "patchdist_monopoly_max",
+                    "patchdist_overlap_cos_mean", "patchdist_overlap_cos_max",
+                    "patchdist_overlap_iou_mean", "patchdist_overlap_iou_max",
+                    "patchdist_effective_rank_mean",
+                    "patchdist_sv_top1_cum_mean", "patchdist_sv_top2_cum_mean", "patchdist_sv_top3_cum_mean",
+                ]
+                for mk in metric_keys:
+                    vals = [x for x in lbuf.get(mk, []) if np.isfinite(x)]
+                    row[mk] = float(np.mean(vals)) if len(vals) > 0 else None
+
+                sv_entries = lbuf.get("patchdist_sv_mean", [])
+                if isinstance(sv_entries, list) and len(sv_entries) > 0:
+                    max_r = max(len(v) for v in sv_entries if isinstance(v, list))
+                    if max_r > 0:
+                        sv_mat = np.full((len(sv_entries), max_r), np.nan, dtype=np.float64)
+                        for si, vec in enumerate(sv_entries):
+                            if not isinstance(vec, list):
+                                continue
+                            n = min(len(vec), max_r)
+                            sv_mat[si, :n] = np.asarray(vec[:n], dtype=np.float64)
+                        sv_mean = np.nanmean(sv_mat, axis=0)
+                        row["patchdist_sv_mean"] = [float(x) for x in sv_mean if np.isfinite(x)]
+                        ssum = float(np.nansum(sv_mean))
+                        if ssum > 0:
+                            c = np.cumsum(np.nan_to_num(sv_mean, nan=0.0)) / ssum
+                            row["patchdist_sv_top1_cum_mean"] = float(c[0]) if c.size > 0 else row.get("patchdist_sv_top1_cum_mean")
+                            row["patchdist_sv_top2_cum_mean"] = float(c[min(1, c.size - 1)]) if c.size > 0 else row.get("patchdist_sv_top2_cum_mean")
+                            row["patchdist_sv_top3_cum_mean"] = float(c[min(2, c.size - 1)]) if c.size > 0 else row.get("patchdist_sv_top3_cum_mean")
+                        for r_idx, sv in enumerate(sv_mean, start=1):
+                            if np.isfinite(sv):
+                                sv_rows.append({
+                                    "epoch": epoch, "split": split, "layer": int(li),
+                                    "sv_idx": int(r_idx), "sv_mean": float(sv)
+                                })
+                tp_rows.append(row)
+
+            save_json(os.path.join(trend_dir, f"epoch_{epoch:03d}_token_patch_layer_summary.json"), {"rows": tp_rows})
+            tp_field_order = [
+                "epoch", "split", "layer",
+                "patchdist_entropy_mean", "patchdist_entropy_std", "patchdist_entropy_min", "patchdist_entropy_max",
+                "patchdist_gini_mean", "patchdist_gini_std", "patchdist_gini_min", "patchdist_gini_max",
+                "patchdist_monopoly_mean", "patchdist_monopoly_std", "patchdist_monopoly_min", "patchdist_monopoly_max",
+                "patchdist_overlap_cos_mean", "patchdist_overlap_cos_max",
+                "patchdist_overlap_iou_mean", "patchdist_overlap_iou_max",
+                "patchdist_effective_rank_mean",
+                "patchdist_sv_top1_cum_mean", "patchdist_sv_top2_cum_mean", "patchdist_sv_top3_cum_mean",
+            ]
+            for row in tp_rows:
+                append_csv_row(
+                    os.path.join(trend_dir, "token_patch_layer_summary.csv"),
+                    row,
+                    field_order=tp_field_order,
+                )
+            if len(sv_rows) > 0:
+                for row in sv_rows:
+                    append_csv_row(
+                        os.path.join(trend_dir, "token_patch_sv_spectrum.csv"),
+                        row,
+                        field_order=["epoch", "split", "layer", "sv_idx", "sv_mean"],
+                    )
         append_csv_row(
             os.path.join(trend_dir, "trend_summary.csv"),
             {
@@ -715,6 +963,10 @@ class Trainer():
                 "free_usage_gini": out_json["free_usage_gini"],
                 "anchor_monopoly": out_json["anchor_monopoly"],
                 "free_monopoly": out_json["free_monopoly"],
+                "patchdist_entropy_mean_last": float(np.mean([x for x in layers.get(layer_ids[-1], {}).get("patchdist_entropy_mean", []) if np.isfinite(x)])) if self.token_patch_stats_enable and len(layer_ids) > 0 else None,
+                "patchdist_gini_mean_last": float(np.mean([x for x in layers.get(layer_ids[-1], {}).get("patchdist_gini_mean", []) if np.isfinite(x)])) if self.token_patch_stats_enable and len(layer_ids) > 0 else None,
+                "patchdist_monopoly_mean_last": float(np.mean([x for x in layers.get(layer_ids[-1], {}).get("patchdist_monopoly_mean", []) if np.isfinite(x)])) if self.token_patch_stats_enable and len(layer_ids) > 0 else None,
+                "patchdist_effective_rank_mean_last": float(np.mean([x for x in layers.get(layer_ids[-1], {}).get("patchdist_effective_rank_mean", []) if np.isfinite(x)])) if self.token_patch_stats_enable and len(layer_ids) > 0 else None,
             },
             field_order=[
                 "epoch", "split", "token_specialization", "token_pairwise_cos",
@@ -724,6 +976,8 @@ class Trainer():
                 "token_usage_gini", "token_monopoly_index",
                 "anchor_usage_gini", "free_usage_gini",
                 "anchor_monopoly", "free_monopoly",
+                "patchdist_entropy_mean_last", "patchdist_gini_mean_last",
+                "patchdist_monopoly_mean_last", "patchdist_effective_rank_mean_last",
             ],
         )
         logger.info(
@@ -735,6 +989,21 @@ class Trainer():
             float(out_json["token_usage_gini"]) if out_json["token_usage_gini"] is not None else float("nan"),
             float(out_json["token_monopoly_index"]) if out_json["token_monopoly_index"] is not None else float("nan"),
         )
+        if self.token_patch_stats_enable and len(layer_ids) > 0:
+            li_last = int(layer_ids[-1])
+            lbuf = layers.get(li_last, {})
+            pe = [x for x in lbuf.get("patchdist_entropy_mean", []) if np.isfinite(x)]
+            pg = [x for x in lbuf.get("patchdist_gini_mean", []) if np.isfinite(x)]
+            pm = [x for x in lbuf.get("patchdist_monopoly_mean", []) if np.isfinite(x)]
+            logger.info(
+                "[vis-patchdist] split=%s epoch=%d layer=%d entropy=%.4f gini=%.4f monopoly=%.4f",
+                split,
+                epoch,
+                li_last,
+                float(np.mean(pe)) if len(pe) > 0 else float("nan"),
+                float(np.mean(pg)) if len(pg) > 0 else float("nan"),
+                float(np.mean(pm)) if len(pm) > 0 else float("nan"),
+            )
         if self.vis_save_images and len(layer_ids) > 0:
             plt.figure(figsize=(6, 4))
             plt.plot(layer_ids, avs_curve, marker="o", label="Avs entropy")
@@ -775,48 +1044,83 @@ class Trainer():
         img_u8 = to_uint8_image(image_chw)
         h, w = img_u8.shape[:2]
 
-        # Group 1: semantic-token local control maps from Avs.
+        # Group 1: token-patch diagnostics from A[T,P] (default source: Avs).
         if self.vis_local_control:
-            avs_last = None
-            for aff in reversed(affinities):
-                if isinstance(aff, dict) and torch.is_tensor(aff.get("Avs")):
-                    avs_last = aff["Avs"]
-                    break
-            if torch.is_tensor(avs_last):
-                avs = avs_last.detach().cpu()
-                if avs.dim() == 4:
-                    avs = avs.mean(dim=1)  # [B,N,M]
-                if avs.dim() == 3 and local_idx < avs.shape[0]:
-                    am = avs[local_idx]  # [N,M]
-                    n_patch, n_tok = int(am.shape[0]), int(am.shape[1])
-                    g = self._infer_grid(n_patch)
-                    panels = []
-                    titles = []
-                    raw_maps = {}
-                    for k in range(n_tok):
-                        mk = am[:, k].view(g, g).numpy()
-                        mk_up = resize_map_torch(mk, (h, w))
-                        raw_maps[f"token_{k}"] = mk_up
-                        panels.append(overlay_heatmap(img_u8, mk_up))
-                        titles.append(f"semantic token {k}")
-                        if self.vis_save_images:
-                            save_overlay(
-                                os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_local_token{k}.png"),
-                                img_u8,
-                                mk_up,
-                                title=f"{split} ep{epoch} idx{sample_idx} token{k}",
-                            )
-                    if self.vis_save_images and len(panels) > 0:
-                        save_panel(
-                            os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_local_panel.png"),
-                            panels,
-                            titles=titles,
-                            ncols=2,
-                        )
+            if self._vis_processed < int(self.token_patch_max_samples):
+                for li, aff in enumerate(affinities):
+                    a_b = self._token_patch_from_affinity(aff) if self.token_patch_stats_enable else None
+                    if (not torch.is_tensor(a_b)) or a_b.dim() != 3 or local_idx >= a_b.shape[0]:
+                        continue
+                    a = a_b[local_idx].detach().cpu().numpy()  # [T,P]
+                    t_num, p_num = int(a.shape[0]), int(a.shape[1])
+                    g = self._infer_grid(p_num)
+                    a_bar = a.mean(axis=0)  # [P]
+                    residual = a - a_bar[None, :]  # [T,P]
+                    mean_abs = np.mean(np.abs(residual), axis=1)
+                    max_abs = np.max(np.abs(residual), axis=1)
+                    l2 = np.sqrt(np.sum(residual * residual, axis=1))
+                    # overlap
+                    a_n = a / np.clip(np.linalg.norm(a, axis=1, keepdims=True), 1e-12, None)
+                    ov_cos = a_n @ a_n.T
+                    k = max(1, int(round(float(self.token_patch_toprho) * float(p_num))))
+                    topk_idx = np.argpartition(-a, kth=k - 1, axis=1)[:, :k]
+                    mask = np.zeros_like(a, dtype=np.float32)
+                    for ti in range(t_num):
+                        mask[ti, topk_idx[ti]] = 1.0
+                    inter = mask @ mask.T
+                    msum = mask.sum(axis=1, keepdims=True)
+                    union = msum + msum.T - inter
+                    ov_iou = inter / np.clip(union, 1e-12, None)
+                    # singular values
+                    try:
+                        sv = np.linalg.svd(a, full_matrices=False, compute_uv=False)
+                    except Exception:
+                        sv = np.zeros((min(t_num, p_num),), dtype=np.float64)
+                    ssum = float(np.sum(sv))
+                    if ssum > 0:
+                        sv_ratio = sv / ssum
+                        er = float(np.exp(-np.sum(sv_ratio * np.log(np.clip(sv_ratio, 1e-12, None)))))
+                        cum = np.cumsum(sv_ratio)
+                    else:
+                        er = float("nan")
+                        cum = np.zeros_like(sv)
+                    stats_obj = {
+                        "split": split,
+                        "epoch": int(epoch),
+                        "sample_idx": int(sample_idx),
+                        "layer": int(li),
+                        "source": self.token_patch_source,
+                        "head_mode": self.token_patch_head_mode,
+                        "toprho": float(self.token_patch_toprho),
+                        "patchdist_entropy_mean": float(np.mean(-np.sum(a * np.log(np.clip(a, 1e-12, None)), axis=1))),
+                        "patchdist_gini_mean": float(np.mean([self._gini_np(x) for x in a])) if a.shape[0] > 0 else None,
+                        "patchdist_monopoly_mean": float(np.mean(np.max(a, axis=1))) if a.shape[0] > 0 else None,
+                        "patchdist_effective_rank": er,
+                        "patchdist_sv_top1_cum": float(cum[0]) if cum.size > 0 else None,
+                        "patchdist_sv_top2_cum": float(cum[min(1, cum.size - 1)]) if cum.size > 0 else None,
+                        "patchdist_sv_top3_cum": float(cum[min(2, cum.size - 1)]) if cum.size > 0 else None,
+                        "residual_mean_abs": mean_abs.tolist(),
+                        "residual_max_abs": max_abs.tolist(),
+                        "residual_l2": l2.tolist(),
+                    }
                     if self.vis_save_raw:
-                        np.savez_compressed(
-                            os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_local_maps.npz"),
-                            maps=raw_maps,
+                        np.save(os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_a_bar.npy"), a_bar)
+                        np.save(os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_residual.npy"), residual)
+                        np.save(os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_overlap_cos.npy"), ov_cos)
+                        np.save(os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_overlap_iou.npy"), ov_iou)
+                        np.save(os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_sv.npy"), sv)
+                        save_json(
+                            os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_tokenpatch.json"),
+                            stats_obj,
+                        )
+                    # Only one total map overlay; do not export per-token small maps.
+                    if self.token_patch_save_maps and self.vis_save_images:
+                        bar_up = resize_map_torch(a_bar.reshape(g, g), (h, w))
+                        save_overlay(
+                            os.path.join(base, f"{split}_ep{epoch:03d}_idx{sample_idx:05d}_layer{li:02d}_abar.png"),
+                            img_u8,
+                            bar_up,
+                            title=f"a_bar layer{li}",
                         )
 
         # Group 2: rollout maps (CLS + prompt tokens).
@@ -1676,6 +1980,18 @@ class Trainer():
                 # 甯歌鍒嗙被鎹熷け锛堝 SoftmaxLoss锛夛紝鍙渶瑕?outputs / targets / class_weights
                 loss = self.cls_criterion(
                     loss_outputs, loss_targets, loss_weights, kwargs=loss_kwargs)
+
+            if is_train and self.patch_compete_balance_weight > 0.0:
+                sem_state = None
+                enc_ref = getattr(model_ref, "enc", None)
+                transformer_ref = getattr(enc_ref, "transformer", None) if enc_ref is not None else None
+                if transformer_ref is not None:
+                    sem_state = getattr(transformer_ref, "_last_semantic_side_state", None)
+                balance_term = sem_state.get("patch_compete_balance_loss") if isinstance(sem_state, dict) else None
+                if torch.is_tensor(balance_term):
+                    balance_term = balance_term.float().mean()
+                    loss = loss + self.patch_compete_balance_weight * balance_term
+                    self._last_train_debug["patch_compete_balance_loss"] = float(balance_term.detach().item())
 
             # ========== 4. 妫€鏌ユ崯澶辨槸鍚﹀紓甯革紙inf 鎴?NaN锛?==========
             if loss == float('inf'):

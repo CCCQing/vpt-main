@@ -211,6 +211,12 @@ _C.MODEL.AFFINITY.RETURN_CROSS = False     # 鏄惁杩斿洖璺ㄦā鎬佷翰
 _C.MODEL.AFFINITY.NORMALIZE = True         # 浜插拰鐭╅樀鏄惁褰掍竴鍖?
 _C.MODEL.AFFINITY.DETACH = True            # 璁＄畻浜插拰鏃舵槸鍚﹀垎绂绘搴?
 _C.MODEL.AFFINITY.VIS = False              # 鏄惁鍚屾椂杩斿洖娉ㄦ剰鍔涙潈閲嶏紙vis 妯″紡锛?
+_C.MODEL.AFFINITY.PATCH_COMPETE_ENABLE = True
+_C.MODEL.AFFINITY.PATCH_COMPETE_LAYERS = [-1]  # default: last layer only
+_C.MODEL.AFFINITY.PATCH_COMPETE_TEMPERATURE = 1.0
+_C.MODEL.AFFINITY.PATCH_COMPETE_MODE = "token_softmax"  # token_softmax | anchor_then_free
+_C.MODEL.AFFINITY.PATCH_COMPETE_BALANCE_WEIGHT = 0.0
+_C.MODEL.AFFINITY.PATCH_COMPETE_USE_NULL_TOKEN = False
 # ----------------------------------------------------------------------
 # adapter options
 # ----------------------------------------------------------------------
@@ -285,7 +291,7 @@ _C.SOLVER.LOG_EVERY_N = 1000
 
 # 璋冭瘯璁粌琛屼负
 _C.SOLVER.DEBUG_GRAD_NORM = False
-_C.SOLVER.DEBUG_TRACE_ONCE = False
+_C.SOLVER.DEBUG_TRACE_ONCE = True
 _C.SOLVER.DEBUG_SHAPES = False
 _C.SOLVER.OVERFIT_ONE_BATCH_STEPS = 0
 _C.SOLVER.OVERFIT_DISABLE_PROMPT_SAMPLING = False
@@ -295,13 +301,19 @@ _C.SOLVER.EVAL_MODE = "zsl"
 _C.SOLVER.GZSL = True  # 鏃х増鍏煎寮€鍏筹紝寤鸿瀹為檯浠?EVAL_MODE 涓哄噯
 
 _C.SOLVER.MONITOR = CfgNode()
-_C.SOLVER.MONITOR.ENABLE = False
+_C.SOLVER.c.ENABLE = False
 _C.SOLVER.MONITOR.EVERY_EPOCH = 1
 _C.SOLVER.MONITOR.MAX_SAMPLES = 512
 _C.SOLVER.MONITOR.SAVE_JSON = True
 _C.SOLVER.MONITOR.SAVE_CSV = True
 _C.SOLVER.MONITOR.SAVE_HEATMAP = False
 _C.SOLVER.MONITOR.HEATMAP_TOPK = 50
+_C.SOLVER.MONITOR.TOKEN_PATCH_STATS_ENABLE = True
+_C.SOLVER.MONITOR.TOKEN_PATCH_SOURCE = "avs"        # avs
+_C.SOLVER.MONITOR.TOKEN_PATCH_HEAD_MODE = "head_avg"  # head_avg | head0
+_C.SOLVER.MONITOR.TOKEN_PATCH_TOPRHO = 0.2
+_C.SOLVER.MONITOR.TOKEN_PATCH_SAVE_MAPS = False
+_C.SOLVER.MONITOR.TOKEN_PATCH_MAX_SAMPLES = 8
 
 # -----------------------------------------------------------------------------
 # Visualization pipeline (off by default)
@@ -384,5 +396,3 @@ def get_cfg():
     """
     Get a copy of the default config. 鑾峰彇榛樿閰嶇疆鐨勫壇鏈€?    """
     return _C.clone()
-
-
