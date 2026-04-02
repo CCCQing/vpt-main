@@ -206,11 +206,11 @@ _C.MODEL.PROMPT_FUSION.RETURN_AUX = False  # 榛樿鎺ㄧ悊鏄惁杩斿�
 # -----------------------------------------------------------------------------
 _C.MODEL.AFFINITY = CfgNode()
 _C.MODEL.AFFINITY.ENABLE = True            # 鏄惁鍚敤 forward_with_affinity 鍒嗘敮
-_C.MODEL.AFFINITY.PROMPT_LENGTH = 0        # prompt 闀垮害锛堢己鐪佹椂鐢?NUM_TOKENS 濉厖锛?
-_C.MODEL.AFFINITY.RETURN_CROSS = False     # 鏄惁杩斿洖璺ㄦā鎬佷翰鍜?
+_C.MODEL.AFFINITY.PROMPT_LENGTH = 16        # prompt 闀垮害锛堢己鐪佹椂鐢?NUM_TOKENS 濉厖锛?
+_C.MODEL.AFFINITY.RETURN_CROSS = True     # 鏄惁杩斿洖璺ㄦā鎬佷翰鍜?
 _C.MODEL.AFFINITY.NORMALIZE = True         # 浜插拰鐭╅樀鏄惁褰掍竴鍖?
 _C.MODEL.AFFINITY.DETACH = True            # 璁＄畻浜插拰鏃舵槸鍚﹀垎绂绘搴?
-_C.MODEL.AFFINITY.VIS = False              # 鏄惁鍚屾椂杩斿洖娉ㄦ剰鍔涙潈閲嶏紙vis 妯″紡锛?
+_C.MODEL.AFFINITY.VIS = True              # 鏄惁鍚屾椂杩斿洖娉ㄦ剰鍔涙潈閲嶏紙vis 妯″紡锛?
 _C.MODEL.AFFINITY.PATCH_COMPETE_ENABLE = True
 _C.MODEL.AFFINITY.PATCH_COMPETE_LAYERS = [-1]  # default: last layer only
 _C.MODEL.AFFINITY.PATCH_COMPETE_TEMPERATURE = 1.0

@@ -2351,8 +2351,14 @@ class Trainer():
                     logits_dbg = None
                 if torch.is_tensor(logits_dbg):
                     finite_ratio = float(torch.isfinite(logits_dbg).float().mean().item())
-                    logit_min = float(torch.nan_to_num(logits_dbg, nan=0.0, posinf=0.0, neginf=0.0).min().item())
-                    logit_max = float(torch.nan_to_num(logits_dbg, nan=0.0, posinf=0.0, neginf=0.0).max().item())
+                    if hasattr(torch, "nan_to_num"):
+                        logits_safe = torch.nan_to_num(logits_dbg, nan=0.0, posinf=0.0, neginf=0.0)
+                    else:
+                        logits_safe = logits_dbg.clone()
+                        finite_mask = torch.isfinite(logits_safe)
+                        logits_safe = logits_safe.masked_fill(~finite_mask, 0.0)
+                    logit_min = float(logits_safe.min().item())
+                    logit_max = float(logits_safe.max().item())
                 else:
                     finite_ratio = float("nan")
                     logit_min = float("nan")
