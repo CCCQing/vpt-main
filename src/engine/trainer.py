@@ -155,8 +155,6 @@ class Trainer():
         self._last_ce_logits = None
         self._last_raw_logits = None
 
-        self.patch_compete_balance_weight = cfg.MODEL.AFFINITY.PATCH_COMPETE_BALANCE_WEIGHT
-
         self._trace_epoch = -1
         self._trace_iter = -1
         self._trace_stage = "init"
@@ -955,13 +953,6 @@ class Trainer():
             x = aff.get("Asv")
             if (not torch.is_tensor(x)) and source == "avs":
                 x = aff.get("Avs")
-        elif source in {"patch_compete", "compete", "patch_compete_map"}:
-            x = aff.get("PatchCompeteMap")
-            if torch.is_tensor(x) and x.dim() == 3:
-                a = x.detach().float()  # already [B,T,P]
-                a = a.clamp_min(0.0)
-                a = a / a.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                return a
         if not torch.is_tensor(x) or x.numel() == 0:
             return None
         a = x.detach().float()
@@ -2646,19 +2637,6 @@ class Trainer():
             # 常规分类损失（如 SoftmaxLoss），只需 outputs / targets / class_weights。
             loss = self.cls_criterion(
                 loss_outputs, loss_targets, loss_weights, kwargs=loss_kwargs)
-
-            # patch_compete_balance_loss
-            if is_train and self.patch_compete_balance_weight > 0.0:
-                sem_state = None
-                enc_ref = getattr(model_ref, "enc", None)
-                transformer_ref = getattr(enc_ref, "transformer", None) if enc_ref is not None else None
-                if transformer_ref is not None:
-                    sem_state = getattr(transformer_ref, "_last_semantic_side_state", None)
-                balance_term = sem_state.get("patch_compete_balance_loss") if isinstance(sem_state, dict) else None
-                if torch.is_tensor(balance_term):
-                    balance_term = balance_term.float().mean()
-                    loss = loss + self.patch_compete_balance_weight * balance_term
-                    self._last_train_debug["patch_compete_balance_loss"] = float(balance_term.detach().item())
 
             # ========== 4. NaN / inf 防御==========
             if loss == float('inf'):
