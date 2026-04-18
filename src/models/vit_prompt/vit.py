@@ -1,9 +1,6 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 vit with prompt: a clean version with the default settings of VPT
-甯︽湁 Prompt 鐨?ViT锛氶伒寰?VPT锛圴isual Prompt Tuning锛夐粯璁よ瀹氱殑骞插噣瀹炵幇銆?
-鏍稿績鎬濇兂锛氬湪涓嶏紙鎴栧皯閲忥級鏇存柊涓诲共鍙傛暟鐨勬儏鍐典笅锛屼负杈撳叆搴忓垪鈥滃墠缃€濊嫢骞插彲璁粌鐨勬彁绀?token锛?
-涓庡浘鍍?patch 鐨?token 涓€璧烽€佸叆 Transformer锛屼粠鑰屽疄鐜板弬鏁伴珮鏁堢殑杩佺Щ/寰皟銆?
 """
 import math
 import numpy as np
@@ -18,15 +15,54 @@ from torch.nn.modules.utils import _pair
 from torch.nn import Conv2d, Dropout, LayerNorm, Linear
 from scipy import ndimage
 
-# 澶嶇敤鍘熷 ViT 鐨勭粍浠跺拰閰嶇疆锛?
-# - CONFIGS: 鍚勪釜妯″瀷绫诲瀷锛堝 ViT-B/16锛夌殑缁撴瀯閰嶇疆瀛楀吀
-# - Transformer: 鍘熷鐨?Transformer 缂栫爜鍣紙鍖呭惈 embeddings/encoder 绛夛級
-# - VisionTransformer: 甯﹀垎绫诲ご鐨勬爣鍑?ViT
-# - np2th: numpy -> torch 鐨勬潈閲嶈浆鎹㈠伐鍏?
+
 from ..vit_backbones.vit import CONFIGS, Transformer, VisionTransformer, np2th
 from ...utils import logging
 
 logger = logging.get_logger("visual_prompt")
+
+
+class SemanticCrossAttention(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        self.hidden_size = int(hidden_size)
+        self.num_heads = int(num_heads)
+        self.head_dim = self.hidden_size // self.num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size)
+
+        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size)
+
+        self.attn_dropout = nn.Dropout(float(dropout))
+        self.proj_dropout = nn.Dropout(float(dropout))
+
+    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, seq, _ = x.shape
+        x = x.view(bsz, seq, self.num_heads, self.head_dim)
+        return x.permute(0, 2, 1, 3).contiguous()
+
+    def forward(self, query: torch.Tensor, source: torch.Tensor):
+        # query: [B,Q,D], source: [B,K,D]
+        q = self._reshape_heads(self.q_proj(query))
+        k = self._reshape_heads(self.k_proj(source))
+        v = self._reshape_heads(self.v_proj(source))
+
+        logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # [B,H,Q,K]
+        attn = torch.softmax(logits, dim=-1)
+        attn = self.attn_dropout(attn)
+
+        ctx = torch.matmul(attn, v)  # [B,H,Q,d]
+        ctx = ctx.permute(0, 2, 1, 3).contiguous().view(query.shape[0], query.shape[1], self.hidden_size)
+
+        out = self.out_proj(ctx)
+        out = self.proj_dropout(out)
+        return out, attn, logits
+
 
 class LateSemanticSideBranch(nn.Module):
     """
@@ -36,67 +72,127 @@ class LateSemanticSideBranch(nn.Module):
       - progressively larger update strength from early to late layers
     """
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_tokens: int = 4,
-        use_anchor_free: bool = False,
-        anchor_tokens: int = 8,
-        free_tokens: int = 2,
-        free_compete_lambda: float = 0.5,
-        gamma_anchor_scale: float = 1.0,
-        gamma_free_scale: float = 1.0,
-        gamma_min: float = 0.05,
-        gamma_max: float = 1.0,
-        start_layer: int = 0,
-        end_layer: int = -1,
-        patch_compete_enable: bool = False,
-        patch_compete_layers: Optional[List[int]] = None,
-        patch_compete_temperature: float = 1.0,
-        patch_compete_mode: str = "token_softmax",
-        patch_compete_balance_weight: float = 0.0,
-        patch_compete_use_null_token: bool = False,
-    ) -> None:
+    def __init__(self, hidden_size: int, semantic_branch_cfg, affinity_cfg) -> None:
         super().__init__()
+        if semantic_branch_cfg is None:
+            raise ValueError("semantic_branch_cfg is required for LateSemanticSideBranch")
+        if affinity_cfg is None:
+            raise ValueError("affinity_cfg is required for LateSemanticSideBranch")
         self.hidden_size = int(hidden_size)
-        self.use_anchor_free = bool(use_anchor_free)
-        self.anchor_tokens = int(max(1, anchor_tokens))
-        self.free_tokens = int(max(0, free_tokens))
-        self.num_tokens = int(max(1, self.anchor_tokens + self.free_tokens)) if self.use_anchor_free else int(max(1, num_tokens))
-        self.free_compete_lambda = float(free_compete_lambda)
-        self.gamma_anchor_scale = float(gamma_anchor_scale)
-        self.gamma_free_scale = float(gamma_free_scale)
-        self.gamma_min = float(gamma_min)
-        self.gamma_max = float(gamma_max)
-        self.start_layer = int(start_layer)
-        self.end_layer = int(end_layer)
-        self.patch_compete_enable = bool(patch_compete_enable)
-        self.patch_compete_layers = [int(x) for x in (patch_compete_layers or [-1])]
-        self.patch_compete_temperature = float(max(1e-6, patch_compete_temperature))
-        self.patch_compete_mode = str(patch_compete_mode).lower()
-        self.patch_compete_balance_weight = float(max(0.0, patch_compete_balance_weight))
-        self.patch_compete_use_null_token = bool(patch_compete_use_null_token)
+
+        sb = semantic_branch_cfg
+        af = affinity_cfg
+
+        self.cross_attn_enable = bool(sb.CROSS_ATTN_ENABLE)
+        self.cross_attn_num_heads = int(sb.CROSS_ATTN_HEADS)
+        self.cross_attn_dropout = float(sb.CROSS_ATTN_DROPOUT)
+        self.cross_attn_pre_norm = bool(sb.CROSS_ATTN_PRE_NORM)
+        self.cross_attn_use_ffn = bool(sb.CROSS_ATTN_USE_FFN)
+
+        self.delta_gate_sp = float(sb.DELTA_GATE_SP)
+        self.delta_gate_sv = float(sb.DELTA_GATE_SV)
+        self.delta_gate_ps = float(sb.DELTA_GATE_PS)
+        self.delta_gate_vs = float(sb.DELTA_GATE_VS)
+        self.cross_attn_compute_all_routes = bool(sb.CROSS_ATTN_COMPUTE_ALL_ROUTES)
+        self.delta_gate_open_routes = [str(x).lower() for x in list(sb.DELTA_GATE_OPEN_ROUTES)]
+        self.delta_gate_threshold = float(sb.DELTA_GATE_THRESHOLD)
+        self.delta_gate_normalize = bool(sb.DELTA_GATE_NORMALIZE)
+
+        invalid_routes = [r for r in self.delta_gate_open_routes if r not in {"sp-att", "sv-att", "ps-att", "vs-att"}]
+        if len(invalid_routes) > 0:
+            raise ValueError(f"Invalid DELTA_GATE_OPEN_ROUTES entries: {invalid_routes}")
+        if self.delta_gate_threshold < 0.0:
+            raise ValueError("DELTA_GATE_THRESHOLD must be >= 0")
+
+        self.use_anchor_free = bool(sb.USE_ANCHOR_FREE)
+        self.anchor_tokens = int(max(1, sb.ANCHOR_TOKENS))
+        self.free_tokens = int(max(0, sb.FREE_TOKENS))
+        self.num_tokens = (int(max(1, self.anchor_tokens + self.free_tokens))
+            if self.use_anchor_free else int(max(1, sb.NUM_TOKENS)))
+        # Competition intensity coefficient of free token against anchor token
+        self.free_compete_lambda = float(sb.FREE_COMPETE_LAMBDA)
+        # Actual update intensity = gamma * gamma_anchor_scale
+        self.gamma_anchor_scale = float(sb.GAMMA_ANCHOR_SCALE)
+        # Actual update intensity = gamma * gamma_free_scale
+        self.gamma_free_scale = float(sb.GAMMA_FREE_SCALE)
+        self.gamma_min = float(sb.GAMMA_MIN)
+        self.gamma_max = float(sb.GAMMA_MAX)
+        self.start_layer = int(sb.START_LAYER)
+        self.end_layer = int(sb.END_LAYER)
+
+        self.patch_compete_enable = bool(af.PATCH_COMPETE_ENABLE)
+        self.patch_compete_layers = [int(x) for x in list(af.PATCH_COMPETE_LAYERS)]
+        # The smaller the temperature, the sharper the softmax.
+        self.patch_compete_temperature = float(max(1e-6, af.PATCH_COMPETE_TEMPERATURE))
+        self.patch_compete_mode = str(af.PATCH_COMPETE_MODE).lower()
+        self.patch_compete_balance_weight = float(max(0.0, af.PATCH_COMPETE_BALANCE_WEIGHT))
 
         self.anchor_proj: Optional[nn.Linear] = None
+
         self.token_init = nn.Linear(hidden_size, self.num_tokens * hidden_size)
         self.anchor_token_init = nn.Linear(hidden_size, self.anchor_tokens * hidden_size) if self.use_anchor_free else None
         self.free_token_init = nn.Linear(hidden_size, max(1, self.free_tokens) * hidden_size) if (self.use_anchor_free and self.free_tokens > 0) else None
+
+        # Identity bias
         self.anchor_slot_embed = nn.Parameter(torch.zeros(1, self.anchor_tokens, hidden_size)) if self.use_anchor_free else None
         self.free_slot_embed = nn.Parameter(torch.zeros(1, self.free_tokens, hidden_size)) if (self.use_anchor_free and self.free_tokens > 0) else None
+
+        # Semantic update in normal mode
         self.delta_mlp = nn.Sequential(
             nn.Linear(hidden_size * 3, hidden_size * 2),
             nn.GELU(),
             nn.Linear(hidden_size * 2, hidden_size),
         )
+
+        # Normalization
         self.delta_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.sem_prompt_q_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.sem_prompt_kv_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.sem_visual_q_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.sem_visual_kv_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+
+        # cross-attention
+        self.sem_from_prompt_attn = SemanticCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=self.cross_attn_num_heads,
+            dropout=self.cross_attn_dropout,
+        )
+        self.prompt_from_sem_attn = SemanticCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=self.cross_attn_num_heads,
+            dropout=self.cross_attn_dropout,
+        )
+        self.sem_from_visual_attn = SemanticCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=self.cross_attn_num_heads,
+            dropout=self.cross_attn_dropout,
+        )
+        self.visual_from_sem_attn = SemanticCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=self.cross_attn_num_heads,
+            dropout=self.cross_attn_dropout,
+        )
+
+        # semantic token's own FFN (optional)
+        self.sem_ffn_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.sem_ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Dropout(self.cross_attn_dropout),
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Dropout(self.cross_attn_dropout),
+        )
+
         self.readout_token_norm = nn.LayerNorm(hidden_size, eps=1e-6)
         self.readout_gate = nn.Linear(hidden_size, 1)
         self.readout_norm = nn.LayerNorm(hidden_size, eps=1e-6)
         self._last_readout_alpha: Optional[torch.Tensor] = None
+
         self.debug_shapes = False
         self._shape_debug_step_logged = False
         self._shape_debug_readout_logged = False
         self._shape_debug_init_logged = False
+
         if self.anchor_slot_embed is not None:
             nn.init.normal_(self.anchor_slot_embed, mean=0.0, std=0.02)
         if self.free_slot_embed is not None:
@@ -107,6 +203,8 @@ class LateSemanticSideBranch(nn.Module):
             self.anchor_proj = nn.Linear(int(semantic_dim), self.hidden_size).to(device)
 
     def _gamma(self, layer_idx: int, num_layers: int) -> float:
+        """Computes the layer-dependent update strength for semantic token evolution,
+        increasing from early to late layers within the configured  range"""
         if layer_idx < self.start_layer:
             return 0.0
         end_layer = self.end_layer if self.end_layer >= 0 else (num_layers - 1)
@@ -117,6 +215,8 @@ class LateSemanticSideBranch(nn.Module):
         return self.gamma_min + (self.gamma_max - self.gamma_min) * t
 
     def _patch_compete_on_layer(self, layer_idx: int, num_layers: int) -> bool:
+        """Decides whether patch-level token competition is enabled
+        for the current layer based on config and selected layer indices"""
         if not self.patch_compete_enable:
             return False
         if len(self.patch_compete_layers) == 0:
@@ -129,27 +229,55 @@ class LateSemanticSideBranch(nn.Module):
                 enabled_ids.add(int(li))
         return int(layer_idx) in enabled_ids
 
-    def init_state(self, semantics: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def init_state( self, semantics: torch.Tensor, device: torch.device, visual_stats: Optional[torch.Tensor] = None,) -> Tuple[torch.Tensor, torch.Tensor]:
+
         if semantics.dim() == 3 and semantics.shape[1] == 1:
             semantics = semantics[:, 0, :]
         if semantics.dim() != 2:
             raise ValueError(f"LateSemanticSideBranch expects [B, S] or [B,1,S], got {tuple(semantics.shape)}")
+
         self._ensure_anchor_proj(semantics.shape[-1], device=device)
         h_y = self.anchor_proj(semantics.to(device))
+
         if self.use_anchor_free:
             anchor_tokens = self.anchor_token_init(h_y).view(h_y.shape[0], self.anchor_tokens, self.hidden_size)
             if self.anchor_slot_embed is not None:
                 anchor_tokens = anchor_tokens + self.anchor_slot_embed.expand(h_y.shape[0], -1, -1)
+
             if self.free_tokens > 0:
-                free_tokens = self.free_token_init(h_y).view(h_y.shape[0], self.free_tokens, self.hidden_size)
+                if torch.is_tensor(visual_stats):
+                    v_ctx = visual_stats.to(device)
+                    if v_ctx.dim() == 3:
+                        v_ctx = v_ctx.mean(dim=1)
+                    if v_ctx.dim() != 2:
+                        raise ValueError(f"visual_stats should be [B,D] or [B,L,D], got {tuple(v_ctx.shape)}")
+                    if v_ctx.shape[0] != h_y.shape[0]:
+                        raise ValueError(
+                            f"visual_stats batch {v_ctx.shape[0]} incompatible with semantics batch {h_y.shape[0]}"
+                        )
+                    if v_ctx.shape[-1] != self.hidden_size:
+                        raise ValueError(
+                            f"visual_stats dim {v_ctx.shape[-1]} incompatible with hidden_size {self.hidden_size}"
+                        )
+                else:
+                    raise ValueError(
+                        "visual_stats is required when FREE_TOKENS > 0. "
+                        "Expected Tensor [B,D] or [B,L,D], got None/non-tensor."
+                    )
+
+                free_tokens = self.free_token_init(v_ctx).view(h_y.shape[0], self.free_tokens, self.hidden_size)
+
                 if self.free_slot_embed is not None:
                     free_tokens = free_tokens + self.free_slot_embed.expand(h_y.shape[0], -1, -1)
+
                 sem_tokens = torch.cat([anchor_tokens, free_tokens], dim=1)
             else:
                 sem_tokens = anchor_tokens
         else:
             sem_tokens = self.token_init(h_y).view(h_y.shape[0], self.num_tokens, self.hidden_size)
+
         sem_tokens = self.delta_norm(sem_tokens)
+
         if self.debug_shapes and (not self._shape_debug_init_logged):
             print(
                 "[SHAPE-DEBUG] LateSemanticSideBranch.init_state semantics={} h_y={} sem_tokens={}".format(
@@ -161,153 +289,208 @@ class LateSemanticSideBranch(nn.Module):
             self._shape_debug_init_logged = True
         return sem_tokens, h_y
 
-    def step(
-        self,
-        sem_tokens: torch.Tensor,
-        prompt_tokens: torch.Tensor,
-        visual_tokens: torch.Tensor,
-        layer_idx: int,
-        num_layers: int,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, float]]:
+    def step(self, sem_tokens: torch.Tensor, prompt_tokens: torch.Tensor, visual_tokens: torch.Tensor,
+        layer_idx: int, num_layers: int,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, float]]:
+        """Update semantic tokens at each layer"""
         gamma = float(self._gamma(layer_idx, num_layers))
-        sem_n = torch.nn.functional.normalize(sem_tokens.float(), dim=-1)
 
-        aps = None
-        aps_logits = None
-        if torch.is_tensor(prompt_tokens) and prompt_tokens.numel() > 0:
-            p_n = torch.nn.functional.normalize(prompt_tokens.float(), dim=-1)
-            aps_logits = torch.einsum("bpd,bmd->bpm", p_n, sem_n)
-            aps = torch.softmax(aps_logits, dim=-1)
-            ctx_p = torch.einsum("bpm,bpd->bmd", aps, prompt_tokens)
-        else:
+        if self.cross_attn_enable:
+            # Scores before attention softmax
+            asp_logits = None
+            asv_logits = None
+            aps_logits = None
+            avs_logits = None
+            # Multi-head raw attention weights, usually shaped [B,H,Q,K]
+            asp_raw = None
+            asv_raw = None
+            aps_raw = None
+            avs_raw = None
+            # Initialize to all zeros
             ctx_p = sem_tokens.new_zeros(sem_tokens.shape)
-
-        avs_logits = None
-        if torch.is_tensor(visual_tokens) and visual_tokens.numel() > 0:
-            v_n = torch.nn.functional.normalize(visual_tokens.float(), dim=-1)
-            avs_logits = torch.einsum("bnd,bmd->bnm", v_n, sem_n)
-            avs = torch.softmax(avs_logits, dim=-1)
-            ctx_v = torch.einsum("bnm,bnd->bmd", avs, visual_tokens)
-        else:
-            avs = sem_tokens.new_zeros((sem_tokens.shape[0], 0, sem_tokens.shape[1]))
             ctx_v = sem_tokens.new_zeros(sem_tokens.shape)
 
-        free_patch_score = None
-        anchor_logits_adj = None
-        anchor_attn = None
-        free_logits = None
-        free_attn = None
-        anchor_delta = None
-        free_delta = None
-        patch_compete_usage = None
-        patch_compete_map = None
-        patch_compete_balance = None
-        patch_compete_on = self._patch_compete_on_layer(layer_idx, num_layers)
-        if self.use_anchor_free and torch.is_tensor(visual_tokens) and visual_tokens.numel() > 0 and self.anchor_tokens > 0:
-            a = sem_tokens[:, :self.anchor_tokens, :]
-            f = sem_tokens[:, self.anchor_tokens:, :] if self.free_tokens > 0 else sem_tokens[:, :0, :]
-            a_n = torch.nn.functional.normalize(a.float(), dim=-1)
-            v_n = torch.nn.functional.normalize(visual_tokens.float(), dim=-1)
-            anchor_logits = torch.einsum("bad,bnd->ban", a_n, v_n)
-            if self.free_tokens > 0 and f.numel() > 0:
-                f_n = torch.nn.functional.normalize(f.float(), dim=-1)
-                free_logits = torch.einsum("bfd,bnd->bfn", f_n, v_n)
-                free_patch_score = free_logits.max(dim=1, keepdim=True).values
-                anchor_logits_adj = anchor_logits - self.free_compete_lambda * free_patch_score.detach()
-                if patch_compete_on and self.patch_compete_mode == "token_softmax":
-                    logits_all = torch.cat([anchor_logits_adj, free_logits], dim=1) / self.patch_compete_temperature
-                    attn_all = torch.softmax(logits_all, dim=1)  # patch-wise token competition
-                    patch_compete_map = attn_all
-                    anchor_attn = attn_all[:, :self.anchor_tokens, :]
-                    free_attn = attn_all[:, self.anchor_tokens:, :]
-                    patch_compete_usage = attn_all.sum(dim=-1)  # [B,T]
-                else:
-                    free_attn = torch.softmax(free_logits, dim=-1)
-            else:
-                anchor_logits_adj = anchor_logits
-            if anchor_attn is None:
-                anchor_attn = torch.softmax(anchor_logits_adj, dim=-1)
-                if patch_compete_on and self.patch_compete_mode == "token_softmax":
-                    patch_compete_usage = anchor_attn.sum(dim=-1)
-            anchor_denom = anchor_attn.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            anchor_delta = torch.matmul(anchor_attn, visual_tokens) / anchor_denom
-            anchor_next = a + (gamma * self.gamma_anchor_scale) * anchor_delta
-            if self.free_tokens > 0 and f.numel() > 0 and free_attn is not None:
-                free_denom = free_attn.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-                free_delta = torch.matmul(free_attn, visual_tokens) / free_denom
-                free_next = f + (gamma * self.gamma_free_scale) * free_delta
-                sem_next = torch.cat([anchor_next, free_next], dim=1)
-            else:
-                sem_next = anchor_next
-            sem_next = self.delta_norm(sem_next)
-        else:
-            delta = self.delta_mlp(torch.cat([sem_tokens, ctx_p, ctx_v], dim=-1))
-            sem_next = self.delta_norm(sem_tokens + gamma * delta)
-            anchor_delta = delta
+            open_routes = set(self.delta_gate_open_routes)
+            compute_all = bool(self.cross_attn_compute_all_routes)
+            need_sp = compute_all or ("sp-att" in open_routes)
+            need_ps = compute_all or ("ps-att" in open_routes)
+            need_sv = compute_all or ("sv-att" in open_routes)
+            need_vs = compute_all or ("vs-att" in open_routes)
+            need_prompt = need_sp or need_ps
+            need_visual = need_sv or need_vs
 
-        if torch.is_tensor(patch_compete_usage) and patch_compete_usage.numel() > 0:
-            u = patch_compete_usage.float()
-            u_mean = u.mean(dim=1, keepdim=True).clamp_min(1e-12)
-            patch_compete_balance = ((u - u_mean) ** 2 / (u_mean ** 2)).mean()
+            if need_prompt:
+                if (not torch.is_tensor(prompt_tokens)) or prompt_tokens.numel() == 0:
+                    raise ValueError(
+                        "prompt_tokens is required for requested prompt/semantic routes "
+                        f"(open_routes={self.delta_gate_open_routes}), but got None/empty prompt_tokens."
+                    )
+                # Sem <- Prompt
+                # ctx_p:   [B, M, D]
+                # asp_raw: [B, H, M, P]
+                if need_sp:
+                    sem_q = self.sem_prompt_q_norm(sem_tokens) if self.cross_attn_pre_norm else sem_tokens
+                    p_kv = self.sem_prompt_kv_norm(prompt_tokens) if self.cross_attn_pre_norm else prompt_tokens
+                    ctx_p, asp_raw, asp_logits = self.sem_from_prompt_attn(sem_q, p_kv)
+                # Prompt <- Sem
+                if need_ps:
+                    p_q = self.sem_prompt_kv_norm(prompt_tokens) if self.cross_attn_pre_norm else prompt_tokens
+                    s_kv = self.sem_prompt_q_norm(sem_tokens) if self.cross_attn_pre_norm else sem_tokens
+                    _, aps_raw, aps_logits = self.prompt_from_sem_attn(p_q, s_kv)
 
-        out_aff = {
-            "Aps": aps.unsqueeze(1) if aps is not None else sem_tokens.new_zeros((sem_tokens.shape[0], 1, 0, sem_tokens.shape[1])),
-            "Avs": avs.unsqueeze(1),
-        }
-        if torch.is_tensor(patch_compete_usage):
-            out_aff["PatchCompeteUsage"] = patch_compete_usage
-        if torch.is_tensor(patch_compete_map):
-            out_aff["PatchCompeteMap"] = patch_compete_map
-        if torch.is_tensor(patch_compete_balance):
-            out_aff["PatchCompeteBalance"] = patch_compete_balance
-        diag = {
-            "gamma": gamma,
-            "aps_energy": float(out_aff["Aps"].float().abs().mean().item()) if out_aff["Aps"].numel() > 0 else 0.0,
-            "avs_energy": float(out_aff["Avs"].float().abs().mean().item()) if out_aff["Avs"].numel() > 0 else 0.0,
-            "patch_compete_on": bool(patch_compete_on),
-        }
-        if torch.is_tensor(patch_compete_usage):
-            u = patch_compete_usage.detach().float()
-            diag["patch_compete_usage_mean"] = float(u.mean().item())
-            diag["patch_compete_usage_std"] = float(u.std().item())
-            diag["patch_compete_usage_min"] = float(u.min().item())
-            diag["patch_compete_usage_max"] = float(u.max().item())
-        if torch.is_tensor(patch_compete_balance):
-            diag["patch_compete_balance_loss"] = float(patch_compete_balance.detach().item())
-        if self.debug_shapes and (not self._shape_debug_step_logged):
-            print(
-                "[SHAPE-DEBUG] LateSemanticSideBranch.step sem_tokens={} prompt_tokens={} visual_tokens={} "
-                "aps_logits={} avs_logits={} aps={} avs={} anchor_logits_adj={} free_patch_score={} "
-                "anchor_attn={} free_attn={} ctx_p={} ctx_v={} delta={} sem_next={} patch_compete_on={} usage={}".format(
-                    tuple(sem_tokens.shape),
-                    tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None,
-                    tuple(visual_tokens.shape) if torch.is_tensor(visual_tokens) else None,
-                    tuple(aps_logits.shape) if torch.is_tensor(aps_logits) else None,
-                    tuple(avs_logits.shape) if torch.is_tensor(avs_logits) else None,
-                    tuple(aps.shape) if torch.is_tensor(aps) else None,
-                    tuple(avs.shape) if torch.is_tensor(avs) else None,
-                    tuple(anchor_logits_adj.shape) if torch.is_tensor(anchor_logits_adj) else None,
-                    tuple(free_patch_score.shape) if torch.is_tensor(free_patch_score) else None,
-                    tuple(anchor_attn.shape) if torch.is_tensor(anchor_attn) else None,
-                    tuple(free_attn.shape) if torch.is_tensor(free_attn) else None,
-                    tuple(ctx_p.shape),
-                    tuple(ctx_v.shape),
-                    tuple(anchor_delta.shape) if torch.is_tensor(anchor_delta) else None,
-                    tuple(sem_next.shape),
-                    bool(patch_compete_on),
-                    tuple(patch_compete_usage.shape) if torch.is_tensor(patch_compete_usage) else None,
+            if need_visual:
+                if (not torch.is_tensor(visual_tokens)) or visual_tokens.numel() == 0:
+                    raise ValueError(
+                        "visual_tokens is required for requested visual/semantic routes "
+                        f"(open_routes={self.delta_gate_open_routes}), but got None/empty visual_tokens."
+                    )
+                if need_sv:
+                    sem_q = self.sem_visual_q_norm(sem_tokens) if self.cross_attn_pre_norm else sem_tokens
+                    v_kv = self.sem_visual_kv_norm(visual_tokens) if self.cross_attn_pre_norm else visual_tokens
+                    # ctx_v: [B, M, D], asv_raw: [B, H, M, N]
+                    ctx_v, asv_raw, asv_logits = self.sem_from_visual_attn(sem_q, v_kv)
+                if need_vs:
+                    v_q = self.sem_visual_kv_norm(visual_tokens) if self.cross_attn_pre_norm else visual_tokens
+                    s_kv = self.sem_visual_q_norm(sem_tokens) if self.cross_attn_pre_norm else sem_tokens
+                    _, avs_raw, avs_logits = self.visual_from_sem_attn(v_q, s_kv)
+
+            # Forward directions (query is semantic)
+            ctx_sp = ctx_p  # Sem <- Prompt
+            ctx_sv = ctx_v  # Sem <- Visual
+
+            # Reverse directions projected back to semantic-token space
+            aps_mean = aps_raw.mean(dim=1) if torch.is_tensor(aps_raw) and aps_raw.dim() == 4 else aps_raw  # [B,P,M]
+            avs_mean = avs_raw.mean(dim=1) if torch.is_tensor(avs_raw) and avs_raw.dim() == 4 else avs_raw  # [B,N,M]
+
+            if torch.is_tensor(prompt_tokens) and prompt_tokens.numel() > 0 and torch.is_tensor(aps_mean) and aps_mean.numel() > 0:
+                w_ps = aps_mean.transpose(1, 2).contiguous()  # [B,M,P]
+                w_ps = w_ps / w_ps.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                ctx_ps = torch.matmul(w_ps, prompt_tokens)     # [B,M,D]
+            else:
+                ctx_ps = sem_tokens.new_zeros(sem_tokens.shape)
+            if torch.is_tensor(visual_tokens) and visual_tokens.numel() > 0 and torch.is_tensor(avs_mean) and avs_mean.numel() > 0:
+                w_vs = avs_mean.transpose(1, 2).contiguous()   # [B,M,N]
+                w_vs = w_vs / w_vs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                ctx_vs = torch.matmul(w_vs, visual_tokens)      # [B,M,D]
+            else:
+                ctx_vs = sem_tokens.new_zeros(sem_tokens.shape)
+
+            # Four-channel gated fusion
+            gate_raw = sem_tokens.new_tensor( [self.delta_gate_sp, self.delta_gate_sv, self.delta_gate_ps, self.delta_gate_vs] )
+            route_mask = sem_tokens.new_zeros((4,))
+            route_to_idx = {"sp-att": 0, "sv-att": 1, "ps-att": 2, "vs-att": 3}
+            for r in self.delta_gate_open_routes:
+                route_mask[route_to_idx[r]] = 1.0
+            thr_mask = (gate_raw >= float(self.delta_gate_threshold)).float()
+            gate = gate_raw * route_mask * thr_mask
+            if float(gate.sum().item()) <= 0.0:
+                raise RuntimeError(
+                    "No active delta routes after DELTA_GATE_OPEN_ROUTES + DELTA_GATE_THRESHOLD filtering. "
+                    f"gate_raw={gate_raw.tolist()}, open_routes={self.delta_gate_open_routes}, "
+                    f"threshold={self.delta_gate_threshold}"
                 )
+            if self.delta_gate_normalize:
+                gate = gate / gate.sum().clamp_min(1e-12)
+            delta = (
+                gate[0] * ctx_sp
+                + gate[1] * ctx_sv
+                + gate[2] * ctx_ps
+                + gate[3] * ctx_vs
             )
-            self._shape_debug_step_logged = True
-        return sem_next, out_aff, diag
+
+            # anchor / free token update
+            if self.use_anchor_free and self.anchor_tokens > 0:
+                a = sem_tokens[:, :self.anchor_tokens, :]
+                d_a = delta[:, :self.anchor_tokens, :]
+                a_next = a + (gamma * self.gamma_anchor_scale) * d_a
+                if self.free_tokens > 0:
+                    f = sem_tokens[:, self.anchor_tokens:, :]
+                    d_f = delta[:, self.anchor_tokens:, :]
+                    f_next = f + (gamma * self.gamma_free_scale) * d_f
+                    sem_next = torch.cat([a_next, f_next], dim=1)
+                else:
+                    sem_next = a_next
+            else:
+                sem_next = sem_tokens + gamma * delta
+
+            if self.cross_attn_use_ffn:
+                ffn_in = self.sem_ffn_norm(sem_next) if self.cross_attn_pre_norm else sem_next
+                sem_next = sem_next + gamma * self.sem_ffn(ffn_in)
+            sem_next = self.delta_norm(sem_next)
+
+            # output attention map for monitoring
+            asp = asp_raw.mean(dim=1, keepdim=True) if torch.is_tensor(asp_raw) and asp_raw.dim() == 4 else asp_raw
+            asv = asv_raw.mean(dim=1, keepdim=True) if torch.is_tensor(asv_raw) and asv_raw.dim() == 4 else asv_raw
+            aps = aps_raw.mean(dim=1, keepdim=True) if torch.is_tensor(aps_raw) and aps_raw.dim() == 4 else aps_raw
+            avs = avs_raw.mean(dim=1, keepdim=True) if torch.is_tensor(avs_raw) and avs_raw.dim() == 4 else avs_raw
+            out_aff = {
+                # New canonical direction (Q=Sem): [B,1,M,P], [B,1,M,N]
+                "Asp": asp,
+                "Asv": asv,
+                "Asp_raw": asp_raw,
+                "Asv_raw": asv_raw,
+                # True reverse direction (Q=Prompt/Visual)
+                "Aps": aps,
+                "Avs": avs,
+                "Aps_raw": aps_raw,
+                "Avs_raw": avs_raw,
+            }
+            diag = {
+                "gamma": gamma,
+                "asp_energy": float(asp.float().abs().mean().item()) if torch.is_tensor(asp) and asp.numel() > 0 else 0.0,
+                "asv_energy": float(asv.float().abs().mean().item()) if torch.is_tensor(asv) and asv.numel() > 0 else 0.0,
+                "aps_energy": float(aps.float().abs().mean().item()) if torch.is_tensor(aps) and aps.numel() > 0 else 0.0,
+                "avs_energy": float(avs.float().abs().mean().item()) if torch.is_tensor(avs) and avs.numel() > 0 else 0.0,
+                "delta_gate_sp": float(gate[0].detach().item()),
+                "delta_gate_sv": float(gate[1].detach().item()),
+                "delta_gate_ps": float(gate[2].detach().item()),
+                "delta_gate_vs": float(gate[3].detach().item()),
+                "delta_gate_threshold": float(self.delta_gate_threshold),
+                "delta_gate_normalize": bool(self.delta_gate_normalize),
+                "delta_gate_open_routes": list(self.delta_gate_open_routes),
+                "cross_attn_compute_all_routes": bool(self.cross_attn_compute_all_routes),
+                "cross_attn_enable": True,
+            }
+            if self.debug_shapes and (not self._shape_debug_step_logged):
+                print(
+                    "[SHAPE-DEBUG] LateSemanticSideBranch.step sem_tokens={} prompt_tokens={} visual_tokens={} "
+                    "asp_logits={} asv_logits={} aps_logits={} avs_logits={} "
+                    "Asp_raw={} Asv_raw={} Aps_raw={} Avs_raw={} "
+                    "ctx_sp={} ctx_sv={} ctx_ps={} ctx_vs={} gate={} sem_next={}".format(
+                        tuple(sem_tokens.shape),
+                        tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None,
+                        tuple(visual_tokens.shape) if torch.is_tensor(visual_tokens) else None,
+                        tuple(asp_logits.shape) if torch.is_tensor(asp_logits) else None,
+                        tuple(asv_logits.shape) if torch.is_tensor(asv_logits) else None,
+                        tuple(aps_logits.shape) if torch.is_tensor(aps_logits) else None,
+                        tuple(avs_logits.shape) if torch.is_tensor(avs_logits) else None,
+                        tuple(asp_raw.shape),
+                        tuple(asv_raw.shape),
+                        tuple(aps_raw.shape),
+                        tuple(avs_raw.shape),
+                        tuple(ctx_sp.shape),
+                        tuple(ctx_sv.shape),
+                        tuple(ctx_ps.shape),
+                        tuple(ctx_vs.shape),
+                        tuple(gate.shape),
+                        tuple(sem_next.shape),
+                    )
+                )
+                self._shape_debug_step_logged = True
+            return sem_next, out_aff, diag
+        raise RuntimeError(
+            "LateSemanticSideBranch requires MODEL.SEMANTIC_BRANCH.CROSS_ATTN_ENABLE=True; "
+            "the legacy normalize/einsum semantic update path was removed."
+        )
 
     def readout(self, sem_tokens: torch.Tensor) -> torch.Tensor:
+        """Convert the token into a vector"""
         # sem_tokens: [B, M, D]
         read_tokens = sem_tokens[:, :self.anchor_tokens, :] if self.use_anchor_free else sem_tokens
         tokens_n = self.readout_token_norm(read_tokens)
         # score: [B, M, 1] -> [B, M]
         score = self.readout_gate(tokens_n).squeeze(-1)
         alpha = torch.softmax(score, dim=1)
+
         self._last_readout_alpha = alpha.detach()
         # weighted sum over token dimension
         mu = torch.sum(alpha.unsqueeze(-1) * read_tokens, dim=1)
@@ -326,229 +509,87 @@ class LateSemanticSideBranch(nn.Module):
         return out
 
 class PromptedTransformer(Transformer):
-    """
-    鍦ㄥ師濮?Transformer 缂栫爜鍣ㄥ熀纭€涓婂姞鍏モ€滃墠缃?Prompt token鈥濈殑鐗堟湰銆?
-
-    搴忓垪褰㈠紡锛?
-        [CLS] + [PROMPT 脳 P] + [PATCH 脳 N]
-
-    闄愬埗鏉′欢锛堝綋鍓嶅疄鐜板彧鏀寔鏈€甯哥敤鐨勪竴绉嶈瀹氾級锛?
-    - LOCATION == "prepend"锛氭彁绀?token 鍙兘鎻掑叆鍦?CLS 涔嬪悗銆乸atch tokens 涔嬪墠锛?
-    - INITIATION == "random"锛氭彁绀哄悜閲忛噰鐢ㄩ殢鏈哄垵濮嬪寲锛圶avier 绫讳技鐨勫潎鍖€鍒嗗竷锛夛紱
-    - 涓嶆敮鎸侊細
-        * prompt_config.NUM_DEEP_LAYERS 闈?None 鐨勨€滃彧鍦ㄩ儴鍒嗗眰鎻掑叆 deep prompt鈥濓紱
-        * prompt_config.DEEP_SHARED = True 鐨勨€滄墍鏈夊眰鍏辩敤涓€浠?deep prompt鈥濄€?
-
-    鍚屾椂鏀寔锛?
-    - 甯歌鍓嶇疆 prompt锛堢 0 灞傝緭鍏ュ墠鎻掑叆锛夛紱
-    - Deep Prompt锛氬湪姣忎釜涓棿灞備箣鍓嶉兘鎻掑叆涓€浠借灞備笓灞炵殑 prompt锛屽苟鏇挎崲鎺変笂涓€灞傜殑 prompt 娈点€?
-    """
-
     def __init__(self, prompt_config, config, img_size, vis, prompt_init=None, prompt_init_provider=None):
 
-        assert prompt_config.LOCATION == "prepend"  # 鍙敮鎸佸墠缃彁绀猴紙鎻掑湪 CLS 鍚庛€乸atch 鍓嶏級
-        assert prompt_config.INITIATION == "random" # 鎻愮ず鍚戦噺闅忔満鍒濆鍖栵紙Xavier 椋庢牸鍖洪棿锛?
+        self.semantic_branch_cfg = prompt_config.SEMANTIC_BRANCH
+        self.semantic_branch_enable = bool(self.semantic_branch_cfg.ENABLE)
 
-        # 涓嶆敮鎸佷綘鍦?12 灞傞噷鍙寫鈥滅 3銆?銆?1 灞傗€濇彃鍏ョ殑閭ｇ閮ㄥ垎灞?deep-prompt
-        # 鏀寔鐨?deep 鐗堟湰鏄細绗?0 灞傜敤鈥滃墠缃?prompt鈥濓紝浠庣 1 灞傚埌绗?L-1 灞傗€滄瘡灞傞兘鐢ㄤ竴浠?deep-prompt鈥?
-        assert prompt_config.NUM_DEEP_LAYERS is None
-
-        # 涓嶆敮鎸佹墍鏈夊眰鍏辩敤鍚屼竴缁勬彁绀哄悜閲忥紙鍏变韩鍙傛暟锛?鏀寔鐨勬槸姣忎竴灞傞兘鏈夎嚜宸辩殑鎻愮ず鍙傛暟
-        assert not prompt_config.DEEP_SHARED
-
-        # 鍒濆鍖栫埗绫伙紙浼氭瀯寤?embeddings銆乪ncoder 绛夛級
-        # semantic_dim锛氳嫢浣犲湪 encoder 灞傞噷鍔犲叆浜嗏€滆涔?cross-attention鈥濓紝鍙互閫氳繃杩欎釜缁村害鍐冲畾璇箟鍚戦噺鐨勬姇褰辩淮搴?
-        # 閫氬父绛変簬鏁版嵁闆嗙殑灞炴€х淮搴︼紙濡?312锛夈€?
-        semantic_dim = getattr(prompt_config, "SEMANTIC_DIM", None)
-
-        self.semantic_branch_cfg = getattr(prompt_config, "SEMANTIC_BRANCH", None)
-        self.semantic_branch_enable = bool(
-            self.semantic_branch_cfg is not None and getattr(self.semantic_branch_cfg, "ENABLE", True)
-        )
-        self.semantic_cross_attn_enable = False
-
-        # 璋冪敤鐖剁被 Transformer 鐨勫垵濮嬪寲锛屽苟鍛婄煡 semantic_dim锛堜究浜庡叾鍐呴儴鍒涘缓璇箟鐩稿叧鎶曞奖锛?
-        super(PromptedTransformer, self).__init__(
-            config,
-            img_size,
-            vis,
-            semantic_dim=None,
-            semantic_cross_attn_enable=False,
-        )
+        super().__init__(config, img_size, vis)
 
         # 淇濆瓨 prompt 閰嶇疆鍜?vit 閰嶇疆
         self.prompt_config = prompt_config
         self.vit_config = config
         self._monitor_last_raw_semantics = None
         self._monitor_last_refined_semantics = None
+        self._last_visual_stats = None
         self._last_semantic_side_state = None
         self._last_prompt_role_stats = None
 
         if self.semantic_branch_enable:
-            num_layers = int(config.transformer["num_layers"])
-            start_layer = int(getattr(self.semantic_branch_cfg, "START_LAYER", 0))
-            end_layer_cfg = int(getattr(self.semantic_branch_cfg, "END_LAYER", -1))
-            end_layer = (num_layers - 1) if end_layer_cfg < 0 else end_layer_cfg
-            affinity_cfg = getattr(prompt_config, "AFFINITY", None)
+            affinity_cfg = prompt_config.AFFINITY
             self.semantic_side_branch = LateSemanticSideBranch(
                 hidden_size=int(config.hidden_size),
-                num_tokens=int(getattr(self.semantic_branch_cfg, "NUM_TOKENS", 4)),
-                use_anchor_free=bool(getattr(self.semantic_branch_cfg, "USE_ANCHOR_FREE", False)),
-                anchor_tokens=int(getattr(self.semantic_branch_cfg, "ANCHOR_TOKENS", 8)),
-                free_tokens=int(getattr(self.semantic_branch_cfg, "FREE_TOKENS", 2)),
-                free_compete_lambda=float(getattr(self.semantic_branch_cfg, "FREE_COMPETE_LAMBDA", 0.5)),
-                gamma_anchor_scale=float(getattr(self.semantic_branch_cfg, "GAMMA_ANCHOR_SCALE", 1.0)),
-                gamma_free_scale=float(getattr(self.semantic_branch_cfg, "GAMMA_FREE_SCALE", 1.0)),
-                gamma_min=float(getattr(self.semantic_branch_cfg, "GAMMA_MIN", 0.05)),
-                gamma_max=float(getattr(self.semantic_branch_cfg, "GAMMA_MAX", 1.0)),
-                start_layer=start_layer,
-                end_layer=end_layer,
-                patch_compete_enable=bool(getattr(affinity_cfg, "PATCH_COMPETE_ENABLE", False)) if affinity_cfg is not None else False,
-                patch_compete_layers=list(getattr(affinity_cfg, "PATCH_COMPETE_LAYERS", [-1])) if affinity_cfg is not None else [-1],
-                patch_compete_temperature=float(getattr(affinity_cfg, "PATCH_COMPETE_TEMPERATURE", 1.0)) if affinity_cfg is not None else 1.0,
-                patch_compete_mode=str(getattr(affinity_cfg, "PATCH_COMPETE_MODE", "token_softmax")) if affinity_cfg is not None else "token_softmax",
-                patch_compete_balance_weight=float(getattr(affinity_cfg, "PATCH_COMPETE_BALANCE_WEIGHT", 0.0)) if affinity_cfg is not None else 0.0,
-                patch_compete_use_null_token=bool(getattr(affinity_cfg, "PATCH_COMPETE_USE_NULL_TOKEN", False)) if affinity_cfg is not None else False,
+                semantic_branch_cfg=self.semantic_branch_cfg,
+                affinity_cfg=affinity_cfg,
             )
         else:
             self.semantic_side_branch = None
 
-        # 瑙勮寖杈撳叆灏哄 & 鍙栧嚭 patch 澶у皬锛岀粺涓€灏嗗昂瀵歌浆鎴愪簩鍏冪粍锛圚, W锛?
+        # Unify image and patch size formats
         img_size = _pair(img_size)
         patch_size = _pair(config.patches["size"])
 
-        # 鎻愮ず token 鏁伴噺锛堜緥濡?5/10/...锛? patch 灏哄涓?(H, W) 褰㈠紡
+        # prompt token number
         num_tokens = self.prompt_config.NUM_TOKENS
         self.num_tokens = num_tokens  # number of prompted tokens
-
-        # 瀵规彁绀?token 鍙€夌殑 dropout锛堣缁冩湡闅忔満涓㈠純锛屽寮洪瞾妫掓€э級
+        # prompt dropout
         self.prompt_dropout = Dropout(self.prompt_config.DROPOUT)
 
-        # ====== 鎻愮ず token 缁村害璁惧畾 ======
-        # 鐩存帴鍦?ViT hidden_size 缁村害涓婄淮鎶?鐢熸垚 prompt锛屽悓鏃朵繚鐣欏彲璁粌鐨?prompt 鏄犲皠灞?
-        prompt_dim = config.hidden_size
-        self.prompt_proj = Linear(prompt_dim, config.hidden_size)
-        if prompt_dim == config.hidden_size:
-            # 缁村害涓€鑷存椂鍒濆鍖栦负鎺ヨ繎鎭掔瓑鏄犲皠锛屾搴︿富瑕佽惤鍦ㄥ彲璁粌鐨勬槧灏勫眰
-            with torch.no_grad():
-                self.prompt_proj.weight.copy_(torch.eye(config.hidden_size))
-                if self.prompt_proj.bias is not None:
-                    self.prompt_proj.bias.zero_()
-
-        # 鍦ㄥ墠鍚戣繃绋嬩腑鏍规嵁瑙嗚 token 鐢熸垚 prompt 鐨勬ā鍧楋紝姣斿浣犺嚜宸辩殑鈥滄彁绀哄垎甯冪綉缁溾€濓紝杈撳叆 patch_tokens锛岃緭鍑?prompt_tokens
         self.prompt_init_provider = prompt_init_provider
 
-        # 鏄惁瀹屽叏渚濊禆鈥滆繍琛屾椂鍒嗗竷鈥濈敓鎴愭彁绀猴紝鑰屼笉浣跨敤浠讳綍鍙涔犵殑 prompt 鍙傛暟
-        self.runtime_prompt_only = getattr(
-            self.prompt_config, "DISTRIBUTION_ONLY", False)
-        self.detach_prompt_grad = getattr(
-            self.prompt_config, "DETACH_PROMPT_GRAD", False)
-        self.debug_prompt_flow = getattr(self.prompt_config, "DEBUG_FLOW", False)
-        self.debug_shapes = bool(getattr(self.prompt_config, "DEBUG_SHAPES", False))
-        self.noop_keep_params = bool(getattr(self.prompt_config, "NOOP_KEEP_PARAMS", False))
-        self._debug_prompt_flow_logged = False
+        # Runtime Configuration
+        self.debug_shapes = bool(self.prompt_config.DEBUG_SHAPES)
         self._shape_debug_incorporate_logged = False
-        self._last_prompt_noop_info = {}
+        self._last_prompt_path_info = {}
 
-        if self.runtime_prompt_only:
-            # 鏃㈢劧璇粹€滃彧闈犲垎甯?鐢熸垚鍣ㄢ€濓紝閭ｅ氨蹇呴』鎻愪緵涓€涓?prompt_init_provider
-            if self.prompt_init_provider is None:
-                raise ValueError(
-                    "PROMPT.DISTRIBUTION_ONLY=True requires a prompt_init_provider"
-                )
-            # 骞朵笖涓嶅厑璁稿悓鏃剁粰涓€涓潤鎬佸垵濮?prompt锛堜袱鑰呯煕鐩撅級
-            if prompt_init is not None:
-                raise ValueError(
-                    "prompt_init cannot be provided when DISTRIBUTION_ONLY=True"
-                )
         if self.prompt_init_provider is None:
-            raise ValueError(
-                "Prompt static embeddings have been removed. "
-                "Please enable and provide MODEL.PROMPT.DISTRIBUTOR/prompt_init_provider."
-            )
+            raise ValueError("Prompt static embeddings have been removed. "
+                "Please enable and provide MODEL.PROMPT.DISTRIBUTOR/prompt_init_provider.")
+        if prompt_init is not None:
+            raise ValueError("Static prompt initialization has been removed; prompt_init must be None.")
 
-        # ====== 鍒濆鍖栨彁绀?token 鍙傛暟 ======
-        if self.prompt_config.INITIATION == "random":
-            # Xavier-uniform 椋庢牸鐨勪笂涓嬬晫锛屾牴鎹緭鍏ョ淮搴︿笌 prompt_dim 璁＄畻 val = sqrt( 6 / ( fan_in + fan_out ) )
-            # 鐩殑锛氳闅忔満鍒濆鍖栫殑鎻愮ず鍚戦噺鍜?patch 宓屽叆鐨勯噺绾茬浉杩戯紝渚夸簬涓よ€呭湪鍚屼竴搴忓垪閲岃娉ㄦ剰鍔涚綉缁滀竴璧峰鐞?
-            # fan_in 杩戜技涓猴細姣忎釜 patch 鐨勫師濮嬭緭鍏ョ淮搴?= 3 * patch_h * patch_w锛圧GB 涓夐€氶亾 脳 patch 鍍忕礌鏁帮級
-            # fan_out 杩戜技涓猴細prompt_dim锛堟彁绀哄悜閲忕殑缁村害锛?
-            # eg:patch_size = 16脳16 = 256锛? * 256 = 768锛涜 prompt_dim = 192锛屽垯 val = sqrt(6/(768+192)) = sqrt(6/960) 鈮?0.079锛?
-            # 鍒濆鍖栧尯闂?[-0.079, 0.079]銆傚鏋?PROJECT < 0 鐩存帴鐢?D=768 鍋?prompt_dim锛屽垯 val = sqrt(6/(768+768)) 鈮?0.0625
-            val = math.sqrt(6. / float(3 * reduce(mul, patch_size, 1) + prompt_dim))  # noqa
-
-            if prompt_init is not None:
-                logger.warning("prompt_init is ignored: static prompt embeddings are removed.")
-
-            # -------- Deep Prompt锛堜腑闂村眰浣跨敤锛?--------
-            # Deep Prompt embeddings are removed; deep behavior is implemented via prompt_update_layers.
-        # [CLS] + [ PROMPT 脳 P ] + [ PATCH 脳 N ]   鈫? (B, 1+P+N, D)
-        else:
-            raise ValueError("Other initiation scheme is not supported")
-
+        # Synchronize the debug switch to each layer of the semantic branch and encoder
         if self.semantic_side_branch is not None:
             self.semantic_side_branch.debug_shapes = bool(self.debug_shapes)
-        for layer_block in getattr(self.encoder, "layer", []):
+        for layer_block in self.encoder.layer:
             setattr(layer_block, "debug_shapes", bool(self.debug_shapes))
             if hasattr(layer_block, "attn"):
                 setattr(layer_block.attn, "debug_shapes", bool(self.debug_shapes))
-            if hasattr(layer_block, "semantic_attn") and layer_block.semantic_attn is not None:
-                setattr(layer_block.semantic_attn, "debug_shapes", bool(self.debug_shapes))
 
-        # 鏄惁鍐荤粨鍘熷 prompt 宓屽叆鍙傛暟锛屼娇姊害涓昏钀藉湪鍒嗗竷缃戠粶绛夊叾浠栨敮璺笂
-        self.freeze_embeddings = getattr(self.prompt_config, "FREEZE_EMBEDDINGS", True)
-
-        # 鈥斺€?Layer-wise prompt evolution锛氱 1鈥-1 灞傞€氳繃绾挎€у眰鏇存柊涓婁竴灞傜殑 prompt 鈥斺€?#
+        # Layer-wise prompt evolution
         num_layers = config.transformer["num_layers"]
         hidden_size = config.hidden_size
-        self.prompt_update_layers = nn.ModuleList([
-            Linear(hidden_size, hidden_size) for _ in range(num_layers - 1)
-        ])
-        # Transfer-learning motivation:
-        # optionally use zero init to minimize initial perturbation and protect frozen backbone.
-        evolve_mode = str(getattr(self.prompt_config, "EVOLVE_INIT_MODE", "identity")).lower()
-        if evolve_mode not in {"identity", "zero"}:
-            evolve_mode = "zero" if bool(getattr(self.prompt_config, "EVOLVE_ZERO_INIT", False)) else "identity"
+        self.prompt_update_layers = nn.ModuleList([Linear(hidden_size, hidden_size) for _ in range(num_layers - 1)])
+
+        evolve_mode = str(self.prompt_config.EVOLVE_INIT_MODE).lower()
+        if evolve_mode != "identity":
+            raise ValueError(f"Unsupported PROMPT.EVOLVE_INIT_MODE: {self.prompt_config.EVOLVE_INIT_MODE}")
         self.evolve_init_mode = evolve_mode
-        # Layer-wise prompt evolution init: legacy identity vs optional zero.
+
+        # Layer-wise prompt evolution init: identity.
         with torch.no_grad():
             for layer in self.prompt_update_layers:
-                if self.evolve_init_mode == "zero":
-                    layer.weight.zero_()
-                else:
-                    eye = torch.eye(hidden_size, device=layer.weight.device, dtype=layer.weight.dtype)
-                    layer.weight.copy_(eye)
+                eye = torch.eye(hidden_size, device=layer.weight.device, dtype=layer.weight.dtype)
+                layer.weight.copy_(eye)
                 if layer.bias is not None:
                     layer.bias.zero_()
-        if len(self.prompt_update_layers) > 0:
-            w0 = self.prompt_update_layers[0].weight.detach().float()
-            b0 = self.prompt_update_layers[0].bias.detach().float() if self.prompt_update_layers[0].bias is not None else None
-            logger.info(
-                "[prompt-evolve-init] mode=%s zero_flag=%s layer0_w_mean=%.6e layer0_w_norm=%.6e layer0_b_mean=%s",
-                self.evolve_init_mode,
-                bool(getattr(self.prompt_config, "EVOLVE_ZERO_INIT", False)),
-                float(w0.mean().item()),
-                float(w0.norm().item()),
-                "{:.6e}".format(float(b0.mean().item())) if b0 is not None else "None",
-            )
-
     def incorporate_prompt(self, x, semantics=None):
-        """
-        灏?prompt token 鎸夆€減repend鈥濈瓥鐣ュ苟鍏ワ細eg:N=14脳14=196锛涜嫢 P=10锛屽垯鎬婚暱 1+10+196=207
-        杈撳叆锛?
-          x: 鍘熷鍥惧儚寮犻噺 (B, C, H, W)
-        涓昏姝ラ锛?
-          1) 浣跨敤 embeddings.forward_patches 鎻愬彇绾?patch tokens锛歏_raw锛屽舰鐘?[B, N, D]
-          2) 鐢熸垚 prompt_tokens锛氬繀椤讳粠 prompt_init_provider 鍔ㄦ€佺敓鎴?
-          3) 璋冪敤 embeddings.add_cls_and_pos(V_raw) 閲嶆柊鏋勯€?[CLS|PATCH] + pos 缂栫爜锛?
-          4) 鍦?CLS 涔嬪悗鎻掑叆 prompt_tokens锛堝厛鎶曞奖鍐?dropout锛夛紝寰楀埌锛?
-             [CLS] + [PROMPT 脳 P] + [PATCH 脳 N]锛屽舰鐘?[B, 1+P+N, D]
-        """
 
         B = x.shape[0]
         self._last_semantic_side_state = None
+        self._last_visual_stats = None
 
-        # 1) 鎻愬彇绾?patch 宓屽叆锛氫笉鍖呭惈 CLS / 浣嶇疆缂栫爜锛歏_raw
+        # extract vision patch
         patch_tokens = self.embeddings.forward_patches(x)  # (B, n_patches, hidden_dim)
 
         # New mainline: semantic update is done by lightweight side-branch per layer.
@@ -558,73 +599,23 @@ class PromptedTransformer(Transformer):
             refined_semantics.detach() if torch.is_tensor(refined_semantics) else None
         )
 
-        # 2) 鐢熸垚 prompt_tokens
-        provider_used = bool(self.prompt_init_provider is not None)
-        prompt_tokens = None
-        if self.prompt_init_provider is not None:
-            # 鐢扁€滄彁绀哄垎甯冪綉缁溾€濇垨鍏朵粬妯″潡锛屽熀浜?patch_tokens 鐢熸垚 prompt
-            provider_out = self.prompt_init_provider(patch_tokens)
-            # 鍏煎杩斿洖 (prompts, stats) 鐨勫舰寮忥紝浠呭彇 prompts
-            if isinstance(provider_out, tuple):
-                prompt_tokens = provider_out[0]
-            elif isinstance(provider_out, dict) and "prompts" in provider_out:
-                prompt_tokens = provider_out["prompts"]
-            else:
-                prompt_tokens = provider_out
-
-            if not torch.is_tensor(prompt_tokens):
-                raise TypeError(
-                    "prompt_init_provider must return a Tensor or (Tensor, stats), "
-                    f"got {type(prompt_tokens)}"
-                )
-            # 鑻ヨ緭鍑轰负 [P, D]锛屽垯瑙嗕负鍗曟牱鏈ā鏉匡紝鎵╁睍 batch 缁?
-            if prompt_tokens.dim() == 2:
-                prompt_tokens = prompt_tokens.unsqueeze(0)
-
-            # 妫€鏌?prompt 鏁伴噺鏄惁涓庨厤缃竴鑷?
-            if prompt_tokens.shape[1] != self.num_tokens:
-                raise ValueError(
-                    f"prompt_init_provider returned shape {prompt_tokens.shape}, expected num_tokens={self.num_tokens}"
-                )
-
-            # 鑻?provider 鍙繑鍥炲崟涓?batch 鐨?prompt锛岃€岀湡瀹?batch_size > 1锛屽垯澶嶅埗鎵╁睍
-            if prompt_tokens.shape[0] == 1 and B > 1:
-                prompt_tokens = prompt_tokens.expand(B, -1, -1)
-            elif prompt_tokens.shape[0] != B:
-                # 鑻?provider 杈撳嚭鐨?batch 鏁颁笌杈撳叆涓嶄竴鑷达紝鍒欑洿鎺ユ姤閿?
-                raise ValueError(
-                    f"prompt_init_provider batch {prompt_tokens.shape[0]} incompatible with input batch {B}"
-                )
-        else:
-            raise RuntimeError(
-                "Static prompt parameters were removed. "
-                "prompt_init_provider is required to generate prompt tokens."
-            )
-        if prompt_tokens.shape[-1] != self.vit_config.hidden_size:
-            raise ValueError(
-                f"Prompt feature dim {prompt_tokens.shape[-1]} incompatible with hidden_size {self.vit_config.hidden_size}"
-            )
-        # 3) 閲嶅缓甯?CLS/浣嶇疆缂栫爜鐨勪富搴忓垪锛歔CLS|PATCH] + pos
+        # generate prompt
+        provider_out = self.prompt_init_provider(patch_tokens)
+        if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
+            raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
+        prompt_tokens, provider_stats = provider_out
+        expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
+        if (not torch.is_tensor(prompt_tokens)) or tuple(prompt_tokens.shape) != expected_shape:
+            raise ValueError(f"prompt_init_provider must return prompt_tokens with shape {expected_shape}, got {type(prompt_tokens)} {getattr(prompt_tokens, 'shape', None)}")
+        h_v = provider_stats["h_v"]
+        self._last_visual_stats = h_v
+        # 3) construct [CLS|PATCH] + pos
         x_base = self.embeddings.add_cls_and_pos(patch_tokens)  # (B, 1 + n_patches, hidden_dim)
-
-        prompt_generated = torch.is_tensor(prompt_tokens)
-        prompt_injected = False
-        prompt_norm = None
-        if prompt_generated:
-            with torch.no_grad():
-                prompt_norm = float(prompt_tokens.float().norm(dim=-1).mean().item())
-
-        # 4) 浠呭湪姝ｅ父妯″紡涓嬫敞鍏?prompt锛汵OOP 妯″紡涓嬩繚鎸佸弬鏁?妯″潡瀛樺湪浣嗕笉鏀瑰啓涓?token 搴忓垪
-        if self.noop_keep_params:
-            x = x_base
-        else:
-            prompt_tokens = self.prompt_proj(prompt_tokens)
-            x = torch.cat((
-                    x_base[:, :1, :],    # 鍙彇 CLS
-                    self.prompt_dropout(prompt_tokens.expand(B, -1, -1)),
-                    x_base[:, 1:, :]     # 鍏朵綑 patch token
-                ), dim=1)
-            prompt_injected = True
+        x = torch.cat((
+                x_base[:, :1, :],
+                self.prompt_dropout(prompt_tokens),
+                x_base[:, 1:, :]
+            ), dim=1)
 
         if self.debug_shapes and (not self._shape_debug_incorporate_logged):
             print(
@@ -638,38 +629,9 @@ class PromptedTransformer(Transformer):
             )
             self._shape_debug_incorporate_logged = True
 
-        if self.debug_prompt_flow and not self._debug_prompt_flow_logged:
-            trace_id = getattr(self, "_debug_trace_id", "trace=NA")
-            logger.info(
-                "[trace] %s node=B.incorporate_prompt prompt_noop_keep_params=%s provider_used=%s "
-                "whether_prompt_generated=%s whether_prompt_injected_into_tokens=%s detach_prompt_grad=%s freeze_embeddings=%s "
-                "prompt_requires_grad=%s token_len_before=%d token_len_after=%d prompt_shape=%s "
-                "actual_token_shape_entering_backbone=%s prompt_norm=%s visual_feature_norm=%s refined_semantics=%s",
-                trace_id,
-                bool(self.noop_keep_params),
-                provider_used,
-                bool(prompt_generated),
-                bool(prompt_injected),
-                bool(self.detach_prompt_grad),
-                bool(self.freeze_embeddings),
-                bool(getattr(prompt_tokens, "requires_grad", False)) if prompt_generated else False,
-                int(1 + patch_tokens.shape[1]),
-                int(x.shape[1]),
-                tuple(prompt_tokens.shape) if prompt_generated else None,
-                tuple(x.shape),
-                prompt_norm,
-                float(patch_tokens.float().norm(dim=-1).mean().item()),
-                tuple(refined_semantics.shape) if torch.is_tensor(refined_semantics) else None,
-            )
-            self._debug_prompt_flow_logged = True
-        self._last_prompt_noop_info = {
-            "prompt_noop_keep_params": bool(self.noop_keep_params),
+        self._last_prompt_path_info = {
             "semantic_branch_enable": bool(self.semantic_branch_enable),
-            "semantic_cross_attn_enable": bool(self.semantic_cross_attn_enable),
-            "whether_prompt_generated": bool(prompt_generated),
-            "whether_prompt_injected_into_tokens": bool(prompt_injected),
             "actual_token_shape_entering_backbone": tuple(x.shape),
-            "prompt_norm": prompt_norm,
             "visual_feature_norm": float(patch_tokens.float().norm(dim=-1).mean().item()),
         }
 
@@ -677,32 +639,17 @@ class PromptedTransformer(Transformer):
 
     def train(self, mode=True):
         """
-        閲嶅啓 nn.Module.train锛岀敤浜庢帶鍒垛€滃彧璁粌 prompt 鐩稿叧妯″潡锛屽喕缁撲富骞测€濄€?
-
-        琛屼负锛?
-        - 褰?mode=True锛堣缁冩ā寮忥級锛?
-            * encoder / embeddings 缃负 eval()锛堝喕缁撱€佸叧闂?Dropout/BN 鐨勯殢鏈烘€э級锛?
-            * prompt_dropout 浠嶅浜?train() 鐘舵€侊紱
-            * 鑻?prompt_init_provider 鏄?nn.Module锛屼篃浼氭牴鎹?mode 璁剧疆銆?
-        - 褰?mode=False锛堣瘎浼版ā寮忥級锛?
-            * 瀵规墍鏈夊瓙妯″潡璋冪敤 module.train(False)锛岀粺涓€鍒囧埌 eval銆?
+        set train status for this class: disable all but the prompt-related modules
         """
-        # set train status for this class: disable all but the prompt-related modules
         if mode:
-            # training: 璁粌鏈燂細鍐荤粨涓诲共
             self.encoder.eval()
             self.embeddings.eval()
-
-            # 鍙 prompt 鐩稿叧灞備繚鎸?train 鐘舵€?
-            self.prompt_proj.train(mode)
             self.prompt_dropout.train()
             self.prompt_update_layers.train(mode)
 
-            # 鑻?provider 鏈韩鏄竴涓彲瀛︿範妯″潡锛屽垯涔熼伒寰?mode 璁剧疆
             if isinstance(self.prompt_init_provider, torch.nn.Module):
                 self.prompt_init_provider.train(mode)
         else:
-            # 璇勪及/鎺ㄧ悊鏃讹細鎵€鏈夊瓙妯″潡缁熶竴璺熼殢 mode
             for module in self.children():
                 module.train(mode)
 
@@ -717,13 +664,14 @@ class PromptedTransformer(Transformer):
         sem_tokens, h_y = self.semantic_side_branch.init_state(
             semantics=semantics,
             device=semantics.device,
+            visual_stats=self._last_visual_stats,
         )
         self._last_prompt_role_stats = {
             "semantic_branch_enable": True,
             "semantic_branch_num_tokens": int(self.semantic_side_branch.num_tokens),
-            "semantic_branch_use_anchor_free": bool(getattr(self.semantic_side_branch, "use_anchor_free", False)),
-            "semantic_branch_anchor_tokens": int(getattr(self.semantic_side_branch, "anchor_tokens", self.semantic_side_branch.num_tokens)),
-            "semantic_branch_free_tokens": int(getattr(self.semantic_side_branch, "free_tokens", 0)),
+            "semantic_branch_use_anchor_free": bool(self.semantic_side_branch.use_anchor_free),
+            "semantic_branch_anchor_tokens": int(self.semantic_side_branch.anchor_tokens),
+            "semantic_branch_free_tokens": int(self.semantic_side_branch.free_tokens),
             "semantic_branch_start_layer": int(self.semantic_side_branch.start_layer),
             "semantic_branch_end_layer": int(self.semantic_side_branch.end_layer),
             "semantic_branch_num_layers": int(num_layers),
@@ -732,6 +680,9 @@ class PromptedTransformer(Transformer):
         return sem_tokens, h_y
 
     def _update_semantic_side_branch(self, sem_tokens, hidden_states, layer_idx: int, num_layers: int):
+        """
+        Cut prompt/visual tokens from the main sequence and feed them to the semantic branch for one step of update
+        """
         if sem_tokens is None:
             return None, {}, None
         p_start = 1
@@ -748,28 +699,26 @@ class PromptedTransformer(Transformer):
         if isinstance(self._last_prompt_role_stats, dict):
             self._last_prompt_role_stats["semantic_branch_layer_stats"][int(layer_idx)] = {
                 "gamma": float(diag.get("gamma", 0.0)),
-                "aps_energy": float(diag.get("aps_energy", 0.0)),
-                "avs_energy": float(diag.get("avs_energy", 0.0)),
+                "asp_energy": float(diag.get("asp_energy", 0.0)),
+                "asv_energy": float(diag.get("asv_energy", 0.0)),
             }
         return sem_tokens, sem_aff, diag
 
+    def _split_anchor_free_tokens(self, sem_tokens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        sb = self.semantic_side_branch
+        if sb is None:
+            raise ValueError("semantic_side_branch is None")
+        if sb.use_anchor_free:
+            return sem_tokens[:, :sb.anchor_tokens, :], sem_tokens[:, sb.anchor_tokens:, :]
+        return sem_tokens, sem_tokens[:, :0, :]
+
     def forward_deep_prompt(self, embedding_output, semantics=None):
         """
-        Deep Prompt 妯″紡涓嬬殑鍓嶅悜浼犳挱銆?
-        - 褰撳墠涓昏矾寰勪负 semantic side-branch锛孲^#/mu_s_final 鐢辫交閲忓 token 璇箟鍒嗘敮閫愬眰鏇存柊寰楀埌锛?
-          涓嶅啀浣跨敤 legacy shared-concept cross-attention 鍒嗘敮銆?
-
-        杈撳叆锛?
-          - embedding_output: 缁忚繃 incorporate_prompt 鐨勫簭鍒?(B, 1+P+N, D)
-          - semantics:        璇箟妯℃€佺壒寰侊紙鍙€夛級锛岀敤浜庝綘鍦?encoder 涓姞鍏ョ殑 cross-attention
-
-        鏈哄埗锛?
-          - 绗?0 灞傦細鐩存帴瀵?[CLS + 鍓嶇疆 PROMPT + PATCH] 鍋?self-attention 涓?MLP锛?
-          - 绗?1 鈥?L-1 灞傦細
-              * 浠庝笂涓€灞傝緭鍑轰腑鎴彇 prompt 娈碉紝閫氳繃璇ュ眰涓撳睘 Linear 鍋氣€減rompt 婕斿寲鈥濓紱
-              * 鐢ㄦ紨鍖栧悗鐨?prompt 鏇挎崲搴忓垪涓殑 prompt 娈碉紝鍐嶈繃 encoder.layer[i]銆?
+        - Layer 0: Directly use the [CLS|P|PATCH] generated by incorporate_prompt
+        - Layers 1 to L-1: First perform layer-wise evolution on the prompt, then replace it back into the main sequence
+        - After each layer, let the semantic branch read the current prompt / visual token and update
         """
-        attn_weights: list = []           # 鎸夐渶淇濆瓨姣忓眰鐨勬敞鎰忓姏鏉冮噸锛坴is=True 鏃舵湁鏁堬級
+        attn_weights: list = []
         hidden_states = embedding_output
         weights = None
         num_layers = self.vit_config.transformer["num_layers"]
@@ -778,28 +727,22 @@ class PromptedTransformer(Transformer):
 
         for i in range(num_layers):
             if i == 0:
-                # 绗?0 灞傦細浣跨敤 provider/琛ㄥ垵濮嬪寲寰楀埌鐨?[CLS|P^0|PATCH] 搴忓垪锛屾搴︽祦鍚?provider
                 hidden_states, weights, _ = self.encoder.layer[i](hidden_states, None, self.num_tokens)
             else:
-                # 1) 鍙栧嚭涓婁竴灞傝緭鍑轰腑鐨?prompt 娈碉紙闀垮害鍥哄畾涓?self.num_tokens锛?
                 prev_prompt = hidden_states[:, 1:1 + self.num_tokens, :]
-
-                # 2) 閫氳繃璇ュ眰涓撳睘鐨勭嚎鎬у眰婕斿寲 prompt锛屾搴﹁惤鍦?prompt_update_layers
                 evolved_prompt = self.prompt_update_layers[i - 1](prev_prompt)
                 evolved_prompt = self.prompt_dropout(evolved_prompt)
 
-                # 3) 閲嶇粍搴忓垪锛歔CLS | P^i | PATCH]锛屼繚鎸侀暱搴?1 + P + N 涓嶅彉
                 hidden_states = torch.cat(
                     (
                         hidden_states[:, :1, :],  # CLS
-                        evolved_prompt,  # 鏇存柊鍚庣殑 prompt
-                        hidden_states[:, 1 + self.num_tokens:, :],  # PATCH 娈?
+                        evolved_prompt,  # prompt
+                        hidden_states[:, 1 + self.num_tokens:, :],  # PATCH
                     ),
                     dim=1,)
 
-                # 4) 缁忚繃绗?i 灞?Transformer block锛堜粛鏀寔璇箟 cross-attn锛?
                 hidden_states, weights, _ = self.encoder.layer[i](hidden_states, None, self.num_tokens)
-
+            # update sem side
             sem_tokens, sem_aff, _ = self._update_semantic_side_branch(
                 sem_tokens=sem_tokens,
                 hidden_states=hidden_states,
@@ -814,37 +757,24 @@ class PromptedTransformer(Transformer):
             if self.encoder.vis:
                 attn_weights.append(weights)
 
-        # 鏈€缁堣緭鍑哄墠鍋氫竴娆?LayerNorm
-        encoded = self.encoder.encoder_norm(hidden_states)  # 鏈€鍚庡眰鐨?LayerNorm
+        encoded = self.encoder.encoder_norm(hidden_states)
         if sem_tokens is not None and h_y is not None:
             mu_s_final = self.semantic_side_branch.readout(sem_tokens)
             delta_sem = mu_s_final - h_y
+            anchor_tokens, free_tokens = self._split_anchor_free_tokens(sem_tokens)
             self._last_semantic_side_state = {
                 "h_y": h_y,
                 "sem_tokens": sem_tokens,
                 "mu_s_final": mu_s_final,
                 "delta_sem": delta_sem,
                 "patch_compete_balance_loss": patch_compete_balance_accum,
-                "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
-                "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
+                "anchor_tokens": anchor_tokens,
+                "free_tokens": free_tokens,
             }
             self._monitor_last_refined_semantics = mu_s_final.detach()
         return encoded, attn_weights
 
     def forward_deep_prompt_with_affinity(self, embedding_output, affinity_config, semantics=None):
-        """
-        甯︿翰鍜屽垎鏀殑 Deep Prompt 鍓嶅悜锛氫笌 forward_deep_prompt 骞宠銆?
-
-        瀵瑰簲鍏崇郴锛?
-          - forward_deep_prompt           鈫?forward_deep_prompt_with_affinity
-          - encoder.layer[i].forward      鈫?encoder.layer[i].forward_with_affinity
-          - forward/forward_with_affinity 鍚屾牱鍏变韩 incorporate_prompt 鐢熸垚鐨?[CLS|P|PATCH]
-
-        杩斿洖:
-          encoded:     LayerNorm 鍚庣殑鏈€缁堝簭鍒?
-          attn_weights: 鍙鍖栫敤娉ㄦ剰鍔涙潈閲嶏紙vis=True 鏃讹級
-          affinities:   姣忓眰鐨勪翰鍜岀煩闃靛垪琛紝鏉ヨ嚜 compute_affinity锛堥€愬眰鏀堕泦锛屾柟渚夸笂灞傛寜闇€鎸戦€夊仛瀵归綈鎹熷け鎴栬皟璇曪級
-        """
         attn_weights: list = []
         affinities: list = []
         hidden_states = embedding_output
@@ -855,7 +785,6 @@ class PromptedTransformer(Transformer):
 
         for i in range(num_layers):
             if i == 0:
-                # 绗?0 灞傦細鐩存帴浣跨敤 provider/琛ㄧ敓鎴愮殑 prompt 搴忓垪锛屽苟璧板甫浜插拰鐨勫墠鍚?
                 hidden_states, weights, affinity, _ = self.encoder.layer[i].forward_with_affinity(
                     hidden_states, affinity_config, None, self.num_tokens
                 )
@@ -870,7 +799,6 @@ class PromptedTransformer(Transformer):
                 hidden_states, weights, affinity, _ = self.encoder.layer[i].forward_with_affinity(
                     hidden_states, affinity_config, None, self.num_tokens
                 )
-
             sem_tokens, sem_aff, _ = self._update_semantic_side_branch(
                 sem_tokens=sem_tokens,
                 hidden_states=hidden_states,
@@ -892,40 +820,29 @@ class PromptedTransformer(Transformer):
         if sem_tokens is not None and h_y is not None:
             mu_s_final = self.semantic_side_branch.readout(sem_tokens)
             delta_sem = mu_s_final - h_y
+            anchor_tokens, free_tokens = self._split_anchor_free_tokens(sem_tokens)
             self._last_semantic_side_state = {
                 "h_y": h_y,
                 "sem_tokens": sem_tokens,
                 "mu_s_final": mu_s_final,
                 "delta_sem": delta_sem,
                 "patch_compete_balance_loss": patch_compete_balance_accum,
-                "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
-                "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
+                "anchor_tokens": anchor_tokens,
+                "free_tokens": free_tokens,
             }
             self._monitor_last_refined_semantics = mu_s_final.detach()
         return encoded, attn_weights, affinities
     def forward(self, x, semantics=None):
         """
-        鏍囧噯鍓嶅悜锛?
-        - 杈撳叆 semantics 涓?batch 鐨勭被绾ц涔夛紙灞炴€у悜閲忥級锛屽舰鐘朵竴鑸负 [B, att_dim]锛?
-        - incorporate_prompt 鍏堟彁鍙?patch tokens 鍜?provider prompt锛?
-        - 鍚庣画 forward_deep_prompt/forward_with_affinity 鍐呴儴閫愬眰鏇存柊 semantic side-branch锛屾渶缁堣鍑?mu_s_final銆?
-        娴佺▼锛?
-          1) 璋冪敤 incorporate_prompt(x) 灏?prompt 鍚堝叆杈撳叆搴忓垪锛?
-          2) 鑻ュ惎鐢?Deep Prompt锛屽垯璋冪敤 forward_deep_prompt 鍋氬灞傛繁搴︽彁绀猴紱
-             鍚﹀垯鐩存帴灏嗗簭鍒楅€佸叆 encoder锛?
-          3) 杩斿洖缂栫爜鍚庣殑瀹屾暣 token 搴忓垪 encoded 鍜屽彲閫夌殑 attn_weights銆?
+        standard forward
         """
-        # 1) prepend prompt锛堝湪 CLS 鍚庢彃鍏ユ彁绀猴級
         embedding_output, semantics = self.incorporate_prompt(x, semantics)
 
-        # 2) deep prompt锛堝彲閫夛級
-        # NOOP 妯″紡涓嬩笉鍏佽 prompt 褰卞搷涓?token 璺緞锛屽洜姝や笉杩涘叆 deep prompt 婕斿寲鍒嗘敮銆?
-        effective_prompt_tokens = 0 if self.noop_keep_params else self.num_tokens
-        if self.prompt_config.DEEP and (not self.noop_keep_params):
+        effective_prompt_tokens = self.num_tokens
+        if self.prompt_config.DEEP:
             encoded, attn_weights = self.forward_deep_prompt(
                 embedding_output, semantics)
         else:
-            # 鑻ヤ笉浣跨敤 Deep Prompt锛屽垯鐩存帴灏嗘暣涓簭鍒楅€佸叆 encoder
             encoded, attn_weights = self.encoder(embedding_output, None, effective_prompt_tokens)
             num_layers = self.vit_config.transformer["num_layers"]
             sem_tokens, h_y = self._init_semantic_side_state(semantics, num_layers)
@@ -942,14 +859,15 @@ class PromptedTransformer(Transformer):
                     num_layers=num_layers,
                 )
                 mu_s_final = self.semantic_side_branch.readout(sem_tokens)
+                anchor_tokens, free_tokens = self._split_anchor_free_tokens(sem_tokens)
                 self._last_semantic_side_state = {
                     "h_y": h_y,
                     "sem_tokens": sem_tokens,
                     "mu_s_final": mu_s_final,
                     "delta_sem": mu_s_final - h_y,
                     "patch_compete_balance_loss": None,
-                    "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
-                    "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
+                    "anchor_tokens": anchor_tokens,
+                    "free_tokens": free_tokens,
                 }
                 self._monitor_last_refined_semantics = mu_s_final.detach()
 
@@ -965,15 +883,10 @@ class PromptedTransformer(Transformer):
         """
         embedding_output, semantics = self.incorporate_prompt(x, semantics)
 
-        effective_prompt_tokens = 0 if self.noop_keep_params else self.num_tokens
+        effective_prompt_tokens = self.num_tokens
         effective_affinity_config = affinity_config
-        if self.noop_keep_params and isinstance(affinity_config, dict):
-            # In NOOP mode there is no prompt segment in the sequence.
-            # Force affinity prompt length to 0 to avoid treating first patches as prompt tokens.
-            effective_affinity_config = dict(affinity_config)
-            effective_affinity_config["prompt_length"] = 0
 
-        if self.prompt_config.DEEP and (not self.noop_keep_params):
+        if self.prompt_config.DEEP:
             encoded, attn_weights, affinities = self.forward_deep_prompt_with_affinity(
                 embedding_output, effective_affinity_config, semantics
             )
@@ -998,14 +911,15 @@ class PromptedTransformer(Transformer):
                 if isinstance(affinities, list) and len(affinities) > 0 and isinstance(affinities[-1], dict):
                     affinities[-1].update(sem_aff)
                 mu_s_final = self.semantic_side_branch.readout(sem_tokens)
+                anchor_tokens, free_tokens = self._split_anchor_free_tokens(sem_tokens)
                 self._last_semantic_side_state = {
                     "h_y": h_y,
                     "sem_tokens": sem_tokens,
                     "mu_s_final": mu_s_final,
                     "delta_sem": mu_s_final - h_y,
                     "patch_compete_balance_loss": sem_aff.get("PatchCompeteBalance") if isinstance(sem_aff, dict) else None,
-                    "anchor_tokens": sem_tokens[:, :self.semantic_side_branch.anchor_tokens, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens,
-                    "free_tokens": sem_tokens[:, self.semantic_side_branch.anchor_tokens:, :] if getattr(self.semantic_side_branch, "use_anchor_free", False) else sem_tokens[:, :0, :],
+                    "anchor_tokens": anchor_tokens,
+                    "free_tokens": free_tokens,
                 }
                 self._monitor_last_refined_semantics = mu_s_final.detach()
 
@@ -1013,71 +927,31 @@ class PromptedTransformer(Transformer):
 
 class PromptedVisionTransformer(VisionTransformer):
     """
-    鍦ㄦ爣鍑?VisionTransformer 澶栧３涓嬶紝浣跨敤 PromptedTransformer 浣滀负鍐呴儴鐨?transformer 缂栫爜鍣ㄣ€?
-
-    濂藉锛?
-    - 澶嶇敤鍘熸湁 VisionTransformer 鐨勬帴鍙ｄ笌鍒嗙被澶磋璁★紱
-    - 鍦ㄤ笉鏀瑰彉鈥淐LS 姹犲寲 + 绾挎€у垎绫烩€濇暣浣撻€昏緫鐨勬儏鍐典笅锛屽皢 Prompt 鏈哄埗鏃犵紳娉ㄥ叆锛?
-    - 瀵瑰鐨?forward 鎺ュ彛鍩烘湰淇濇寔涓€鑷达紝鍙槸鍐呴儴缂栫爜闃舵鎹㈡垚浜?PromptedTransformer銆?
+    Replace the original VisionTransformer's internal transformer backbone with PromptedTransformer
     """
-    def __init__(self, prompt_cfg, model_type,img_size=224, num_classes=21843, vis=False, prompt_init=None, prompt_init_provider=None):        # 褰撳墠瀹炵幇鍙敮鎸佸師鐢熺殑 CLS 姹犲寲鏂瑰紡锛坥riginal锛?
-        """
-        :param prompt_cfg:   PROMPT 瀛愰厤缃紙NUM_TOKENS / PROJECT / DEEP 绛夛級
-        :param model_type:   ViT 妯″瀷绫诲瀷锛堢敤浜庝粠 CONFIGS 涓彇缁撴瀯閰嶇疆锛?
-        :param img_size:     杈撳叆鍥惧儚灏哄锛堥粯璁?224锛?
-        :param num_classes:  鍒嗙被绫诲埆鏁帮紙榛樿 21843锛屽搴?ImageNet-21K锛?
-        :param vis:          鏄惁杩斿洖娉ㄦ剰鍔涙潈閲?
-        :param prompt_init:  澶栭儴 prompt 鍒濆鍖栧紶閲忥紙鍙€夛級
-        :param prompt_init_provider: 杩愯鏃?prompt 鐢熸垚鍣紙鍙€夛級
-        """
-        # 褰撳墠鍙敮鎸佸師濮嬬殑 CLS 姹犲寲鏂瑰紡锛堜笉鍋?GAP 绛夋浛浠ｆ睜鍖栵級
-        assert prompt_cfg.VIT_POOL_TYPE == "original"
-
-        # 鍏堣皟鐢ㄧ埗绫?VisionTransformer 鍒濆鍖栧熀纭€缁撴瀯
+    def __init__(self, prompt_cfg, model_type,img_size=224, num_classes=21843, vis=False, prompt_init=None, prompt_init_provider=None):
         super(PromptedVisionTransformer, self).__init__(model_type, img_size, num_classes, vis)
 
         if prompt_cfg is None:
             raise ValueError("prompt_cfg cannot be None if using PromptedVisionTransformer")
         self.prompt_cfg = prompt_cfg
 
-        # 鍙栧嚭缁撴瀯瑙勬牸锛堝 hidden_size銆佸眰鏁般€乸atch 澶у皬绛夛級
         vit_cfg = CONFIGS[model_type]
-        # 鏍稿績鏇挎崲锛氭妸鍐呴儴鐨?transformer 鐢ㄢ€滃甫 Prompt 鐨勨€濈増鏈浛鎹?
         self.transformer = PromptedTransformer(prompt_cfg, vit_cfg, img_size, vis, prompt_init=prompt_init, prompt_init_provider=prompt_init_provider,)
 
     def forward(self, x, vis=False, semantics=None):
-        """
-        鍓嶅悜娴佺▼锛?
-
-        1) 璋冪敤鍐呴儴鐨?PromptedTransformer(x, semantics)锛?
-           - 寰楀埌缂栫爜鍚庣殑搴忓垪 x锛堝惈 CLS + PROMPT + PATCH锛夛紱
-           - 鍙€夎繑鍥炲悇灞傜殑娉ㄦ剰鍔涙潈閲?attn_weights銆?
-        2) 鍙?CLS 浣嶇疆鐨?token锛坸[:, 0]锛変綔涓哄叏灞€琛ㄥ緛锛?
-        3) 閫氳繃 self.head锛堢嚎鎬у眰锛夊緱鍒版渶缁?logits锛?
-        4) 鑻?vis=False锛屽垯鍙繑鍥?logits锛?
-           鑻?vis=True锛屽垯杩斿洖 (logits, attn_weights)锛屼究浜庡彲瑙嗗寲/鍒嗘瀽銆?
-        """
-        # transformer 杩斿洖鐨?x 涓虹紪鐮佸悗鐨?token 搴忓垪锛宎ttn_weights 涓哄彲瑙嗗寲鐢ㄦ敞鎰忓姏鏉冮噸
         x, attn_weights = self.transformer(x, semantics)
 
-        # 鍙?CLS token锛堜綅缃?0锛変綔涓哄叏灞€琛ㄥ緛
-        x = x[:, 0]
+        x = x[:, 0] # CLS
 
-        # 绾挎€у垎绫诲ご -> logits锛堟湭鍋?softmax锛?
-        logits = self.head(x)
+        logits = self.head(x)   # Category Header
 
         if not vis:
             return logits
         return logits, attn_weights
 
     def forward_with_affinity(self, x, affinity_config, vis=False, semantics=None):
-        """
-        甯︿翰鍜岀煩闃佃緭鍑虹殑鍓嶅悜鎺ュ彛锛堜笌 VisionTransformer.forward_with_affinity 骞宠锛夈€?
 
-        - 璋冪敤鍐呴儴 PromptedTransformer.forward_with_affinity 杩斿洖搴忓垪/鏉冮噸/浜插拰
-        - 鍙?CLS 鍋氬垎绫?
-        - vis=False 杩斿洖 (logits, affinities)锛寁is=True 棰濆杩斿洖 attn_weights
-        """
         x, attn_weights, affinities = self.transformer.forward_with_affinity(x, affinity_config, semantics)
 
         logits = self.head(x[:, 0])

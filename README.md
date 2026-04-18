@@ -37,9 +37,7 @@ See `env_setup.sh`
 - `src/utils`: helper functions for io, loggings, training, visualizations. 用于 io、日志、训练、可视化的辅助函数。
 - 👉`train.py`: call this one for training and eval a model with a specified transfer type. 调用这个来训练并评估具有指定传输类型的模型。
   -                 调用此脚本来调整具有指定迁移类型的模型的学习率和权重衰减。我们将此脚本用于 FGVC 任务。
-- 👉`tune_fgvc.py`: call this one for tuning learning rate and weight decay for a model with a specified transfer type. We used this script for FGVC tasks.
   -                  调用此方法调整 vtab 任务：使用 800/200 分割来找到最佳 lr 和 wd，并使用最佳 lr/wd 进行最终运行
-- 👉`tune_vtab.py`: call this one for tuning vtab tasks: use 800/200 split to find the best lr and wd, and use the best lr/wd for the final runs
 - `launch.py`: contains functions used to launch the job. 包含用于启动作业的功能。
 
 ## Experiments

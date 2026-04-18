@@ -4,7 +4,6 @@ DATA:
   NAME: "OxfordFlowers"
   DATAPATH: ""  #TODO: need to specify here
   NUMBER_CLASSES: 102
-  MULTILABEL: False
 MODEL:
   TYPE: "vit"
 SOLVER:

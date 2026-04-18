@@ -21,10 +21,8 @@ def _init_stats(groups: List[str]) -> Dict[str, Dict[str, object]]:
             "total_numel": 0,
             "train_numel": 0,
             "train_count": 0,
-            "examples": [],
         }
     stats["prompt_tokens"]["subtypes"] = {
-        "prompt_proj": {"total": 0, "train": 0},
         "prompt_dropout": {"total": 0, "train": 0},
         "prompt_other": {"total": 0, "train": 0},
     }
@@ -33,8 +31,6 @@ def _init_stats(groups: List[str]) -> Dict[str, Dict[str, object]]:
 
 def _classify_prompt_subtype(name: str) -> str:
     lower = name.lower()
-    if any(k in lower for k in ["prompt_proj", "prompt_linear", "prompt_mlp"]):
-        return "prompt_proj"
     if "dropout" in lower and "prompt" in lower:
         return "prompt_dropout"
     return "prompt_other"
@@ -124,8 +120,6 @@ def log_trainable_parameters(
         if param.requires_grad:
             group_stats["train_numel"] += param.numel()
             group_stats["train_count"] += 1
-            if len(group_stats["examples"]) < max_examples_per_group:
-                group_stats["examples"].append(name)
 
         if group == "prompt_tokens":
             subtype = _classify_prompt_subtype(name)
@@ -136,37 +130,20 @@ def log_trainable_parameters(
 
     total_params = sum(v["total_numel"] for v in stats.values())
     trainable_params = sum(v["train_numel"] for v in stats.values())
-    tuned_percent = (trainable_params / total_params * 100) if total_params else 0.0
-
-    logger.info(
-        f"[visual_prompt]: Total Parameters: {total_params}   Gradient Parameters: {trainable_params}"
-    )
-    logger.info(f"[visual_prompt]: tuned percent:{tuned_percent:.3f}")
-
     sorted_groups = sorted(stats.items(), key=lambda item: item[1]["train_numel"], reverse=True)
-    logger.info("[visual_prompt]: Trainable breakdown (sorted):")
-    for group_name, group_stats in sorted_groups:
+    nonzero_groups = [
+        (group_name, group_stats)
+        for group_name, group_stats in sorted_groups
+        if group_stats["train_numel"] > 0
+    ]
+    summary_parts = []
+    for group_name, group_stats in nonzero_groups[:3]:
         total = group_stats["total_numel"]
         trainable = group_stats["train_numel"]
-        pct_trainable = (trainable / trainable_params * 100) if trainable_params else 0.0
         pct_all = (total / total_params * 100) if total_params else 0.0
-        logger.info(
-            f"[visual_prompt]:   {group_name}: {trainable} train / {total} total ({pct_trainable:.2f}% of trainable, {pct_all:.2f}% of all)"
-        )
-
-        if group_name == "prompt_tokens":
-            sub = group_stats["subtypes"]
-            logger.info(
-                "[visual_prompt]:   prompt_tokens details: "
-                f"proj: {sub['prompt_proj']['train']} train / {sub['prompt_proj']['total']} total, "
-                f"dropout: {sub['prompt_dropout']['train']} train / {sub['prompt_dropout']['total']} total, "
-                f"other: {sub['prompt_other']['train']} train / {sub['prompt_other']['total']} total"
-            )
-
-        if group_stats["examples"]:
-            logger.info(
-                f"[visual_prompt]:   examples: {', '.join(group_stats['examples'])}"
-            )
+        summary_parts.append(f"{group_name}={trainable} ({pct_all:.2f}% all)")
+    if summary_parts:
+        logger.info("[visual_prompt]: trainable modules: %s", ", ".join(summary_parts))
 
     if stats["backbone_pretrained"]["train_numel"] > 0:
         logger.warning(

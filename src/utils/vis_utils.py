@@ -1,29 +1,27 @@
 """
-实验结果汇总&可视化工具
-"""
+实验结果汇?可视化工?"""
 import datetime
 import os
 import glob
 import numpy as np
 import pandas as pd
-import torch
 
 from tqdm import tqdm
 from collections import defaultdict
-from sklearn.metrics import confusion_matrix
 # plt.rcParams["axes.grid"] = False
 
 import warnings
 warnings.filterwarnings("ignore")
 LOG_NAME = "logs.txt"
+VAL_METRIC_KEY = "val_unseen_top1"
+TEST_UNSEEN_METRIC_KEY = "test_unseen_top1"
 
 
 def remove_trailing(eval_dict):
-    min_num = min([len(v) for k, v in eval_dict.items() if "top5" not in k])
+    min_num = min([len(v) for k, v in eval_dict.items()])
     new_dict ={}
     for k, v in eval_dict.items():
-        if "top5" not in k:
-            new_dict[k] = v[:min_num]
+        new_dict[k] = v[:min_num]
     return new_dict
 
 
@@ -37,15 +35,18 @@ def get_meta(job_root, job_path, model_type):
     return data_name, feat_type, lr, wd
 
 
-def update_eval(line, eval_dict, data_name):        
-    if "top1" in line and "top" in line.split(": top1:")[-1]:
-        metric = "top"     
-    else:
-        metric = "rocauc"
-    top1 = float(line.split(": top1:")[-1].split(metric)[0])
-    eval_type = line.split(" Classification results with ")[-1].split(": top1")[0] 
-    eval_type = "".join(eval_type.split("_" + data_name))
-    eval_dict[eval_type + "_top1"].append(top1)
+def update_eval(line, eval_dict, data_name):
+    if " Classification results with " in line:
+        top1 = float(line.split(": top1:")[-1].split()[0])
+        eval_type = line.split(" Classification results with ")[-1].split(": top1")[0]
+        eval_type = "".join(eval_type.split("_" + data_name))
+        eval_dict[eval_type + "_top1"].append(top1)
+        return
+    if line.strip().startswith("Eval "):
+        m_name = line.split("Eval ", 1)[1].split(":", 1)[0]
+        eval_type = "".join(m_name.split("_" + data_name))
+        m_top1 = line.split(" top1=")[-1].split()[0]
+        eval_dict[eval_type + "_top1"].append(float(m_top1))
 
 
 def get_nmi(job_path):
@@ -69,22 +70,6 @@ def get_nmi(job_path):
     return nmi_dict
 
 
-def get_mean_accuracy(job_path, data_name):
-    val_data = torch.load(
-        job_path.replace("logs.txt", f"val_{data_name}_logits.pth"))
-    test_data = torch.load(
-        job_path.replace("logs.txt", f"val_{data_name}_logits.pth"))
-    v_matrix = confusion_matrix(
-        val_data['targets'],
-        np.argmax(val_data['joint_logits'], 1)
-    )
-    t_matrix = confusion_matrix(
-        test_data['targets'],
-        np.argmax(test_data['joint_logits'], 1)
-    )
-    return np.mean(v_matrix.diagonal()/v_matrix.sum(axis=1) ) * 100, np.mean(t_matrix.diagonal()/t_matrix.sum(axis=1) ) * 100
-
-
 def get_training_data(job_path, model_type, job_root):
     data_name, feat_type, lr, wd = get_meta(job_root, job_path, model_type)
     with open(job_path) as f:
@@ -106,6 +91,9 @@ def get_training_data(job_path, model_type, job_root):
         if "Total Parameters: " in line:
             total_params = int(line.split("Total Parameters: ")[-1].split("\t")[0])
             gradiented_params = int(line.split("Gradient Parameters: ")[-1].split("\n")[0])
+        if "Model params: total=" in line:
+            total_params = int(line.split("Model params: total=")[-1].split()[0])
+            gradiented_params = int(line.split(" trainable=")[-1].split()[0])
 
         if "Rank of current process:" in line:
             num_jobs += 1
@@ -114,7 +102,10 @@ def get_training_data(job_path, model_type, job_root):
         if "average train loss:" in line:
             loss = float(line.split("average train loss: ")[-1])
             train_loss.append(loss)
-        if " Classification results with " in line:
+        if " train: loss=" in line and "Epoch " in line:
+            loss = float(line.split(" train: loss=")[-1].split()[0])
+            train_loss.append(loss)
+        if " Classification results with " in line or line.strip().startswith("Eval "):
             update_eval(line, eval_dict, data_name)
 
     meta_dict = {
@@ -167,24 +158,22 @@ def get_df(files, model_type, root, is_best=True, is_last=True, max_epoch=300):
         if len(eval_results) == 0:
             print(f"job {job_path} not ready")
             continue
-        if len(eval_results["val_top1"]) == 0:
+        if len(eval_results[VAL_METRIC_KEY]) == 0:
             print(f"job {job_path} not ready")
             continue
 
-        if "val_top1" not in eval_results or "test_top1" not in eval_results:
+        if VAL_METRIC_KEY not in eval_results or TEST_UNSEEN_METRIC_KEY not in eval_results:
             print(f"inbalanced: {job_path}")
             continue
                 
         for k, v in meta_dict.items():
             pd_dict[k].append(v)
         
-        metric_b = "val_top1"
+        metric_b = VAL_METRIC_KEY
         best_epoch = np.argmax(eval_results[metric_b])
 
         if is_best:
             for name, val in eval_results.items():
-                if "top5" in name:
-                    continue
                 if len(val) == 0:
                     continue
                 if not isinstance(val[0], list):
@@ -197,13 +186,11 @@ def get_df(files, model_type, root, is_best=True, is_last=True, max_epoch=300):
         # last epoch
         if is_last:
             if v_top1 is not None:
-                pd_dict["l-val_top1"].append(v_top1)
-                pd_dict["l-test_top1"].append(t_top1)
-                val = eval_results["val_top1"]
+                pd_dict["l-" + VAL_METRIC_KEY].append(v_top1)
+                pd_dict["l-" + TEST_UNSEEN_METRIC_KEY].append(t_top1)
+                val = eval_results[VAL_METRIC_KEY]
             else:
                 for name, val in eval_results.items():
-                    if "top5" in name:
-                        continue
                     if len(val) == 0:
                         continue
                     pd_dict["l-" + name].append(val[-1])
@@ -229,8 +216,10 @@ def delete_ckpts(f):
         print(f"removed {f_delete}")
 
 
-def average_df(df, metric_names=["l-val_top1", "l-val_base_top1"], take_average=True):
+def average_df(df, metric_names=None, take_average=True):
     # for each data and features and train type, display the averaged results
+    if metric_names is None:
+        metric_names = ["l-" + VAL_METRIC_KEY]
     data_names = set(list(df["data"]))
     f_names = set(list(df["feature"]))
     t_names = set(list(df["type"]))
@@ -295,9 +284,12 @@ def filter_df(df, sorted_cols, max_num):
     return pd.concat(df_list)
 
 
-def display_results(df, sorted_cols=["data", "feature", "type", "l-val_top1"], max_num=1):
+def display_results(df, sorted_cols=None, max_num=1):
+    if sorted_cols is None:
+        sorted_cols = ["data", "feature", "type", "l-" + VAL_METRIC_KEY]
     cols = [c for c in df.columns if c not in []]
     df = df[cols]
     if max_num is not None:
         df = filter_df(df, sorted_cols[3:], max_num)
     return df.sort_values(sorted_cols).reset_index(drop=True)
+

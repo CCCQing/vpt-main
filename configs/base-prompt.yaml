@@ -3,14 +3,11 @@ NUM_SHARDS: 1
 OUTPUT_DIR: "D:\\postgraduate1\\project\\vpt-main\\output"
 RUN_N_TIMES: 1
 MODEL:
-  TRANSFER_TYPE: "prompt"
   TYPE: "vit"
-  LINEAR:
-    MLP_SIZES: []
 SOLVER:
   SCHEDULER: "cosine"
   PATIENCE: 300
-  LOSS: "softmax"
+  LOSS: "softmax_margin_cm"
   OPTIMIZER: "sgd"
   MOMENTUM: 0.9
   WEIGHT_DECAY: 0.0001

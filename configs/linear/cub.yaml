@@ -4,7 +4,6 @@ DATA:
   NAME: "CUB"
   DATAPATH: ""  #TODO: need to specify here
   NUMBER_CLASSES: 200
-  MULTILABEL: False
 MODEL:
   TYPE: "vit"
 SOLVER:

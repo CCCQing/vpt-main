@@ -9,7 +9,6 @@ launch helper functions
 import argparse
 import os
 import sys
-import pprint
 import PIL
 from collections import defaultdict
 from tabulate import tabulate
@@ -186,8 +185,6 @@ def logging_train_setup(args, cfg) -> None:
         )
     # Show the config
     # 5) 打印最终生效的配置（pprint 友好显示）
-    logger.info("Training with config:")
-    logger.info(pprint.pformat(cfg))
     # cudnn benchmark has large overhead.
     # It shouldn't be used considering the small size of typical val set.
     # 6) CUDNN benchmark：若只评估（eval_only=True）就不动；训练时按配置项决定是否启用。

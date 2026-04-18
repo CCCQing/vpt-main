@@ -231,7 +231,6 @@ class ADPT_VisionTransformer(nn.Module):
           - 编码器末端的 LayerNorm；
           - 位置编码（若分辨率不同，做网格插值到新大小）；
           - 逐层把 encoder block 参数拷入（调用上面的 ADPT_Block.load_from）
-          - 若启用了 hybrid stem（如 CNN 前端），也一并拷入。
         """
         with torch.no_grad():
             # ----- patch embedding -----
@@ -283,14 +282,3 @@ class ADPT_VisionTransformer(nn.Module):
                 for uname, unit in block.named_children():
                     unit.load_from(weights, n_block=uname)
 
-            # 若采用“混合嵌入”（hybrid，卷积干预的那种），还要加载最前面的 conv + GN
-            if self.transformer.embeddings.hybrid:
-                self.transformer.embeddings.hybrid_model.root.conv.weight.copy_(np2th(weights["conv_root/kernel"], conv=True))
-                gn_weight = np2th(weights["gn_root/scale"]).view(-1)
-                gn_bias = np2th(weights["gn_root/bias"]).view(-1)
-                self.transformer.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
-                self.transformer.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
-
-                for bname, block in self.transformer.embeddings.hybrid_model.body.named_children():
-                    for uname, unit in block.named_children():
-                        unit.load_from(weights, n_block=bname, n_unit=uname)

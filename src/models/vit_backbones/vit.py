@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved
 """
 models for vits, borrowed from
@@ -15,8 +15,6 @@ from typing import Any, Dict, Optional
 # from os.path import join as pjoin  # 原有Win下os.path.join会产生反斜杠 \
 from turtle import forward           # 原有代码就这两行
 from posixpath import join as pjoin  # 关键：确保键名里总是用 "/"
-from collections import OrderedDict  # 解决 OrderedDict 未导入
-import torch.nn.functional as F      # 解决 F 未导入
 # 8.21改动结束
 
 import torch
@@ -43,7 +41,6 @@ CONFIGS = {
     'sup_vitb32_imagenet21k': configs.get_b32_config(),
     'sup_vitb8_imagenet21k': configs.get_b8_config(),
     'sup_vith14_imagenet21k': configs.get_h14_config(),
-    # 'R50-ViT-B_16': configs.get_r50_b16_config(),
 }
 
 # 下列常量为从 TF/Flax 权重转 PyTorch 时对应的键名片段
@@ -67,15 +64,7 @@ def np2th(weights, conv=False):
         weights = weights.transpose([3, 2, 0, 1])
     return torch.from_numpy(weights)
 
-
-def swish(x):
-    """Swish 激活函数：x * sigmoid(x)"""
-    return x * torch.sigmoid(x)
-
-# 支持的激活函数查表
-ACT2FN = {"gelu": torch.nn.functional.gelu, "relu": torch.nn.functional.relu, "swish": swish}
-
-
+ACT2FN = {"gelu": torch.nn.functional.gelu}
 class Attention(nn.Module):
     """
     标准多头自注意力模块（MHSA）。
@@ -109,9 +98,6 @@ class Attention(nn.Module):
         x = x.view(*new_x_shape)    # [B, N, h, d_k]
         return x.permute(0, 2, 1, 3)    # -> [B, h, N, d_k]
 
-# ----------------11.17日更换函数名：构造亲和--------------------------------------------
-#    def forward(self, hidden_states):
-# ----------------11.17日更换函数名结束--------------------------------------------
     def _project_qkv(self, hidden_states):
         """
         对整段序列一次性做 Q/K/V 线性映射，并且直接变形为多头形式。
@@ -281,103 +267,6 @@ class Attention(nn.Module):
 
         return affinities
 
-class SemanticCrossAttention(nn.Module):
-    """Cross-attention adapter that only updates semantics (S ← S + CrossAttn(S, F))."""
-
-    def __init__(self, hidden_size: int, semantic_dim: int, num_heads: int, dropout: float = 0.0):
-        super().__init__()
-        self.num_heads = num_heads
-        self.debug_shapes = False
-        self._shape_debug_transpose_logged = False
-        self.head_dim = hidden_size // num_heads
-        self.all_head_size = self.head_dim * num_heads
-
-        # semantics → query；patch → key/value
-        # 遵循 VSPCN 式 adapter：S ← S + CrossAttn(S, F)，视觉序列不在此处被改写
-        self.query = Linear(hidden_size, self.all_head_size)  # W_q^s
-        self.key = Linear(semantic_dim, self.all_head_size)  # W_k^v
-        self.value = Linear(semantic_dim, self.all_head_size)  # W_v^v
-        self.out = Linear(hidden_size, hidden_size)            # 输出映射回 D
-
-        self.attn_dropout = Dropout(dropout)
-        self.proj_dropout = Dropout(dropout)
-        self.softmax = Softmax(dim=-1)
-
-    def _transpose_for_scores(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        将 [B, L, D_all] reshape 成多头格式 [B, h, L, d]。
-        用于 patch/semantic 两侧的 Q/K/V 统一处理。
-        """
-        x_in_shape = tuple(x.shape)
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_dim)
-        x = x.view(*new_x_shape)
-        out = x.permute(0, 2, 1, 3)
-        if self.debug_shapes and (not self._shape_debug_transpose_logged):
-            print(
-                "[SHAPE-DEBUG] SemanticCrossAttention._transpose_for_scores in={} out={}".format(
-                    x_in_shape,
-                    tuple(out.shape),
-                )
-            )
-            self._shape_debug_transpose_logged = True
-        return out
-
-    def forward(self, hidden_states: torch.Tensor, semantics: torch.Tensor, num_prompt_tokens: int = 0):
-        """
-        仅对语义分支做 CrossAttn 适配（S ← S + CrossAttn(S, F)），视觉序列保持原样。
-
-        参数:
-            hidden_states: [B, 1+P+N, D] (CLS + prompt + patch)
-            semantics: [B, d_s] 或 [B, 1, d_s]
-
-            num_prompt_tokens: prompt 个数 P，用于切分 CLS / prompt / patch
-
-        返回:
-            hidden_states: 原样返回，CLS/prompt/patch 不在此处改写
-            semantics_out: 语义残差更新后的张量 [B, d_s]
-        """
-        if semantics.dim() == 2:
-            semantics = semantics.unsqueeze(1)
-
-        # 按 CLS / prompt / patch 切分序列        # 序列切分：视觉序列仅作为上下文，保持不改写
-        cls_tokens = hidden_states[:, :1, :]                           # [B, 1, D]
-        prompt_tokens = hidden_states[:, 1:1 + num_prompt_tokens, :]   # [B, P, D]
-        patch_tokens = hidden_states[:, 1 + num_prompt_tokens:, :]     # [B, N, D]
-
-        # 语义统一成长度为 1 的序列，便于与多头注意力接口对齐
-        if semantics.dim() == 2:
-            semantics_seq = semantics.unsqueeze(1)  # [B, 1, D]
-        elif semantics.dim() == 3:
-            semantics_seq = semantics  # 约定为 [B, 1, D]
-        else:
-            raise ValueError(f"Unexpected semantics shape: {semantics.shape}")
-
-        # Q: semantics；K/V: patch tokens（视觉特征）
-        query_layer = self._transpose_for_scores(self.query(semantics_seq))
-        key_layer = self._transpose_for_scores(self.key(patch_tokens))
-        value_layer = self._transpose_for_scores(self.value(patch_tokens))
-
-        # 缩放点积注意力，遵循 VSPCN 式“仅更新 S”的适配器设计
-        attn_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-        attn_scores = attn_scores / math.sqrt(self.head_dim)
-
-        attn_probs = self.softmax(attn_scores)
-        attn_probs = self.attn_dropout(attn_probs)
-
-        context_layer = torch.matmul(attn_probs, value_layer)                  # [B, h, 1, d]
-        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()         # [B, 1, h, d]
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-        context_layer = context_layer.view(*new_context_layer_shape)  # [B, 1, D]
-        context_layer = self.out(context_layer)
-        context_layer = self.proj_dropout(context_layer)
-
-        # 语义残差更新（S ← S + CrossAttn(S, F)），视觉序列保持不变
-        delta = context_layer.squeeze(1)  # [B, D]
-        semantics_out = semantics + delta
-
-        return torch.cat([cls_tokens, prompt_tokens, patch_tokens], dim=1), semantics_out
-
-
 class Mlp(nn.Module):
     """
     前馈网络（FFN）：两层 MLP
@@ -410,64 +299,26 @@ class Mlp(nn.Module):
 
 
 class Embeddings(nn.Module):
-    """
-    Construct the embeddings from patch, position embeddings.
-    将图像转换为 Transformer 的输入序列：
-    - 纯 ViT：以 patch_size 为 kernel=stride 的卷积划分 patch，再线性映射到隐藏维
-    - hybrid：先用 ResNetV2 提取特征（步幅 16），再以小 patch 做映射
-    - 加上可学习的 [CLS] 与绝对位置编码
-    输出：embeddings [B, 1+N, D]
-    """
     def __init__(self, config, img_size, in_channels=3):
         super(Embeddings, self).__init__()
-        self.hybrid = None
-        img_size = _pair(img_size)  # 支持单值或二元组
-        # 两种 patch 设定：
-        # 1) hybrid 模式：使用 ResNetV2 做低层特征，随后以 16x16 的 stride 切块
-        # 2) 纯 ViT：直接以 patch_size 卷积进行切块
-        if config.patches.get("grid") is not None:
-            grid_size = config.patches["grid"]
-            # 由图像 / 16 再除 grid 得到“每个 patch 的核/步幅”，n_patches= (H/16) * (W/16)
-            patch_size = (img_size[0] // 16 // grid_size[0], img_size[1] // 16 // grid_size[1])
-            n_patches = (img_size[0] // 16) * (img_size[1] // 16)
-            self.hybrid = True
-        else:   # config.patches["grid"] 不存在时vit
-            patch_size = _pair(config.patches["size"])  # 例如 (16,16)
-            n_patches = (img_size[0] // patch_size[0]) * (img_size[1] // patch_size[1])
-            self.hybrid = False
-
-        if self.hybrid:
-            # ResNetV2 作为视觉前端   # 切块并映射到 hidden_size
-            self.hybrid_model = ResNetV2(block_units=config.resnet.num_layers,
-                                         width_factor=config.resnet.width_factor)
-            in_channels = self.hybrid_model.width * 16  # 升维，匹配ResNet 输出的通道数，后面降到hidden_size
-        # 将图像/特征图划分为 patch：Conv2d 的 kernel=stride=patch_size # 做“切块 + 线性映射”
-        self.patch_embeddings = Conv2d(in_channels=in_channels,
-                                       out_channels=config.hidden_size,
-                                       kernel_size=patch_size,
-                                       stride=patch_size)
-        # 位置编码，长度为 n_patches + 1（包含 cls）
-        self.position_embeddings = nn.Parameter(torch.zeros(1, n_patches+1, config.hidden_size))
-        # 可学习的 [CLS] token
+        img_size = _pair(img_size)
+        patch_size = _pair(config.patches["size"])
+        n_patches = (img_size[0] // patch_size[0]) * (img_size[1] // patch_size[1])
+        self.patch_embeddings = Conv2d(
+            in_channels=in_channels,
+            out_channels=config.hidden_size,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        self.position_embeddings = nn.Parameter(torch.zeros(1, n_patches + 1, config.hidden_size))
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
-
         self.dropout = Dropout(config.transformer["dropout_rate"])
 
     def forward_patches(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        仅计算 patch 的嵌入，不加入 CLS 也不加位置编码。
-        输入：x [B, C, H, W]
-        输出：patch_tokens [B, N, D]
-        """
-
-
-        if self.hybrid:
-            x = self.hybrid_model(x)    # 先经过 ResNetV2
-        x = self.patch_embeddings(x)    # 划分 patch 并升维到 D，形状 [B, D, H', W']
-        x = x.flatten(2)                # -> [B, D, N]
-        patch_tokens = x.transpose(-1, -2)         # -> [B, N, D]
+        x = self.patch_embeddings(x)
+        x = x.flatten(2)
+        patch_tokens = x.transpose(-1, -2)
         return patch_tokens
-
     def add_cls_and_pos(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         """
         在 patch tokens 前追加 CLS，并加上位置编码与 dropout。
@@ -499,130 +350,20 @@ class Block(nn.Module):
     段1：LN → MHSA → 残差
     段2：LN → MLP  → 残差
     """
-    def __init__(self, config, vis, semantic_dim=None, semantic_cross_attn_enable: bool = True):
+    def __init__(self, config, vis):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size   # hidden_size=D：每个 token 的通道维度
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)   # 段1的 LayerNorm
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)         # 段2的 LayerNorm
         self.ffn = Mlp(config)                  # 段2的两层 MLP（D→H→D，通常 H≈4D），完成通道内的非线性变换
         self.attn = Attention(config, vis)      # 段1的多头自注意力
-        self.semantic_norm = LayerNorm(config.hidden_size, eps=1e-6)
-        self.semantic_cross_attn_enable = bool(semantic_cross_attn_enable)
         self.debug_shapes = False
-        self._shape_debug_sem_aff_logged = False
-        self.semantic_attn = None if (semantic_dim is None or not self.semantic_cross_attn_enable) else SemanticCrossAttention(
-            config.hidden_size,
-            semantic_dim,
-            config.transformer["num_heads"],
-            dropout=config.transformer["attention_dropout_rate"],
-        )
-        self._semantic_dim = semantic_dim
-
-    def _ensure_semantic_attn(self, semantics: torch.Tensor, device: torch.device = None):
-        """
-        Lazy 初始化 semantic_attn：
-        - 若构造 Block 时 semantic_dim=None，但运行时传入了 semantics，
-          则在第一次调用时根据 semantics.size(-1) 实例化 SemanticCrossAttention。
-        - 同时把新建的 semantic_attn 移到当前 device，避免参数留在 CPU。
-        """
-        if not self.semantic_cross_attn_enable:
-            return
-        if self.semantic_attn is None and semantics is not None:
-            # 根据当前语义张量的最后一维确定 semantic_dim
-            self._semantic_dim = semantics.size(-1)
-            self.semantic_attn = SemanticCrossAttention(
-                self.hidden_size,
-                self._semantic_dim,
-                self.attn.num_attention_heads,
-                dropout=self.attn.attn_dropout.p,
-            )
-            if device is not None:
-                self.semantic_attn = self.semantic_attn.to(device)
-
-    def _compute_semantic_affinity(
-            self,
-            q_proj: torch.Tensor,
-            semantics: Optional[torch.Tensor],
-            affinity_config: Optional[Dict[str, Any]],
-            num_prompt_tokens: int,
-    ) -> Dict[str, torch.Tensor]:
-        """基于 self-attention 的 q 与语义侧 k 计算 Avs/Aps 亲和矩阵。"""
-
-        if semantics is None or self.semantic_attn is None or affinity_config is None:
-            return {}
-
-        prompt_length = affinity_config.get("prompt_length", num_prompt_tokens)
-        normalize = affinity_config.get("normalize", True)
-        detach = affinity_config.get("detach", True)
-
-        if q_proj.size(2) < 1 + prompt_length:
-            return {}
-
-        cls_offset = 1
-        prompt_slice = slice(cls_offset, cls_offset + prompt_length)
-        patch_slice = slice(cls_offset + prompt_length, None)
-
-        if semantics.dim() == 2:
-            semantics_seq = semantics.unsqueeze(1)
-        elif semantics.dim() == 3:
-            semantics_seq = semantics
-        else:
-            raise ValueError(f"Unexpected semantics shape: {semantics.shape}")
-
-        sem_key = self.semantic_attn._transpose_for_scores(
-            self.semantic_attn.key(semantics_seq)
-        )
-
-        prompt_query = q_proj[:, :, prompt_slice, :]
-        patch_query = q_proj[:, :, patch_slice, :]
-
-        if detach:
-            sem_key = sem_key.detach()
-            prompt_query = prompt_query.detach()
-            patch_query = patch_query.detach()
-
-        scale = 1.0 / math.sqrt(self.attn.attention_head_size)
-        sem_aff: Dict[str, torch.Tensor] = {}
-
-        if patch_query.numel() > 0:
-            avs_logits = torch.matmul(patch_query, sem_key.transpose(-1, -2)) * scale
-            sem_aff["Avs"] = F.softmax(avs_logits, dim=-1) if normalize else avs_logits
-
-        if prompt_query.numel() > 0:
-            aps_logits = torch.matmul(prompt_query, sem_key.transpose(-1, -2)) * scale
-            sem_aff["Aps"] = F.softmax(aps_logits, dim=-1) if normalize else aps_logits
-
-        if self.debug_shapes and (not self._shape_debug_sem_aff_logged):
-            print(
-                "[SHAPE-DEBUG] Block._compute_semantic_affinity semantics={} semantics_seq={} sem_key={} "
-                "prompt_query={} patch_query={} Aps={} Avs={}".format(
-                    tuple(semantics.shape) if torch.is_tensor(semantics) else None,
-                    tuple(semantics_seq.shape),
-                    tuple(sem_key.shape),
-                    tuple(prompt_query.shape),
-                    tuple(patch_query.shape),
-                    tuple(sem_aff["Aps"].shape) if "Aps" in sem_aff else None,
-                    tuple(sem_aff["Avs"].shape) if "Avs" in sem_aff else None,
-                )
-            )
-            self._shape_debug_sem_aff_logged = True
-
-        return sem_aff
-
     def forward(self, x, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
         # 段1：注意力 + 残差
         h = x  # 残差分支
         x = self.attention_norm(x)  # LN
         x, weights = self.attn(x)   # MHSA（输出同形状）; weights 仅在 vis=True 时非 None
         x = x + h                   # 残差相加
-
-        # 语义交叉注意力（可选）
-        if semantics is not None and self.semantic_cross_attn_enable:
-            self._ensure_semantic_attn(semantics, device=x.device)
-            if self.semantic_attn is not None:
-                # 仅更新语义分支：遵循 VSPCN 式适配器，视觉序列保持由 ViT+prompt 控制
-                x_norm = self.semantic_norm(x)
-                _, semantics = self.semantic_attn(x_norm, semantics, num_prompt_tokens)
 
         # 段2：FFN + 残差
         h = x
@@ -662,7 +403,7 @@ class Block(nn.Module):
         返回:
             x:          [B, N, D]，本层输出
             weights:    注意力权重（仅 vis=True 时非 None）
-            affinities: dict，包含 App/Avv(/Apv) 以及 Avs/Aps（若传入 semantics）
+            affinities: dict，包含 App/Avv(/Apv)
         """
         # --- 注意力分支 + 残差 ---
         h = x
@@ -670,13 +411,6 @@ class Block(nn.Module):
         # 同时拿到 MHSA 输出 + 多头形式的 q_proj / k_proj
         x, weights, q_proj, k_proj = self.attn.forward_with_projections(x_norm)
         x = x + h
-
-        # 语义交叉注意力（可选）
-        if semantics is not None and self.semantic_cross_attn_enable:
-            self._ensure_semantic_attn(semantics, device=x.device)
-            if self.semantic_attn is not None:
-                x_norm = self.semantic_norm(x)
-                _, semantics = self.semantic_attn(x_norm, semantics, num_prompt_tokens)
 
         # --- FFN 分支 + 残差 ---
         h = x
@@ -695,13 +429,7 @@ class Block(nn.Module):
             detach=affinity_config.get("detach", True),
         )
 
-        sem_aff = self._compute_semantic_affinity(
-            q_proj, semantics, affinity_config, num_prompt_tokens
-        )
-
-        affinities = {**attn_aff, **sem_aff}
-
-        return x, weights, affinities, semantics
+        return x, weights, attn_aff, semantics
 
     def load_from(self, weights, n_block):
         """从预训练权重字典中加载当前 block 的参数（处理维度与键名）。"""
@@ -748,13 +476,13 @@ class Block(nn.Module):
 
 class Encoder(nn.Module):
     """堆叠多个 Transformer Block，并在末尾加一层 LayerNorm。"""
-    def __init__(self, config, vis, semantic_dim: int = None, semantic_cross_attn_enable: bool = True):
+    def __init__(self, config, vis):
         super(Encoder, self).__init__()
         self.vis = vis
         self.layer = nn.ModuleList()    # 保存有序的多层子模块
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6) # 在所有 block 之后再做一次 LayerNorm
         for _ in range(config.transformer["num_layers"]):
-            layer = Block(config, vis, semantic_dim, semantic_cross_attn_enable=semantic_cross_attn_enable)  # 每层都是同结构的 Transformer Block（内部是 LN→MHSA→残差；LN→MLP→残差）
+            layer = Block(config, vis)  # 每层都是同结构的 Transformer Block（内部是 LN→MHSA→残差；LN→MLP→残差）
             self.layer.append(copy.deepcopy(layer))
         # 本实现的 Block 属于 Pre-LN（在每个子层前 LN），额外的末端 LN（有些论文称 final LN）有助于稳定训练并改善表征
     def forward(self, hidden_states, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
@@ -833,10 +561,10 @@ class Transformer(nn.Module):
     """
     完整的 Transformer：Embeddings（CLS+patch+pos）+ Encoder（多层 Block）
     """
-    def __init__(self, config, img_size, vis, semantic_dim: int = None, semantic_cross_attn_enable: bool = True):
+    def __init__(self, config, img_size, vis):
         super(Transformer, self).__init__()
         self.embeddings = Embeddings(config, img_size=img_size)
-        self.encoder = Encoder(config, vis, semantic_dim, semantic_cross_attn_enable=semantic_cross_attn_enable)
+        self.encoder = Encoder(config, vis)
 
     def forward(self, input_ids, semantics: torch.Tensor = None):
         """标准前向：返回编码后的序列与注意力权重。"""
@@ -949,11 +677,6 @@ class VisionTransformer(nn.Module):
         插值是什么：预训练的“位置参数”只有 G 份，但你现在需要 N 份。故预训练的位置编码“缩放”到新网格 —— 这就是“插值”
             位置编码是可学习参数，只有在预训练用到的那些格子位置上有“合理”的值
         双线性插值是什么：二维上对每个新坐标的值，在旧网格里找到它落在哪个2×2邻域中（四个最近的旧点），沿x方向做一次线性插值，再沿y方向对前一步结果再做一次线性插值
-        hybrid前端是什么：在纯 ViT：直接以 patch_size 做 Conv2d(stride=patch) 切块
-                        hybrid：先用 ResNetV2(CNN)把图变为步幅 16 的特征图（例如 224→14×14），再做一个小卷积（常是 1×1）把通道映射到 hidden_size，然后再进 Transformer
-                        既是hybrid将图像用CNN进行预处理成特征图，再切成token送进transformer，这样引入 CNN 的归纳偏置，让模型天生具备“局部+共享+层级”的先验，这能在数据不多
-                        、训练预算有限时明显提升稳定性和数据效率。
-                        CNN 的归纳偏置主要有三条：局部性：近邻像素更相关（小卷积核只看局部）。平移等变/共享权重：同一个卷积核在整个图上共享，相同的图案不管在左上还是右下，都能被“同一组参数”检测到。
                         金字塔/层级特征：多层卷积+下采样，天然形成“边缘→纹理→部件→物体”的层级抽象。
         """
         with torch.no_grad():
@@ -997,175 +720,5 @@ class VisionTransformer(nn.Module):
             for bname, block in self.transformer.encoder.named_children():
                 for uname, unit in block.named_children():
                     unit.load_from(weights, n_block=uname)
-            # 若为 hybrid（带 ResNetV2），加载其权重
-            if self.transformer.embeddings.hybrid:
-                self.transformer.embeddings.hybrid_model.root.conv.weight.copy_(np2th(weights["conv_root/kernel"], conv=True))
-                gn_weight = np2th(weights["gn_root/scale"]).view(-1)
-                gn_bias = np2th(weights["gn_root/bias"]).view(-1)
-                self.transformer.embeddings.hybrid_model.root.gn.weight.copy_(gn_weight)
-                self.transformer.embeddings.hybrid_model.root.gn.bias.copy_(gn_bias)
-
-                for bname, block in self.transformer.embeddings.hybrid_model.body.named_children():
-                    for uname, unit in block.named_children():
-                        unit.load_from(weights, n_block=bname, n_unit=uname)
 
 
-def np2th(weights, conv=False):
-    """
-    Possibly convert HWIO to OIHW.（重复定义）将 numpy 权重转为 torch.Tensor；conv=True 时执行 HWIO->OIHW。
-    注：上方已定义同名函数，这里重复并不影响运行（后者会覆盖前者）。
-    """
-    if conv:
-        weights = weights.transpose([3, 2, 0, 1])
-    return torch.from_numpy(weights)
-
-
-class StdConv2d(nn.Conv2d):
-    """权重标准化卷积（Weight Standardization），有助于稳定训练。"""
-    def forward(self, x):
-        w = self.weight
-        # 对每个输出通道做标准化：减均值、除以标准差
-        v, m = torch.var_mean(w, dim=[1, 2, 3], keepdim=True, unbiased=False)
-        w = (w - m) / torch.sqrt(v + 1e-5)
-        return F.conv2d(x, w, self.bias, self.stride, self.padding,
-                        self.dilation, self.groups)
-
-
-def conv3x3(cin, cout, stride=1, groups=1, bias=False):
-    """封装 3x3 StdConv2d。"""
-    return StdConv2d(cin, cout, kernel_size=3, stride=stride,
-                     padding=1, bias=bias, groups=groups)
-
-
-def conv1x1(cin, cout, stride=1, bias=False):
-    """封装 1x1 StdConv2d。"""
-    return StdConv2d(cin, cout, kernel_size=1, stride=stride,
-                     padding=0, bias=bias)
-
-
-class PreActBottleneck(nn.Module):
-    """Pre-activation (v2) bottleneck block.
-    ResNetV2 的 pre-activation 瓶颈残差块（GN + ReLU 在卷积前）。
-    """
-
-    def __init__(self, cin, cout=None, cmid=None, stride=1):
-        super().__init__()
-        cout = cout or cin
-        cmid = cmid or cout//4  # 中间通道数（瓶颈）
-
-        self.gn1 = nn.GroupNorm(32, cmid, eps=1e-6)
-        self.conv1 = conv1x1(cin, cmid, bias=False)
-        self.gn2 = nn.GroupNorm(32, cmid, eps=1e-6)
-        self.conv2 = conv3x3(cmid, cmid, stride, bias=False)  # Original code has it on conv1!!# 注意：步幅在 conv2
-        self.gn3 = nn.GroupNorm(32, cout, eps=1e-6)
-        self.conv3 = conv1x1(cmid, cout, bias=False)
-        self.relu = nn.ReLU(inplace=True)
-
-        if (stride != 1 or cin != cout):
-            # Projection also with pre-activation according to paper.下采样分支（投影）：保持残差与主分支形状一致
-            self.downsample = conv1x1(cin, cout, stride, bias=False)
-            self.gn_proj = nn.GroupNorm(cout, cout)
-
-    def forward(self, x):
-
-        # Residual branch 残差分支（可能包含下采样）
-        residual = x
-        if hasattr(self, 'downsample'):
-            residual = self.downsample(x)
-            residual = self.gn_proj(residual)
-
-        # Unit's branch 主干分支：GN + ReLU + Conv
-        y = self.relu(self.gn1(self.conv1(x)))
-        y = self.relu(self.gn2(self.conv2(y)))
-        y = self.gn3(self.conv3(y))
-        # 残差相加后再 ReLU
-        y = self.relu(residual + y)
-        return y
-
-    def load_from(self, weights, n_block, n_unit):
-        """从预训练字典中加载本残差块的卷积与 GN 参数。"""
-        conv1_weight = np2th(weights[pjoin(n_block, n_unit, "conv1/kernel")], conv=True)
-        conv2_weight = np2th(weights[pjoin(n_block, n_unit, "conv2/kernel")], conv=True)
-        conv3_weight = np2th(weights[pjoin(n_block, n_unit, "conv3/kernel")], conv=True)
-
-        gn1_weight = np2th(weights[pjoin(n_block, n_unit, "gn1/scale")])
-        gn1_bias = np2th(weights[pjoin(n_block, n_unit, "gn1/bias")])
-
-        gn2_weight = np2th(weights[pjoin(n_block, n_unit, "gn2/scale")])
-        gn2_bias = np2th(weights[pjoin(n_block, n_unit, "gn2/bias")])
-
-        gn3_weight = np2th(weights[pjoin(n_block, n_unit, "gn3/scale")])
-        gn3_bias = np2th(weights[pjoin(n_block, n_unit, "gn3/bias")])
-
-        self.conv1.weight.copy_(conv1_weight)
-        self.conv2.weight.copy_(conv2_weight)
-        self.conv3.weight.copy_(conv3_weight)
-
-        self.gn1.weight.copy_(gn1_weight.view(-1))
-        self.gn1.bias.copy_(gn1_bias.view(-1))
-
-        self.gn2.weight.copy_(gn2_weight.view(-1))
-        self.gn2.bias.copy_(gn2_bias.view(-1))
-
-        self.gn3.weight.copy_(gn3_weight.view(-1))
-        self.gn3.bias.copy_(gn3_bias.view(-1))
-
-        if hasattr(self, 'downsample'):
-            proj_conv_weight = np2th(weights[pjoin(n_block, n_unit, "conv_proj/kernel")], conv=True)
-            proj_gn_weight = np2th(weights[pjoin(n_block, n_unit, "gn_proj/scale")])
-            proj_gn_bias = np2th(weights[pjoin(n_block, n_unit, "gn_proj/bias")])
-
-            self.downsample.weight.copy_(proj_conv_weight)
-            self.gn_proj.weight.copy_(proj_gn_weight.view(-1))
-            self.gn_proj.bias.copy_(proj_gn_bias.view(-1))
-
-
-class ResNetV2(nn.Module):
-    """
-    Implementation of Pre-activation (v2) ResNet mode.
-    Pre-activation (v2) ResNet 主干的简化实现（root + 3 个 block）。
-    - root：7×7 Conv（stride=2）+ GN + ReLU + 3×3 MaxPool（stride=2）
-    - body：三个 block（每个 block 含若干 PreActBottleneck；block2/3 的首个 unit stride=2 做下采样）
-    作为 ViT 的 hybrid 前端时，输出步幅固定为 16。
-
-    """
-
-    def __init__(self, block_units, width_factor):
-        """
-        block_units: 每个 block 内的 bottleneck 个数，例如 [3,4,9]
-        width_factor: 宽度放大系数（影响通道数）
-        """
-        super().__init__()
-        width = int(64 * width_factor)
-        self.width = width
-
-        # The following will be unreadable if we split lines.
-        # pylint: disable=line-too-long
-        # Stem（root）：7x7 卷积 + GN + ReLU + 3x3 最大池化
-        # 说明：padding=0 保持与原实现一致（可能略减小特征图尺寸
-        self.root = nn.Sequential(OrderedDict([
-            ('conv', StdConv2d(3, width, kernel_size=7, stride=2, bias=False, padding=3)),
-            ('gn', nn.GroupNorm(32, width, eps=1e-6)),
-            ('relu', nn.ReLU(inplace=True)),
-            ('pool', nn.MaxPool2d(kernel_size=3, stride=2, padding=0))
-        ]))
-        # 3 个 stage，每个 stage 的第一个 unit 可能带下采样（stride=2）
-        self.body = nn.Sequential(OrderedDict([
-            ('block1', nn.Sequential(OrderedDict(
-                [('unit1', PreActBottleneck(cin=width, cout=width*4, cmid=width))] +
-                [(f'unit{i:d}', PreActBottleneck(cin=width*4, cout=width*4, cmid=width)) for i in range(2, block_units[0] + 1)],
-                ))),
-            ('block2', nn.Sequential(OrderedDict(
-                [('unit1', PreActBottleneck(cin=width*4, cout=width*8, cmid=width*2, stride=2))] +
-                [(f'unit{i:d}', PreActBottleneck(cin=width*8, cout=width*8, cmid=width*2)) for i in range(2, block_units[1] + 1)],
-                ))),
-            ('block3', nn.Sequential(OrderedDict(
-                [('unit1', PreActBottleneck(cin=width*8, cout=width*16, cmid=width*4, stride=2))] +
-                [(f'unit{i:d}', PreActBottleneck(cin=width*16, cout=width*16, cmid=width*4)) for i in range(2, block_units[2] + 1)],
-                ))),
-        ]))
-
-    def forward(self, x):
-        x = self.root(x)
-        x = self.body(x)
-        return x

@@ -17,7 +17,7 @@ def get_transforms(split, size):
     elif size == 384:
         resize_dim = 438
         crop_dim = 384
-    if split == "train":
+    if split in {"train", "trainval"}:
         transform = tv.transforms.Compose(
             [
                 tv.transforms.Resize(resize_dim),

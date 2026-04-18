@@ -1,10 +1,9 @@
-_BASE_: "../debug_json_dataset.yaml"
+_BASE_: "../TEST/run_xlsa_dataset_demo.yaml"
 RUN_N_TIMES: 1
 DATA:
   NAME: "OxfordFlowers"
   DATAPATH: ""  #TODO: need to specify here
   NUMBER_CLASSES: 102
-  MULTILABEL: False
 MODEL:
   TYPE: "vit"
 SOLVER:

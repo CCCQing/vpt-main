@@ -121,27 +121,18 @@ def build_vit_sup_models(model_type, crop_size, prompt_cfg=None, fusion_cfg=None
     distribution_only = False   # 仅运行时调用 provider 生成 prompt，而不在构建阶段预生成/持有 prompt 参数（用于“分布专用”模式）
     prompt_provider = prompt_init_provider
     if prompt_cfg is not None:
-        distribution_only = getattr(prompt_cfg, "DISTRIBUTION_ONLY", False)
 
         # 如配置启用提示分布模块，则在此构建 PreViTPromptDistributor 作为 provider
         dist_cfg = getattr(prompt_cfg, "DISTRIBUTOR", None)
         if dist_cfg is not None and getattr(dist_cfg, "ENABLE", False) and prompt_provider is None:
-            semantic_dim = dist_cfg.SEMANTIC_DIM if dist_cfg.SEMANTIC_DIM > 0 else None
-            semantic_proj_dim = dist_cfg.SEMANTIC_PROJ_DIM if dist_cfg.SEMANTIC_PROJ_DIM > 0 else None
             prompt_provider = PreViTPromptDistributor(
                 dim=m2featdim[model_type],
                 prompt_len=prompt_cfg.NUM_TOKENS,
                 latent_dim=dist_cfg.LATENT_DIM,
                 hidden_dim=dist_cfg.HIDDEN_DIM,
                 pool=dist_cfg.POOL,
-                semantic_dim=semantic_dim,
-                semantic_proj_dim=semantic_proj_dim,
             )
 
-
-    if (not distribution_only and prompt_init is None and
-            prompt_provider is not None):
-        prompt_init = prompt_provider()
 
     if prompt_cfg is not None:
         model = PromptedVisionTransformer(
