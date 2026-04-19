@@ -48,13 +48,13 @@ class ViT(nn.Module):
     def build_backbone(self, prompt_cfg, cfg, adapter_cfg, load_pretrain, vis):
 
         self.enc, self.feat_dim = build_vit_sup_models(
-            cfg.DATA.FEATURE,         # 棰勮缁冨悕绉帮紝濡?"imagenet21k_sup_vitb16"
-            cfg.DATA.CROPSIZE,        # 杈撳叆瑁佸壀灏哄锛堝 224锛?
-            prompt_cfg,               # prompt 瀛愰厤缃紙鍙兘涓?None锛?
-            cfg.MODEL.MODEL_ROOT,     # 瀛樻斁棰勮缁冩潈閲嶇殑璺緞
-            adapter_cfg,              # adapter 瀛愰厤缃紙鍙兘涓?None锛?
-            load_pretrain,            # 鏄惁鍔犺浇棰勮缁冩潈閲?
-            vis                       # 鍙鍖?璋冭瘯寮€鍏?
+            model_type=cfg.DATA.FEATURE,
+            crop_size=cfg.DATA.CROPSIZE,
+            prompt_cfg=prompt_cfg,
+            model_root=cfg.MODEL.MODEL_ROOT,
+            adapter_cfg=adapter_cfg,
+            load_pretrain=load_pretrain,
+            vis=vis,
         )
         trainable_keys = []
         if cfg.MODEL.PROMPT.ENABLE:
