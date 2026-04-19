@@ -491,6 +491,7 @@ class PromptedTransformer(Transformer):
 
         self.semantic_branch_cfg = prompt_config.SEMANTIC_BRANCH
         self.semantic_branch_enable = bool(self.semantic_branch_cfg.ENABLE)
+        self.prompt_enable = bool(prompt_config.ENABLE)
 
         super().__init__(config, img_size, vis)
 
@@ -518,7 +519,7 @@ class PromptedTransformer(Transformer):
         patch_size = _pair(config.patches["size"])
 
         # prompt token number
-        num_tokens = self.prompt_config.NUM_TOKENS
+        num_tokens = self.prompt_config.NUM_TOKENS if self.prompt_enable else 0
         self.num_tokens = num_tokens  # number of prompted tokens
         # prompt dropout
         self.prompt_dropout = Dropout(self.prompt_config.DROPOUT)
@@ -530,7 +531,7 @@ class PromptedTransformer(Transformer):
         self._shape_debug_incorporate_logged = False
         self._last_prompt_path_info = {}
 
-        if self.prompt_init_provider is None:
+        if self.prompt_enable and self.prompt_init_provider is None:
             raise ValueError("Prompt static embeddings have been removed. "
                 "Please enable and provide MODEL.PROMPT.DISTRIBUTOR/prompt_init_provider.")
         if prompt_init is not None:
@@ -577,23 +578,27 @@ class PromptedTransformer(Transformer):
             refined_semantics.detach() if torch.is_tensor(refined_semantics) else None
         )
 
-        # generate prompt
-        provider_out = self.prompt_init_provider(patch_tokens)
-        if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
-            raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
-        prompt_tokens, provider_stats = provider_out
-        expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
-        if (not torch.is_tensor(prompt_tokens)) or tuple(prompt_tokens.shape) != expected_shape:
-            raise ValueError(f"prompt_init_provider must return prompt_tokens with shape {expected_shape}, got {type(prompt_tokens)} {getattr(prompt_tokens, 'shape', None)}")
-        h_v = provider_stats["h_v"]
-        self._last_visual_stats = h_v
-        # 3) construct [CLS|PATCH] + pos
         x_base = self.embeddings.add_cls_and_pos(patch_tokens)  # (B, 1 + n_patches, hidden_dim)
-        x = torch.cat((
-                x_base[:, :1, :],
-                self.prompt_dropout(prompt_tokens),
-                x_base[:, 1:, :]
-            ), dim=1)
+        if self.prompt_enable:
+            provider_out = self.prompt_init_provider(patch_tokens)
+            if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
+                raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
+            prompt_tokens, provider_stats = provider_out
+            expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
+            got_shape = tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None
+            if (not torch.is_tensor(prompt_tokens)) or tuple(prompt_tokens.shape) != expected_shape:
+                raise ValueError(f"prompt_init_provider must return prompt_tokens with shape {expected_shape}, got {type(prompt_tokens)} {got_shape}")
+            h_v = provider_stats["h_v"]
+            self._last_visual_stats = h_v
+            x = torch.cat((
+                    x_base[:, :1, :],
+                    self.prompt_dropout(prompt_tokens),
+                    x_base[:, 1:, :]
+                ), dim=1)
+        else:
+            prompt_tokens = x_base[:, :0, :]
+            self._last_visual_stats = patch_tokens.mean(dim=1)
+            x = x_base
 
         if self.debug_shapes and (not self._shape_debug_incorporate_logged):
             print(
@@ -608,6 +613,7 @@ class PromptedTransformer(Transformer):
             self._shape_debug_incorporate_logged = True
 
         self._last_prompt_path_info = {
+            "prompt_enable": bool(self.prompt_enable),
             "semantic_branch_enable": bool(self.semantic_branch_enable),
             "actual_token_shape_entering_backbone": tuple(x.shape),
             "visual_feature_norm": float(patch_tokens.float().norm(dim=-1).mean().item()),
@@ -704,10 +710,25 @@ class PromptedTransformer(Transformer):
         for i in range(num_layers):
             if i == 0:
                 hidden_states, weights, _ = self.encoder.layer[i](hidden_states, None, self.num_tokens)
+                if torch.is_tensor(hidden_states):
+                    row_hidden_ok = torch.isfinite(hidden_states).flatten(1).all(dim=1)
+                    if not bool(row_hidden_ok.all().item()):
+                        bad_hidden = (~row_hidden_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+                        print(f"[nan-locate] layer={i} bad_hidden_rows={bad_hidden}")
             else:
                 prev_prompt = hidden_states[:, 1:1 + self.num_tokens, :]
+                if torch.is_tensor(prev_prompt):
+                    row_prev_ok = torch.isfinite(prev_prompt).flatten(1).all(dim=1)
+                    if not bool(row_prev_ok.all().item()):
+                        bad_prev = (~row_prev_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+                        print(f"[nan-locate] layer={i} bad_prev_prompt_rows={bad_prev}")
                 evolved_prompt = self.prompt_update_layers[i - 1](prev_prompt)
                 evolved_prompt = self.prompt_dropout(evolved_prompt)
+                if torch.is_tensor(evolved_prompt):
+                    row_evolved_ok = torch.isfinite(evolved_prompt).flatten(1).all(dim=1)
+                    if not bool(row_evolved_ok.all().item()):
+                        bad_evolved = (~row_evolved_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+                        print(f"[nan-locate] layer={i} bad_evolved_prompt_rows={bad_evolved}")
 
                 hidden_states = torch.cat(
                     (
@@ -718,6 +739,11 @@ class PromptedTransformer(Transformer):
                     dim=1,)
 
                 hidden_states, weights, _ = self.encoder.layer[i](hidden_states, None, self.num_tokens)
+                if torch.is_tensor(hidden_states):
+                    row_hidden_ok = torch.isfinite(hidden_states).flatten(1).all(dim=1)
+                    if not bool(row_hidden_ok.all().item()):
+                        bad_hidden = (~row_hidden_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+                        print(f"[nan-locate] layer={i} bad_hidden_rows={bad_hidden}")
             # update sem side
             sem_tokens, sem_aff, _ = self._update_semantic_side_branch(
                 sem_tokens=sem_tokens,
@@ -802,7 +828,7 @@ class PromptedTransformer(Transformer):
         embedding_output, semantics = self.incorporate_prompt(x, semantics)
 
         effective_prompt_tokens = self.num_tokens
-        if self.prompt_config.DEEP:
+        if self.prompt_enable and self.prompt_config.DEEP:
             encoded, attn_weights = self.forward_deep_prompt(
                 embedding_output, semantics)
         else:
@@ -848,7 +874,7 @@ class PromptedTransformer(Transformer):
         effective_prompt_tokens = self.num_tokens
         effective_affinity_config = affinity_config
 
-        if self.prompt_config.DEEP:
+        if self.prompt_enable and self.prompt_config.DEEP:
             encoded, attn_weights, affinities = self.forward_deep_prompt_with_affinity(
                 embedding_output, effective_affinity_config, semantics
             )

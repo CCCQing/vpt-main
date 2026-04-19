@@ -237,6 +237,7 @@ def _compute_consistency_loss_from_rhead_cache(
 # ===========================
 LOSS = {
     "softmax_margin_cm": None,
+    "vspcn_baseline": None,
 }
 
 
@@ -407,6 +408,67 @@ class SoftmaxMarginCMLoss(nn.Module):
 
 LOSS["softmax_margin_cm"] = SoftmaxMarginCMLoss
 
+
+class VSPCNBaselineLoss(nn.Module):
+    """
+    VSPCN-style baseline:
+      L = CE(logits, y) + lambda_ar * mean(||cls_feat - proto_y||_2)
+    """
+    def __init__(self, cfg=None):
+        super().__init__()
+        self.lambda_ar = float(cfg.SOLVER.LOSS_VSPCN_AR_WEIGHT)
+        self._last_hn_stats: Dict[str, float] = {}
+
+    def is_single(self):
+        return True
+
+    def loss(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        logits, _ = _extract_logits_and_aux(pred_logits, kwargs)
+        if not torch.is_tensor(logits):
+            raise TypeError("VSPCNBaselineLoss expects tensor logits.")
+
+        model = kwargs.get("model", None) if isinstance(kwargs, Dict) else None
+
+        # Step 1. 基础交叉熵
+        ce = F.cross_entropy(logits, targets, reduction="mean")
+        total = ce
+
+        self._last_hn_stats = {
+            "baseline_ce_loss": float(ce.detach().item()),
+        }
+
+        # Step 2. AR loss
+        if self.lambda_ar > 0 and model is not None:
+            r_head = model.r_similarity_head
+            cls_token = r_head._loss_last_cls_token
+            proto_bank = r_head._loss_last_projected_prototypes
+            if (
+                torch.is_tensor(cls_token)
+                and torch.is_tensor(proto_bank)
+                and cls_token.dim() == 2
+                and proto_bank.dim() == 2
+                and cls_token.shape[0] == logits.shape[0]
+            ):
+                # targets 应该对应当前 proto_bank 的 local label
+                y = targets.to(device=proto_bank.device, dtype=torch.long)
+                if y.shape[0] == cls_token.shape[0] and y.min().item() >= 0 and y.max().item() < proto_bank.shape[0]:
+                    # 取出每个样本真实类别对应的 prototype
+                    pos_proto = proto_bank.index_select(0, y)
+                    # AR loss：
+                    # 每个样本的图像特征与其正类 prototype 的 L2 距离
+                    # 再对 batch 求平均
+                    ar = torch.norm(cls_token - pos_proto, p=2, dim=-1).mean()
+                    total = total + self.lambda_ar * ar
+                    self._last_hn_stats["baseline_ar_loss"] = float(ar.detach().item())
+
+        return total
+
+    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        return self.loss(pred_logits, targets, per_cls_weights, kwargs)
+
+
+LOSS["vspcn_baseline"] = VSPCNBaselineLoss
+
 # ===========================
 # 4. 基于共享语义原型的相似度分类头
 # ===========================
@@ -472,6 +534,10 @@ class RSimilarityClassifier(nn.Module):
         self._loss_last_cons_target = None    # 当前 batch consistency target
         self._loss_last_mu_s_final = None     # 当前 batch 最终 refined semantic
         self._loss_last_h_y = None            # 当前 batch 对应类别的基础 semantic anchor
+        self._last_bad_feat_rows = None
+        self._last_bad_visual_rows = None
+        self._last_bad_sim_rows = None
+        self._last_semantic_all_finite = None
 
         self._runtime_targets = None          # 当前 batch 的 raw global targets
         self._runtime_token_sequence = None   # 当前 batch 的 token 序列（供 debug/vis）
@@ -579,6 +645,22 @@ class RSimilarityClassifier(nn.Module):
             raw_sim = logits
             scale = logits.new_tensor(1.0)
 
+        row_feat_ok = torch.isfinite(cls_feat).all(dim=1)
+        row_visual_ok = torch.isfinite(cls_visual).all(dim=1)
+        sem_ok = torch.isfinite(cls_semantic).all()
+        row_sim_ok = torch.isfinite(raw_sim).all(dim=1)
+
+        self._last_bad_feat_rows = None
+        self._last_bad_visual_rows = None
+        self._last_bad_sim_rows = None
+        self._last_semantic_all_finite = bool(sem_ok.item())
+        if not bool(row_feat_ok.all().item()):
+            self._last_bad_feat_rows = (~row_feat_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+        if not bool(row_visual_ok.all().item()):
+            self._last_bad_visual_rows = (~row_visual_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+        if not bool(row_sim_ok.all().item()):
+            self._last_bad_sim_rows = (~row_sim_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+
         runtime_targets_global = self._runtime_targets if torch.is_tensor(self._runtime_targets) else None
 
         if self.debug_trace_once and (not self._debug_sem_source_logged):
@@ -627,6 +709,107 @@ class RSimilarityClassifier(nn.Module):
                         target = self.consistency_head(attr_y)
                         target = F.normalize(target, dim=-1) if self.use_cosine else target
                         self._loss_last_cons_target = target
+
+        return logits
+
+
+class VSPCNBaselineClassifier(nn.Module):
+    """
+    1. 每个类别都有一个原始语义属性向量 a_y
+       例如 CUB 中每个类别是 312 维属性。
+
+    2. 先通过一个线性层 W_d，把类别属性映射到视觉特征空间：
+           \tilde{a}_y = a_y · W_d
+       也就是：
+           prototype_y = prototype_proj(a_y)
+
+    3. 对输入图像，取 backbone 输出的 cls_feat 作为图像表征。
+
+    4. 最后做最简单的分类打分：
+           logits = cls_feat @ prototype_bank^T
+
+    也就是说：
+    - 图像侧：直接用 cls_feat
+    - 语义侧：class_attr 经过一个线性映射得到类别原型
+    - 分类：图像特征与类别原型做点积
+    """
+
+    def __init__(self, class_attr: torch.Tensor, hidden_size: int, cfg,) -> None:
+        super().__init__()
+        self.register_buffer("class_attr", class_attr.float())
+        self.num_classes = class_attr.shape[0]
+        self.attr_dim = class_attr.shape[-1]
+        self.hidden_size = int(hidden_size)
+
+        # VSPCN Eq.(12): \tilde{a}_y = a_y · W_d
+        self.prototype_proj = nn.Linear(self.attr_dim, self.hidden_size, bias=True)
+        self.visual_proj = None
+
+        self.use_cosine = False
+        self.fixed_logit_scale = 0.0
+        self.logit_scale = None
+
+        self.debug_trace_once = cfg.SOLVER.DEBUG_TRACE_ONCE
+        self.debug_shapes = cfg.SOLVER.DEBUG_SHAPES
+        self._debug_logged = False
+        self._shape_debug_logged = False
+
+        self._loss_last_cls_token = None
+        self._loss_last_projected_prototypes = None
+        self._loss_last_scale = None
+
+        self._runtime_targets = None
+        self._runtime_token_sequence = None
+        self._runtime_affinities = None
+        self._runtime_semantic_state = None
+
+    def _project_class_prototypes(self) -> torch.Tensor:
+        return self.prototype_proj(self.class_attr)
+
+    def _resolve_active_class_space(self, class_ids, device: torch.device):
+        if class_ids is None:
+            active_ids = torch.arange(self.num_classes, device=device, dtype=torch.long)
+        elif torch.is_tensor(class_ids):
+            active_ids = class_ids.to(device=device, dtype=torch.long).view(-1)
+        else:
+            active_ids = torch.as_tensor(list(class_ids), device=device, dtype=torch.long).view(-1)
+        if active_ids.numel() == 0:
+            raise ValueError("Active class space is empty.")
+        return active_ids
+
+    def forward(self, cls_feat: torch.Tensor, class_ids=None) -> torch.Tensor:
+        """
+        Step 1. 解析当前 active class space
+        Step 2. 从全局类别原型库中切出当前 active class 的 prototype bank
+        Step 3. 用 cls_feat 与 prototype bank 做点积分类
+        Step 4. 打印 shape / trace debug（只一次）
+        Step 5. 缓存中间量供 VSPCNBaselineLoss 使用"""
+        active_class_ids = self._resolve_active_class_space(class_ids, device=cls_feat.device)
+        proto_bank = self._project_class_prototypes().index_select(0, active_class_ids)
+        logits = cls_feat @ proto_bank.t()
+
+        if self.debug_shapes and (not self._shape_debug_logged):
+            print(
+                "[SHAPE-DEBUG] VSPCNBaselineClassifier.forward cls_feat={} proto_bank={} logits={}".format(
+                    tuple(cls_feat.shape) if torch.is_tensor(cls_feat) else None,
+                    tuple(proto_bank.shape) if torch.is_tensor(proto_bank) else None,
+                    tuple(logits.shape) if torch.is_tensor(logits) else None,
+                )
+            )
+            self._shape_debug_logged = True
+
+        if self.debug_trace_once and (not self._debug_logged):
+            print(
+                "[trace] node=C.vspcn_baseline classifier=VSPCNBaselineClassifier score=cls_dot_attrWd logits_shape={} active_classes={}".format(
+                    tuple(logits.shape),
+                    int(active_class_ids.numel()),
+                )
+            )
+            self._debug_logged = True
+
+        self._loss_last_cls_token = cls_feat
+        self._loss_last_projected_prototypes = proto_bank
+        self._loss_last_scale = logits.new_tensor(1.0)
 
         return logits
 

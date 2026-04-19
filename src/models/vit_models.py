@@ -9,7 +9,7 @@ import torch.nn as nn
 from .build_vit_backbone import (build_vit_sup_models)
 from ..utils import logging
 logger = logging.get_logger("visual_prompt")
-from ..solver.losses import RSimilarityClassifier
+from ..solver.losses import RSimilarityClassifier, VSPCNBaselineClassifier
 from ..utils.param_logging import log_trainable_parameters
 
 
@@ -46,11 +46,15 @@ class ViT(nn.Module):
             load_pretrain,            # 鏄惁鍔犺浇棰勮缁冩潈閲?
             vis                       # 鍙鍖?璋冭瘯寮€鍏?
         )
-        trainable_keys = (
-            "prompt_update_layers",
-            "prompt_init_provider",
-            "semantic_side_branch",
-        )
+        trainable_keys = []
+        if cfg.MODEL.PROMPT.ENABLE:
+            trainable_keys.extend([
+                "prompt_update_layers",
+                "prompt_init_provider",
+            ])
+        if cfg.MODEL.SEMANTIC_BRANCH.ENABLE:
+            trainable_keys.append("semantic_side_branch")
+
         for k, p in self.enc.named_parameters():
             if not any(key in k for key in trainable_keys):
                 p.requires_grad = False
@@ -80,16 +84,28 @@ class ViT(nn.Module):
 
         device = next(self.parameters()).device
         class_attributes = class_attributes.to(device)
+        classifier_name = str(self.cfg.MODEL.CLASSIFIER).lower()
+        if classifier_name == "r_similarity":
+            head_cls = RSimilarityClassifier
+        elif classifier_name == "vspcn_baseline":
+            head_cls = VSPCNBaselineClassifier
+        else:
+            raise ValueError(f"Unsupported MODEL.CLASSIFIER='{self.cfg.MODEL.CLASSIFIER}'")
 
-        self.r_similarity_head = RSimilarityClassifier(
-            class_attributes,                                   # 绫荤骇璇箟灞炴€х煩闃?[C, d_s]
-            hidden_size=self.feat_dim,                          # ViT 杈撳嚭鐨勭壒寰佺淮搴︼紙閫氬父绛変簬 hidden_size锛?
+        self.r_similarity_head = head_cls(
+            class_attributes,
+            hidden_size=self.feat_dim,
             cfg=self.cfg,
-        ).to(device)                    # 鎶婃暣涓垎绫诲ご绉诲姩鍒颁笌涓绘ā鍨嬬浉鍚岀殑 device 涓婏紝淇濊瘉鍓嶅悜/鍙嶅悜閮藉湪鍚屼竴璁惧鎵ц
+        ).to(device)
 
     def forward(self, x, return_feature=False, semantics=None, class_ids=None):
 
         x = self.enc(x, semantics=semantics)  # batch_size x self.feat_dim
+        self._last_bad_enc_rows = None
+        if torch.is_tensor(x) and x.dim() == 2:
+            row_enc_ok = torch.isfinite(x).all(dim=1)
+            if not bool(row_enc_ok.all().item()):
+                self._last_bad_enc_rows = (~row_enc_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
         feature_norm_mean = None
         if torch.is_tensor(x) and x.dim() == 2:
             with torch.no_grad():

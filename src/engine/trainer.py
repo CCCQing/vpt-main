@@ -2045,7 +2045,9 @@ class Trainer():
                     v_patch = r_head.visual_proj(patch_tokens) if getattr(r_head, "visual_proj", None) is not None else patch_tokens
                     if bool(getattr(r_head, "use_cosine", True)):
                         v_patch = torch.nn.functional.normalize(v_patch, dim=-1)
-                    sem = getattr(r_head, "_loss_last_semantic", None)
+                    sem = getattr(r_head, "_loss_last_projected_prototypes", None)
+                    if sem is None:
+                        sem = getattr(r_head, "_loss_last_semantic", None)
                     if torch.is_tensor(sem):
                         sem = sem.detach()
                         if bool(getattr(r_head, "use_cosine", True)):
@@ -2653,6 +2655,11 @@ class Trainer():
                         finite_logits = logits_dbg[finite_mask]
                         logit_min = float(finite_logits.min().item())
                         logit_max = float(finite_logits.max().item())
+                bad_rows = None
+                if torch.is_tensor(logits_dbg) and logits_dbg.dim() == 2:
+                    row_ok = torch.isfinite(logits_dbg).all(dim=1)
+                    if not bool(row_ok.all().item()):
+                        bad_rows = (~row_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
 
                 # scale可防止softmax 太平以及影响 margin loss 的实际强度
                 scale_dbg = None
@@ -2672,6 +2679,26 @@ class Trainer():
                     reason = "non-finite logit scale"
                 else:
                     reason = "loss became NaN after logits were formed"
+
+                if bad_rows is not None:
+                    logger.info("[nan-debug] bad_rows=%s", bad_rows)
+                if model_ref_dbg is not None:
+                    bad_enc_rows = getattr(model_ref_dbg, "_last_bad_enc_rows", None)
+                    if bad_enc_rows is not None:
+                        logger.info("[nan-debug] bad_enc_rows=%s", bad_enc_rows)
+                if r_head_dbg is not None:
+                    bad_feat_rows = getattr(r_head_dbg, "_last_bad_feat_rows", None)
+                    bad_visual_rows = getattr(r_head_dbg, "_last_bad_visual_rows", None)
+                    bad_sim_rows = getattr(r_head_dbg, "_last_bad_sim_rows", None)
+                    sem_all_finite = getattr(r_head_dbg, "_last_semantic_all_finite", None)
+                    if bad_feat_rows is not None:
+                        logger.info("[nan-debug] bad_feat_rows=%s", bad_feat_rows)
+                    if bad_visual_rows is not None:
+                        logger.info("[nan-debug] bad_visual_rows=%s", bad_visual_rows)
+                    if sem_all_finite is not None:
+                        logger.info("[nan-debug] semantic_all_finite=%s", bool(sem_all_finite))
+                    if bad_sim_rows is not None:
+                        logger.info("[nan-debug] bad_sim_rows=%s", bad_sim_rows)
 
                 raise FloatingPointError(
                     "encountered nan loss during forward_one_batch: "
