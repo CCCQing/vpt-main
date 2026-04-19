@@ -21,12 +21,22 @@ class ViT(nn.Module):
         super(ViT, self).__init__()
         self.cfg = cfg
 
-        prompt_cfg = cfg.MODEL.PROMPT.clone()
-        prompt_cfg.defrost()
-        prompt_cfg.DEBUG_SHAPES = cfg.SOLVER.DEBUG_SHAPES
-        prompt_cfg.SEMANTIC_BRANCH = cfg.MODEL.SEMANTIC_BRANCH.clone()
-        prompt_cfg.AFFINITY = cfg.MODEL.AFFINITY.clone()
-        prompt_cfg.freeze()
+        classifier_name = str(cfg.MODEL.CLASSIFIER).lower()
+        use_plain_vit_backbone = (
+            classifier_name == "vspcn_baseline"
+            and (not cfg.MODEL.PROMPT.ENABLE)
+            and (not cfg.MODEL.SEMANTIC_BRANCH.ENABLE)
+        )
+
+        if use_plain_vit_backbone:
+            prompt_cfg = None
+        else:
+            prompt_cfg = cfg.MODEL.PROMPT.clone()
+            prompt_cfg.defrost()
+            prompt_cfg.DEBUG_SHAPES = cfg.SOLVER.DEBUG_SHAPES
+            prompt_cfg.SEMANTIC_BRANCH = cfg.MODEL.SEMANTIC_BRANCH.clone()
+            prompt_cfg.AFFINITY = cfg.MODEL.AFFINITY.clone()
+            prompt_cfg.freeze()
 
         adapter_cfg = None
 

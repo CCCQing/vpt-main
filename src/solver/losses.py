@@ -412,7 +412,7 @@ LOSS["softmax_margin_cm"] = SoftmaxMarginCMLoss
 class VSPCNBaselineLoss(nn.Module):
     """
     VSPCN-style baseline:
-      L = CE(logits, y) + lambda_ar * mean(||cls_feat - proto_y||_2)
+      L = CE(logits, y) + lambda_ar * mean(||cls_feat - proto_y||_2^2)
     """
     def __init__(self, cfg=None):
         super().__init__()
@@ -454,10 +454,8 @@ class VSPCNBaselineLoss(nn.Module):
                 if y.shape[0] == cls_token.shape[0] and y.min().item() >= 0 and y.max().item() < proto_bank.shape[0]:
                     # 取出每个样本真实类别对应的 prototype
                     pos_proto = proto_bank.index_select(0, y)
-                    # AR loss：
-                    # 每个样本的图像特征与其正类 prototype 的 L2 距离
-                    # 再对 batch 求平均
-                    ar = torch.norm(cls_token - pos_proto, p=2, dim=-1).mean()
+                    diff = cls_token - pos_proto
+                    ar = diff.pow(2).sum(dim=-1).mean()
                     total = total + self.lambda_ar * ar
                     self._last_hn_stats["baseline_ar_loss"] = float(ar.detach().item())
 
