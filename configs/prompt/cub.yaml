@@ -41,7 +41,7 @@ SOLVER:
   TOTAL_EPOCH: 20
   LOSS: "vspcn_baseline"     # softmax_margin_cm   vspcn_baseline
   LOSS_MARGIN: 0.00
-  LOSS_VSPCN_AR_WEIGHT: 0.05
+  LOSS_VSPCN_AR_WEIGHT: 0.0001
   LOSS_CM_WEIGHT: 0.05
   LOSS_CONS_WEIGHT: 0.00
   LOSS_ANCHOR_CONS_WEIGHT: 0.00
