@@ -3,7 +3,7 @@ DATA:
   NAME: "CUB"
   NUMBER_CLASSES: 200
   XLSA:
-    PROTOCOL_MODE: "dev"
+    PROTOCOL_MODE: "dev"      #dev / final_zsl / final_gzsl
 MODEL:
   TYPE: "vit"
   CLASSIFIER: "vspcn_baseline"
@@ -49,7 +49,6 @@ SOLVER:
   OPTIMIZER: "adamw"
   SCHEDULER: "cosine"
   BIAS_MULTIPLIER: 1.0
-  EVAL_MODE: "gzsl"
   VIS:
     ENABLE: False
     EPOCH_LIST: [1, 3, 5, 7, 10, 15, 20]

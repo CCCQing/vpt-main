@@ -146,8 +146,18 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
         "gzsl_seen_last",
         "gzsl_unseen_best",
         "gzsl_unseen_last",
+        "train_loss_first",
+        "train_loss_last",
         "run_dir",
     ]
+    extra_keys = []
+    seen = set(keys)
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                extra_keys.append(key)
+    keys.extend(extra_keys)
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
@@ -160,9 +170,9 @@ def main() -> None:
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
     ap.add_argument("--out-root", default="output/grid_vspcn_baseline_full")
-    ap.add_argument("--ar-grid", default="0,1e-4,5e-4,1e-3,5e-3")
-    ap.add_argument("--lr-grid", default="3e-4,1e-3,3e-3")
-    ap.add_argument("--wd-grid", default="0,1e-5,1e-4")
+    ap.add_argument("--ar-grid", default="0,2e-4,5e-4,8e-4")
+    ap.add_argument("--lr-grid", default="3e-4,7e-4,1e-3")
+    ap.add_argument("--wd-grid", default="0,1e-5")
     ap.add_argument("--total-epoch", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("opts", nargs=argparse.REMAINDER)
