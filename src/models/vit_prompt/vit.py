@@ -492,6 +492,9 @@ class PromptedTransformer(Transformer):
         self.semantic_branch_cfg = prompt_config.SEMANTIC_BRANCH
         self.semantic_branch_enable = bool(self.semantic_branch_cfg.ENABLE)
         self.prompt_enable = bool(prompt_config.ENABLE)
+        self.prompt_backend = str(prompt_config.BACKEND).lower()
+        if self.prompt_backend not in {"dynamic", "vpt_deep"}:
+            raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{prompt_config.BACKEND}'")
 
         super().__init__(config, img_size, vis)
 
@@ -525,17 +528,23 @@ class PromptedTransformer(Transformer):
         self.prompt_dropout = Dropout(self.prompt_config.DROPOUT)
 
         self.prompt_init_provider = prompt_init_provider
+        self.prompt_proj = nn.Identity()
+        self.prompt_embeddings = None
+        self.deep_prompt_embeddings = None
+        self.prompt_update_layers = nn.ModuleList()
 
         # Runtime Configuration
         self.debug_shapes = bool(self.prompt_config.DEBUG_SHAPES)
         self._shape_debug_incorporate_logged = False
         self._last_prompt_path_info = {}
 
-        if self.prompt_enable and self.prompt_init_provider is None:
-            raise ValueError("Prompt static embeddings have been removed. "
-                "Please enable and provide MODEL.PROMPT.DISTRIBUTOR/prompt_init_provider.")
         if prompt_init is not None:
             raise ValueError("Static prompt initialization has been removed; prompt_init must be None.")
+
+        if self.prompt_enable and self.prompt_backend == "dynamic" and self.prompt_init_provider is None:
+            raise ValueError(
+                "Dynamic prompt backend requires MODEL.PROMPT.DISTRIBUTOR/prompt_init_provider."
+            )
 
         # Synchronize the debug switch to each layer of the semantic branch and encoder
         if self.semantic_side_branch is not None:
@@ -548,20 +557,39 @@ class PromptedTransformer(Transformer):
         # Layer-wise prompt evolution
         num_layers = config.transformer["num_layers"]
         hidden_size = config.hidden_size
-        self.prompt_update_layers = nn.ModuleList([Linear(hidden_size, hidden_size) for _ in range(num_layers - 1)])
+        if self.prompt_enable and self.prompt_backend == "dynamic":
+            self.prompt_update_layers = nn.ModuleList([Linear(hidden_size, hidden_size) for _ in range(num_layers - 1)])
 
-        evolve_mode = str(self.prompt_config.EVOLVE_INIT_MODE).lower()
-        if evolve_mode != "identity":
-            raise ValueError(f"Unsupported PROMPT.EVOLVE_INIT_MODE: {self.prompt_config.EVOLVE_INIT_MODE}")
-        self.evolve_init_mode = evolve_mode
+            evolve_mode = str(self.prompt_config.EVOLVE_INIT_MODE).lower()
+            if evolve_mode != "identity":
+                raise ValueError(f"Unsupported PROMPT.EVOLVE_INIT_MODE: {self.prompt_config.EVOLVE_INIT_MODE}")
+            self.evolve_init_mode = evolve_mode
 
-        # Layer-wise prompt evolution init: identity.
-        with torch.no_grad():
-            for layer in self.prompt_update_layers:
-                eye = torch.eye(hidden_size, device=layer.weight.device, dtype=layer.weight.dtype)
-                layer.weight.copy_(eye)
-                if layer.bias is not None:
-                    layer.bias.zero_()
+            with torch.no_grad():
+                for layer in self.prompt_update_layers:
+                    eye = torch.eye(hidden_size, device=layer.weight.device, dtype=layer.weight.dtype)
+                    layer.weight.copy_(eye)
+                    if layer.bias is not None:
+                        layer.bias.zero_()
+        elif self.prompt_enable and self.prompt_backend == "vpt_deep":
+            prompt_dim = config.hidden_size
+            val = math.sqrt(6.0 / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
+            self.prompt_embeddings = nn.Parameter(torch.zeros(1, num_tokens, prompt_dim))
+            nn.init.uniform_(self.prompt_embeddings.data, -val, val)
+            if self.prompt_config.DEEP:
+                total_d_layer = config.transformer["num_layers"] - 1
+                self.deep_prompt_embeddings = nn.Parameter(torch.zeros(total_d_layer, num_tokens, prompt_dim))
+                nn.init.uniform_(self.deep_prompt_embeddings.data, -val, val)
+    def _replace_prompt_tokens(self, hidden_states: torch.Tensor, prompt_tokens: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            (
+                hidden_states[:, :1, :],
+                prompt_tokens,
+                hidden_states[:, 1 + self.num_tokens:, :],
+            ),
+            dim=1,
+        )
+
     def incorporate_prompt(self, x, semantics=None):
 
         B = x.shape[0]
@@ -580,16 +608,21 @@ class PromptedTransformer(Transformer):
 
         x_base = self.embeddings.add_cls_and_pos(patch_tokens)  # (B, 1 + n_patches, hidden_dim)
         if self.prompt_enable:
-            provider_out = self.prompt_init_provider(patch_tokens)
-            if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
-                raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
-            prompt_tokens, provider_stats = provider_out
-            expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
-            got_shape = tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None
-            if (not torch.is_tensor(prompt_tokens)) or tuple(prompt_tokens.shape) != expected_shape:
-                raise ValueError(f"prompt_init_provider must return prompt_tokens with shape {expected_shape}, got {type(prompt_tokens)} {got_shape}")
-            h_v = provider_stats["h_v"]
-            self._last_visual_stats = h_v
+            if self.prompt_backend == "dynamic":
+                provider_out = self.prompt_init_provider(patch_tokens)
+                if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
+                    raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
+                prompt_tokens, provider_stats = provider_out
+                expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
+                got_shape = tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None
+                if (not torch.is_tensor(prompt_tokens)) or tuple(prompt_tokens.shape) != expected_shape:
+                    raise ValueError(f"prompt_init_provider must return prompt_tokens with shape {expected_shape}, got {type(prompt_tokens)} {got_shape}")
+                self._last_visual_stats = provider_stats["h_v"]
+            elif self.prompt_backend == "vpt_deep":
+                prompt_tokens = self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)
+                self._last_visual_stats = patch_tokens.mean(dim=1)
+            else:
+                raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{self.prompt_backend}'")
             x = torch.cat((
                     x_base[:, :1, :],
                     self.prompt_dropout(prompt_tokens),
@@ -614,6 +647,7 @@ class PromptedTransformer(Transformer):
 
         self._last_prompt_path_info = {
             "prompt_enable": bool(self.prompt_enable),
+            "prompt_backend": self.prompt_backend,
             "semantic_branch_enable": bool(self.semantic_branch_enable),
             "actual_token_shape_entering_backbone": tuple(x.shape),
             "visual_feature_norm": float(patch_tokens.float().norm(dim=-1).mean().item()),
@@ -629,10 +663,12 @@ class PromptedTransformer(Transformer):
             self.encoder.eval()
             self.embeddings.eval()
             self.prompt_dropout.train()
-            self.prompt_update_layers.train(mode)
-
-            if isinstance(self.prompt_init_provider, torch.nn.Module):
-                self.prompt_init_provider.train(mode)
+            if self.prompt_backend == "dynamic":
+                self.prompt_update_layers.train(mode)
+                if isinstance(self.prompt_init_provider, torch.nn.Module):
+                    self.prompt_init_provider.train(mode)
+            elif self.prompt_backend == "vpt_deep":
+                self.prompt_proj.train(mode)
         else:
             for module in self.children():
                 module.train(mode)
@@ -722,21 +758,26 @@ class PromptedTransformer(Transformer):
                     if not bool(row_prev_ok.all().item()):
                         bad_prev = (~row_prev_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
                         print(f"[nan-locate] layer={i} bad_prev_prompt_rows={bad_prev}")
-                evolved_prompt = self.prompt_update_layers[i - 1](prev_prompt)
-                evolved_prompt = self.prompt_dropout(evolved_prompt)
-                if torch.is_tensor(evolved_prompt):
-                    row_evolved_ok = torch.isfinite(evolved_prompt).flatten(1).all(dim=1)
-                    if not bool(row_evolved_ok.all().item()):
-                        bad_evolved = (~row_evolved_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
-                        print(f"[nan-locate] layer={i} bad_evolved_prompt_rows={bad_evolved}")
 
-                hidden_states = torch.cat(
-                    (
-                        hidden_states[:, :1, :],  # CLS
-                        evolved_prompt,  # prompt
-                        hidden_states[:, 1 + self.num_tokens:, :],  # PATCH
-                    ),
-                    dim=1,)
+                if self.prompt_backend == "dynamic":
+                    next_prompt = self.prompt_update_layers[i - 1](prev_prompt)
+                    next_prompt = self.prompt_dropout(next_prompt)
+                elif self.prompt_backend == "vpt_deep":
+                    if self.deep_prompt_embeddings is None:
+                        raise ValueError("VPT deep prompt backend requires deep_prompt_embeddings when PROMPT.DEEP=True")
+                    next_prompt = self.prompt_dropout(
+                        self.prompt_proj(self.deep_prompt_embeddings[i - 1]).expand(hidden_states.shape[0], -1, -1)
+                    )
+                else:
+                    raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{self.prompt_backend}'")
+
+                if torch.is_tensor(next_prompt):
+                    row_next_ok = torch.isfinite(next_prompt).flatten(1).all(dim=1)
+                    if not bool(row_next_ok.all().item()):
+                        bad_next = (~row_next_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
+                        print(f"[nan-locate] layer={i} bad_next_prompt_rows={bad_next}")
+
+                hidden_states = self._replace_prompt_tokens(hidden_states, next_prompt)
 
                 hidden_states, weights, _ = self.encoder.layer[i](hidden_states, None, self.num_tokens)
                 if torch.is_tensor(hidden_states):
@@ -784,11 +825,19 @@ class PromptedTransformer(Transformer):
                 )
             else:
                 prev_prompt = hidden_states[:, 1:1 + self.num_tokens, :]
-                evolved_prompt = self.prompt_update_layers[i - 1](prev_prompt)
-                evolved_prompt = self.prompt_dropout(evolved_prompt)
+                if self.prompt_backend == "dynamic":
+                    next_prompt = self.prompt_update_layers[i - 1](prev_prompt)
+                    next_prompt = self.prompt_dropout(next_prompt)
+                elif self.prompt_backend == "vpt_deep":
+                    if self.deep_prompt_embeddings is None:
+                        raise ValueError("VPT deep prompt backend requires deep_prompt_embeddings when PROMPT.DEEP=True")
+                    next_prompt = self.prompt_dropout(
+                        self.prompt_proj(self.deep_prompt_embeddings[i - 1]).expand(hidden_states.shape[0], -1, -1)
+                    )
+                else:
+                    raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{self.prompt_backend}'")
 
-                hidden_states = torch.cat(
-                    (hidden_states[:, :1, :],evolved_prompt,hidden_states[:, 1 + self.num_tokens:, :],),dim=1,)
+                hidden_states = self._replace_prompt_tokens(hidden_states, next_prompt)
 
                 hidden_states, weights, affinity, _ = self.encoder.layer[i].forward_with_affinity(
                     hidden_states, affinity_config, None, self.num_tokens

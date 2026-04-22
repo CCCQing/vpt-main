@@ -3,14 +3,18 @@ DATA:
   NAME: "CUB"
   NUMBER_CLASSES: 200
   XLSA:
-    PROTOCOL_MODE: "dev"      #dev / final_zsl / final_gzsl
+    PROTOCOL_MODE: "final_gzsl"      #dev / final_zsl / final_gzsl
 MODEL:
   TYPE: "vit"
   CLASSIFIER: "vspcn_baseline"
   PROMPT:
-    ENABLE: False
+    ENABLE: True
+    BACKEND: "vpt_deep"
+    DEEP: True
     NUM_TOKENS: 16
     DROPOUT: 0.0
+    DISTRIBUTOR:
+      ENABLE: False
 
   SEMANTIC_BRANCH:
     ENABLE: False
@@ -36,12 +40,11 @@ MODEL:
 
 SOLVER:
   BASE_LR: 0.001
-  WEIGHT_DECAY: 0.0001
+  WEIGHT_DECAY: 0.00001
   WARMUP_EPOCH: 3
   TOTAL_EPOCH: 20
-  LOSS: "vspcn_baseline"     # softmax_margin_cm   vspcn_baseline
-  LOSS_MARGIN: 0.00
-  LOSS_VSPCN_AR_WEIGHT: 0.0001
+  LOSS: "vspcn_baseline"     # softmax_cm   vspcn_baseline
+  LOSS_VSPCN_AR_WEIGHT: 0.0
   LOSS_CM_WEIGHT: 0.05
   LOSS_CONS_WEIGHT: 0.00
   LOSS_ANCHOR_CONS_WEIGHT: 0.00

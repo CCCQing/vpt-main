@@ -150,8 +150,7 @@ def mode_quick(args):
         "SOLVER.DEBUG_GRAD_NORM", "True",
         "SOLVER.DIAG.PRINT_LOSS_WIRING", "True",
         "MODEL.AFFINITY.ENABLE", "True",
-        "SOLVER.LOSS", "softmax_margin_cm",
-        "SOLVER.LOSS_MARGIN", "0.05",
+        "SOLVER.LOSS", "softmax_cm",
     ]
 
     results = {"checks": []}
@@ -240,8 +239,7 @@ def mode_short_train(args):
         "SOLVER.LOG_EVERY_N", "20",
         "SOLVER.DEBUG_TRACE_ONCE", "True",
         "MODEL.AFFINITY.ENABLE", "True",
-        "SOLVER.LOSS", "softmax_margin_cm",
-        "SOLVER.LOSS_MARGIN", "0.05",
+        "SOLVER.LOSS", "softmax_cm",
         "SOLVER.LOSS_CM_WEIGHT", "0.05",
     ]
     run_dir, m, code = _launch_train(repo, args.config_file, base, common)

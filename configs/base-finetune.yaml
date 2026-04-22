@@ -7,7 +7,7 @@ MODEL:
 SOLVER:
   SCHEDULER: "cosine"
   WARMUP_EPOCH: 5
-  LOSS: "softmax_margin_cm"
+  LOSS: "softmax_cm"
   OPTIMIZER: "adamw"
   MOMENTUM: 0.9
   WEIGHT_DECAY: 0.0001

@@ -592,7 +592,7 @@ class Trainer():
                 any("r_similarity_head" in n for n in names),
                 any("prompt_init_provider" in n for n in names),
                 any("prompt_update_layers" in n for n in names),
-                any(("semantic_side_branch" in n) or ("semantic_anchor" in n) for n in names),
+                any(("semantic_side_branch" in n) or ("prototype_proj" in n) for n in names),
             )
 
     def _log_batch_stats_once(self, logits, targets):
@@ -631,9 +631,9 @@ class Trainer():
             model_ref = self._model_ref(self.model)
             r_head = model_ref.r_similarity_head
             if r_head is not None:
-                fixed_scale = float(getattr(r_head, "fixed_logit_scale", 0.0))
+                fixed_scale = float(r_head.fixed_logit_scale)
                 learnable_scale = None
-                if getattr(r_head, "logit_scale", None) is not None:
+                if r_head.logit_scale is not None:
                     learnable_scale = float(r_head.logit_scale.exp().item())
                 effective_scale = fixed_scale if fixed_scale > 0 else learnable_scale
                 logger.info(
@@ -726,7 +726,7 @@ class Trainer():
             - seen-only top1
             - CE logits 与 raw logits 是否是同一份张量
             - r_similarity_head 的一些评分统计
-            - HN margin loss 的辅助统计
+            - 当前 loss 的辅助统计
         4. 把这些信息放到 self._last_train_debug 里，
            供训练日志、overfit debug、NaN debug 等地方复用"""
         ce_logits = self._extract_logits(loss_outputs)
@@ -768,14 +768,14 @@ class Trainer():
             model_ref = self._model_ref(self.model)
             r_head = model_ref.r_similarity_head
             if r_head is not None:
-                fixed_scale = float(getattr(r_head, "fixed_logit_scale", 0.0))
+                fixed_scale = float(r_head.fixed_logit_scale)
                 self._last_train_debug["whether_fixed_logit_scale"] = bool(fixed_scale > 0)
-                scale_t = getattr(r_head, "_loss_last_scale", None)
+                scale_t = r_head._loss_last_logit_scale
                 if torch.is_tensor(scale_t):
                     self._last_train_debug["effective_logit_scale"] = float(scale_t.detach().mean().item())
-            hn_stats = getattr(self.cls_criterion, "_last_hn_stats", None)
-            if isinstance(hn_stats, dict) and len(hn_stats) > 0:
-                self._last_train_debug.update(hn_stats)
+            loss_stats = self.cls_criterion._last_loss_stats
+            if isinstance(loss_stats, dict) and len(loss_stats) > 0:
+                self._last_train_debug.update(loss_stats)
 
     ##=========================== 4. affinity / token-patch helpers=========================
     @staticmethod
@@ -1895,11 +1895,11 @@ class Trainer():
     def _vis_collect_sample(self, split: str, local_idx: int, sample_idx: int, image_chw: torch.Tensor, logits: torch.Tensor, target: int, global_class_ids, model_ref,):
         if self._vis_processed >= self.vis_max_samples:
             return
-        r_head = getattr(model_ref, "r_similarity_head", None)
+        r_head = model_ref.r_similarity_head
         if r_head is None:
             return
-        affinities = getattr(r_head, "_runtime_affinities", None)
-        token_seq = getattr(r_head, "_runtime_token_sequence", None)
+        affinities = r_head._runtime_affinities
+        token_seq = r_head._runtime_token_sequence
         if not isinstance(affinities, list):
             return
 
@@ -2042,15 +2042,15 @@ class Trainer():
                 p_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS)
                 patch_tokens = token_seq[local_idx:local_idx + 1, 1 + p_len:, :]
                 if patch_tokens.numel() > 0:
-                    v_patch = r_head.visual_proj(patch_tokens) if getattr(r_head, "visual_proj", None) is not None else patch_tokens
-                    if bool(getattr(r_head, "use_cosine", True)):
+                    v_patch = r_head.visual_proj(patch_tokens) if r_head.visual_proj is not None else patch_tokens
+                    if bool(r_head.use_cosine):
                         v_patch = torch.nn.functional.normalize(v_patch, dim=-1)
-                    sem = getattr(r_head, "_loss_last_projected_prototypes", None)
+                    sem = r_head._loss_last_semantic_repr
                     if sem is None:
-                        sem = getattr(r_head, "_loss_last_semantic", None)
+                        sem = r_head._loss_last_semantic_input
                     if torch.is_tensor(sem):
                         sem = sem.detach()
-                        if bool(getattr(r_head, "use_cosine", True)):
+                        if bool(r_head.use_cosine):
                             sem = torch.nn.functional.normalize(sem, dim=-1)
                         score_patch_cls = torch.einsum("bnd,cd->bnc", v_patch, sem)[0]  # [N,C]
                         y = int(target)
@@ -2171,12 +2171,12 @@ class Trainer():
         bank = {
             "candidate_ids": cids,
             "raw_attr": raw_attr_cand,
-            "semantic_proj": None,
+            "semantic_repr": None,
         }
 
         if r_head is not None:
-            raw_embed = r_head.semantic_anchor(raw_attr_cand)
-            bank["semantic_proj"] = r_head.semantic_proj(raw_embed)
+            semantic_input = r_head.prototype_proj(raw_attr_cand)
+            bank["semantic_repr"] = r_head.semantic_proj(semantic_input) if r_head.semantic_proj is not None else semantic_input
 
         return bank
 
@@ -2191,7 +2191,7 @@ class Trainer():
         num_samples = int(sample_pack["num_samples"])
 
         model_ref = self._model_ref(self.model)
-        r_head = getattr(model_ref, "r_similarity_head", None)
+        r_head = model_ref.r_similarity_head
         if r_head is None:
             logger.warning("[monitor] split=%s skipped: r_similarity_head is missing", split)
             return None
@@ -2226,7 +2226,7 @@ class Trainer():
         if refined_sem_batch is not None:
             refined_sem_batch = refined_sem_batch[keep_mask]
 
-        v_proj = r_head.visual_proj(feats) if getattr(r_head, "visual_proj", None) is not None else feats
+        v_proj = r_head.visual_proj(feats) if r_head.visual_proj is not None else feats
         v_norm = torch.nn.functional.normalize(v_proj.float(), dim=-1)
 
         metrics = {
@@ -2257,16 +2257,16 @@ class Trainer():
             if tri.numel() > 0:
                 metrics["visual_inter_l2"] = float(tri.mean().item())
 
-        semantic_proj = banks.get("semantic_proj")
-        if torch.is_tensor(semantic_proj):
-            sem_sim = self._safe_cosine_matrix(semantic_proj)
+        semantic_repr = banks.get("semantic_repr")
+        if torch.is_tensor(semantic_repr):
+            sem_sim = self._safe_cosine_matrix(semantic_repr)
             tri = self._upper_tri_flat(sem_sim)
             if tri.numel() > 0:
                 metrics["semantic_sep_cos_dissim"] = float((1.0 - tri).mean().item())
 
         # Layer 2: cross-modal alignment.
-        if torch.is_tensor(semantic_proj):
-            sem_norm = torch.nn.functional.normalize(semantic_proj.float(), dim=-1)
+        if torch.is_tensor(semantic_repr):
+            sem_norm = torch.nn.functional.normalize(semantic_repr.float(), dim=-1)
             sim = v_norm @ sem_norm.t()
             pos = sim.gather(1, y_local.view(-1, 1)).squeeze(1)
             neg = sim.clone()
@@ -2318,7 +2318,7 @@ class Trainer():
         # Layer 3: S^# specific monitoring.
         if torch.is_tensor(refined_sem_batch):
             if raw_sem_batch is not None:
-                raw_map = r_head.semantic_anchor(raw_sem_batch)
+                raw_map = r_head.prototype_proj(raw_sem_batch)
                 faith = torch.nn.functional.cosine_similarity(
                     torch.nn.functional.normalize(refined_sem_batch.float(), dim=-1),
                     torch.nn.functional.normalize(raw_map.float(), dim=-1),
@@ -2339,7 +2339,7 @@ class Trainer():
             if len(st_vals) > 0:
                 metrics["sref_intra_l2"] = float(torch.stack(st_vals).mean().item())
 
-        if torch.is_tensor(semantic_proj) and len(centers) >= 2:
+        if torch.is_tensor(semantic_repr) and len(centers) >= 2:
             center_t = torch.stack(centers, dim=0)
             mv = self._safe_cosine_matrix(center_t)
             center_cls_ids = [int(x) for x in uniq.detach().cpu().tolist()]
@@ -2661,12 +2661,12 @@ class Trainer():
                     if not bool(row_ok.all().item()):
                         bad_rows = (~row_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
 
-                # scale可防止softmax 太平以及影响 margin loss 的实际强度
+                # scale 可帮助判断 logits 的有效温度是否异常
                 scale_dbg = None
                 model_ref_dbg = self._model_ref(self.model)
                 r_head_dbg = model_ref_dbg.r_similarity_head
                 if r_head_dbg is not None:
-                    scale_dbg = getattr(r_head_dbg, "_loss_last_scale", None)
+                    scale_dbg = r_head_dbg._loss_last_logit_scale
                 scale_str = (
                     str(float(scale_dbg.detach().item()))
                     if torch.is_tensor(scale_dbg) and scale_dbg.numel() == 1
@@ -2683,14 +2683,14 @@ class Trainer():
                 if bad_rows is not None:
                     logger.info("[nan-debug] bad_rows=%s", bad_rows)
                 if model_ref_dbg is not None:
-                    bad_enc_rows = getattr(model_ref_dbg, "_last_bad_enc_rows", None)
+                    bad_enc_rows = model_ref_dbg._last_bad_enc_rows
                     if bad_enc_rows is not None:
                         logger.info("[nan-debug] bad_enc_rows=%s", bad_enc_rows)
                 if r_head_dbg is not None:
-                    bad_feat_rows = getattr(r_head_dbg, "_last_bad_feat_rows", None)
-                    bad_visual_rows = getattr(r_head_dbg, "_last_bad_visual_rows", None)
-                    bad_sim_rows = getattr(r_head_dbg, "_last_bad_sim_rows", None)
-                    sem_all_finite = getattr(r_head_dbg, "_last_semantic_all_finite", None)
+                    bad_feat_rows = r_head_dbg._last_bad_feat_rows
+                    bad_visual_rows = r_head_dbg._last_bad_visual_rows
+                    bad_sim_rows = r_head_dbg._last_bad_sim_rows
+                    sem_all_finite = r_head_dbg._last_semantic_all_finite
                     if bad_feat_rows is not None:
                         logger.info("[nan-debug] bad_feat_rows=%s", bad_feat_rows)
                     if bad_visual_rows is not None:
@@ -3020,12 +3020,12 @@ class Trainer():
             if self._vis_split_enabled(prefix):
                 sem_tokens = None
                 vis_tokens = None
-                r_head_vis = getattr(model_ref, "r_similarity_head", None)
-                affinities_vis = getattr(r_head_vis, "_runtime_affinities", None) if r_head_vis is not None else None
-                sem_state_vis = getattr(r_head_vis, "_runtime_semantic_state", None) if r_head_vis is not None else None
+                r_head_vis = model_ref.r_similarity_head
+                affinities_vis = r_head_vis._runtime_affinities if r_head_vis is not None else None
+                sem_state_vis = r_head_vis._runtime_semantic_state if r_head_vis is not None else None
                 if isinstance(sem_state_vis, dict):
                     sem_tokens = sem_state_vis.get("sem_tokens", None)
-                token_seq_vis = getattr(r_head_vis, "_runtime_token_sequence", None) if r_head_vis is not None else None
+                token_seq_vis = r_head_vis._runtime_token_sequence if r_head_vis is not None else None
                 if torch.is_tensor(token_seq_vis) and token_seq_vis.dim() == 3:
                     p_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS)
                     p_eff = p_len if token_seq_vis.shape[1] > (1 + p_len) else 0

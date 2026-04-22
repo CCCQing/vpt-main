@@ -9,7 +9,7 @@ import torch.nn as nn
 from .build_vit_backbone import (build_vit_sup_models)
 from ..utils import logging
 logger = logging.get_logger("visual_prompt")
-from ..solver.losses import RSimilarityClassifier, VSPCNBaselineClassifier
+from ..solver.losses import RSimilarityClassifier, RSimilarityClassifierV2, VSPCNBaselineClassifier
 from ..utils.param_logging import log_trainable_parameters
 
 
@@ -23,7 +23,7 @@ class ViT(nn.Module):
 
         classifier_name = str(cfg.MODEL.CLASSIFIER).lower()
         use_plain_vit_backbone = (
-            classifier_name == "vspcn_baseline"
+            classifier_name in {"vspcn_baseline", "r_similarity_v2"}
             and (not cfg.MODEL.PROMPT.ENABLE)
             and (not cfg.MODEL.SEMANTIC_BRANCH.ENABLE)
         )
@@ -58,10 +58,20 @@ class ViT(nn.Module):
         )
         trainable_keys = []
         if cfg.MODEL.PROMPT.ENABLE:
-            trainable_keys.extend([
-                "prompt_update_layers",
-                "prompt_init_provider",
-            ])
+            prompt_backend = str(cfg.MODEL.PROMPT.BACKEND).lower()
+            if prompt_backend == "dynamic":
+                trainable_keys.extend([
+                    "prompt_update_layers",
+                    "prompt_init_provider",
+                ])
+            elif prompt_backend == "vpt_deep":
+                trainable_keys.extend([
+                    "prompt_embeddings",
+                    "deep_prompt_embeddings",
+                    "prompt_proj",
+                ])
+            else:
+                raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{cfg.MODEL.PROMPT.BACKEND}'")
         if cfg.MODEL.SEMANTIC_BRANCH.ENABLE:
             trainable_keys.append("semantic_side_branch")
 
@@ -97,6 +107,8 @@ class ViT(nn.Module):
         classifier_name = str(self.cfg.MODEL.CLASSIFIER).lower()
         if classifier_name == "r_similarity":
             head_cls = RSimilarityClassifier
+        elif classifier_name == "r_similarity_v2":
+            head_cls = RSimilarityClassifierV2
         elif classifier_name == "vspcn_baseline":
             head_cls = VSPCNBaselineClassifier
         else:

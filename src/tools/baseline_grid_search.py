@@ -35,11 +35,12 @@ def _format_float_tag(x: float) -> str:
     return f"{mantissa}e{exp_i}"
 
 
-def _trial_name(idx: int, ar: float, lr: float, wd: float) -> str:
-    return "exp{idx:03d}_ar{ar}_lr{lr}_wd{wd}".format(
+def _trial_name(idx: int, aw: float, lr: float, scale: float, wd: float) -> str:
+    return "exp{idx:03d}_aw{aw}_lr{lr}_s{scale}_wd{wd}".format(
         idx=idx,
-        ar=_format_float_tag(ar),
+        aw=_format_float_tag(aw),
         lr=_format_float_tag(lr),
+        scale=_format_float_tag(scale),
         wd=_format_float_tag(wd),
     )
 
@@ -73,7 +74,10 @@ def _parse_metrics(log_path: str) -> Dict[str, float]:
     zsl_unseen: List[float] = []
     gzsl_seen: List[float] = []
     gzsl_unseen: List[float] = []
+    gzsl_h: List[float] = []
     best_epoch = None
+    protocol_mode = None
+    eval_mode = None
 
     with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -81,26 +85,39 @@ def _parse_metrics(log_path: str) -> Dict[str, float]:
             if m:
                 train_losses.append(float(m.group(1)))
 
+            m = re.search(r"XLSA protocol mode=([a-z_]+)\s+eval_mode=([a-z_]+)", line)
+            if m:
+                protocol_mode = m.group(1)
+                eval_mode = m.group(2)
+
             m = re.search(r"dev_unseen=([0-9.]+)", line)
             if m:
                 dev_unseen.append(float(m.group(1)))
 
-            m = re.search(r"zsl_unseen=([0-9.]+)", line)
+            m = re.search(r"\bzsl_unseen=([0-9.]+)", line)
             if m:
                 zsl_unseen.append(float(m.group(1)))
 
-            m = re.search(r"gzsl_seen=([0-9.]+)", line)
+            m = re.search(r"Eval\s+test_seen_[^:]+:.*gzsl_seen=([0-9.]+)", line)
             if m:
                 gzsl_seen.append(float(m.group(1)))
 
-            m = re.search(r"gzsl_unseen=([0-9.]+)", line)
+            m = re.search(r"Eval\s+test_unseen_[^:]+:.*gzsl_unseen=([0-9.]+)", line)
             if m:
                 gzsl_unseen.append(float(m.group(1)))
+
+            m = re.search(r"\[gzsl-record\].*gzsl_h=([0-9.]+)", line)
+            if m:
+                gzsl_h.append(float(m.group(1)) * 100.0)
 
             m = re.search(r"Best epoch\s+(\d+)", line)
             if m:
                 best_epoch = int(m.group(1))
 
+    if protocol_mode is not None:
+        out["protocol_mode"] = protocol_mode
+    if eval_mode is not None:
+        out["eval_mode"] = eval_mode
     if train_losses:
         out["train_loss_first"] = train_losses[0]
         out["train_loss_last"] = train_losses[-1]
@@ -116,13 +133,16 @@ def _parse_metrics(log_path: str) -> Dict[str, float]:
     if gzsl_unseen:
         out["gzsl_unseen_best"] = max(gzsl_unseen)
         out["gzsl_unseen_last"] = gzsl_unseen[-1]
+    if gzsl_h:
+        out["gzsl_h_best"] = max(gzsl_h)
+        out["gzsl_h_last"] = gzsl_h[-1]
     if best_epoch is not None:
         out["best_epoch"] = float(best_epoch)
     return out
 
 
 def _score_key(metrics: Dict[str, float]) -> Tuple[str, float]:
-    for key in ["dev_unseen_best", "zsl_unseen_best", "gzsl_unseen_best"]:
+    for key in ["gzsl_h_best", "dev_unseen_best", "zsl_unseen_best", "gzsl_unseen_best"]:
         if key in metrics:
             return key, metrics[key]
     return "score", float("-inf")
@@ -131,8 +151,9 @@ def _score_key(metrics: Dict[str, float]) -> Tuple[str, float]:
 def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
     keys = [
         "trial_name",
-        "ar_weight",
+        "align_weight",
         "base_lr",
+        "fixed_logit_scale",
         "weight_decay",
         "exit_code",
         "score_key",
@@ -146,8 +167,12 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
         "gzsl_seen_last",
         "gzsl_unseen_best",
         "gzsl_unseen_last",
+        "gzsl_h_best",
+        "gzsl_h_last",
         "train_loss_first",
         "train_loss_last",
+        "protocol_mode",
+        "eval_mode",
         "run_dir",
     ]
     extra_keys = []
@@ -159,7 +184,7 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
                 extra_keys.append(key)
     keys.extend(extra_keys)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
+        writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -169,10 +194,11 @@ def main() -> None:
     ap = argparse.ArgumentParser("baseline_grid_search")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
-    ap.add_argument("--out-root", default="output/grid_vspcn_baseline_full")
-    ap.add_argument("--ar-grid", default="0,2e-4,5e-4,8e-4")
-    ap.add_argument("--lr-grid", default="3e-4,7e-4,1e-3")
-    ap.add_argument("--wd-grid", default="0,1e-5")
+    ap.add_argument("--out-root", default="output/grid_rsim_v2_cosine_cm_stage1")
+    ap.add_argument("--align-grid", default="1e-5,5e-5,1e-4,5e-4")
+    ap.add_argument("--lr-grid", default="1e-4,3e-4,7e-4")
+    ap.add_argument("--scale-grid", default="1.0,5.0")
+    ap.add_argument("--wd-grid", default="0")
     ap.add_argument("--total-epoch", type=int, default=None)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("opts", nargs=argparse.REMAINDER)
@@ -182,17 +208,19 @@ def main() -> None:
     out_root = os.path.abspath(os.path.join(repo_root, args.out_root))
     os.makedirs(out_root, exist_ok=True)
 
-    ar_grid = _parse_float_list(args.ar_grid)
+    align_grid = _parse_float_list(args.align_grid)
     lr_grid = _parse_float_list(args.lr_grid)
+    scale_grid = _parse_float_list(args.scale_grid)
     wd_grid = _parse_float_list(args.wd_grid)
-    total_trials = len(ar_grid) * len(lr_grid) * len(wd_grid)
+    total_trials = len(align_grid) * len(lr_grid) * len(scale_grid) * len(wd_grid)
 
     search_space = {
         "config_file": args.config_file,
         "out_root": out_root,
         "total_trials": total_trials,
-        "ar_grid": ar_grid,
+        "align_grid": align_grid,
         "lr_grid": lr_grid,
+        "scale_grid": scale_grid,
         "wd_grid": wd_grid,
         "total_epoch": args.total_epoch,
         "extra_opts": args.opts,
@@ -202,10 +230,13 @@ def main() -> None:
 
     base_opts = [
         "RUN_N_TIMES", "1",
-        "MODEL.CLASSIFIER", "vspcn_baseline",
+        "MODEL.CLASSIFIER", "r_similarity_v2",
         "MODEL.PROMPT.ENABLE", "False",
         "MODEL.SEMANTIC_BRANCH.ENABLE", "False",
-        "SOLVER.LOSS", "vspcn_baseline",
+        "SOLVER.LOSS", "r_similarity_v2",
+        "MODEL.R_SIMILARITY_V2.SCORE_MODE", "cosine",
+        "MODEL.R_SIMILARITY_V2.LEARNABLE_SCALE", "False",
+        "SOLVER.RSIM_V2.ALIGN_MODE", "cm",
     ]
     if args.total_epoch is not None:
         base_opts.extend(["SOLVER.TOTAL_EPOCH", str(args.total_epoch)])
@@ -214,83 +245,87 @@ def main() -> None:
 
     rows: List[Dict[str, object]] = []
     idx = 1
-    for ar in ar_grid:
+    for align_weight in align_grid:
         for lr in lr_grid:
-            for wd in wd_grid:
-                trial_name = _trial_name(idx, ar, lr, wd)
-                trial_root = os.path.join(out_root, trial_name)
-                os.makedirs(trial_root, exist_ok=True)
-                stdout_path = os.path.join(trial_root, "launcher_stdout.txt")
+            for fixed_scale in scale_grid:
+                for wd in wd_grid:
+                    trial_name = _trial_name(idx, align_weight, lr, fixed_scale, wd)
+                    trial_root = os.path.join(out_root, trial_name)
+                    os.makedirs(trial_root, exist_ok=True)
+                    stdout_path = os.path.join(trial_root, "launcher_stdout.txt")
 
-                cmd = [
-                    sys.executable,
-                    "train.py",
-                    "--config-file",
-                    args.config_file,
-                    "OUTPUT_DIR",
-                    trial_root,
-                    "SOLVER.LOSS_VSPCN_AR_WEIGHT",
-                    str(ar),
-                    "SOLVER.BASE_LR",
-                    str(lr),
-                    "SOLVER.WEIGHT_DECAY",
-                    str(wd),
-                ] + base_opts
+                    cmd = [
+                        sys.executable,
+                        "train.py",
+                        "--config-file",
+                        args.config_file,
+                        "OUTPUT_DIR",
+                        trial_root,
+                        "SOLVER.RSIM_V2.ALIGN_WEIGHT",
+                        str(align_weight),
+                        "SOLVER.BASE_LR",
+                        str(lr),
+                        "MODEL.R_SIMILARITY_V2.FIXED_LOGIT_SCALE",
+                        str(fixed_scale),
+                        "SOLVER.WEIGHT_DECAY",
+                        str(wd),
+                    ] + base_opts
 
-                row: Dict[str, object] = {
-                    "trial_name": trial_name,
-                    "ar_weight": ar,
-                    "base_lr": lr,
-                    "weight_decay": wd,
-                    "exit_code": -1,
-                    "run_dir": "",
-                }
+                    row: Dict[str, object] = {
+                        "trial_name": trial_name,
+                        "align_weight": align_weight,
+                        "base_lr": lr,
+                        "fixed_logit_scale": fixed_scale,
+                        "weight_decay": wd,
+                        "exit_code": -1,
+                        "run_dir": "",
+                    }
 
-                run_dir = _find_run_dir(trial_root)
-                if run_dir is not None:
-                    log_path = os.path.join(run_dir, "logs.txt")
-                    metrics = _parse_metrics(log_path)
-                    score_key, score = _score_key(metrics)
-                    row.update(metrics)
-                    row["score_key"] = score_key
-                    row["score"] = score
-                    row["run_dir"] = run_dir
-                    row["exit_code"] = 0
+                    run_dir = _find_run_dir(trial_root)
+                    if run_dir is not None:
+                        log_path = os.path.join(run_dir, "logs.txt")
+                        metrics = _parse_metrics(log_path)
+                        score_key, score = _score_key(metrics)
+                        row.update(metrics)
+                        row["score_key"] = score_key
+                        row["score"] = score
+                        row["run_dir"] = run_dir
+                        row["exit_code"] = 0
+                        rows.append(row)
+                        idx += 1
+                        continue
+
+                    if args.dry_run:
+                        row["score_key"] = "dry_run"
+                        row["score"] = ""
+                        rows.append(row)
+                        print(" ".join(cmd))
+                        idx += 1
+                        continue
+
+                    code = _run_cmd(cmd, cwd=repo_root, stdout_path=stdout_path)
+                    row["exit_code"] = code
+
+                    run_dir = _find_run_dir(trial_root)
+                    if run_dir is not None:
+                        log_path = os.path.join(run_dir, "logs.txt")
+                        metrics = _parse_metrics(log_path)
+                        score_key, score = _score_key(metrics)
+                        row.update(metrics)
+                        row["score_key"] = score_key
+                        row["score"] = score
+                        row["run_dir"] = run_dir
+                    else:
+                        row["score_key"] = "missing_logs"
+                        row["score"] = ""
+
                     rows.append(row)
+
+                    _write_summary_csv(os.path.join(out_root, "summary.csv"), rows)
+                    with open(os.path.join(out_root, "summary.json"), "w", encoding="utf-8") as f:
+                        json.dump(rows, f, ensure_ascii=False, indent=2)
+
                     idx += 1
-                    continue
-
-                if args.dry_run:
-                    row["score_key"] = "dry_run"
-                    row["score"] = ""
-                    rows.append(row)
-                    print(" ".join(cmd))
-                    idx += 1
-                    continue
-
-                code = _run_cmd(cmd, cwd=repo_root, stdout_path=stdout_path)
-                row["exit_code"] = code
-
-                run_dir = _find_run_dir(trial_root)
-                if run_dir is not None:
-                    log_path = os.path.join(run_dir, "logs.txt")
-                    metrics = _parse_metrics(log_path)
-                    score_key, score = _score_key(metrics)
-                    row.update(metrics)
-                    row["score_key"] = score_key
-                    row["score"] = score
-                    row["run_dir"] = run_dir
-                else:
-                    row["score_key"] = "missing_logs"
-                    row["score"] = ""
-
-                rows.append(row)
-
-                _write_summary_csv(os.path.join(out_root, "summary.csv"), rows)
-                with open(os.path.join(out_root, "summary.json"), "w", encoding="utf-8") as f:
-                    json.dump(rows, f, ensure_ascii=False, indent=2)
-
-                idx += 1
 
     rows_sorted = sorted(
         rows,
