@@ -21,7 +21,7 @@ class ViT(nn.Module):
         super(ViT, self).__init__()
         self.cfg = cfg
 
-        classifier_name = str(cfg.MODEL.CLASSIFIER).lower()
+        classifier_name = cfg.MODEL.CLASSIFIER.lower()
         use_plain_vit_backbone = (
             classifier_name in {"vspcn_baseline", "r_similarity_v2"}
             and (not cfg.MODEL.PROMPT.ENABLE)
@@ -58,18 +58,43 @@ class ViT(nn.Module):
         )
         trainable_keys = []
         if cfg.MODEL.PROMPT.ENABLE:
-            prompt_backend = str(cfg.MODEL.PROMPT.BACKEND).lower()
+            prompt_backend = cfg.MODEL.PROMPT.BACKEND.lower()
             if prompt_backend == "dynamic":
-                trainable_keys.extend([
-                    "prompt_update_layers",
-                    "prompt_init_provider",
-                ])
+                prompt_init_source = cfg.MODEL.PROMPT.INIT_SOURCE.lower()
+                if prompt_init_source == "learned":
+                    trainable_keys.extend([
+                        "prompt_embeddings",
+                        "prompt_update_layers",
+                        "prompt_proj",
+                    ])
+                elif prompt_init_source == "distributor_mean":
+                    trainable_keys.extend([
+                        "prompt_init_provider",
+                        "prompt_update_layers",
+                        "prompt_proj",
+                    ])
+                else:
+                    raise ValueError(
+                        f"Unsupported MODEL.PROMPT.INIT_SOURCE='{cfg.MODEL.PROMPT.INIT_SOURCE}'"
+                    )
             elif prompt_backend == "vpt_deep":
-                trainable_keys.extend([
-                    "prompt_embeddings",
-                    "deep_prompt_embeddings",
-                    "prompt_proj",
-                ])
+                prompt_init_source = cfg.MODEL.PROMPT.INIT_SOURCE.lower()
+                if prompt_init_source == "learned":
+                    trainable_keys.extend([
+                        "prompt_embeddings",
+                        "deep_prompt_embeddings",
+                        "prompt_proj",
+                    ])
+                elif prompt_init_source == "distributor_mean":
+                    trainable_keys.extend([
+                        "prompt_init_provider",
+                        "deep_prompt_embeddings",
+                        "prompt_proj",
+                    ])
+                else:
+                    raise ValueError(
+                        f"Unsupported MODEL.PROMPT.INIT_SOURCE='{cfg.MODEL.PROMPT.INIT_SOURCE}'"
+                    )
             else:
                 raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{cfg.MODEL.PROMPT.BACKEND}'")
         if cfg.MODEL.SEMANTIC_BRANCH.ENABLE:
@@ -104,7 +129,7 @@ class ViT(nn.Module):
 
         device = next(self.parameters()).device
         class_attributes = class_attributes.to(device)
-        classifier_name = str(self.cfg.MODEL.CLASSIFIER).lower()
+        classifier_name = self.cfg.MODEL.CLASSIFIER.lower()
         if classifier_name == "r_similarity":
             head_cls = RSimilarityClassifier
         elif classifier_name == "r_similarity_v2":

@@ -492,9 +492,12 @@ class PromptedTransformer(Transformer):
         self.semantic_branch_cfg = prompt_config.SEMANTIC_BRANCH
         self.semantic_branch_enable = bool(self.semantic_branch_cfg.ENABLE)
         self.prompt_enable = bool(prompt_config.ENABLE)
-        self.prompt_backend = str(prompt_config.BACKEND).lower()
+        self.prompt_backend = prompt_config.BACKEND.lower()
         if self.prompt_backend not in {"dynamic", "vpt_deep"}:
             raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{prompt_config.BACKEND}'")
+        self.prompt_init_source = prompt_config.INIT_SOURCE.lower()
+        if self.prompt_init_source not in {"learned", "distributor_mean"}:
+            raise ValueError(f"Unsupported MODEL.PROMPT.INIT_SOURCE='{prompt_config.INIT_SOURCE}'")
 
         super().__init__(config, img_size, vis)
 
@@ -541,10 +544,18 @@ class PromptedTransformer(Transformer):
         if prompt_init is not None:
             raise ValueError("Static prompt initialization has been removed; prompt_init must be None.")
 
-        if self.prompt_enable and self.prompt_backend == "dynamic" and self.prompt_init_provider is None:
-            raise ValueError(
-                "Dynamic prompt backend requires MODEL.PROMPT.DISTRIBUTOR/prompt_init_provider."
-            )
+        if self.prompt_enable and self.prompt_backend == "dynamic" and self.prompt_init_source == "distributor_mean":
+            if self.prompt_init_provider is None:
+                raise ValueError(
+                    "Dynamic prompt with INIT_SOURCE='distributor_mean' requires "
+                    "MODEL.PROMPT.DISTRIBUTOR.ENABLE=True and a prompt_init_provider."
+                )
+        if self.prompt_enable and self.prompt_backend == "vpt_deep" and self.prompt_init_source == "distributor_mean":
+            if self.prompt_init_provider is None:
+                raise ValueError(
+                    "VPT deep prompt with INIT_SOURCE='distributor_mean' requires "
+                    "MODEL.PROMPT.DISTRIBUTOR.ENABLE=True and a prompt_init_provider."
+                )
 
         # Synchronize the debug switch to each layer of the semantic branch and encoder
         if self.semantic_side_branch is not None:
@@ -560,7 +571,7 @@ class PromptedTransformer(Transformer):
         if self.prompt_enable and self.prompt_backend == "dynamic":
             self.prompt_update_layers = nn.ModuleList([Linear(hidden_size, hidden_size) for _ in range(num_layers - 1)])
 
-            evolve_mode = str(self.prompt_config.EVOLVE_INIT_MODE).lower()
+            evolve_mode = self.prompt_config.EVOLVE_INIT_MODE.lower()
             if evolve_mode != "identity":
                 raise ValueError(f"Unsupported PROMPT.EVOLVE_INIT_MODE: {self.prompt_config.EVOLVE_INIT_MODE}")
             self.evolve_init_mode = evolve_mode
@@ -571,11 +582,17 @@ class PromptedTransformer(Transformer):
                     layer.weight.copy_(eye)
                     if layer.bias is not None:
                         layer.bias.zero_()
+            if self.prompt_init_source == "learned":
+                prompt_dim = config.hidden_size
+                val = math.sqrt(6.0 / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
+                self.prompt_embeddings = nn.Parameter(torch.zeros(1, num_tokens, prompt_dim))
+                nn.init.uniform_(self.prompt_embeddings.data, -val, val)
         elif self.prompt_enable and self.prompt_backend == "vpt_deep":
             prompt_dim = config.hidden_size
             val = math.sqrt(6.0 / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
-            self.prompt_embeddings = nn.Parameter(torch.zeros(1, num_tokens, prompt_dim))
-            nn.init.uniform_(self.prompt_embeddings.data, -val, val)
+            if self.prompt_init_source == "learned":
+                self.prompt_embeddings = nn.Parameter(torch.zeros(1, num_tokens, prompt_dim))
+                nn.init.uniform_(self.prompt_embeddings.data, -val, val)
             if self.prompt_config.DEEP:
                 total_d_layer = config.transformer["num_layers"] - 1
                 self.deep_prompt_embeddings = nn.Parameter(torch.zeros(total_d_layer, num_tokens, prompt_dim))
@@ -609,18 +626,44 @@ class PromptedTransformer(Transformer):
         x_base = self.embeddings.add_cls_and_pos(patch_tokens)  # (B, 1 + n_patches, hidden_dim)
         if self.prompt_enable:
             if self.prompt_backend == "dynamic":
-                provider_out = self.prompt_init_provider(patch_tokens)
-                if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
-                    raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
-                prompt_tokens, provider_stats = provider_out
-                expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
-                got_shape = tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None
-                if (not torch.is_tensor(prompt_tokens)) or tuple(prompt_tokens.shape) != expected_shape:
-                    raise ValueError(f"prompt_init_provider must return prompt_tokens with shape {expected_shape}, got {type(prompt_tokens)} {got_shape}")
-                self._last_visual_stats = provider_stats["h_v"]
+                if self.prompt_init_source == "learned":
+                    if self.prompt_embeddings is None:
+                        raise ValueError("Dynamic prompt with INIT_SOURCE='learned' requires prompt_embeddings.")
+                    prompt_tokens = self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)
+                    self._last_visual_stats = patch_tokens.mean(dim=1)
+                elif self.prompt_init_source == "distributor_mean":
+                    provider_out = self.prompt_init_provider(patch_tokens)
+                    if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
+                        raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
+                    prompt_tokens, provider_stats = provider_out
+                    expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
+                    got_shape = tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None
+                    if (not torch.is_tensor(prompt_tokens)) or tuple(prompt_tokens.shape) != expected_shape:
+                        raise ValueError(f"prompt_init_provider must return prompt_tokens with shape {expected_shape}, got {type(prompt_tokens)} {got_shape}")
+                    self._last_visual_stats = provider_stats["h_v"]
+                else:
+                    raise ValueError(f"Unsupported MODEL.PROMPT.INIT_SOURCE='{self.prompt_config.INIT_SOURCE}'")
             elif self.prompt_backend == "vpt_deep":
-                prompt_tokens = self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)
-                self._last_visual_stats = patch_tokens.mean(dim=1)
+                if self.prompt_init_source == "learned":
+                    if self.prompt_embeddings is None:
+                        raise ValueError("VPT deep prompt with INIT_SOURCE='learned' requires prompt_embeddings.")
+                    prompt_tokens = self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)
+                    self._last_visual_stats = patch_tokens.mean(dim=1)
+                elif self.prompt_init_source == "distributor_mean":
+                    provider_out = self.prompt_init_provider(patch_tokens)
+                    if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
+                        raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
+                    prompt_tokens, provider_stats = provider_out
+                    expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
+                    got_shape = tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None
+                    if (not torch.is_tensor(prompt_tokens)) or tuple(prompt_tokens.shape) != expected_shape:
+                        raise ValueError(
+                            f"prompt_init_provider must return prompt_tokens with shape {expected_shape}, "
+                            f"got {type(prompt_tokens)} {got_shape}"
+                        )
+                    self._last_visual_stats = provider_stats["h_v"]
+                else:
+                    raise ValueError(f"Unsupported MODEL.PROMPT.INIT_SOURCE='{self.prompt_config.INIT_SOURCE}'")
             else:
                 raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{self.prompt_backend}'")
             x = torch.cat((
@@ -648,6 +691,7 @@ class PromptedTransformer(Transformer):
         self._last_prompt_path_info = {
             "prompt_enable": bool(self.prompt_enable),
             "prompt_backend": self.prompt_backend,
+            "prompt_init_source": self.prompt_init_source,
             "semantic_branch_enable": bool(self.semantic_branch_enable),
             "actual_token_shape_entering_backbone": tuple(x.shape),
             "visual_feature_norm": float(patch_tokens.float().norm(dim=-1).mean().item()),
@@ -664,11 +708,14 @@ class PromptedTransformer(Transformer):
             self.embeddings.eval()
             self.prompt_dropout.train()
             if self.prompt_backend == "dynamic":
+                self.prompt_proj.train(mode)
                 self.prompt_update_layers.train(mode)
-                if isinstance(self.prompt_init_provider, torch.nn.Module):
+                if self.prompt_init_source == "distributor_mean" and isinstance(self.prompt_init_provider, torch.nn.Module):
                     self.prompt_init_provider.train(mode)
             elif self.prompt_backend == "vpt_deep":
                 self.prompt_proj.train(mode)
+                if self.prompt_init_source == "distributor_mean" and isinstance(self.prompt_init_provider, torch.nn.Module):
+                    self.prompt_init_provider.train(mode)
         else:
             for module in self.children():
                 module.train(mode)

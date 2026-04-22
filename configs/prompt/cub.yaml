@@ -9,12 +9,14 @@ MODEL:
   CLASSIFIER: "vspcn_baseline"
   PROMPT:
     ENABLE: True
-    BACKEND: "vpt_deep"
+    BACKEND: "dynamic"             # dynamic / vpt_deep
+    INIT_SOURCE: "distributor_mean"
     DEEP: True
     NUM_TOKENS: 16
     DROPOUT: 0.0
     DISTRIBUTOR:
-      ENABLE: False
+      ENABLE: True
+      DISABLE_SAMPLING: True
 
   SEMANTIC_BRANCH:
     ENABLE: False

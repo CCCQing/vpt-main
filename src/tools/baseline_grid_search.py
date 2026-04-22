@@ -35,13 +35,25 @@ def _format_float_tag(x: float) -> str:
     return f"{mantissa}e{exp_i}"
 
 
-def _trial_name(idx: int, aw: float, lr: float, scale: float, wd: float) -> str:
-    return "exp{idx:03d}_aw{aw}_lr{lr}_s{scale}_wd{wd}".format(
+def _parse_int_list(raw: str) -> List[int]:
+    vals = []
+    for item in raw.split(","):
+        s = item.strip()
+        if not s:
+            continue
+        vals.append(int(s))
+    if not vals:
+        raise ValueError("Empty integer grid value list.")
+    return vals
+
+
+def _trial_name(idx: int, ar: float, lr: float, ntok: int, epochs: int) -> str:
+    return "exp{idx:03d}_ar{ar}_lr{lr}_tok{ntok}_ep{epochs}".format(
         idx=idx,
-        aw=_format_float_tag(aw),
+        ar=_format_float_tag(ar),
         lr=_format_float_tag(lr),
-        scale=_format_float_tag(scale),
-        wd=_format_float_tag(wd),
+        ntok=ntok,
+        epochs=epochs,
     )
 
 
@@ -151,9 +163,10 @@ def _score_key(metrics: Dict[str, float]) -> Tuple[str, float]:
 def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
     keys = [
         "trial_name",
-        "align_weight",
+        "ar_weight",
         "base_lr",
-        "fixed_logit_scale",
+        "num_tokens",
+        "total_epoch",
         "weight_decay",
         "exit_code",
         "score_key",
@@ -194,12 +207,12 @@ def main() -> None:
     ap = argparse.ArgumentParser("baseline_grid_search")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
-    ap.add_argument("--out-root", default="output/grid_rsim_v2_cosine_cm_stage1")
-    ap.add_argument("--align-grid", default="1e-5,5e-5,1e-4,5e-4")
-    ap.add_argument("--lr-grid", default="1e-4,3e-4,7e-4")
-    ap.add_argument("--scale-grid", default="1.0,5.0")
-    ap.add_argument("--wd-grid", default="0")
-    ap.add_argument("--total-epoch", type=int, default=None)
+    ap.add_argument("--out-root", default="output/grid_final_gzsl_dynamic_distributor_mean_stage1")
+    ap.add_argument("--ar-grid", default="0,1e-4,5e-4")
+    ap.add_argument("--lr-grid", default="3e-4,5e-4,7e-4,1e-3")
+    ap.add_argument("--num-tokens-grid", default="8,16,32")
+    ap.add_argument("--epoch-grid", default="20,30,40")
+    ap.add_argument("--weight-decay", type=float, default=1e-5)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("opts", nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -208,21 +221,21 @@ def main() -> None:
     out_root = os.path.abspath(os.path.join(repo_root, args.out_root))
     os.makedirs(out_root, exist_ok=True)
 
-    align_grid = _parse_float_list(args.align_grid)
+    ar_grid = _parse_float_list(args.ar_grid)
     lr_grid = _parse_float_list(args.lr_grid)
-    scale_grid = _parse_float_list(args.scale_grid)
-    wd_grid = _parse_float_list(args.wd_grid)
-    total_trials = len(align_grid) * len(lr_grid) * len(scale_grid) * len(wd_grid)
+    num_tokens_grid = _parse_int_list(args.num_tokens_grid)
+    epoch_grid = _parse_int_list(args.epoch_grid)
+    total_trials = len(ar_grid) * len(lr_grid) * len(num_tokens_grid) * len(epoch_grid)
 
     search_space = {
         "config_file": args.config_file,
         "out_root": out_root,
         "total_trials": total_trials,
-        "align_grid": align_grid,
+        "ar_grid": ar_grid,
         "lr_grid": lr_grid,
-        "scale_grid": scale_grid,
-        "wd_grid": wd_grid,
-        "total_epoch": args.total_epoch,
+        "num_tokens_grid": num_tokens_grid,
+        "epoch_grid": epoch_grid,
+        "weight_decay": args.weight_decay,
         "extra_opts": args.opts,
     }
     with open(os.path.join(out_root, "search_space.json"), "w", encoding="utf-8") as f:
@@ -230,26 +243,27 @@ def main() -> None:
 
     base_opts = [
         "RUN_N_TIMES", "1",
-        "MODEL.CLASSIFIER", "r_similarity_v2",
-        "MODEL.PROMPT.ENABLE", "False",
+        "DATA.XLSA.PROTOCOL_MODE", "final_gzsl",
+        "MODEL.CLASSIFIER", "vspcn_baseline",
+        "MODEL.PROMPT.ENABLE", "True",
+        "MODEL.PROMPT.BACKEND", "dynamic",
+        "MODEL.PROMPT.INIT_SOURCE", "distributor_mean",
+        "MODEL.PROMPT.DEEP", "True",
+        "MODEL.PROMPT.DISTRIBUTOR.ENABLE", "True",
+        "MODEL.PROMPT.DISTRIBUTOR.DISABLE_SAMPLING", "True",
         "MODEL.SEMANTIC_BRANCH.ENABLE", "False",
-        "SOLVER.LOSS", "r_similarity_v2",
-        "MODEL.R_SIMILARITY_V2.SCORE_MODE", "cosine",
-        "MODEL.R_SIMILARITY_V2.LEARNABLE_SCALE", "False",
-        "SOLVER.RSIM_V2.ALIGN_MODE", "cm",
+        "SOLVER.LOSS", "vspcn_baseline",
     ]
-    if args.total_epoch is not None:
-        base_opts.extend(["SOLVER.TOTAL_EPOCH", str(args.total_epoch)])
     if args.opts:
         base_opts.extend(args.opts)
 
     rows: List[Dict[str, object]] = []
     idx = 1
-    for align_weight in align_grid:
+    for ar_weight in ar_grid:
         for lr in lr_grid:
-            for fixed_scale in scale_grid:
-                for wd in wd_grid:
-                    trial_name = _trial_name(idx, align_weight, lr, fixed_scale, wd)
+            for num_tokens in num_tokens_grid:
+                for total_epoch in epoch_grid:
+                    trial_name = _trial_name(idx, ar_weight, lr, num_tokens, total_epoch)
                     trial_root = os.path.join(out_root, trial_name)
                     os.makedirs(trial_root, exist_ok=True)
                     stdout_path = os.path.join(trial_root, "launcher_stdout.txt")
@@ -261,22 +275,25 @@ def main() -> None:
                         args.config_file,
                         "OUTPUT_DIR",
                         trial_root,
-                        "SOLVER.RSIM_V2.ALIGN_WEIGHT",
-                        str(align_weight),
+                        "SOLVER.LOSS_VSPCN_AR_WEIGHT",
+                        str(ar_weight),
                         "SOLVER.BASE_LR",
                         str(lr),
-                        "MODEL.R_SIMILARITY_V2.FIXED_LOGIT_SCALE",
-                        str(fixed_scale),
+                        "MODEL.PROMPT.NUM_TOKENS",
+                        str(num_tokens),
+                        "SOLVER.TOTAL_EPOCH",
+                        str(total_epoch),
                         "SOLVER.WEIGHT_DECAY",
-                        str(wd),
+                        str(args.weight_decay),
                     ] + base_opts
 
                     row: Dict[str, object] = {
                         "trial_name": trial_name,
-                        "align_weight": align_weight,
+                        "ar_weight": ar_weight,
                         "base_lr": lr,
-                        "fixed_logit_scale": fixed_scale,
-                        "weight_decay": wd,
+                        "num_tokens": num_tokens,
+                        "total_epoch": total_epoch,
+                        "weight_decay": args.weight_decay,
                         "exit_code": -1,
                         "run_dir": "",
                     }

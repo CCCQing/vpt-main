@@ -53,13 +53,22 @@ def build_vit_sup_models(
     }
 
     prompt_provider = prompt_init_provider
-    prompt_backend = str(prompt_cfg.BACKEND).lower() if prompt_cfg is not None else "dynamic"
+    prompt_backend = prompt_cfg.BACKEND.lower() if prompt_cfg is not None else "dynamic"
     if prompt_cfg is not None:
-        dist_cfg = getattr(prompt_cfg, "DISTRIBUTOR", None)
+        dist_cfg = prompt_cfg.DISTRIBUTOR
+        use_distributor = False
+        if prompt_backend == "dynamic":
+            use_distributor = (
+                prompt_cfg.INIT_SOURCE.lower() == "distributor_mean"
+                and bool(dist_cfg.ENABLE)
+            )
+        elif prompt_backend == "vpt_deep":
+            use_distributor = (
+                prompt_cfg.INIT_SOURCE.lower() == "distributor_mean"
+                and bool(dist_cfg.ENABLE)
+            )
         if (
-            prompt_backend == "dynamic"
-            and dist_cfg is not None
-            and getattr(dist_cfg, "ENABLE", False)
+            use_distributor
             and prompt_provider is None
         ):
             prompt_provider = PreViTPromptDistributor(
@@ -69,6 +78,8 @@ def build_vit_sup_models(
                 hidden_dim=dist_cfg.HIDDEN_DIM,
                 pool=dist_cfg.POOL,
             )
+        if prompt_provider is not None:
+            prompt_provider.disable_sampling = bool(dist_cfg.DISABLE_SAMPLING)
 
     if prompt_cfg is not None:
         model = PromptedVisionTransformer(
