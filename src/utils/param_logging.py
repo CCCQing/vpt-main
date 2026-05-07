@@ -56,9 +56,6 @@ def _classify_group(name: str) -> str:
     if any(k in lower for k in prompt_dist_keys):
         return "prompt_distribution"
 
-    if "anchor_slot_embed" in lower:
-        return "semantic_branch_anchor_params"
-
     if "semantic_side_branch" in lower:
         return "semantic_side_branch"
 
@@ -106,7 +103,6 @@ def log_trainable_parameters(
         "prompt_tokens",
         "prompt_distribution",
         "semantic_side_branch",
-        "semantic_branch_anchor_params",
         "affinity_branch",
         "cls_head",
         "other",

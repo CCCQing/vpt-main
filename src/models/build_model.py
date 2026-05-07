@@ -17,7 +17,8 @@ def build_model(cfg):
     assert cfg.MODEL.TYPE in _MODEL_TYPES, "Model type '{}' not supported".format(cfg.MODEL.TYPE)
     assert cfg.NUM_GPUS <= torch.cuda.device_count(), "Cannot use more GPU devices than available"
 
-    model = _MODEL_TYPES[cfg.MODEL.TYPE](cfg)
+    vis = bool(cfg.MODEL.AFFINITY.VIS or cfg.SOLVER.VIS.ENABLE)
+    model = _MODEL_TYPES[cfg.MODEL.TYPE](cfg, vis=vis)
     log_model_info(model, verbose=False)
 
     model, device = load_model_to_device(model, cfg)

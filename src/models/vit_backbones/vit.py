@@ -168,6 +168,14 @@ class Attention(nn.Module):
         attention_output = self.out(context_layer)  # [B, N, D]
         attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
+
+    @staticmethod
+    def _minmax_normalize_lastdim(x: torch.Tensor) -> torch.Tensor:
+        """用于把 raw logits 转成仅用于画图的 vis_norm"""
+        x_min = x.amin(dim=-1, keepdim=True)
+        x_max = x.amax(dim=-1, keepdim=True)
+        denom = (x_max - x_min).clamp_min(1e-12)
+        return (x - x_min) / denom
     def forward(self, hidden_states):
         """
         对整段序列执行标准 self-attention 前向。
@@ -196,76 +204,56 @@ class Attention(nn.Module):
             self._shape_debug_forward_proj_logged = True
         return attention_output, weights, query_layer, key_layer
 
-    def compute_affinity(self, query_layer, key_layer, prompt_length, mode="qq", *,
-                         return_cross=False, normalize=True, detach=True):
+    def compute_prompt_visual_monitors(self, query_layer, key_layer, prompt_length, *, detach=True):
         """
-        使用（通常是被冻结的）W_q/W_k 投影后的 q/k，按 CLS | prompt | patch 切分，
-        构造提示段/视觉段内部及（可选）prompt→patch 的亲和矩阵。
+        统一导出主干 prompt/visual 的原始亲和矩阵。
 
-        参数:
-            query_layer / key_layer:
-                - 形状 [B, h, N, d_k]，来自 forward_with_projections 的输出
-                - 一般使用同一层的 q/k，这保证亲和与该层注意力共享几何基底
-            prompt_length:
-                - prompt token 的数量 L_p（不含 CLS）
-                - 序列结构假设为：
-                    index 0: CLS
-                    index 1..L_p: prompt token
-                    index 1+L_p..: patch token
-            mode:
-                - "qq": 使用 q 计算 self-similarity (Q Q^T)
-                - "kk": 使用 k 计算 self-similarity (K K^T)
-            return_cross:
-                - 若为 True，同时返回 Apv（prompt→patch）亲和矩阵
-            normalize:
-                - True: 在最后一维上做 softmax，得到“注意力风格”的亲和（行归一）
-                - False: 返回未归一化的相似度矩阵（可用于自定义归一/温度）
-            detach:
-                - True: 对用于构亲和的 q/k 调用 .detach()
-                    -> 亲和损失仅作为几何约束，不会对 W_q/W_k 产生梯度
-                - False: 允许亲和损失反向到 W_q/W_k（例如最后几层微调）
+        这一版直接取代旧的 compute_affinity：
+        - 不再接收 normalize
+        - 主输出一律保留 raw logits
+        - 额外附带仅用于画图的 min-max 归一化版本
 
-        返回:
-            affinities: dict，键包括:
-                - "App": [B, h, L_p, L_p]，prompt 内自亲和
-                - "Avv": [B, h, L_v, L_v]，patch 内自亲和
-                - "Apv": [B, h, L_p, L_v]，prompt→patch 亲和（可选）
+        返回：
+        - QpQv_raw / QpQv_vis
+        - KpKv_raw / KpKv_vis
+        - QpKv_raw / QpKv_vis
         """
-        if mode not in {"qq", "kk"}:
-            raise ValueError(f"Unsupported affinity mode: {mode}")
+        q_base = query_layer.detach() if detach else query_layer
+        k_base = key_layer.detach() if detach else key_layer
 
-        base = query_layer if mode == "qq" else key_layer
-        if detach:
-            base = base.detach()
-
-        if base.size(2) < 1 + prompt_length:
+        if q_base.size(2) < 1 + prompt_length or k_base.size(2) < 1 + prompt_length:
             raise ValueError(
-                f"Sequence length {base.size(2)} is insufficient for prompt_length={prompt_length} (needs >= {1 + prompt_length})."
+                f"Sequence length is insufficient for prompt_length={prompt_length}: "
+                f"q_len={q_base.size(2)}, k_len={k_base.size(2)}"
             )
 
         cls_offset = 1
         prompt_slice = slice(cls_offset, cls_offset + prompt_length)
         patch_slice = slice(cls_offset + prompt_length, None)
 
-        prompt_tokens = base[:, :, prompt_slice, :]
-        patch_tokens = base[:, :, patch_slice, :]
+        q_prompt = q_base[:, :, prompt_slice, :]
+        q_patch = q_base[:, :, patch_slice, :]
+        k_prompt = k_base[:, :, prompt_slice, :]
+        k_patch = k_base[:, :, patch_slice, :]
         scale = 1.0 / math.sqrt(self.attention_head_size)
 
-        affinities = {}
+        monitors = {}
+        if q_prompt.numel() > 0 and q_patch.numel() > 0:
+            qpqv_raw = torch.matmul(q_prompt, q_patch.transpose(-1, -2)) * scale
+            monitors["QpQv_raw"] = qpqv_raw
+            monitors["QpQv_vis"] = self._minmax_normalize_lastdim(qpqv_raw)
 
-        if prompt_tokens.numel() > 0:
-            app = torch.matmul(prompt_tokens, prompt_tokens.transpose(-1, -2)) * scale
-            affinities["App"] = self.softmax(app) if normalize else app
+        if k_prompt.numel() > 0 and k_patch.numel() > 0:
+            kpkv_raw = torch.matmul(k_prompt, k_patch.transpose(-1, -2)) * scale
+            monitors["KpKv_raw"] = kpkv_raw
+            monitors["KpKv_vis"] = self._minmax_normalize_lastdim(kpkv_raw)
 
-        if patch_tokens.numel() > 0:
-            avv = torch.matmul(patch_tokens, patch_tokens.transpose(-1, -2)) * scale
-            affinities["Avv"] = self.softmax(avv) if normalize else avv
+        if q_prompt.numel() > 0 and k_patch.numel() > 0:
+            qpkv_raw = torch.matmul(q_prompt, k_patch.transpose(-1, -2)) * scale
+            monitors["QpKv_raw"] = qpkv_raw
+            monitors["QpKv_vis"] = self._minmax_normalize_lastdim(qpkv_raw)
 
-        if return_cross and prompt_tokens.numel() > 0 and patch_tokens.numel() > 0:
-            apv = torch.matmul(prompt_tokens, patch_tokens.transpose(-1, -2)) * scale
-            affinities["Apv"] = self.softmax(apv) if normalize else apv
-
-        return affinities
+        return monitors
 
 class Mlp(nn.Module):
     """
@@ -390,20 +378,17 @@ class Block(nn.Module):
 
         额外逻辑：
             - 在注意力部分，通过 forward_with_projections 一次性拿到 q_proj/k_proj；
-            - 使用 compute_affinity 在同一层的 Q/K 上构造 App/Avv(/Apv)；
+            - 使用 compute_prompt_visual_monitors 在同一层的 Q/K 上构造 raw/vis 亲和；
             - 将该层的亲和 dict 返回给上级 Encoder 统一收集。
 
         affinity_config: dict，支持字段：
             - "prompt_length": int，prompt token 数量 L_p
-            - "mode": "qq" 或 "kk"（决定使用 Q 还是 K）
-            - "return_cross": bool，是否额外返回 Apv
-            - "normalize": bool，是否 softmax 归一
             - "detach": bool，是否在构亲和前对 q/k detach
 
         返回:
             x:          [B, N, D]，本层输出
             weights:    注意力权重（仅 vis=True 时非 None）
-            affinities: dict，包含 App/Avv(/Apv)
+            affinities: dict，包含 raw/vis 亲和矩阵
         """
         # --- 注意力分支 + 残差 ---
         h = x
@@ -419,13 +404,10 @@ class Block(nn.Module):
         x = x + h
 
         # --- 基于 Q/K 计算 prompt/patch 亲和 ---
-        attn_aff = self.attn.compute_affinity(
+        attn_aff = self.attn.compute_prompt_visual_monitors(
             q_proj,
             k_proj,
             affinity_config.get("prompt_length", 0),
-            mode=affinity_config.get("mode", "qq"),
-            return_cross=affinity_config.get("return_cross", False),
-            normalize=affinity_config.get("normalize", True),
             detach=affinity_config.get("detach", True),
         )
 
@@ -517,7 +499,7 @@ class Encoder(nn.Module):
         返回:
             encoded:     [B, N, D]，末端 LN 后的输出
             attn_weights: list，长度 = num_layers（视 vis 而定）
-            affinities:   list，长度 = num_layers，每个元素是 dict(App/Avv/Apv)
+            affinities:   list，长度 = num_layers，每个元素是一层的 raw/vis 亲和字典
         """
         attn_weights = []
         affinities = []
@@ -583,7 +565,7 @@ class Transformer(nn.Module):
             2) Encoder.forward_with_affinity:
                 - 得到 encoded（末端 LN）
                 - attn_weights: 每层 MHSA 的 attention map（可选）
-                - affinities:   每层 App/Avv(/Apv) 亲和字典
+                - affinities:   每层 raw/vis 亲和字典
 
         返回:
             encoded:   [B, N, D]
@@ -643,7 +625,7 @@ class VisionTransformer(nn.Module):
                 得到:
                     - 序列输出 x_seq: [B, 1+N, D]
                     - attn_weights:  每层 MHSA 权重（可选）
-                    - affinities:    每层 App/Avv(/Apv) 亲和字典
+                    - affinities:    每层 raw/vis 亲和字典
             2) 分类头:
                 用 CLS token 的表征 x_seq[:, 0] 做线性分类
 

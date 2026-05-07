@@ -12,8 +12,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+def as_long_path(path: str) -> str:
+    if os.name != "nt":
+        return path
+    abs_path = os.path.abspath(path)
+    if abs_path.startswith("\\\\?\\"):
+        return abs_path
+    if abs_path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + abs_path.lstrip("\\")
+    return "\\\\?\\" + abs_path
+
+
 def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
+    os.makedirs(as_long_path(path), exist_ok=True)
 
 
 def to_uint8_image(img: torch.Tensor) -> np.ndarray:
@@ -69,7 +80,7 @@ def save_overlay(path: str, image_u8: np.ndarray, heat: np.ndarray, title: str =
         plt.title(title)
     plt.axis("off")
     plt.tight_layout()
-    plt.savefig(path, dpi=160)
+    plt.savefig(as_long_path(path), dpi=160)
     plt.close()
 
 
@@ -88,7 +99,7 @@ def save_panel(path: str, images: List[np.ndarray], titles: Optional[List[str]] 
         if titles is not None and i < len(titles):
             ax.set_title(str(titles[i]))
     plt.tight_layout()
-    plt.savefig(path, dpi=160)
+    plt.savefig(as_long_path(path), dpi=160)
     plt.close()
 
 
@@ -122,8 +133,8 @@ def append_csv_row(path: str, row: Dict[str, object], field_order: Optional[List
     ensure_dir(os.path.dirname(path))
     if field_order is None:
         field_order = list(row.keys())
-    write_header = not os.path.exists(path)
-    with open(path, "a", newline="", encoding="utf-8") as f:
+    write_header = not os.path.exists(as_long_path(path))
+    with open(as_long_path(path), "a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=field_order)
         if write_header:
             w.writeheader()
@@ -132,6 +143,5 @@ def append_csv_row(path: str, row: Dict[str, object], field_order: Optional[List
 
 def save_json(path: str, obj: Dict[str, object]) -> None:
     ensure_dir(os.path.dirname(path))
-    with open(path, "w", encoding="utf-8") as f:
+    with open(as_long_path(path), "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
-

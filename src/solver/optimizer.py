@@ -30,8 +30,6 @@ def _build_adamw_param_groups(
         "position_embeddings",
         "pos_embed",
         "positional_embedding",
-        "anchor_slot_embed",
-        "free_slot_embed",
     )
 
     norm_classes = (

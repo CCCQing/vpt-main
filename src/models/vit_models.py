@@ -176,21 +176,18 @@ class ViT(nn.Module):
         if self.debug_trace_once and not self._debug_head_route_logged:
             trace_id = getattr(self, "_debug_trace_id", "trace=NA")
             prompt_path_info = None
-            prompt_role_stats = None
             transformer = getattr(self.enc, "transformer", None)
             if transformer is not None:
                 prompt_path_info = getattr(transformer, "_last_prompt_path_info", None)
-                prompt_role_stats = getattr(transformer, "_last_prompt_role_stats", None)
             logger.info(
                 "[trace] %s node=C.vit_models.forward use_r_similarity_head=%s logits_source=%s logits_shape=%s "
-                "final_cls_or_pooled_feature_norm=%s prompt_path_info=%s prompt_role_stats=%s",
+                "final_cls_or_pooled_feature_norm=%s prompt_path_info=%s",
                 trace_id,
                 True,
                 logits_source,
                 tuple(x.shape) if torch.is_tensor(x) else None,
                 feature_norm_mean,
                 prompt_path_info if isinstance(prompt_path_info, dict) else None,
-                prompt_role_stats if isinstance(prompt_role_stats, dict) else None,
             )
             self._debug_head_route_logged = True
 

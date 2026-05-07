@@ -9,31 +9,25 @@ MODEL:
   CLASSIFIER: "vspcn_baseline"
   PROMPT:
     ENABLE: True
-    BACKEND: "dynamic"             # dynamic / vpt_deep
-    INIT_SOURCE: "distributor_mean"
+    BACKEND: "vpt_deep"             # dynamic / vpt_deep
+    INIT_SOURCE: "learned"    # learned / distributor_mean
     DEEP: True
-    NUM_TOKENS: 16
+    NUM_TOKENS: 32
     DROPOUT: 0.0
     DISTRIBUTOR:
       ENABLE: True
       DISABLE_SAMPLING: True
 
   SEMANTIC_BRANCH:
-    ENABLE: False
-    USE_ANCHOR_FREE: False
-    ANCHOR_TOKENS: 4
-    FREE_TOKENS: 2
-    FREE_COMPETE_LAMBDA: 0.0
+    ENABLE: True
+
+  AFFINITY:
+    ENABLE: True
 
   R_SIMILARITY:
     ENABLE: True
     USE_COSINE: True
     LOGIT_SCALE_INIT: 10.0
-
-  ROLE_MIGRATION:
-    ENABLE: False
-    EARLY_END: 3
-    LATE_START: 9
 
   CONSISTENCY:
     ENABLE: False
@@ -41,12 +35,12 @@ MODEL:
     DIST: "cosine"
 
 SOLVER:
-  BASE_LR: 0.001
+  BASE_LR: 0.0006
   WEIGHT_DECAY: 0.00001
   WARMUP_EPOCH: 3
-  TOTAL_EPOCH: 20
+  TOTAL_EPOCH: 30
   LOSS: "vspcn_baseline"     # softmax_cm   vspcn_baseline
-  LOSS_VSPCN_AR_WEIGHT: 0.0
+  LOSS_VSPCN_AR_WEIGHT: 0.0005
   LOSS_CM_WEIGHT: 0.05
   LOSS_CONS_WEIGHT: 0.00
   LOSS_ANCHOR_CONS_WEIGHT: 0.00
@@ -55,11 +49,11 @@ SOLVER:
   SCHEDULER: "cosine"
   BIAS_MULTIPLIER: 1.0
   VIS:
-    ENABLE: False
-    EPOCH_LIST: [1, 3, 5, 7, 10, 15, 20]
-    SPLITS: ["test_seen", "test_unseen"]
-    MAX_SAMPLES: 8
-    LOCAL_CONTROL: true
-    ROLLOUT: true
-    GT_HN_COMPARE: true
-    TRENDS: true
+    ENABLE: True
+    FINAL_ONLY: True
+    EPOCH_LIST: []
+    SPLITS: ["test_unseen"]
+    MAX_SAMPLES: 5
+    CORRECT_SAMPLES: 3
+    WRONG_SAMPLES: 2
+    ROLLOUT: True
