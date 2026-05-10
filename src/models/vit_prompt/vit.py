@@ -76,6 +76,14 @@ class SemanticTokenProjector(nn.Module):
         # 语义状态及 joint cross-attention 输入的归一化，主要用于稳定更新过程
         self.semantic_norm = nn.LayerNorm(hidden_size, eps=1e-6)
         self.semantic_type_embed = nn.Parameter(torch.zeros(1, self.num_tokens, hidden_size))
+        # BEGIN SEMANTIC_ABLATION_EXPERIMENT
+        self.learned_semantic_token = nn.Parameter(torch.empty(1, self.num_tokens, hidden_size))
+        nn.init.normal_(
+            self.learned_semantic_token,
+            mean=0.0,
+            std=float(semantic_tokens_cfg.LEARNED_INIT_STD),
+        )
+        # END SEMANTIC_ABLATION_EXPERIMENT
 
         # 唯一真实语义交互路由：Qs-K(p+v)
         self.debug_shapes = False
@@ -122,6 +130,19 @@ class SemanticTokenProjector(nn.Module):
         - sem_state：后续逐层被更新的语义状态
         - semantic_input：初始语义输入，便于后续监控或做残差比较
         """
+
+        # BEGIN SEMANTIC_ABLATION_EXPERIMENT
+        if semantics.dim() == 2 and semantics.shape[-1] == 0:
+            batch_size = int(semantics.shape[0])
+            semantic_token = self.learned_semantic_token.to(device).expand(batch_size, -1, -1)
+            semantic_projected = semantic_token[:, 0, :]
+            state = {
+                "semantic_projected": semantic_projected,
+                "semantic_normalized": semantic_projected,
+                "semantic_token": semantic_token,
+            }
+            return semantic_token, state
+        # END SEMANTIC_ABLATION_EXPERIMENT
 
         if semantics.dim() == 3 and semantics.shape[1] == 1:
             semantics = semantics[:, 0, :]

@@ -22,8 +22,11 @@ MODEL:
     ENABLE: True
     NUM_TOKENS: 1
     INPUT_DIM: 312
-    TRAIN_SOURCE: "class_mean"       # label / class_mean / none
-    EVAL_SOURCE: "class_mean"         # label / class_mean / none
+    TRAIN_SOURCE: "class_mean"       # label / class_mean / none / random_fixed / label_shuffle / learned_token
+    EVAL_SOURCE: "class_mean"         # label / class_mean / none / random_fixed / label_shuffle / learned_token
+    RANDOM_SEED: 0
+    RANDOM_STD: 1.0
+    LEARNED_INIT_STD: 0.02
 
   AFFINITY:
     ENABLE: True
@@ -68,3 +71,8 @@ SOLVER:
     CORRECT_SAMPLES: 2
     WRONG_SAMPLES: 2
     ROLLOUT: True
+    SEMANTIC_ABLATION:
+      ENABLE: False
+      DELTA_ASV: False
+      ATTENTION_MASS: False
+      DELTA_REFERENCE_SOURCE: "class_mean"

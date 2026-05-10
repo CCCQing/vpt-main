@@ -140,6 +140,16 @@ class Trainer():
         self._last_ce_logits = None
         self._last_raw_logits = None
 
+        # BEGIN SEMANTIC_ABLATION_EXPERIMENT
+        semantic_cfg = cfg.MODEL.SEMANTIC_TOKENS
+        semantic_gen = torch.Generator(device="cpu")
+        semantic_gen.manual_seed(int(semantic_cfg.RANDOM_SEED))
+        self._semantic_random_fixed = (
+            torch.randn(int(semantic_cfg.INPUT_DIM), generator=semantic_gen)
+            * float(semantic_cfg.RANDOM_STD)
+        )
+        # END SEMANTIC_ABLATION_EXPERIMENT
+
         self._trace_epoch = -1
         self._trace_iter = -1
         self._trace_stage = "init"
@@ -161,6 +171,14 @@ class Trainer():
         self.vis_save_raw = bool(vis_cfg.SAVE_RAW)
         self.vis_save_images = bool(vis_cfg.SAVE_IMAGES)
         self.vis_rollout = bool(vis_cfg.ROLLOUT)
+        # BEGIN SEMANTIC_ABLATION_EXPERIMENT
+        self.semantic_ablation_enable = bool(vis_cfg.SEMANTIC_ABLATION.ENABLE)
+        self.semantic_ablation_delta_asv = bool(vis_cfg.SEMANTIC_ABLATION.DELTA_ASV)
+        self.semantic_ablation_attention_mass = bool(vis_cfg.SEMANTIC_ABLATION.ATTENTION_MASS)
+        self.semantic_ablation_delta_reference_source = str(vis_cfg.SEMANTIC_ABLATION.DELTA_REFERENCE_SOURCE).lower()
+        if self.semantic_ablation_delta_reference_source != "class_mean":
+            raise ValueError("SOLVER.VIS.SEMANTIC_ABLATION.DELTA_REFERENCE_SOURCE currently supports only 'class_mean'.")
+        # END SEMANTIC_ABLATION_EXPERIMENT
         self.vis_dir = os.path.join(self.cfg.OUTPUT_DIR, "visualization")
         self._last_attn_weights = None
         self._vis_processed = 0
@@ -504,14 +522,36 @@ class Trainer():
         semantic_cfg = self.cfg.MODEL.SEMANTIC_TOKENS
         source = semantic_cfg.TRAIN_SOURCE if is_train else semantic_cfg.EVAL_SOURCE
         source = str(source).lower()
-        if source not in {"label", "class_mean", "none"}:
+        # BEGIN SEMANTIC_ABLATION_EXPERIMENT
+        valid_sources = {"label", "class_mean", "none", "random_fixed", "label_shuffle", "learned_token"}
+        # END SEMANTIC_ABLATION_EXPERIMENT
+        if source not in valid_sources:
             raise ValueError(
-                "Unsupported MODEL.SEMANTIC_TOKENS.{}_SOURCE='{}'; expected one of label/class_mean/none.".format(
+                "Unsupported MODEL.SEMANTIC_TOKENS.{}_SOURCE='{}'; expected one of {}.".format(
                     "TRAIN" if is_train else "EVAL",
                     source,
+                    "/".join(sorted(valid_sources)),
                 )
             )
         return source
+
+    # BEGIN SEMANTIC_ABLATION_EXPERIMENT
+    def _class_mean_semantics(self, dataset, batch_size: int) -> torch.Tensor:
+        if dataset is None or not hasattr(dataset, "class_attributes") or dataset.class_attributes is None:
+            raise ValueError("MODEL.SEMANTIC_TOKENS source='class_mean' requires dataset.class_attributes.")
+        class_attributes = dataset.class_attributes
+        if not torch.is_tensor(class_attributes):
+            class_attributes = torch.from_numpy(class_attributes)
+        mean_attr = class_attributes.to(self.device, non_blocking=True).float().mean(dim=0)
+        return mean_attr.unsqueeze(0).expand(int(batch_size), -1)
+
+    def _label_semantics(self, attributes) -> torch.Tensor:
+        if attributes is None:
+            raise ValueError("MODEL.SEMANTIC_TOKENS source='label' requires batch['attribute'].")
+        if not torch.is_tensor(attributes):
+            attributes = torch.from_numpy(attributes)
+        return attributes.to(self.device, non_blocking=True).float()
+    # END SEMANTIC_ABLATION_EXPERIMENT
 
     def _prepare_semantics_for_stage(self, attributes, dataset, batch_size: int, is_train: bool):
         if not bool(self.cfg.MODEL.SEMANTIC_TOKENS.ENABLE):
@@ -520,18 +560,28 @@ class Trainer():
         if source == "none":
             return None
         if source == "label":
-            if attributes is None:
-                raise ValueError("MODEL.SEMANTIC_TOKENS source='label' requires batch['attribute'].")
-            if not torch.is_tensor(attributes):
-                attributes = torch.from_numpy(attributes)
-            return attributes.to(self.device, non_blocking=True)
-        if dataset is None or not hasattr(dataset, "class_attributes") or dataset.class_attributes is None:
-            raise ValueError("MODEL.SEMANTIC_TOKENS source='class_mean' requires dataset.class_attributes.")
-        class_attributes = dataset.class_attributes
-        if not torch.is_tensor(class_attributes):
-            class_attributes = torch.from_numpy(class_attributes)
-        mean_attr = class_attributes.to(self.device, non_blocking=True).float().mean(dim=0)
-        return mean_attr.unsqueeze(0).expand(int(batch_size), -1)
+            return self._label_semantics(attributes)
+        if source == "class_mean":
+            return self._class_mean_semantics(dataset, batch_size)
+        # BEGIN SEMANTIC_ABLATION_EXPERIMENT
+        if source == "random_fixed":
+            return self._semantic_random_fixed.to(self.device, non_blocking=True).float().unsqueeze(0).expand(int(batch_size), -1)
+        if source == "label_shuffle":
+            label_semantics = self._label_semantics(attributes)
+            if int(label_semantics.shape[0]) != int(batch_size):
+                raise ValueError(
+                    f"label_shuffle requires attributes batch size {int(batch_size)}, got {int(label_semantics.shape[0])}."
+                )
+            if int(batch_size) < 2:
+                raise ValueError("label_shuffle requires batch_size >= 2.")
+            perm = torch.randperm(int(batch_size), device=label_semantics.device)
+            if bool(torch.equal(perm, torch.arange(int(batch_size), device=label_semantics.device))):
+                perm = torch.roll(perm, shifts=1, dims=0)
+            return label_semantics.index_select(0, perm)
+        if source == "learned_token":
+            return torch.empty((int(batch_size), 0), device=self.device, dtype=torch.float32)
+        # END SEMANTIC_ABLATION_EXPERIMENT
+        raise ValueError(f"Unsupported MODEL.SEMANTIC_TOKENS source='{source}'.")
 
     def _log_optimizer_param_groups(self):
         named = self._named_params()
@@ -1249,13 +1299,214 @@ class Trainer():
             arrays[f"layer_{li:02d}_prompt_heads_vis"] = np.asarray(item["head_vis"], dtype=np.float32)
         np.savez_compressed(as_long_path(path), **arrays)
 
-    def _vis_collect_sample(self, split: str, local_idx: int, sample_idx: int, image_chw: torch.Tensor, logits: torch.Tensor, target: int, pred: int, is_correct: bool, global_class_ids, model_ref,):
+    # BEGIN SEMANTIC_ABLATION_EXPERIMENT
+    def _attention_mass_rows_and_arrays(self, split: str, sample_idx: int, target: int, pred: int, is_correct: bool,
+        local_idx: int, attn_weights: list,):
+        if not isinstance(attn_weights, list) or len(attn_weights) == 0:
+            raise ValueError("attention mass requires per-layer attention weights.")
+        prompt_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS) if bool(self.cfg.MODEL.PROMPT.ENABLE) else 0
+        semantic_len = int(self._last_semantic_length)
+        if prompt_len <= 0:
+            raise ValueError("attention mass prompt-to-S requires MODEL.PROMPT.ENABLE=True and NUM_TOKENS>0.")
+        if semantic_len <= 0:
+            raise ValueError("attention mass requires active semantic tokens.")
+
+        rows = []
+        arrays = {}
+        for li, weights in enumerate(attn_weights):
+            if (not torch.is_tensor(weights)) or weights.dim() != 4 or local_idx >= weights.shape[0]:
+                raise ValueError(f"Invalid attention weights at layer {li}: expected [B,H,T,T].")
+            sample = weights[local_idx].detach().cpu().float()
+            num_heads = int(sample.shape[0])
+            start_patch = 1 + prompt_len
+            end_patch = int(sample.shape[-1] - semantic_len)
+            if end_patch <= start_patch:
+                raise ValueError(f"Layer {li} has no visual patch segment for attention mass.")
+            sem_slice = slice(end_patch, end_patch + semantic_len)
+            prompt_slice = slice(1, 1 + prompt_len)
+            visual_slice = slice(start_patch, end_patch)
+
+            s_to_cls = sample[:, sem_slice, 0].mean(dim=1)
+            cls_to_s = sample[:, 0, sem_slice].sum(dim=1)
+            v_to_s_tokens = sample[:, visual_slice, sem_slice].sum(dim=-1)
+            p_to_s_tokens = sample[:, prompt_slice, sem_slice].sum(dim=-1)
+            s_to_v = sample[:, sem_slice, visual_slice].mean(dim=1)
+            cls_to_v = sample[:, 0, visual_slice]
+
+            s_centered = s_to_v - s_to_v.mean(dim=1, keepdim=True)
+            c_centered = cls_to_v - cls_to_v.mean(dim=1, keepdim=True)
+            numerator = (s_centered * c_centered).sum(dim=1)
+            denominator = torch.sqrt((s_centered.square().sum(dim=1)) * (c_centered.square().sum(dim=1)))
+            corr = torch.where(
+                denominator > 0,
+                numerator / denominator,
+                torch.full_like(numerator, float("nan")),
+            )
+
+            arrays[f"layer_{li:02d}_v_to_s_token_mass"] = v_to_s_tokens.numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_p_to_s_token_mass"] = p_to_s_tokens.numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_s_to_v_attention"] = s_to_v.numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_cls_to_v_attention"] = cls_to_v.numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_s_to_cls"] = s_to_cls.numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_cls_to_s"] = cls_to_s.numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_corr_s_cls_to_v"] = corr.numpy().astype(np.float32)
+
+            for hi in range(num_heads):
+                rows.append({
+                    "sample_id": int(sample_idx),
+                    "split": str(split),
+                    "epoch": int(self._trace_epoch + 1),
+                    "is_correct": int(bool(is_correct)),
+                    "y": int(target),
+                    "pred": int(pred),
+                    "layer": int(li),
+                    "head": int(hi),
+                    "mass_s_to_cls": float(s_to_cls[hi].item()),
+                    "mass_cls_to_s": float(cls_to_s[hi].item()),
+                    "mass_v_to_s_mean": float(v_to_s_tokens[hi].mean().item()),
+                    "mass_v_to_s_sum": float(v_to_s_tokens[hi].sum().item()),
+                    "mass_v_to_s_max": float(v_to_s_tokens[hi].max().item()),
+                    "mass_p_to_s_mean": float(p_to_s_tokens[hi].mean().item()),
+                    "mass_p_to_s_sum": float(p_to_s_tokens[hi].sum().item()),
+                    "mass_p_to_s_max": float(p_to_s_tokens[hi].max().item()),
+                    "corr_s_cls_to_v": float(corr[hi].item()),
+                })
+            finite_corr = corr[torch.isfinite(corr)]
+            corr_mean = float(finite_corr.mean().item()) if finite_corr.numel() > 0 else float("nan")
+            rows.append({
+                "sample_id": int(sample_idx),
+                "split": str(split),
+                "epoch": int(self._trace_epoch + 1),
+                "is_correct": int(bool(is_correct)),
+                "y": int(target),
+                "pred": int(pred),
+                "layer": int(li),
+                "head": -1,
+                "mass_s_to_cls": float(s_to_cls.mean().item()),
+                "mass_cls_to_s": float(cls_to_s.mean().item()),
+                "mass_v_to_s_mean": float(v_to_s_tokens.mean().item()),
+                "mass_v_to_s_sum": float(v_to_s_tokens.sum(dim=1).mean().item()),
+                "mass_v_to_s_max": float(v_to_s_tokens.max(dim=1).values.mean().item()),
+                "mass_p_to_s_mean": float(p_to_s_tokens.mean().item()),
+                "mass_p_to_s_sum": float(p_to_s_tokens.sum(dim=1).mean().item()),
+                "mass_p_to_s_max": float(p_to_s_tokens.max(dim=1).values.mean().item()),
+                "corr_s_cls_to_v": corr_mean,
+            })
+        return rows, arrays
+
+    def _vis_save_attention_mass(self, sample_dir: str, split: str, sample_idx: int, target: int, pred: int,
+        is_correct: bool, local_idx: int, attn_weights: list,) -> None:
+        rows, arrays = self._attention_mass_rows_and_arrays(
+            split=split,
+            sample_idx=sample_idx,
+            target=target,
+            pred=pred,
+            is_correct=is_correct,
+            local_idx=local_idx,
+            attn_weights=attn_weights,
+        )
+        if self.vis_save_raw:
+            np.savez_compressed(as_long_path(os.path.join(sample_dir, "attention_mass_layers.npz")), **arrays)
+        csv_path = os.path.join(sample_dir, "attention_mass_layers.csv")
+        header = [
+            "sample_id", "split", "epoch", "is_correct", "y", "pred", "layer", "head",
+            "mass_s_to_cls", "mass_cls_to_s", "mass_v_to_s_mean", "mass_v_to_s_sum",
+            "mass_v_to_s_max", "mass_p_to_s_mean", "mass_p_to_s_sum", "mass_p_to_s_max",
+            "corr_s_cls_to_v",
+        ]
+        with open(as_long_path(csv_path), "w", encoding="utf-8", newline="") as f:
+            f.write(",".join(header) + "\n")
+            for row in rows:
+                f.write(",".join(str(row[key]) for key in header) + "\n")
+
+    def _qskv_prob_by_layer(self, local_idx: int, affinities: list) -> dict:
+        if not isinstance(affinities, list) or len(affinities) == 0:
+            raise ValueError("Delta-Asv requires affinity outputs.")
+        out = {}
+        for li, aff in enumerate(affinities):
+            if not isinstance(aff, dict):
+                raise ValueError(f"Invalid affinity entry at layer {li}.")
+            raw = aff.get("QsKv_raw", None)
+            if (not torch.is_tensor(raw)) or raw.dim() != 4 or local_idx >= raw.shape[0]:
+                raise ValueError(f"Delta-Asv requires QsKv_raw [B,H,S,V] at layer {li}.")
+            raw_sample = raw[local_idx].detach().cpu().float()
+            prob_sample = torch.softmax(raw_sample, dim=-1)
+            out[int(li)] = {
+                "raw": raw_sample,
+                "prob": prob_sample,
+            }
+        return out
+
+    def _class_mean_reference_affinities(self, image_chw: torch.Tensor, dataset, global_class_ids):
+        if self.affinity_cfg is None:
+            raise ValueError("Delta-Asv requires affinity configuration.")
+        ref_input = image_chw.unsqueeze(0).to(self.device, non_blocking=True)
+        ref_semantics = self._class_mean_semantics(dataset, batch_size=1)
+        ref_affinity_cfg = dict(self.affinity_cfg)
+        ref_affinity_cfg["semantic_length"] = int(self.cfg.MODEL.SEMANTIC_TOKENS.NUM_TOKENS)
+        _, ref_affinities = self.model.forward_with_affinity(
+            ref_input,
+            ref_affinity_cfg,
+            semantics=ref_semantics,
+            vis=False,
+            class_ids=global_class_ids,
+        )
+        return ref_affinities
+
+    def _vis_save_delta_asv(self, sample_dir: str, image_u8: np.ndarray, current_affinities: list,
+        reference_affinities: list, current_local_idx: int,) -> None:
+        current = self._qskv_prob_by_layer(current_local_idx, current_affinities)
+        reference = self._qskv_prob_by_layer(0, reference_affinities)
+        shared_layers = sorted(set(current.keys()) & set(reference.keys()))
+        if len(shared_layers) == 0:
+            raise ValueError("Delta-Asv found no shared QsKv layers.")
+
+        arrays = {}
+        panel_images = []
+        panel_titles = []
+        h, w = image_u8.shape[:2]
+        for li in shared_layers:
+            cur_prob = current[li]["prob"]
+            ref_prob = reference[li]["prob"]
+            if tuple(cur_prob.shape) != tuple(ref_prob.shape):
+                raise ValueError(
+                    f"Delta-Asv shape mismatch at layer {li}: current={tuple(cur_prob.shape)} reference={tuple(ref_prob.shape)}"
+                )
+            delta_prob = cur_prob - ref_prob
+            abs_delta_map = delta_prob.abs().mean(dim=(0, 1))
+            n_patch = int(abs_delta_map.shape[-1])
+            g = self._infer_grid(n_patch)
+            grid = abs_delta_map.view(g, g).numpy()
+
+            arrays[f"layer_{li:02d}_asv_current_raw"] = current[li]["raw"].numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_asv_reference_raw"] = reference[li]["raw"].numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_asv_current_prob"] = cur_prob.numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_asv_reference_prob"] = ref_prob.numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_delta_asv_prob"] = delta_prob.numpy().astype(np.float32)
+            arrays[f"layer_{li:02d}_abs_delta_asv_grid"] = grid.astype(np.float32)
+
+            if self.vis_save_images:
+                panel_images.append(overlay_heatmap(image_u8, resize_map_torch(grid, (h, w))))
+                panel_titles.append(f"abs Delta Asv L{li:02d}")
+
+        if self.vis_save_images and len(panel_images) > 0:
+            save_panel(
+                os.path.join(sample_dir, "delta_asv_layers.png"),
+                panel_images,
+                titles=panel_titles,
+                ncols=min(4, len(panel_images)),
+            )
+        if self.vis_save_raw:
+            np.savez_compressed(as_long_path(os.path.join(sample_dir, "delta_asv_layers.npz")), **arrays)
+    # END SEMANTIC_ABLATION_EXPERIMENT
+
+    def _vis_collect_sample(self, split: str, local_idx: int, sample_idx: int, image_chw: torch.Tensor, logits: torch.Tensor, target: int, pred: int, is_correct: bool, global_class_ids, model_ref, dataset, current_affinities: list, current_attn_weights: list,):
         if not self._vis_should_collect_case(is_correct):
             return
         r_head = model_ref.r_similarity_head
         if r_head is None:
             return
-        affinities = r_head._runtime_affinities
+        affinities = current_affinities
         if not isinstance(affinities, list):
             return
 
@@ -1347,9 +1598,38 @@ class Trainer():
                 qpks_prompt_maps,
             )
 
+        # BEGIN SEMANTIC_ABLATION_EXPERIMENT
+        if self.semantic_ablation_enable and self.semantic_ablation_attention_mass:
+            self._vis_save_attention_mass(
+                sample_dir=sample_dir,
+                split=split,
+                sample_idx=sample_idx,
+                target=target,
+                pred=pred,
+                is_correct=is_correct,
+                local_idx=local_idx,
+                attn_weights=current_attn_weights,
+            )
+        if self.semantic_ablation_enable and self.semantic_ablation_delta_asv:
+            if not semantic_enable:
+                raise ValueError("Delta-Asv visualization requires active semantic tokens.")
+            reference_affinities = self._class_mean_reference_affinities(
+                image_chw=image_chw,
+                dataset=dataset,
+                global_class_ids=global_class_ids,
+            )
+            self._vis_save_delta_asv(
+                sample_dir=sample_dir,
+                image_u8=img_u8,
+                current_affinities=affinities,
+                reference_affinities=reference_affinities,
+                current_local_idx=local_idx,
+            )
+        # END SEMANTIC_ABLATION_EXPERIMENT
+
         # Group 2: rollout maps (CLS + prompt tokens).
-        if self.vis_rollout and isinstance(self._last_attn_weights, list) and len(self._last_attn_weights) > 0:
-            roll = attention_rollout(self._last_attn_weights)
+        if self.vis_rollout and isinstance(current_attn_weights, list) and len(current_attn_weights) > 0:
+            roll = attention_rollout(current_attn_weights)
             if torch.is_tensor(roll) and local_idx < roll.shape[0]:
                 r = roll[local_idx].detach().cpu()
                 p_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS) if bool(self.cfg.MODEL.PROMPT.ENABLE) else 0
@@ -1987,6 +2267,7 @@ class Trainer():
             if self._vis_split_enabled(prefix):
                 r_head_vis = model_ref.r_similarity_head
                 affinities_vis = r_head_vis._runtime_affinities if r_head_vis is not None else None
+                attn_weights_vis = self._last_attn_weights
                 if torch.is_tensor(logits):
                     bsz = int(logits.shape[0])
                     for bi in range(bsz):
@@ -2009,6 +2290,9 @@ class Trainer():
                             is_correct=is_correct,
                             global_class_ids=eval_class_ids,
                             model_ref=model_ref,
+                            dataset=data_loader.dataset,
+                            current_affinities=affinities_vis,
+                            current_attn_weights=attn_weights_vis,
                         )
 
         # 一个 split 跑完后的整体日志
