@@ -204,7 +204,7 @@ class Attention(nn.Module):
             self._shape_debug_forward_proj_logged = True
         return attention_output, weights, query_layer, key_layer
 
-    def compute_prompt_visual_monitors(self, query_layer, key_layer, prompt_length, *, detach=True):
+    def compute_prompt_visual_monitors(self, query_layer, key_layer, prompt_length, semantic_length=0, *, detach=True):
         """
         统一导出主干 prompt/visual 的原始亲和矩阵。
 
@@ -221,20 +221,25 @@ class Attention(nn.Module):
         q_base = query_layer.detach() if detach else query_layer
         k_base = key_layer.detach() if detach else key_layer
 
-        if q_base.size(2) < 1 + prompt_length or k_base.size(2) < 1 + prompt_length:
+        if q_base.size(2) < 1 + prompt_length + semantic_length or k_base.size(2) < 1 + prompt_length + semantic_length:
             raise ValueError(
-                f"Sequence length is insufficient for prompt_length={prompt_length}: "
+                f"Sequence length is insufficient for prompt_length={prompt_length}, semantic_length={semantic_length}: "
                 f"q_len={q_base.size(2)}, k_len={k_base.size(2)}"
             )
 
         cls_offset = 1
         prompt_slice = slice(cls_offset, cls_offset + prompt_length)
-        patch_slice = slice(cls_offset + prompt_length, None)
+        patch_start = cls_offset + prompt_length
+        patch_end = q_base.size(2) - int(semantic_length)
+        patch_slice = slice(patch_start, patch_end)
+        semantic_slice = slice(patch_end, q_base.size(2))
 
         q_prompt = q_base[:, :, prompt_slice, :]
         q_patch = q_base[:, :, patch_slice, :]
+        q_semantic = q_base[:, :, semantic_slice, :]
         k_prompt = k_base[:, :, prompt_slice, :]
         k_patch = k_base[:, :, patch_slice, :]
+        k_semantic = k_base[:, :, semantic_slice, :]
         scale = 1.0 / math.sqrt(self.attention_head_size)
 
         monitors = {}
@@ -252,6 +257,26 @@ class Attention(nn.Module):
             qpkv_raw = torch.matmul(q_prompt, k_patch.transpose(-1, -2)) * scale
             monitors["QpKv_raw"] = qpkv_raw
             monitors["QpKv_vis"] = self._minmax_normalize_lastdim(qpkv_raw)
+
+        if q_semantic.numel() > 0 and k_patch.numel() > 0:
+            qskv_raw = torch.matmul(q_semantic, k_patch.transpose(-1, -2)) * scale
+            monitors["QsKv_raw"] = qskv_raw
+            monitors["QsKv_vis"] = self._minmax_normalize_lastdim(qskv_raw)
+
+        if q_patch.numel() > 0 and k_semantic.numel() > 0:
+            qvks_raw = torch.matmul(q_patch, k_semantic.transpose(-1, -2)) * scale
+            monitors["QvKs_raw"] = qvks_raw
+            monitors["QvKs_vis"] = self._minmax_normalize_lastdim(qvks_raw)
+
+        if q_semantic.numel() > 0 and k_prompt.numel() > 0:
+            qskp_raw = torch.matmul(q_semantic, k_prompt.transpose(-1, -2)) * scale
+            monitors["QsKp_raw"] = qskp_raw
+            monitors["QsKp_vis"] = self._minmax_normalize_lastdim(qskp_raw)
+
+        if q_prompt.numel() > 0 and k_semantic.numel() > 0:
+            qpks_raw = torch.matmul(q_prompt, k_semantic.transpose(-1, -2)) * scale
+            monitors["QpKs_raw"] = qpks_raw
+            monitors["QpKs_vis"] = self._minmax_normalize_lastdim(qpks_raw)
 
         return monitors
 
@@ -408,6 +433,7 @@ class Block(nn.Module):
             q_proj,
             k_proj,
             affinity_config.get("prompt_length", 0),
+            affinity_config.get("semantic_length", 0),
             detach=affinity_config.get("detach", True),
         )
 
@@ -547,6 +573,8 @@ class Transformer(nn.Module):
         super(Transformer, self).__init__()
         self.embeddings = Embeddings(config, img_size=img_size)
         self.encoder = Encoder(config, vis)
+        self._last_semantic_token_state = None
+        self._last_prompt_path_info = {}
 
     def forward(self, input_ids, semantics: torch.Tensor = None):
         """标准前向：返回编码后的序列与注意力权重。"""

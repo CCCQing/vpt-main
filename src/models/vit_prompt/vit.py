@@ -37,55 +37,14 @@ from ...utils import logging
 logger = logging.get_logger("visual_prompt")
 
 
-class SemanticCrossAttention(nn.Module):
+class _UnusedCrossAttention(nn.Module):
     """最小跨注意力单元。
 
     它只负责一件事：让 query 序列从 source 序列中读取上下文。
     文件里语义、prompt、visual 三者的交互都复用它，因此它不绑定任何业务语义，
     只关心输入输出的张量形状。
     """
-    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.0) -> None:
-        super().__init__()
-        if hidden_size % num_heads != 0:
-            raise ValueError("hidden_size must be divisible by num_heads")
-        self.hidden_size = int(hidden_size)
-        self.num_heads = int(num_heads)
-        self.head_dim = self.hidden_size // self.num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.q_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        self.k_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        self.v_proj = nn.Linear(self.hidden_size, self.hidden_size)
-
-        self.out_proj = nn.Linear(self.hidden_size, self.hidden_size)
-
-        self.attn_dropout = nn.Dropout(float(dropout))
-        self.proj_dropout = nn.Dropout(float(dropout))
-
-    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
-        bsz, seq, _ = x.shape
-        x = x.view(bsz, seq, self.num_heads, self.head_dim)
-        return x.permute(0, 2, 1, 3).contiguous()
-
-    def forward(self, query: torch.Tensor, source: torch.Tensor):
-        # query: [B,Q,D], source: [B,K,D]
-        q = self._reshape_heads(self.q_proj(query))
-        k = self._reshape_heads(self.k_proj(source))
-        v = self._reshape_heads(self.v_proj(source))
-
-        logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale  # [B,H,Q,K]
-        attn = torch.softmax(logits, dim=-1)
-        attn = self.attn_dropout(attn)
-
-        ctx = torch.matmul(attn, v)  # [B,H,Q,d]
-        ctx = ctx.permute(0, 2, 1, 3).contiguous().view(query.shape[0], query.shape[1], self.hidden_size)
-
-        out = self.out_proj(ctx)
-        out = self.proj_dropout(out)
-        return out, attn, logits
-
-
-class LateSemanticSideBranch(nn.Module):
+class SemanticTokenProjector(nn.Module):
     """轻量语义交互分支。
 
     当前版本不再把语义拆成多 token 并单独做 readout，而是维护一个单语义状态：
@@ -102,74 +61,25 @@ class LateSemanticSideBranch(nn.Module):
 
     因此它更像一个“语义状态机”，而不是完整的语义编码器。
     """
-    def __init__(self, hidden_size: int, semantic_branch_cfg) -> None:
+    def __init__(self, hidden_size: int, semantic_tokens_cfg) -> None:
         super().__init__()
-        if semantic_branch_cfg is None:
-            raise ValueError("semantic_branch_cfg is required for LateSemanticSideBranch")
+        if semantic_tokens_cfg is None:
+            raise ValueError("semantic_tokens_cfg is required for SemanticTokenProjector")
         self.hidden_size = int(hidden_size)
 
-        sb = semantic_branch_cfg
-        self.cross_attn_enable = bool(sb.CROSS_ATTN_ENABLE)
-        self.cross_attn_num_heads = int(sb.CROSS_ATTN_HEADS)
-        self.cross_attn_dropout = float(sb.CROSS_ATTN_DROPOUT)
-        self.cross_attn_pre_norm = bool(sb.CROSS_ATTN_PRE_NORM)
-        self.cross_attn_use_ffn = bool(sb.CROSS_ATTN_USE_FFN)
-
-        self.num_tokens = 1
-        self.gamma_min = float(sb.GAMMA_MIN)
-        self.gamma_max = float(sb.GAMMA_MAX)
-        self.start_layer = int(sb.START_LAYER)
-        self.end_layer = int(sb.END_LAYER)
-
-        self.semantic_input_proj: Optional[nn.Linear] = None
+        self.num_tokens = int(semantic_tokens_cfg.NUM_TOKENS)
+        if self.num_tokens != 1:
+            raise ValueError("The current semantic-token main-sequence design requires NUM_TOKENS=1.")
+        self.input_dim = int(semantic_tokens_cfg.INPUT_DIM)
+        self.semantic_input_proj = nn.Linear(self.input_dim, self.hidden_size)
 
         # 语义状态及 joint cross-attention 输入的归一化，主要用于稳定更新过程
-        self.delta_norm = nn.LayerNorm(hidden_size, eps=1e-6)
-        self.sem_prompt_visual_q_norm = nn.LayerNorm(hidden_size, eps=1e-6)
-        self.sem_prompt_visual_kv_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.semantic_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        self.semantic_type_embed = nn.Parameter(torch.zeros(1, self.num_tokens, hidden_size))
 
         # 唯一真实语义交互路由：Qs-K(p+v)
-        self.sem_from_prompt_visual_attn = SemanticCrossAttention(
-            hidden_size=hidden_size,
-            num_heads=self.cross_attn_num_heads,
-            dropout=self.cross_attn_dropout,
-        )
-        self.sem_ffn_norm = nn.LayerNorm(hidden_size, eps=1e-6)
-        self.sem_ffn = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.GELU(),
-            nn.Dropout(self.cross_attn_dropout),
-            nn.Linear(hidden_size * 4, hidden_size),
-            nn.Dropout(self.cross_attn_dropout),
-        )
-
         self.debug_shapes = False
-        self._shape_debug_step_logged = False
         self._shape_debug_init_logged = False
-
-    @staticmethod
-    def _minmax_normalize_tokens(x: torch.Tensor) -> torch.Tensor:
-        x_min = x.amin(dim=-1, keepdim=True)
-        x_max = x.amax(dim=-1, keepdim=True)
-        denom = (x_max - x_min).clamp_min(1e-12)
-        return (x - x_min) / denom
-
-    def _pack_qskpv_outputs(self, attn: torch.Tensor, logits: torch.Tensor) -> Dict[str, torch.Tensor]:
-        if (not torch.is_tensor(attn)) or (not torch.is_tensor(logits)):
-            return {}
-        if attn.dim() != 4 or logits.dim() != 4 or attn.shape[2] != 1 or logits.shape[2] != 1:
-            raise ValueError(
-                "Qs-K(p+v) expects attention/logits with shape [B,H,1,P+V], "
-                f"got attn={tuple(attn.shape)} logits={tuple(logits.shape)}"
-            )
-        raw = logits.squeeze(2).contiguous()
-        attn_unified = attn.squeeze(2).contiguous()
-        vis = self._minmax_normalize_tokens(raw)
-        return {
-            "QsKpv_raw": raw,
-            "QsKpv_attn": attn_unified,
-            "QsKpv_vis": vis,
-        }
 
     def _ensure_semantic_input_proj(self, semantic_dim: int, device: torch.device):
         """按需创建语义输入投影层。
@@ -178,8 +88,8 @@ class LateSemanticSideBranch(nn.Module):
         这里第一次看到真实语义维度时，再创建 semantic_dim -> hidden_size
         的线性层，避免把语义维度硬编码在配置里。
         """
-        if self.semantic_input_proj is None:
-            self.semantic_input_proj = nn.Linear(int(semantic_dim), self.hidden_size).to(device)
+        if int(semantic_dim) != self.input_dim:
+            raise ValueError(f"Semantic input dim mismatch: expected {self.input_dim}, got {int(semantic_dim)}")
 
     def _gamma(self, layer_idx: int, num_layers: int) -> float:
         """返回当前层的语义更新强度。
@@ -216,73 +126,35 @@ class LateSemanticSideBranch(nn.Module):
         if semantics.dim() == 3 and semantics.shape[1] == 1:
             semantics = semantics[:, 0, :]
         if semantics.dim() != 2:
-            raise ValueError(f"LateSemanticSideBranch expects [B, S] or [B,1,S], got {tuple(semantics.shape)}")
+            raise ValueError(f"SemanticTokenProjector expects [B, S] or [B,1,S], got {tuple(semantics.shape)}")
 
         self._ensure_semantic_input_proj(semantics.shape[-1], device=device)
-        semantic_input = self.semantic_input_proj(semantics.to(device))
-        sem_state = self.delta_norm(semantic_input)
+        semantic_projected = self.semantic_input_proj(semantics.to(device))
+        semantic_normalized = self.semantic_norm(semantic_projected)
+        semantic_token = semantic_normalized.unsqueeze(1) + self.semantic_type_embed
 
         if self.debug_shapes and (not self._shape_debug_init_logged):
             print(
-                "[SHAPE-DEBUG] LateSemanticSideBranch.init_state semantics={} semantic_input={} sem_state={}".format(
+                "[SHAPE-DEBUG] SemanticTokenProjector.init_state semantics={} projected={} token={}".format(
                     tuple(semantics.shape),
-                    tuple(semantic_input.shape),
-                    tuple(sem_state.shape),
+                    tuple(semantic_projected.shape),
+                    tuple(semantic_token.shape),
                 )
             )
             self._shape_debug_init_logged = True
-        return sem_state, semantic_input
+        state = {
+            "semantic_projected": semantic_projected,
+            "semantic_normalized": semantic_normalized,
+            "semantic_token": semantic_token,
+        }
+        return semantic_token, state
 
-    def step(self, sem_state: torch.Tensor, prompt_tokens: torch.Tensor, visual_tokens: torch.Tensor,
+    def _disabled_step(self, sem_state: torch.Tensor, prompt_tokens: torch.Tensor, visual_tokens: torch.Tensor,
         layer_idx: int, num_layers: int,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, float]]:
         """执行单层语义交互更新：sem_state 作为 query，从 prompt+visual token 中读取上下文。"""
-        gamma = float(self._gamma(layer_idx, num_layers))
+        raise RuntimeError("Semantic tokens are updated only by ViT self-attention in the main token sequence.")
 
-        if self.cross_attn_enable:
-            if (not torch.is_tensor(prompt_tokens)) or prompt_tokens.numel() == 0:
-                raise ValueError("prompt_tokens is required for Qs-K(p+v), but got None/empty prompt_tokens.")
-            if (not torch.is_tensor(visual_tokens)) or visual_tokens.numel() == 0:
-                raise ValueError("visual_tokens is required for Qs-K(p+v), but got None/empty visual_tokens.")
-
-            pv_tokens = torch.cat((prompt_tokens, visual_tokens), dim=1)
-            sem_q = self.sem_prompt_visual_q_norm(sem_state) if self.cross_attn_pre_norm else sem_state
-            pv_kv = self.sem_prompt_visual_kv_norm(pv_tokens) if self.cross_attn_pre_norm else pv_tokens
-            ctx_pv_tok, qskpv_attn, qskpv_logits = self.sem_from_prompt_visual_attn(sem_q.unsqueeze(1), pv_kv)
-            ctx_pv = ctx_pv_tok.squeeze(1)
-
-            sem_next = sem_state + gamma * ctx_pv
-            if self.cross_attn_use_ffn:
-                ffn_in = self.sem_ffn_norm(sem_next) if self.cross_attn_pre_norm else sem_next
-                sem_next = sem_next + gamma * self.sem_ffn(ffn_in)
-            sem_next = self.delta_norm(sem_next)
-
-            out_aff = self._pack_qskpv_outputs(qskpv_attn, qskpv_logits)
-            diag = {
-                "gamma": gamma,
-                "qskpv_energy": float(qskpv_attn.float().abs().mean().item()) if torch.is_tensor(qskpv_attn) and qskpv_attn.numel() > 0 else 0.0,
-                "cross_attn_enable": True,
-            }
-            if self.debug_shapes and (not self._shape_debug_step_logged):
-                print(
-                    "[SHAPE-DEBUG] LateSemanticSideBranch.step sem_state={} prompt_tokens={} visual_tokens={} "
-                    "QsKpv_logits={} QsKpv_attn={} ctx_pv={} sem_next={}".format(
-                        tuple(sem_state.shape),
-                        tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None,
-                        tuple(visual_tokens.shape) if torch.is_tensor(visual_tokens) else None,
-                        tuple(qskpv_logits.shape) if torch.is_tensor(qskpv_logits) else None,
-                        tuple(qskpv_attn.shape) if torch.is_tensor(qskpv_attn) else None,
-                        tuple(ctx_pv.shape),
-                        tuple(sem_next.shape),
-                    )
-                )
-                self._shape_debug_step_logged = True
-            return sem_next, out_aff, diag
-        raise RuntimeError(
-            "LateSemanticSideBranch requires MODEL.SEMANTIC_BRANCH.CROSS_ATTN_ENABLE=True; "
-            "the legacy normalize/einsum semantic update path was removed."
-        )
-
-    def readout(self, sem_state: torch.Tensor) -> torch.Tensor:
+    def export_token_state(self, sem_state: torch.Tensor) -> torch.Tensor:
         """最简输出接口。
 
         旧版会再过 readout head，把语义 token 汇聚成最终语义向量。
@@ -301,8 +173,8 @@ class PromptedTransformer(Transformer):
 
     def __init__(self, prompt_config, config, img_size, vis, prompt_init=None, prompt_init_provider=None):
 
-        self.semantic_branch_cfg = prompt_config.SEMANTIC_BRANCH
-        self.semantic_branch_enable = bool(self.semantic_branch_cfg.ENABLE)
+        self.semantic_tokens_cfg = prompt_config.SEMANTIC_TOKENS
+        self.semantic_tokens_enable = bool(self.semantic_tokens_cfg.ENABLE)
         self.prompt_enable = bool(prompt_config.ENABLE)
         self.prompt_backend = prompt_config.BACKEND.lower()
         if self.prompt_backend not in {"dynamic", "vpt_deep"}:
@@ -316,15 +188,15 @@ class PromptedTransformer(Transformer):
         self.prompt_config = prompt_config
         self.vit_config = config
         # 运行时缓存：最近一次前向得到的语义侧最终状态。
-        self._last_semantic_side_state = None
+        self._last_semantic_token_state = None
 
-        if self.semantic_branch_enable:
-            self.semantic_side_branch = LateSemanticSideBranch(
+        if self.semantic_tokens_enable:
+            self.semantic_token_projector = SemanticTokenProjector(
                 hidden_size=int(config.hidden_size),
-                semantic_branch_cfg=self.semantic_branch_cfg,
+                semantic_tokens_cfg=self.semantic_tokens_cfg,
             )
         else:
-            self.semantic_side_branch = None
+            self.semantic_token_projector = None
 
         # 统一 image / patch 大小表示，避免后续 mixed tuple/int 判断
         img_size = _pair(img_size)
@@ -364,8 +236,8 @@ class PromptedTransformer(Transformer):
                 )
 
         # 把 shape debug 开关同步到语义分支与编码器各层
-        if self.semantic_side_branch is not None:
-            self.semantic_side_branch.debug_shapes = bool(self.debug_shapes)
+        if self.semantic_token_projector is not None:
+            self.semantic_token_projector.debug_shapes = bool(self.debug_shapes)
         for layer_block in self.encoder.layer:
             setattr(layer_block, "debug_shapes", bool(self.debug_shapes))
             if hasattr(layer_block, "attn"):
@@ -438,7 +310,7 @@ class PromptedTransformer(Transformer):
         """
 
         B = x.shape[0]
-        self._last_semantic_side_state = None
+        self._last_semantic_token_state = None
 
         # 提取 patch token，但此时还没有 CLS / pos / prompt
         patch_tokens = self.embeddings.forward_patches(x)  # (B, n_patches, hidden_dim)
@@ -494,11 +366,18 @@ class PromptedTransformer(Transformer):
             prompt_tokens = x_base[:, :0, :]
             x = x_base
 
+        semantic_tokens = x[:, :0, :]
+        if self.semantic_tokens_enable and torch.is_tensor(semantics):
+            semantic_tokens, semantic_state = self._init_semantic_tokens(semantics)
+            x = torch.cat((x, semantic_tokens), dim=1)
+            self._last_semantic_token_state = semantic_state
+
         if self.debug_shapes and (not self._shape_debug_incorporate_logged):
             print(
-                "[SHAPE-DEBUG] PromptedTransformer.incorporate_prompt patch_tokens={} prompt_tokens={} x_base={} x={} semantics={}".format(
+                "[SHAPE-DEBUG] PromptedTransformer.incorporate_prompt patch_tokens={} prompt_tokens={} semantic_tokens={} x_base={} x={} semantics={}".format(
                     tuple(patch_tokens.shape),
                     tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None,
+                    tuple(semantic_tokens.shape),
                     tuple(x_base.shape),
                     tuple(x.shape),
                     tuple(semantics.shape) if torch.is_tensor(semantics) else None,
@@ -510,7 +389,8 @@ class PromptedTransformer(Transformer):
             "prompt_enable": bool(self.prompt_enable),
             "prompt_backend": self.prompt_backend,
             "prompt_init_source": self.prompt_init_source,
-            "semantic_branch_enable": bool(self.semantic_branch_enable),
+            "semantic_tokens_enable": bool(self.semantic_tokens_enable),
+            "semantic_token_shape": tuple(semantic_tokens.shape),
             "actual_token_shape_entering_backbone": tuple(x.shape),
             "visual_feature_norm": float(patch_tokens.float().norm(dim=-1).mean().item()),
         }
@@ -529,6 +409,8 @@ class PromptedTransformer(Transformer):
             self.encoder.eval()
             self.embeddings.eval()
             self.prompt_dropout.train()
+            if self.semantic_token_projector is not None:
+                self.semantic_token_projector.train(mode)
             if self.prompt_backend == "dynamic":
                 self.prompt_proj.train(mode)
                 self.prompt_update_layers.train(mode)
@@ -545,7 +427,7 @@ class PromptedTransformer(Transformer):
             if isinstance(self.prompt_init_provider, torch.nn.Module):
                 self.prompt_init_provider.train(mode)
 
-    def _init_semantic_side_state(self, semantics: Optional[torch.Tensor], num_layers: int):
+    def _init_semantic_tokens(self, semantics: Optional[torch.Tensor]):
         """初始化语义侧运行时状态。
 
         若语义分支关闭，或当前 batch 没有语义输入，则直接返回 None。
@@ -553,34 +435,21 @@ class PromptedTransformer(Transformer):
         - sem_state：后续逐层更新的语义状态
         - semantic_input：语义初始输入，便于监控与残差比较
         """
-        self._last_semantic_side_state = None
-        if (not self.semantic_branch_enable) or (self.semantic_side_branch is None) or (not torch.is_tensor(semantics)):
+        self._last_semantic_token_state = None
+        if (not self.semantic_tokens_enable) or (self.semantic_token_projector is None) or (not torch.is_tensor(semantics)):
             return None, None
-        sem_state, semantic_input = self.semantic_side_branch.init_state(
+        sem_state, semantic_input = self.semantic_token_projector.init_state(
             semantics=semantics,
             device=semantics.device,
         )
         return sem_state, semantic_input
 
-    def _update_semantic_side_branch(self, sem_state, hidden_states, layer_idx: int, num_layers: int):
+    def _update_semantic_tokens(self, sem_state, hidden_states, layer_idx: int, num_layers: int):
         """
         从主序列中切出当前层 prompt / visual token，
         并让语义分支执行一步交互更新。
         """
-        if sem_state is None:
-            return None, {}, None
-        p_start = 1
-        p_end = 1 + int(self.num_tokens)
-        prompt_tokens = hidden_states[:, p_start:p_end, :] if self.num_tokens > 0 else hidden_states[:, :0, :]
-        visual_tokens = hidden_states[:, p_end:, :]
-        sem_state, sem_aff, diag = self.semantic_side_branch.step(
-            sem_state=sem_state,
-            prompt_tokens=prompt_tokens,
-            visual_tokens=visual_tokens,
-            layer_idx=layer_idx,
-            num_layers=num_layers,
-        )
-        return sem_state, sem_aff, diag
+        raise RuntimeError("Semantic tokens are updated only by ViT self-attention in the main token sequence.")
 
     def forward_deep_prompt(self, embedding_output, semantics=None):
         """
@@ -598,7 +467,7 @@ class PromptedTransformer(Transformer):
         hidden_states = embedding_output
         weights = None
         num_layers = self.vit_config.transformer["num_layers"]
-        sem_state, semantic_input = self._init_semantic_side_state(semantics, num_layers)
+        sem_state, semantic_input = None, None
         for i in range(num_layers):
             if i == 0:
                 hidden_states, weights, _ = self.encoder.layer[i](hidden_states, None, self.num_tokens)
@@ -642,25 +511,10 @@ class PromptedTransformer(Transformer):
                         bad_hidden = (~row_hidden_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
                         print(f"[nan-locate] layer={i} bad_hidden_rows={bad_hidden}")
             # 每层 block 之后，让语义侧读取当前 prompt/visual 状态再更新一次
-            sem_state, sem_aff, _ = self._update_semantic_side_branch(
-                sem_state=sem_state,
-                hidden_states=hidden_states,
-                layer_idx=i,
-                num_layers=num_layers,
-            )
             if self.encoder.vis:
                 attn_weights.append(weights)
 
         encoded = self.encoder.encoder_norm(hidden_states)
-        if sem_state is not None and semantic_input is not None:
-            semantic_output = self.semantic_side_branch.readout(sem_state)
-            semantic_delta = semantic_output - semantic_input
-            self._last_semantic_side_state = {
-                "semantic_input": semantic_input,
-                "sem_state": sem_state,
-                "semantic_output": semantic_output,
-                "semantic_delta": semantic_delta,
-            }
         return encoded, attn_weights
 
     def forward_deep_prompt_with_affinity(self, embedding_output, affinity_config, semantics=None):
@@ -674,7 +528,7 @@ class PromptedTransformer(Transformer):
         hidden_states = embedding_output
         weights = None
         num_layers = self.vit_config.transformer["num_layers"]
-        sem_state, semantic_input = self._init_semantic_side_state(semantics, num_layers)
+        sem_state, semantic_input = None, None
         for i in range(num_layers):
             if i == 0:
                 hidden_states, weights, affinity, _ = self.encoder.layer[i].forward_with_affinity(
@@ -699,29 +553,11 @@ class PromptedTransformer(Transformer):
                 hidden_states, weights, affinity, _ = self.encoder.layer[i].forward_with_affinity(
                     hidden_states, affinity_config, None, self.num_tokens
                 )
-            sem_state, sem_aff, _ = self._update_semantic_side_branch(
-                sem_state=sem_state,
-                hidden_states=hidden_states,
-                layer_idx=i,
-                num_layers=num_layers,
-            )
-            if isinstance(affinity, dict) and isinstance(sem_aff, dict):
-                affinity.update(sem_aff)
-
             if self.encoder.vis:
                 attn_weights.append(weights)
             affinities.append(affinity)
 
         encoded = self.encoder.encoder_norm(hidden_states)
-        if sem_state is not None and semantic_input is not None:
-            semantic_output = self.semantic_side_branch.readout(sem_state)
-            semantic_delta = semantic_output - semantic_input
-            self._last_semantic_side_state = {
-                "semantic_input": semantic_input,
-                "sem_state": sem_state,
-                "semantic_output": semantic_output,
-                "semantic_delta": semantic_delta,
-            }
         return encoded, attn_weights, affinities
     def forward(self, x, semantics=None):
         """
@@ -738,27 +574,6 @@ class PromptedTransformer(Transformer):
                 embedding_output, semantics)
         else:
             encoded, attn_weights = self.encoder(embedding_output, None, effective_prompt_tokens)
-            num_layers = self.vit_config.transformer["num_layers"]
-            sem_state, semantic_input = self._init_semantic_side_state(semantics, num_layers)
-            if sem_state is not None and semantic_input is not None:
-                p_start = 1
-                p_end = 1 + int(self.num_tokens)
-                prompt_tokens = encoded[:, p_start:p_end, :] if self.num_tokens > 0 else encoded[:, :0, :]
-                visual_tokens = encoded[:, p_end:, :]
-                sem_state, _, _ = self.semantic_side_branch.step(
-                    sem_state=sem_state,
-                    prompt_tokens=prompt_tokens,
-                    visual_tokens=visual_tokens,
-                    layer_idx=num_layers - 1,
-                    num_layers=num_layers,
-                )
-                semantic_output = self.semantic_side_branch.readout(sem_state)
-                self._last_semantic_side_state = {
-                    "semantic_input": semantic_input,
-                    "sem_state": sem_state,
-                    "semantic_output": semantic_output,
-                    "semantic_delta": semantic_output - semantic_input,
-                }
 
         return encoded, attn_weights
 
@@ -784,29 +599,6 @@ class PromptedTransformer(Transformer):
             encoded, attn_weights, affinities = self.encoder.forward_with_affinity(
                 embedding_output, effective_affinity_config, None, effective_prompt_tokens
             )
-            num_layers = self.vit_config.transformer["num_layers"]
-            sem_state, semantic_input = self._init_semantic_side_state(semantics, num_layers)
-            if sem_state is not None and semantic_input is not None:
-                p_start = 1
-                p_end = 1 + int(self.num_tokens)
-                prompt_tokens = encoded[:, p_start:p_end, :] if self.num_tokens > 0 else encoded[:, :0, :]
-                visual_tokens = encoded[:, p_end:, :]
-                sem_state, sem_aff, _ = self.semantic_side_branch.step(
-                    sem_state=sem_state,
-                    prompt_tokens=prompt_tokens,
-                    visual_tokens=visual_tokens,
-                    layer_idx=num_layers - 1,
-                    num_layers=num_layers,
-                )
-                if isinstance(affinities, list) and len(affinities) > 0 and isinstance(affinities[-1], dict):
-                    affinities[-1].update(sem_aff)
-                semantic_output = self.semantic_side_branch.readout(sem_state)
-                self._last_semantic_side_state = {
-                    "semantic_input": semantic_input,
-                    "sem_state": sem_state,
-                    "semantic_output": semantic_output,
-                    "semantic_delta": semantic_output - semantic_input,
-                }
 
         return encoded, attn_weights, affinities
 

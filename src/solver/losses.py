@@ -8,9 +8,11 @@ from typing import Any, Dict, Optional
 
 def _extract_logits_and_aux(pred_logits: Any, kwargs: Optional[Dict[str, Any]]):
     """
-    Unified extraction of:
-      - logits: Tensor [B, C]
-      - aux: optional dict containing attention tensors for align loss.
+    统一解析模型输出。
+
+    返回:
+    - logits: 分类分数，通常形状为 [B, C]
+    - aux: 可选辅助字典，主要保存 affinity / attention 监测量
     """
     aux = None
     logits = pred_logits
@@ -32,8 +34,9 @@ def _extract_logits_and_aux(pred_logits: Any, kwargs: Optional[Dict[str, Any]]):
 
 def _effective_scale_from_model(model: Optional[nn.Module], logits: torch.Tensor) -> torch.Tensor:
     """
-    Resolve effective classification scale used by r-similarity head.
-    Fallback to 1.0 if unavailable.
+    从分类头读取当前实际使用的 logit scale。
+
+    该值只用于诊断打印，不直接参与当前 loss 的数值计算。
     """
     scale = logits.new_tensor(1.0)
     if model is None:
@@ -96,6 +99,13 @@ def _compute_cm_loss_from_rhead_cache(
 
 
 def _compute_consistency_loss_from_rhead_cache(model: Optional[nn.Module], dist_type: str = "cosine",) -> Optional[torch.Tensor]:
+    """
+    从分类头缓存中计算语义增量一致性损失。
+
+    比较对象:
+    - semantic branch 产生的语义增量 delta_sem
+    - consistency_head 从原始属性预测出的目标方向
+    """
     if model is None:
         return None
     r_head = model.r_similarity_head
@@ -120,14 +130,128 @@ def _compute_consistency_loss_from_rhead_cache(model: Optional[nn.Module], dist_
     return (1.0 - (d * t).sum(dim=-1)).mean()
 
 
-# ===========================
-# 1. 损失名到类的映射
-# ===========================
-LOSS = {
-    "softmax_cm": None,
-    "r_similarity_v2": None,
-    "vspcn_baseline": None,
-}
+def _normalize_semantic_mediated_affinity(x: torch.Tensor, norm_type: str) -> torch.Tensor:
+    """
+    对亲和矩阵做归一化，供 semantic-mediated loss 对齐使用。
+
+    当前第一版只支持 softmax，避免多种归一化混用导致实验含义不清。
+    """
+    norm_type = str(norm_type).lower()
+    if norm_type != "softmax":
+        raise ValueError(f"Unsupported SOLVER.SEM_MED.NORM='{norm_type}'. The first version only supports softmax.")
+    return F.softmax(x, dim=-1)
+
+
+def _semantic_mediated_distance(student: torch.Tensor, teacher: torch.Tensor, metric: str) -> torch.Tensor:
+    """
+    计算两个归一化亲和矩阵之间的距离。
+
+    支持 mse / cosine / kl 三种度量。
+    """
+    metric = str(metric).lower()
+    if metric == "mse":
+        return F.mse_loss(student, teacher)
+    if metric == "cosine":
+        student_flat = student.flatten(1)
+        teacher_flat = teacher.flatten(1)
+        return (1.0 - F.cosine_similarity(student_flat, teacher_flat, dim=-1)).mean()
+    if metric == "kl":
+        return F.kl_div(torch.log(student.clamp_min(1e-8)), teacher, reduction="batchmean")
+    raise ValueError(f"Unsupported SOLVER.SEM_MED.METRIC='{metric}'. Expected mse / kl / cosine.")
+
+
+def _compute_semantic_mediated_affinity_loss(aux: Optional[Dict[str, Any]], cfg) -> torch.Tensor:
+    """
+    L_sem_med aligns direct prompt-visual affinity with semantic-mediated affinity:
+        A_psv = QsKp^T @ QsKv
+
+    Shapes after trainer head-mean:
+        QsKp: [B, S, P]
+        QsKv: [B, S, V]
+        Apv : [B, P, V]
+    """
+    if not isinstance(aux, Dict):
+        raise RuntimeError("Semantic-mediated affinity loss requires affinity aux dict.")
+
+    target = str(cfg.SOLVER.SEM_MED.TARGET)
+    target_map = {
+        "QpKv": "aff_qpkv",
+        "QpQv": "aff_qpqv",
+        "KpKv": "aff_kpkv",
+    }
+    if target not in target_map:
+        raise ValueError(f"Unsupported SOLVER.SEM_MED.TARGET='{target}'. Expected QpKv / QpQv / KpKv.")
+
+    required_keys = ["aff_qskp", "aff_qskv", target_map[target]]
+    missing = [k for k in required_keys if k not in aux or not isinstance(aux[k], Dict)]
+    if missing:
+        raise RuntimeError(f"Semantic-mediated affinity loss missing aux keys: {missing}.")
+
+    qskp_layers = aux["aff_qskp"]
+    qskv_layers = aux["aff_qskv"]
+    apv_layers = aux[target_map[target]]
+
+    shared_layers = sorted(set(qskp_layers.keys()) & set(qskv_layers.keys()) & set(apv_layers.keys()))
+    requested_layers = list(cfg.SOLVER.SEM_MED.LAYERS)
+    if requested_layers:
+        requested_layers = [int(x) for x in requested_layers]
+        shared_layers = [x for x in shared_layers if x in requested_layers]
+    if not shared_layers:
+        raise RuntimeError("Semantic-mediated affinity loss found no shared layers.")
+
+    metric = str(cfg.SOLVER.SEM_MED.METRIC).lower()
+    norm_type = str(cfg.SOLVER.SEM_MED.NORM).lower()
+    detach_mode = str(cfg.SOLVER.SEM_MED.DETACH).lower()
+    if detach_mode not in {"mediated", "direct", "none"}:
+        raise ValueError(f"Unsupported SOLVER.SEM_MED.DETACH='{detach_mode}'. Expected mediated / direct / none.")
+
+    layer_losses = []
+    for layer_idx in shared_layers:
+        qskp = qskp_layers[layer_idx]
+        qskv = qskv_layers[layer_idx]
+        apv = apv_layers[layer_idx]
+        if qskp.dim() != 3 or qskv.dim() != 3 or apv.dim() != 3:
+            raise RuntimeError(
+                "Semantic-mediated affinity loss expects [B,S,P], [B,S,V], [B,P,V], got {}, {}, {} at layer {}.".format(
+                    tuple(qskp.shape),
+                    tuple(qskv.shape),
+                    tuple(apv.shape),
+                    int(layer_idx),
+                )
+            )
+        if qskp.shape[0] != qskv.shape[0] or qskp.shape[0] != apv.shape[0]:
+            raise RuntimeError(f"Semantic-mediated affinity batch mismatch at layer {layer_idx}.")
+        if qskp.shape[1] != qskv.shape[1]:
+            raise RuntimeError(f"Semantic token count mismatch between QsKp and QsKv at layer {layer_idx}.")
+        if qskp.shape[2] != apv.shape[1] or qskv.shape[2] != apv.shape[2]:
+            raise RuntimeError(
+                "Semantic-mediated affinity shape mismatch at layer {}: QsKp={}, QsKv={}, Apv={}.".format(
+                    int(layer_idx),
+                    tuple(qskp.shape),
+                    tuple(qskv.shape),
+                    tuple(apv.shape),
+                )
+            )
+
+        mediated = torch.bmm(qskp.transpose(1, 2), qskv)
+        mediated_norm = _normalize_semantic_mediated_affinity(mediated, norm_type)
+        direct_norm = _normalize_semantic_mediated_affinity(apv, norm_type)
+
+        if detach_mode == "mediated":
+            loss_i = _semantic_mediated_distance(direct_norm, mediated_norm.detach(), metric)
+        elif detach_mode == "direct":
+            loss_i = _semantic_mediated_distance(mediated_norm, direct_norm.detach(), metric)
+        else:
+            if metric == "kl":
+                loss_i = 0.5 * (
+                    _semantic_mediated_distance(direct_norm, mediated_norm.detach(), metric)
+                    + _semantic_mediated_distance(mediated_norm, direct_norm.detach(), metric)
+                )
+            else:
+                loss_i = _semantic_mediated_distance(direct_norm, mediated_norm, metric)
+        layer_losses.append(loss_i)
+
+    return torch.stack(layer_losses).mean()
 
 
 class SoftmaxCMLoss(nn.Module):
@@ -152,6 +276,7 @@ class SoftmaxCMLoss(nn.Module):
       供 CM 项直接复用。
     """
     def __init__(self, cfg=None):
+        """读取 CE+CM 主损失及可选辅助正则的权重配置。"""
         super().__init__()
 
         self.lambda_cm = cfg.SOLVER.LOSS_CM_WEIGHT
@@ -166,6 +291,7 @@ class SoftmaxCMLoss(nn.Module):
         self._last_loss_stats: Dict[str, float] = {}
 
     def is_single(self):
+        """保持旧训练器接口兼容：当前 loss 返回单个标量。"""
         return True
 
     def loss(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
@@ -285,10 +411,8 @@ class SoftmaxCMLoss(nn.Module):
         return total
 
     def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """nn.Module 标准入口，转发到 loss() 执行实际计算。"""
         return self.loss(pred_logits, targets, per_cls_weights, kwargs)
-
-
-LOSS["softmax_cm"] = SoftmaxCMLoss
 
 
 class VSPCNBaselineLoss(nn.Module):
@@ -297,14 +421,23 @@ class VSPCNBaselineLoss(nn.Module):
       L = CE(logits, y) + lambda_ar * mean(||cls_feat - proto_y||_2^2)
     """
     def __init__(self, cfg=None):
+        """读取 VSPCN baseline 的 AR 辅助权重。"""
         super().__init__()
         self.lambda_ar = float(cfg.SOLVER.LOSS_VSPCN_AR_WEIGHT)
         self._last_loss_stats: Dict[str, float] = {}
 
     def is_single(self):
+        """保持旧训练器接口兼容：该 loss 输出单个标量。"""
         return True
 
     def loss(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """
+        计算 VSPCN baseline 损失。
+
+        组成:
+        - CE(logits, y)
+        - 可选 AR: CLS 特征对齐到对应类别 prototype
+        """
         logits, _ = _extract_logits_and_aux(pred_logits, kwargs)
         if not torch.is_tensor(logits):
             raise TypeError("VSPCNBaselineLoss expects tensor logits.")
@@ -344,10 +477,71 @@ class VSPCNBaselineLoss(nn.Module):
         return total
 
     def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """nn.Module 标准入口，转发到 loss() 执行实际计算。"""
         return self.loss(pred_logits, targets, per_cls_weights, kwargs)
 
 
-LOSS["vspcn_baseline"] = VSPCNBaselineLoss
+class SemanticMediatedAffinityAuxLoss(nn.Module):
+    """
+    语义中介 prompt-visual 亲和辅助损失。
+    这个类只负责计算 L_sem_med，不再关心 CE / AR / CM 主损失。
+    """
+    def __init__(self, cfg=None):
+        """读取 semantic-mediated affinity loss 的权重和配置。"""
+        super().__init__()
+        self.name = "sem_med_loss"
+        self.requires_affinity_aux = True
+        self.sem_med_weight = float(cfg.SOLVER.LOSS_SEM_MED_WEIGHT)
+        self.cfg = cfg
+
+    @property
+    def weight(self) -> float:
+        """返回当前辅助损失权重，供 CompositeLoss 判断是否启用。"""
+        return self.sem_med_weight
+
+    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """从模型输出中取 aux，并计算 semantic-mediated affinity loss。"""
+        _, aux = _extract_logits_and_aux(pred_logits, kwargs)
+        return _compute_semantic_mediated_affinity_loss(aux, self.cfg)
+
+
+class CompositeLoss(nn.Module):
+    """
+    组合式 loss：main_loss 负责分类主线，aux_losses 只负责各自的辅助约束。
+    后续新增辅助损失时，只需要新增 aux 类并在 build_loss 中组装，不再新增组合类。
+    """
+    def __init__(self, main_loss: nn.Module, aux_losses):
+        """接收一个主损失和若干辅助损失，组成统一训练入口。"""
+        super().__init__()
+        self.main_loss = main_loss
+        self.aux_losses = nn.ModuleList(aux_losses)
+        self.requires_affinity_aux = any(
+            bool(aux.requires_affinity_aux) and float(aux.weight) > 0
+            for aux in self.aux_losses
+        )
+        self._last_loss_stats: Dict[str, float] = {}
+
+    def is_single(self):
+        """保持旧训练器接口兼容：当前 loss 返回单个标量。"""
+        return True
+
+    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """
+        先算主损失，再按权重叠加所有启用的辅助损失。
+
+        同时合并各子损失的 `_last_loss_stats`，供 trainer 打印日志。
+        """
+        total = self.main_loss(pred_logits, targets, per_cls_weights, kwargs=kwargs)
+        stats = dict(self.main_loss._last_loss_stats)
+        for aux_loss in self.aux_losses:
+            weight = float(aux_loss.weight)
+            if weight <= 0:
+                continue
+            aux_value = aux_loss(pred_logits, targets, per_cls_weights, kwargs=kwargs)
+            total = total + weight * aux_value
+            stats[aux_loss.name] = float(aux_value.detach().item())
+        self._last_loss_stats = stats
+        return total
 
 
 class RSimilarityLossV2(nn.Module):
@@ -369,6 +563,7 @@ class RSimilarityLossV2(nn.Module):
     """
 
     def __init__(self, cfg=None):
+        """读取 RSimilarity v2 的对齐模式和对齐权重。"""
         super().__init__()
         self.align_mode = str(cfg.SOLVER.RSIM_V2.ALIGN_MODE).lower()
         self.align_weight = float(cfg.SOLVER.RSIM_V2.ALIGN_WEIGHT)
@@ -376,9 +571,17 @@ class RSimilarityLossV2(nn.Module):
         self._last_loss_stats: Dict[str, float] = {}
 
     def is_single(self):
+        """保持旧训练器接口兼容：该 loss 输出单个标量。"""
         return True
 
     def loss(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """
+        计算 RSimilarity v2 损失。
+
+        组成:
+        - CE(logits, y)
+        - 可选 AR 或 CM，对齐方式由 SOLVER.RSIM_V2.ALIGN_MODE 决定
+        """
         logits, _ = _extract_logits_and_aux(pred_logits, kwargs)
         if not torch.is_tensor(logits):
             raise TypeError("RSimilarityLossV2 expects tensor logits.")
@@ -427,621 +630,63 @@ class RSimilarityLossV2(nn.Module):
         return total
 
     def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """nn.Module 标准入口，转发到 loss() 执行实际计算。"""
         return self.loss(pred_logits, targets, per_cls_weights, kwargs)
 
 
-LOSS["r_similarity_v2"] = RSimilarityLossV2
-
-# ===========================
-# 4. 基于共享语义原型的相似度分类头
-# ===========================
-class RSimilarityClassifier(nn.Module):
+def _resolve_main_loss_name(cfg) -> str:
     """
-    当前主线使用的视觉-语义相似度分类头。
-
-    这类的职责可以概括成 4 步：
-    1. 从全局 `class_attr` 构造“当前活动类空间”的语义原型；
-    2. 把视觉输入映射到比较空间；
-    3. 把语义输入映射到比较空间；
-    4. 在比较空间里做 cosine 或 dot-product 分类。
-
-    当前统一后的命名约定如下：
-    - `visual_input`
-      指 backbone 直接输出给分类头的视觉输入，通常就是 CLS 特征。
-    - `visual_repr`
-      指真正参与相似度计算、也参与 CM loss 的视觉表示。
-      若启用了 `visual_proj`，它是投影后的结果；否则与 `visual_input` 相同。
-    - `semantic_input`
-      指从 `class_attr` 经过 `prototype_proj` 得到的类别原型输入。
-      这一步已经是“类级语义原型”，但还没进入最终比较空间。
-    - `semantic_repr`
-      指真正参与相似度计算、也参与 CM loss 的语义表示。
-      它来自 `semantic_proj(semantic_input)`。
-
-    这样命名后，你在看两套头时只需要记一件事：
-    - `*_input` 是原料层；
-    - `*_repr` 是分类/损失真正使用的表示层。
+    主损失只由 SOLVER.MAIN_LOSS 决定。
+    辅助损失由各自权重决定，不再通过组合 loss 名开启。
     """
-
-    def __init__(self, class_attr: torch.Tensor, hidden_size: int, cfg,) -> None:
-        super().__init__()
-        proj_dim = cfg.MODEL.R_SIMILARITY.PROJ_DIM
-        if proj_dim is None or proj_dim <= 0:
-            proj_dim = hidden_size
-
-        # 保存全局 class-level semantic bank。
-        # 注意这里存的是“原始类语义”，不是已经投影好的 prototype。
-        self.register_buffer("class_attr", class_attr.float())
-        self.num_classes = class_attr.shape[0]
-        self.attr_dim = class_attr.shape[-1]
-        self.hidden_size = hidden_size
-
-        self.visual_proj_enabled = cfg.MODEL.R_SIMILARITY.VISUAL_PROJ_ENABLE
-        out_dim = proj_dim if self.visual_proj_enabled else hidden_size
-        # 视觉侧：
-        # - 如果开 visual_proj，就先把视觉输入映射到比较空间；
-        # - 否则 visual_repr 直接等于 visual_input。
-        self.visual_proj = nn.Linear(hidden_size, out_dim) if self.visual_proj_enabled else None
-
-        # 语义侧分成两层：
-        # 1. prototype_proj: 原始属性 -> 类别原型输入
-        # 2. semantic_proj : 类别原型输入 -> 最终比较空间语义表示
-        #
-        # 这种拆法的好处是：
-        # - 和 baseline 头可以共享 `semantic_input` 这层语义；
-        # - 主线又能保留自己原来的“再过一层 semantic_proj”的分类风格。
-        self.semantic_proj = nn.Linear(hidden_size, out_dim)
-        self.prototype_proj = nn.Linear(self.attr_dim, hidden_size)
-
-        # True  -> cosine similarity * scale
-        # False -> 直接点积
-        self.use_cosine = cfg.MODEL.R_SIMILARITY.USE_COSINE
-
-        self.fixed_logit_scale = cfg.MODEL.R_SIMILARITY.FIXED_LOGIT_SCALE
-        self.shuffle_prototypes = cfg.SOLVER.DIAG.SHUFFLE_PROTOTYPES
-
-        self.consistency_enable = cfg.MODEL.CONSISTENCY.ENABLE
-        self.consistency_proj = cfg.MODEL.CONSISTENCY.PROJ.lower()
-        self.consistency_dist = cfg.MODEL.CONSISTENCY.DIST.lower()
-
-        if self.consistency_enable:
-            if self.consistency_proj == "mlp":
-                self.consistency_head = nn.Sequential(
-                    nn.Linear(self.attr_dim, hidden_size),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(hidden_size, out_dim),
-                )
-            else:
-                self.consistency_head = nn.Linear(self.attr_dim, out_dim)
-        else:
-            self.consistency_head = None
-
-        # debug 开关
-        self.debug_trace_once = cfg.SOLVER.DEBUG_TRACE_ONCE
-        self.debug_shapes = cfg.SOLVER.DEBUG_SHAPES
-
-        self._debug_sem_source_logged = False
-        self._shape_debug_logged = False
-
-        # loss / trainer / monitor 会从这些缓存里读当前 batch 的中间量。
-        #
-        # 统一约定：
-        # - input: 原料层
-        # - repr : 真正拿去分类和算 CM 的表示层
-        self._loss_last_visual_input = None
-        self._loss_last_visual_repr = None
-        self._loss_last_semantic_input = None
-        self._loss_last_semantic_repr = None
-        self._loss_last_logit_scale = None
-        self._loss_last_semantic_delta = None
-        self._loss_last_consistency_target = None
-        self._loss_last_semantic_final = None
-        self._loss_last_semantic_anchor = None
-        self._last_bad_feat_rows = None
-        self._last_bad_visual_rows = None
-        self._last_bad_sim_rows = None
-        self._last_semantic_all_finite = None
-
-        self._runtime_targets = None          # 当前 batch 的 raw global targets
-        self._runtime_token_sequence = None   # 当前 batch 的 token 序列（供 debug/vis）
-        self._runtime_affinities = None       # 当前 batch 的 affinity（供 debug/vis）
-        self._runtime_semantic_state = None   # 当前 batch 的 semantic state（供 consistency / AGR 等）
-
-        if self.use_cosine:
-            logit_scale_init = cfg.MODEL.R_SIMILARITY.LOGIT_SCALE_INIT
-            self.logit_scale = nn.Parameter(torch.log(torch.tensor(logit_scale_init, dtype=torch.float32)))
-        else:
-            self.logit_scale = None
-
-    def _project_class_prototypes(self) -> torch.Tensor:
-        """
-        构造“全局类别语义原型输入”。
-
-        输入来源：- self.class_attr : [num_classes, attr_dim]
-        处理：- 通过 prototype_proj 映射到 hidden_size
-        输出：- [num_classes, hidden_size]
-
-        直观理解：
-        - 每个类别 c 都有一份 class-level 原始语义 `s_raw_c`
-        - `prototype_proj` 把它映射到 hidden_size
-        - 得到的张量就是统一命名下的 `semantic_input`
-
-        注意：
-        - 这是全局所有类的语义原型
-        - 还没根据 class_ids 切 active class space
-        - 也还没经过 semantic_proj 进入最终比较空间
-        """
-        return self.prototype_proj(self.class_attr)
-
-    def _resolve_active_class_space(self, class_ids, device: torch.device):
-        if class_ids is None:
-            active_ids = torch.arange(self.num_classes, device=device, dtype=torch.long)
-        elif torch.is_tensor(class_ids):
-            active_ids = class_ids.to(device=device, dtype=torch.long).view(-1)
-        else:
-            active_ids = torch.as_tensor(list(class_ids), device=device, dtype=torch.long).view(-1)
-        if active_ids.numel() == 0:
-            raise ValueError("Active class space is empty.")
-        mapping = torch.full((self.num_classes,), -1, device=device, dtype=torch.long)
-        mapping[active_ids] = torch.arange(active_ids.numel(), device=device, dtype=torch.long)
-        return active_ids, mapping
-
-    def forward(self, cls_feat: torch.Tensor, class_ids=None) -> torch.Tensor:
-        """
-        当前 batch 的分类前向。
-
-        输入：
-        - `cls_feat`
-          形状 `[B, hidden_size]`，通常就是 backbone 给出的 CLS 特征。
-        - `class_ids`
-          当前 active class space 对应的 global class ids。
-          如果是 None，表示默认所有类都参与分类。
-
-        输出：
-        - `logits`
-          形状 `[B, num_active_classes]`，表示当前 batch 在当前活动类空间上的分类分数。
-
-        详细流程：
-        1. 先根据 `class_ids` 确定这次 forward 实际参与竞争的类空间；
-        2. 从全局 `class_attr` 里取出这些类的原始语义，并投影成 `semantic_input`；
-        3. 若启用 shuffle 诊断，则随机打乱当前 prototype 顺序；
-        4. 视觉侧把 `cls_feat` 记成 `visual_input`，再可选经过 `visual_proj` 得到 `visual_repr`；
-        5. 语义侧把 `semantic_input` 再经过 `semantic_proj` 得到 `semantic_repr`；
-        6. 在 `visual_repr` 与 `semantic_repr` 之间做 cosine 或 dot-product；
-        7. 把本次 forward 用到的关键张量缓存下来，供：
-           - CE / CM loss
-           - trainer monitor
-           - debug / 可视化
-           直接复用；
-        8. 如果 semantic side branch 这次也产出了运行时语义状态，
-           再额外把 refined semantic / delta_sem / consistency target 缓存下来。
-        """
-        active_class_ids, active_global_to_local = self._resolve_active_class_space(class_ids, device=cls_feat.device)
-        semantic_input_full = self._project_class_prototypes()
-        semantic_input = semantic_input_full.index_select(0, active_class_ids)
-
-        # 这个 shuffle 只用于诊断实验，不是正常训练逻辑。
-        if self.shuffle_prototypes and semantic_input.shape[0] > 1:
-            perm = torch.randperm(semantic_input.shape[0], device=semantic_input.device)
-            semantic_input = semantic_input.index_select(0, perm)
-
-        visual_input = cls_feat
-        visual_repr = self.visual_proj(visual_input) if self.visual_proj else visual_input
-        semantic_repr = self.semantic_proj(semantic_input)
-
-        if self.debug_shapes and (not self._shape_debug_logged):
-            print(
-                "[SHAPE-DEBUG] RSimilarityClassifier.forward visual_input={} semantic_input={} "
-                "visual_repr={} semantic_repr={} logits={} active_classes={}".format(
-                    tuple(cls_feat.shape) if torch.is_tensor(cls_feat) else None,
-                    tuple(semantic_input.shape) if torch.is_tensor(semantic_input) else None,
-                    tuple(visual_repr.shape) if torch.is_tensor(visual_repr) else None,
-                    tuple(semantic_repr.shape) if torch.is_tensor(semantic_repr) else None,
-                    (int(visual_repr.shape[0]), int(semantic_repr.shape[0])) if (torch.is_tensor(visual_repr) and torch.is_tensor(semantic_repr)) else None,
-                    int(active_class_ids.numel()),
-                )
-            )
-            self._shape_debug_logged = True
-
-        # 分类分数有两种模式：
-        # 1. cosine: 先归一化，再乘 logit scale
-        # 2. dot    : 直接点积，scale 视为 1
-        if self.use_cosine:
-            visual_repr = F.normalize(visual_repr, dim=-1)
-            semantic_repr = F.normalize(semantic_repr, dim=-1)
-            raw_sim = visual_repr @ semantic_repr.t()
-            scale = raw_sim.new_tensor(self.fixed_logit_scale) if self.fixed_logit_scale > 0 else self.logit_scale.exp()
-            logits = raw_sim * scale
-        else:
-            logits = visual_repr @ semantic_repr.t()
-            raw_sim = logits
-            scale = logits.new_tensor(1.0)
-
-        # 下面这组 finite 检查只服务于排查 NaN / inf。
-        row_feat_ok = torch.isfinite(cls_feat).all(dim=1)
-        row_visual_ok = torch.isfinite(visual_repr).all(dim=1)
-        sem_ok = torch.isfinite(semantic_repr).all()
-        row_sim_ok = torch.isfinite(raw_sim).all(dim=1)
-
-        self._last_bad_feat_rows = None
-        self._last_bad_visual_rows = None
-        self._last_bad_sim_rows = None
-        self._last_semantic_all_finite = bool(sem_ok.item())
-        if not bool(row_feat_ok.all().item()):
-            self._last_bad_feat_rows = (~row_feat_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
-        if not bool(row_visual_ok.all().item()):
-            self._last_bad_visual_rows = (~row_visual_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
-        if not bool(row_sim_ok.all().item()):
-            self._last_bad_sim_rows = (~row_sim_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
-
-        runtime_targets_global = self._runtime_targets if torch.is_tensor(self._runtime_targets) else None
-
-        if self.debug_trace_once and (not self._debug_sem_source_logged):
-            scale_scalar = float(scale.item()) if torch.is_tensor(scale) else float(scale)
-            fixed_mode = bool(self.fixed_logit_scale > 0)
-            print(
-                "[trace] node=C.semantic_scoring semantic_score_mode={} classifier_semantic_source={} "
-                "semantic_input_shape={} semantic_repr_shape={} semantic_input_norm_mean={:.6f} "
-                "classifier_semantic_norm_mean={:.6f} effective_logit_scale={:.6f} whether_fixed_logit_scale={}".format(
-                    "global_raw",
-                    "prototype_proj",
-                    tuple(semantic_input.shape),
-                    tuple(semantic_repr.shape),
-                    float(semantic_input.float().norm(dim=-1).mean().item()),
-                    float(semantic_repr.float().norm(dim=-1).mean().item()),
-                    scale_scalar,
-                    fixed_mode,
-                )
-            )
-        self._debug_sem_source_logged = True
-
-        # 把“原料层”和“表示层”都缓存下来：
-        # - loss 主要用 repr
-        # - baseline 对照、debug、monitor 有时会直接看 input
-        self._loss_last_visual_input = visual_input
-        self._loss_last_visual_repr = visual_repr
-        self._loss_last_semantic_input = semantic_input
-        self._loss_last_semantic_repr = semantic_repr
-        self._loss_last_logit_scale = scale
-        self._loss_last_consistency_target = None
-        self._loss_last_semantic_delta = None
-        self._loss_last_semantic_final = None
-        self._loss_last_semantic_anchor = None
-
-        # 这部分是“分类头额外把 semantic side branch 的运行时结果转存成 loss 可读缓存”。
-        # 主分类本身不依赖这里，但 consistency / AGR 等附加项会读这些量。
-        sem_state = self._runtime_semantic_state if isinstance(self._runtime_semantic_state, dict) else None
-        if sem_state is not None:
-            semantic_output = sem_state.get("semantic_output")
-            semantic_input = sem_state.get("semantic_input")
-            semantic_delta = sem_state.get("semantic_delta")
-            if torch.is_tensor(semantic_output) and torch.is_tensor(semantic_input):
-                delta_sem = semantic_delta
-                if (delta_sem is None) or (not torch.is_tensor(delta_sem)):
-                    delta_sem = semantic_output - semantic_input
-                self._loss_last_semantic_final = semantic_output
-                self._loss_last_semantic_anchor = semantic_input
-                self._loss_last_semantic_delta = delta_sem
-                if self.consistency_head is not None and runtime_targets_global is not None and runtime_targets_global.numel() == delta_sem.shape[0]:
-                    t = runtime_targets_global.to(delta_sem.device)
-                    valid = active_global_to_local.to(delta_sem.device).index_select(0, t) >= 0
-                    if valid.any():
-                        attr_y = self.class_attr.index_select(0, t[valid]).to(delta_sem.device)
-                        target = self.consistency_head(attr_y)
-                        target = F.normalize(target, dim=-1) if self.use_cosine else target
-                        self._loss_last_consistency_target = target
-            else:
-                mu_s_final = sem_state.get("mu_s_final")
-                h_y = sem_state.get("h_y")
-                delta_sem = sem_state.get("delta_sem")
-                if torch.is_tensor(mu_s_final) and torch.is_tensor(h_y):
-                    if (delta_sem is None) or (not torch.is_tensor(delta_sem)):
-                        delta_sem = mu_s_final - h_y
-                    self._loss_last_semantic_final = mu_s_final
-                    self._loss_last_semantic_anchor = h_y
-                    self._loss_last_semantic_delta = delta_sem
-                    if self.consistency_head is not None and runtime_targets_global is not None and runtime_targets_global.numel() == delta_sem.shape[0]:
-                        t = runtime_targets_global.to(delta_sem.device)
-                        valid = active_global_to_local.to(delta_sem.device).index_select(0, t) >= 0
-                        if valid.any():
-                            attr_y = self.class_attr.index_select(0, t[valid]).to(delta_sem.device)
-                            target = self.consistency_head(attr_y)
-                            target = F.normalize(target, dim=-1) if self.use_cosine else target
-                            self._loss_last_consistency_target = target
-
-        return logits
+    main_name = str(cfg.SOLVER.MAIN_LOSS).lower()
+    if main_name == "":
+        raise ValueError("SOLVER.MAIN_LOSS must be set to vspcn / rsim / rsim_v2.")
+    return main_name
 
 
-class VSPCNBaselineClassifier(nn.Module):
+def _build_main_loss(cfg) -> nn.Module:
     """
-    1. 每个类别都有一个原始语义属性向量 a_y
-       例如 CUB 中每个类别是 312 维属性。
+    根据 SOLVER.MAIN_LOSS 构建主损失。
 
-    2. 先通过一个线性层 W_d，把类别属性映射到视觉特征空间：
-           \tilde{a}_y = a_y · W_d
-       也就是：
-           prototype_y = prototype_proj(a_y)
-
-    3. 对输入图像，取 backbone 输出的 cls_feat 作为图像表征。
-
-    4. 最后做最简单的分类打分：
-           logits = cls_feat @ prototype_bank^T
-
-    也就是说：
-    - 图像侧：直接用 cls_feat
-    - 语义侧：class_attr 经过一个线性映射得到类别原型
-    - 分类：图像特征与类别原型做点积
+    只负责主损失，不处理任何辅助损失开关。
     """
-
-    def __init__(self, class_attr: torch.Tensor, hidden_size: int, cfg,) -> None:
-        super().__init__()
-        self.register_buffer("class_attr", class_attr.float())
-        self.num_classes = class_attr.shape[0]
-        self.attr_dim = class_attr.shape[-1]
-        self.hidden_size = int(hidden_size)
-
-        # VSPCN Eq.(12): \tilde{a}_y = a_y · W_d
-        self.prototype_proj = nn.Linear(self.attr_dim, self.hidden_size, bias=True)
-        self.visual_proj = None
-        self.semantic_proj = None
-
-        self.use_cosine = False
-        self.fixed_logit_scale = 0.0
-        self.logit_scale = None
-
-        self.debug_trace_once = cfg.SOLVER.DEBUG_TRACE_ONCE
-        self.debug_shapes = cfg.SOLVER.DEBUG_SHAPES
-        self._debug_logged = False
-        self._shape_debug_logged = False
-
-        self._loss_last_visual_input = None
-        self._loss_last_visual_repr = None
-        self._loss_last_semantic_input = None
-        self._loss_last_semantic_repr = None
-        self._loss_last_logit_scale = None
-
-        self._runtime_targets = None
-        self._runtime_token_sequence = None
-        self._runtime_affinities = None
-        self._runtime_semantic_state = None
-        self._last_bad_feat_rows = None
-        self._last_bad_visual_rows = None
-        self._last_bad_sim_rows = None
-        self._last_semantic_all_finite = None
-
-    def _project_class_prototypes(self) -> torch.Tensor:
-        return self.prototype_proj(self.class_attr)
-
-    def _resolve_active_class_space(self, class_ids, device: torch.device):
-        if class_ids is None:
-            active_ids = torch.arange(self.num_classes, device=device, dtype=torch.long)
-        elif torch.is_tensor(class_ids):
-            active_ids = class_ids.to(device=device, dtype=torch.long).view(-1)
-        else:
-            active_ids = torch.as_tensor(list(class_ids), device=device, dtype=torch.long).view(-1)
-        if active_ids.numel() == 0:
-            raise ValueError("Active class space is empty.")
-        return active_ids
-
-    def forward(self, cls_feat: torch.Tensor, class_ids=None) -> torch.Tensor:
-        """
-        Step 1. 解析当前 active class space
-        Step 2. 从全局类别原型库中切出当前 active class 的 prototype bank
-        Step 3. 用 cls_feat 与 prototype bank 做点积分类
-        Step 4. 打印 shape / trace debug（只一次）
-        Step 5. 缓存中间量供 VSPCNBaselineLoss 使用"""
-        active_class_ids = self._resolve_active_class_space(class_ids, device=cls_feat.device)
-        semantic_input = self._project_class_prototypes().index_select(0, active_class_ids)
-        visual_input = cls_feat
-        visual_repr = visual_input
-        semantic_repr = semantic_input
-        logits = visual_repr @ semantic_repr.t()
-        row_feat_ok = torch.isfinite(visual_input).all(dim=1)
-        row_visual_ok = torch.isfinite(visual_repr).all(dim=1)
-        row_sim_ok = torch.isfinite(logits).all(dim=1)
-        sem_ok = torch.isfinite(semantic_repr).all()
-
-        self._last_bad_feat_rows = None
-        self._last_bad_visual_rows = None
-        self._last_bad_sim_rows = None
-        self._last_semantic_all_finite = bool(sem_ok.item())
-        if not bool(row_feat_ok.all().item()):
-            self._last_bad_feat_rows = (~row_feat_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
-        if not bool(row_visual_ok.all().item()):
-            self._last_bad_visual_rows = (~row_visual_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
-        if not bool(row_sim_ok.all().item()):
-            self._last_bad_sim_rows = (~row_sim_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
-
-        if self.debug_shapes and (not self._shape_debug_logged):
-            print(
-                "[SHAPE-DEBUG] VSPCNBaselineClassifier.forward visual_input={} semantic_input={} logits={}".format(
-                    tuple(visual_input.shape) if torch.is_tensor(visual_input) else None,
-                    tuple(semantic_input.shape) if torch.is_tensor(semantic_input) else None,
-                    tuple(logits.shape) if torch.is_tensor(logits) else None,
-                )
-            )
-            self._shape_debug_logged = True
-
-        if self.debug_trace_once and (not self._debug_logged):
-            print(
-                "[trace] node=C.vspcn_baseline classifier=VSPCNBaselineClassifier score=cls_dot_attrWd logits_shape={} active_classes={}".format(
-                    tuple(logits.shape),
-                    int(active_class_ids.numel()),
-                )
-            )
-            self._debug_logged = True
-
-        self._loss_last_visual_input = visual_input
-        self._loss_last_visual_repr = visual_repr
-        self._loss_last_semantic_input = semantic_input
-        self._loss_last_semantic_repr = semantic_repr
-        self._loss_last_logit_scale = logits.new_tensor(1.0)
-
-        return logits
+    main_name = _resolve_main_loss_name(cfg)
+    main_losses = {
+        "vspcn": VSPCNBaselineLoss,
+        "rsim": SoftmaxCMLoss,
+        "rsim_v2": RSimilarityLossV2,
+    }
+    if main_name not in main_losses:
+        raise ValueError(f"Unsupported SOLVER.MAIN_LOSS='{main_name}'. Expected vspcn / rsim / rsim_v2.")
+    return main_losses[main_name](cfg)
 
 
-class RSimilarityClassifierV2(nn.Module):
+def _sem_med_enabled(cfg) -> bool:
+    """判断 semantic-mediated affinity 辅助损失是否启用。"""
+    return float(cfg.SOLVER.LOSS_SEM_MED_WEIGHT) > 0
+
+
+def _build_aux_losses(cfg):
     """
-    最小化重构版 RSimilarity 分类头。
+    根据各辅助损失权重构建辅助损失列表。
 
-    共同主干只有两层原料：
-    - visual_input   : backbone 输出的 cls_feat
-    - semantic_input : prototype_proj(class_attr)
-
-    然后根据 `SCORE_MODE` 切两种受控模式：
-    - dot:
-        visual_repr   = visual_input
-        semantic_repr = semantic_input
-        logits        = visual_repr @ semantic_repr^T
-      这条可以用来验证是否与 baseline 等价。
-
-    - cosine:
-        visual_repr   = normalize(visual_input)
-        semantic_repr = normalize(semantic_input)
-        logits        = (visual_repr @ semantic_repr^T) * scale
-      这条表示“在 baseline 主干上只加入归一化”的版本。
+    当前只有 semantic-mediated affinity loss，后续新增辅助项也放这里。
     """
+    aux_losses = []
+    if _sem_med_enabled(cfg):
+        aux_losses.append(SemanticMediatedAffinityAuxLoss(cfg))
+    return aux_losses
 
-    def __init__(self, class_attr: torch.Tensor, hidden_size: int, cfg,) -> None:
-        super().__init__()
-        self.register_buffer("class_attr", class_attr.float())
-        self.num_classes = class_attr.shape[0]
-        self.attr_dim = class_attr.shape[-1]
-        self.hidden_size = int(hidden_size)
-
-        self.prototype_proj = nn.Linear(self.attr_dim, self.hidden_size, bias=True)
-        self.visual_proj = None
-        self.semantic_proj = None
-
-        self.score_mode = str(cfg.MODEL.R_SIMILARITY_V2.SCORE_MODE).lower()
-        self.learnable_scale = bool(cfg.MODEL.R_SIMILARITY_V2.LEARNABLE_SCALE)
-        self.fixed_logit_scale = float(cfg.MODEL.R_SIMILARITY_V2.FIXED_LOGIT_SCALE)
-        self.use_cosine = self.score_mode == "cosine"
-        self.logit_scale = None
-        if self.use_cosine and self.learnable_scale:
-            logit_scale_init = float(cfg.MODEL.R_SIMILARITY_V2.LOGIT_SCALE_INIT)
-            self.logit_scale = nn.Parameter(torch.log(torch.tensor(logit_scale_init, dtype=torch.float32)))
-
-        self.debug_trace_once = cfg.SOLVER.DEBUG_TRACE_ONCE
-        self.debug_shapes = cfg.SOLVER.DEBUG_SHAPES
-        self._debug_logged = False
-        self._shape_debug_logged = False
-
-        self._loss_last_visual_input = None
-        self._loss_last_visual_repr = None
-        self._loss_last_semantic_input = None
-        self._loss_last_semantic_repr = None
-        self._loss_last_logit_scale = None
-        self._loss_last_semantic_delta = None
-        self._loss_last_consistency_target = None
-        self._loss_last_semantic_final = None
-        self._loss_last_semantic_anchor = None
-
-        self._runtime_targets = None
-        self._runtime_token_sequence = None
-        self._runtime_affinities = None
-        self._runtime_semantic_state = None
-        self._last_bad_feat_rows = None
-        self._last_bad_visual_rows = None
-        self._last_bad_sim_rows = None
-        self._last_semantic_all_finite = None
-
-    def _project_class_prototypes(self) -> torch.Tensor:
-        return self.prototype_proj(self.class_attr)
-
-    def _resolve_active_class_space(self, class_ids, device: torch.device):
-        if class_ids is None:
-            active_ids = torch.arange(self.num_classes, device=device, dtype=torch.long)
-        elif torch.is_tensor(class_ids):
-            active_ids = class_ids.to(device=device, dtype=torch.long).view(-1)
-        else:
-            active_ids = torch.as_tensor(list(class_ids), device=device, dtype=torch.long).view(-1)
-        if active_ids.numel() == 0:
-            raise ValueError("Active class space is empty.")
-        return active_ids
-
-    def forward(self, cls_feat: torch.Tensor, class_ids=None) -> torch.Tensor:
-        active_class_ids = self._resolve_active_class_space(class_ids, device=cls_feat.device)
-        semantic_input = self._project_class_prototypes().index_select(0, active_class_ids)
-        visual_input = cls_feat
-
-        if self.score_mode == "dot":
-            visual_repr = visual_input
-            semantic_repr = semantic_input
-            logits = visual_repr @ semantic_repr.t()
-            scale = logits.new_tensor(1.0)
-        elif self.score_mode == "cosine":
-            visual_repr = F.normalize(visual_input, dim=-1)
-            semantic_repr = F.normalize(semantic_input, dim=-1)
-            raw_sim = visual_repr @ semantic_repr.t()
-            if self.fixed_logit_scale > 0:
-                scale = raw_sim.new_tensor(self.fixed_logit_scale)
-            elif self.logit_scale is not None:
-                scale = self.logit_scale.exp()
-            else:
-                scale = raw_sim.new_tensor(1.0)
-            logits = raw_sim * scale
-        else:
-            raise ValueError(f"Unsupported MODEL.R_SIMILARITY_V2.SCORE_MODE='{self.score_mode}'")
-
-        row_feat_ok = torch.isfinite(visual_input).all(dim=1)
-        row_visual_ok = torch.isfinite(visual_repr).all(dim=1)
-        row_sim_ok = torch.isfinite(logits).all(dim=1)
-        sem_ok = torch.isfinite(semantic_repr).all()
-
-        self._last_bad_feat_rows = None
-        self._last_bad_visual_rows = None
-        self._last_bad_sim_rows = None
-        self._last_semantic_all_finite = bool(sem_ok.item())
-        if not bool(row_feat_ok.all().item()):
-            self._last_bad_feat_rows = (~row_feat_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
-        if not bool(row_visual_ok.all().item()):
-            self._last_bad_visual_rows = (~row_visual_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
-        if not bool(row_sim_ok.all().item()):
-            self._last_bad_sim_rows = (~row_sim_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
-
-        if self.debug_shapes and (not self._shape_debug_logged):
-            print(
-                "[SHAPE-DEBUG] RSimilarityClassifierV2.forward visual_input={} semantic_input={} visual_repr={} semantic_repr={} logits={} active_classes={}".format(
-                    tuple(visual_input.shape) if torch.is_tensor(visual_input) else None,
-                    tuple(semantic_input.shape) if torch.is_tensor(semantic_input) else None,
-                    tuple(visual_repr.shape) if torch.is_tensor(visual_repr) else None,
-                    tuple(semantic_repr.shape) if torch.is_tensor(semantic_repr) else None,
-                    tuple(logits.shape) if torch.is_tensor(logits) else None,
-                    int(active_class_ids.numel()),
-                )
-            )
-            self._shape_debug_logged = True
-
-        if self.debug_trace_once and (not self._debug_logged):
-            print(
-                "[trace] node=C.r_similarity_v2 classifier=RSimilarityClassifierV2 score_mode={} logits_shape={} active_classes={}".format(
-                    self.score_mode,
-                    tuple(logits.shape),
-                    int(active_class_ids.numel()),
-                )
-            )
-            self._debug_logged = True
-
-        self._loss_last_visual_input = visual_input
-        self._loss_last_visual_repr = visual_repr
-        self._loss_last_semantic_input = semantic_input
-        self._loss_last_semantic_repr = semantic_repr
-        self._loss_last_logit_scale = scale
-        self._loss_last_semantic_delta = None
-        self._loss_last_consistency_target = None
-        self._loss_last_semantic_final = None
-        self._loss_last_semantic_anchor = None
-
-        return logits
 
 def build_loss(cfg):
     """
-    Build loss module from cfg.SOLVER.LOSS.
+    从配置构建最终训练使用的 loss。
+
+    当前入口统一返回 CompositeLoss：
+    - main_loss: CE/AR/CM 等分类主线
+    - aux_losses: sem_med 等可插拔辅助约束
     """
-    loss_name = cfg.SOLVER.LOSS
-    assert loss_name in LOSS, f'loss name {loss_name} is not supported'
-    loss_fn = LOSS[loss_name]
-    if not loss_fn:
-        return None
-    return loss_fn(cfg)
+    main_loss = _build_main_loss(cfg)
+    aux_losses = _build_aux_losses(cfg)
+    return CompositeLoss(main_loss, aux_losses)

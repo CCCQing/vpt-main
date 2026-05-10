@@ -56,8 +56,8 @@ def _classify_group(name: str) -> str:
     if any(k in lower for k in prompt_dist_keys):
         return "prompt_distribution"
 
-    if "semantic_side_branch" in lower:
-        return "semantic_side_branch"
+    if "semantic_token_projector" in lower:
+        return "semantic_token_projector"
 
     if any(k in lower for k in ["affinity", "a_vs", "a_pv", "a_ps", "triple", "consistency"]):
         return "affinity_branch"
@@ -102,7 +102,7 @@ def log_trainable_parameters(
         "backbone_pretrained",
         "prompt_tokens",
         "prompt_distribution",
-        "semantic_side_branch",
+        "semantic_token_projector",
         "affinity_branch",
         "cls_head",
         "other",

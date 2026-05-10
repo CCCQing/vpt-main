@@ -35,25 +35,31 @@ def _format_float_tag(x: float) -> str:
     return f"{mantissa}e{exp_i}"
 
 
-def _parse_int_list(raw: str) -> List[int]:
+def _parse_str_list(raw: str) -> List[str]:
     vals = []
     for item in raw.split(","):
         s = item.strip()
         if not s:
             continue
-        vals.append(int(s))
+        vals.append(s)
     if not vals:
-        raise ValueError("Empty integer grid value list.")
+        raise ValueError("Empty string grid value list.")
     return vals
 
 
-def _trial_name(idx: int, ar: float, lr: float, ntok: int, epochs: int) -> str:
-    return "exp{idx:03d}_ar{ar}_lr{lr}_tok{ntok}_ep{epochs}".format(
+def _validate_choices(name: str, values: List[str], allowed: List[str]) -> None:
+    bad = [v for v in values if v not in allowed]
+    if bad:
+        raise ValueError(f"Unsupported {name}: {bad}. Expected values from {allowed}.")
+
+
+def _trial_name(idx: int, target: str, metric: str, detach: str, sem_weight: float) -> str:
+    return "exp{idx:03d}_target{target}_metric{metric}_detach{detach}_semw{semw}".format(
         idx=idx,
-        ar=_format_float_tag(ar),
-        lr=_format_float_tag(lr),
-        ntok=ntok,
-        epochs=epochs,
+        target=target,
+        metric=metric,
+        detach=detach,
+        semw=_format_float_tag(sem_weight),
     )
 
 
@@ -163,11 +169,10 @@ def _score_key(metrics: Dict[str, float]) -> Tuple[str, float]:
 def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
     keys = [
         "trial_name",
-        "ar_weight",
-        "base_lr",
-        "num_tokens",
-        "total_epoch",
-        "weight_decay",
+        "sem_med_target",
+        "sem_med_metric",
+        "sem_med_detach",
+        "sem_med_weight",
         "exit_code",
         "score_key",
         "score",
@@ -204,15 +209,14 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("baseline_grid_search")
+    ap = argparse.ArgumentParser("sem_med_grid_search")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
-    ap.add_argument("--out-root", default="output/grid_final_gzsl_dynamic_distributor_mean_stage1")
-    ap.add_argument("--ar-grid", default="0,1e-4,5e-4")
-    ap.add_argument("--lr-grid", default="3e-4,5e-4,7e-4,1e-3")
-    ap.add_argument("--num-tokens-grid", default="8,16,32")
-    ap.add_argument("--epoch-grid", default="20,30,40")
-    ap.add_argument("--weight-decay", type=float, default=1e-5)
+    ap.add_argument("--out-root", default="output/grid_sem_med_affinity")
+    ap.add_argument("--target-grid", default="QpKv,QpQv,KpKv")
+    ap.add_argument("--metric-grid", default="mse,kl,cosine")
+    ap.add_argument("--detach-grid", default="mediated,direct")
+    ap.add_argument("--sem-med-weight-grid", default="0.001,0.0005,0.0001")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("opts", nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -221,21 +225,26 @@ def main() -> None:
     out_root = os.path.abspath(os.path.join(repo_root, args.out_root))
     os.makedirs(out_root, exist_ok=True)
 
-    ar_grid = _parse_float_list(args.ar_grid)
-    lr_grid = _parse_float_list(args.lr_grid)
-    num_tokens_grid = _parse_int_list(args.num_tokens_grid)
-    epoch_grid = _parse_int_list(args.epoch_grid)
-    total_trials = len(ar_grid) * len(lr_grid) * len(num_tokens_grid) * len(epoch_grid)
+    target_grid = _parse_str_list(args.target_grid)
+    metric_grid = _parse_str_list(args.metric_grid)
+    detach_grid = _parse_str_list(args.detach_grid)
+    sem_med_weight_grid = _parse_float_list(args.sem_med_weight_grid)
+    _validate_choices("SOLVER.SEM_MED.TARGET", target_grid, ["QpKv", "QpQv", "KpKv"])
+    _validate_choices("SOLVER.SEM_MED.METRIC", metric_grid, ["mse", "kl", "cosine"])
+    _validate_choices("SOLVER.SEM_MED.DETACH", detach_grid, ["mediated", "direct"])
+    total_trials = len(target_grid) * len(metric_grid) * len(detach_grid) * len(sem_med_weight_grid)
 
     search_space = {
         "config_file": args.config_file,
         "out_root": out_root,
         "total_trials": total_trials,
-        "ar_grid": ar_grid,
-        "lr_grid": lr_grid,
-        "num_tokens_grid": num_tokens_grid,
-        "epoch_grid": epoch_grid,
-        "weight_decay": args.weight_decay,
+        "prompt_backend": "vpt_deep",
+        "prompt_init_source": "learned",
+        "prompt_distributor_enable": False,
+        "target_grid": target_grid,
+        "metric_grid": metric_grid,
+        "detach_grid": detach_grid,
+        "sem_med_weight_grid": sem_med_weight_grid,
         "extra_opts": args.opts,
     }
     with open(os.path.join(out_root, "search_space.json"), "w", encoding="utf-8") as f:
@@ -246,24 +255,25 @@ def main() -> None:
         "DATA.XLSA.PROTOCOL_MODE", "final_gzsl",
         "MODEL.CLASSIFIER", "vspcn_baseline",
         "MODEL.PROMPT.ENABLE", "True",
-        "MODEL.PROMPT.BACKEND", "dynamic",
-        "MODEL.PROMPT.INIT_SOURCE", "distributor_mean",
+        "MODEL.PROMPT.BACKEND", "vpt_deep",
+        "MODEL.PROMPT.INIT_SOURCE", "learned",
         "MODEL.PROMPT.DEEP", "True",
-        "MODEL.PROMPT.DISTRIBUTOR.ENABLE", "True",
+        "MODEL.PROMPT.DISTRIBUTOR.ENABLE", "False",
         "MODEL.PROMPT.DISTRIBUTOR.DISABLE_SAMPLING", "True",
-        "MODEL.SEMANTIC_BRANCH.ENABLE", "False",
-        "SOLVER.LOSS", "vspcn_baseline",
+        "MODEL.SEMANTIC_TOKENS.ENABLE", "True",
+        "SOLVER.MAIN_LOSS", "vspcn",
+        "SOLVER.SEM_MED.NORM", "softmax",
     ]
     if args.opts:
         base_opts.extend(args.opts)
 
     rows: List[Dict[str, object]] = []
     idx = 1
-    for ar_weight in ar_grid:
-        for lr in lr_grid:
-            for num_tokens in num_tokens_grid:
-                for total_epoch in epoch_grid:
-                    trial_name = _trial_name(idx, ar_weight, lr, num_tokens, total_epoch)
+    for target in target_grid:
+        for metric in metric_grid:
+            for detach in detach_grid:
+                for sem_med_weight in sem_med_weight_grid:
+                    trial_name = _trial_name(idx, target, metric, detach, sem_med_weight)
                     trial_root = os.path.join(out_root, trial_name)
                     os.makedirs(trial_root, exist_ok=True)
                     stdout_path = os.path.join(trial_root, "launcher_stdout.txt")
@@ -275,25 +285,22 @@ def main() -> None:
                         args.config_file,
                         "OUTPUT_DIR",
                         trial_root,
-                        "SOLVER.LOSS_VSPCN_AR_WEIGHT",
-                        str(ar_weight),
-                        "SOLVER.BASE_LR",
-                        str(lr),
-                        "MODEL.PROMPT.NUM_TOKENS",
-                        str(num_tokens),
-                        "SOLVER.TOTAL_EPOCH",
-                        str(total_epoch),
-                        "SOLVER.WEIGHT_DECAY",
-                        str(args.weight_decay),
+                        "SOLVER.SEM_MED.TARGET",
+                        target,
+                        "SOLVER.SEM_MED.METRIC",
+                        metric,
+                        "SOLVER.SEM_MED.DETACH",
+                        detach,
+                        "SOLVER.LOSS_SEM_MED_WEIGHT",
+                        str(sem_med_weight),
                     ] + base_opts
 
                     row: Dict[str, object] = {
                         "trial_name": trial_name,
-                        "ar_weight": ar_weight,
-                        "base_lr": lr,
-                        "num_tokens": num_tokens,
-                        "total_epoch": total_epoch,
-                        "weight_decay": args.weight_decay,
+                        "sem_med_target": target,
+                        "sem_med_metric": metric,
+                        "sem_med_detach": detach,
+                        "sem_med_weight": sem_med_weight,
                         "exit_code": -1,
                         "run_dir": "",
                     }

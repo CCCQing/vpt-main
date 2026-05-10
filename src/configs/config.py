@@ -14,13 +14,14 @@ _C.CUDNN_BENCHMARK = False
 _C.NUM_GPUS = 1
 _C.NUM_SHARDS = 1
 _C.SEED = None
+_C.DIST_RANK = 0
 
 # ==========================================================
 # B. MODEL：模型主配置
 # ==========================================================
 _C.MODEL = CfgNode()
 _C.MODEL.WEIGHT_PATH = ""
-_C.MODEL.MODEL_ROOT = "weights/official"
+_C.MODEL.MODEL_ROOT = "D:\\postgraduate1\\project\\vpt-main\\weights\\official"
 _C.MODEL.TYPE = "vit"
 _C.MODEL.CLASSIFIER = "r_similarity"        # r_similarity r_similarity_v2 vspcn_baseline
 
@@ -56,18 +57,12 @@ _C.MODEL.R_SIMILARITY_V2.LEARNABLE_SCALE = False
 _C.MODEL.R_SIMILARITY_V2.LOGIT_SCALE_INIT = 10.0
 _C.MODEL.R_SIMILARITY_V2.FIXED_LOGIT_SCALE = 0.0
 
-_C.MODEL.SEMANTIC_BRANCH = CfgNode()
-_C.MODEL.SEMANTIC_BRANCH.ENABLE = True
-_C.MODEL.SEMANTIC_BRANCH.START_LAYER = 0
-_C.MODEL.SEMANTIC_BRANCH.END_LAYER = -1
-_C.MODEL.SEMANTIC_BRANCH.GAMMA_MIN = 0.05
-_C.MODEL.SEMANTIC_BRANCH.GAMMA_MAX = 1.0
-
-_C.MODEL.SEMANTIC_BRANCH.CROSS_ATTN_ENABLE = True
-_C.MODEL.SEMANTIC_BRANCH.CROSS_ATTN_HEADS = 4           # 可以搜4/8/12
-_C.MODEL.SEMANTIC_BRANCH.CROSS_ATTN_DROPOUT = 0.0
-_C.MODEL.SEMANTIC_BRANCH.CROSS_ATTN_PRE_NORM = True
-_C.MODEL.SEMANTIC_BRANCH.CROSS_ATTN_USE_FFN = True
+_C.MODEL.SEMANTIC_TOKENS = CfgNode()
+_C.MODEL.SEMANTIC_TOKENS.ENABLE = True
+_C.MODEL.SEMANTIC_TOKENS.NUM_TOKENS = 1
+_C.MODEL.SEMANTIC_TOKENS.INPUT_DIM = 312
+_C.MODEL.SEMANTIC_TOKENS.TRAIN_SOURCE = "label"       # label / class_mean / none
+_C.MODEL.SEMANTIC_TOKENS.EVAL_SOURCE = "none"         # label / class_mean / none
 
 _C.MODEL.CONSISTENCY = CfgNode()
 _C.MODEL.CONSISTENCY.ENABLE = False
@@ -84,9 +79,17 @@ _C.MODEL.ADAPTER.REDUCATION_FACTOR = 8
 _C.MODEL.ADAPTER.STYLE = "Pfeiffer"
 
 _C.SOLVER = CfgNode()
-_C.SOLVER.LOSS = "softmax_cm"
-_C.SOLVER.LOSS_CM_WEIGHT = 0.5
-_C.SOLVER.LOSS_VSPCN_AR_WEIGHT = 0.02
+_C.SOLVER.MAIN_LOSS = "vspcn"                          # vspcn / rsim / rsim_v2
+_C.SOLVER.LOSS_CM_WEIGHT = 0.05
+_C.SOLVER.LOSS_VSPCN_AR_WEIGHT = 0.0005
+_C.SOLVER.LOSS_SEM_MED_WEIGHT = 0.0
+
+_C.SOLVER.SEM_MED = CfgNode()
+_C.SOLVER.SEM_MED.TARGET = "KpKv"                 # QpKv / QpQv / KpKv
+_C.SOLVER.SEM_MED.METRIC = "cosine"                  # mse / kl / cosine
+_C.SOLVER.SEM_MED.NORM = "softmax"                # first version only supports softmax
+_C.SOLVER.SEM_MED.DETACH = "mediated"             # mediated / direct / none
+_C.SOLVER.SEM_MED.LAYERS = []                     # empty means all shared layers
 
 _C.SOLVER.RSIM_V2 = CfgNode()
 _C.SOLVER.RSIM_V2.ALIGN_MODE = "ar"                  # ar / cm
@@ -138,7 +141,7 @@ _C.SOLVER.DBG_TRAINABLE = False
 _C.DATA = CfgNode()
 _C.DATA_ROOT = ""
 _C.DATA.NAME = "CUB"
-_C.DATA.DATAPATH = "datasets/CUB/CUB_200_2011"
+_C.DATA.DATAPATH = "D:\\postgraduate1\\project\\datasets\\CUB\\CUB_200_2011"
 _C.DATA.FEATURE = "sup_vitb16_224"
 _C.DATA.NUMBER_CLASSES = 200
 _C.DATA.CLASS_WEIGHTS_TYPE = "none"
@@ -149,8 +152,8 @@ _C.DATA.PIN_MEMORY = True
 
 _C.DATA.XLSA = CfgNode()
 _C.DATA.XLSA.ENABLED = True
-_C.DATA.XLSA.RES101_PATH = "datasets/xlsa17/xlsa17/data/CUB/res101.mat"
-_C.DATA.XLSA.SPLIT_PATH = "datasets/xlsa17/xlsa17/data/CUB/att_splits.mat"
+_C.DATA.XLSA.RES101_PATH = "D:\\postgraduate1\\project\\datasets\\xlsa17\\xlsa17\\data\\CUB\\res101.mat"
+_C.DATA.XLSA.SPLIT_PATH = "D:\\postgraduate1\\project\\datasets\\xlsa17\\xlsa17\\data\\CUB\\att_splits.mat"
 _C.DATA.XLSA.PROTOCOL_MODE = "dev"     #dev / final_zsl / final_gzsl
 _C.DIST_BACKEND = "gloo"
 _C.DIST_INIT_PATH = "env://"

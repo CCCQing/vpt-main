@@ -15,11 +15,15 @@ MODEL:
     NUM_TOKENS: 32
     DROPOUT: 0.0
     DISTRIBUTOR:
-      ENABLE: True
+      ENABLE: False
       DISABLE_SAMPLING: True
 
-  SEMANTIC_BRANCH:
+  SEMANTIC_TOKENS:
     ENABLE: True
+    NUM_TOKENS: 1
+    INPUT_DIM: 312
+    TRAIN_SOURCE: "class_mean"       # label / class_mean / none
+    EVAL_SOURCE: "class_mean"         # label / class_mean / none
 
   AFFINITY:
     ENABLE: True
@@ -39,8 +43,15 @@ SOLVER:
   WEIGHT_DECAY: 0.00001
   WARMUP_EPOCH: 3
   TOTAL_EPOCH: 30
-  LOSS: "vspcn_baseline"     # softmax_cm   vspcn_baseline
+  MAIN_LOSS: "vspcn"         # vspcn / rsim / rsim_v2
   LOSS_VSPCN_AR_WEIGHT: 0.0005
+  LOSS_SEM_MED_WEIGHT: 0.0001
+  SEM_MED:
+    TARGET: "QpQv"           # QpKv / QpQv / KpKv
+    METRIC: "kl"            # mse / kl / cosine
+    NORM: "softmax"
+    DETACH: "none"       # mediated / direct / none
+    LAYERS: []
   LOSS_CM_WEIGHT: 0.05
   LOSS_CONS_WEIGHT: 0.00
   LOSS_ANCHOR_CONS_WEIGHT: 0.00
@@ -53,7 +64,7 @@ SOLVER:
     FINAL_ONLY: True
     EPOCH_LIST: []
     SPLITS: ["test_unseen"]
-    MAX_SAMPLES: 5
-    CORRECT_SAMPLES: 3
+    MAX_SAMPLES: 4
+    CORRECT_SAMPLES: 2
     WRONG_SAMPLES: 2
     ROLLOUT: True

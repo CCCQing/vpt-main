@@ -9,7 +9,7 @@ import torch.nn as nn
 from .build_vit_backbone import (build_vit_sup_models)
 from ..utils import logging
 logger = logging.get_logger("visual_prompt")
-from ..solver.losses import RSimilarityClassifier, RSimilarityClassifierV2, VSPCNBaselineClassifier
+from .classifiers import RSimilarityClassifier, RSimilarityClassifierV2, VSPCNBaselineClassifier
 from ..utils.param_logging import log_trainable_parameters
 
 
@@ -25,7 +25,7 @@ class ViT(nn.Module):
         use_plain_vit_backbone = (
             classifier_name in {"vspcn_baseline", "r_similarity_v2"}
             and (not cfg.MODEL.PROMPT.ENABLE)
-            and (not cfg.MODEL.SEMANTIC_BRANCH.ENABLE)
+            and (not cfg.MODEL.SEMANTIC_TOKENS.ENABLE)
         )
 
         if use_plain_vit_backbone:
@@ -34,7 +34,7 @@ class ViT(nn.Module):
             prompt_cfg = cfg.MODEL.PROMPT.clone()
             prompt_cfg.defrost()
             prompt_cfg.DEBUG_SHAPES = cfg.SOLVER.DEBUG_SHAPES
-            prompt_cfg.SEMANTIC_BRANCH = cfg.MODEL.SEMANTIC_BRANCH.clone()
+            prompt_cfg.SEMANTIC_TOKENS = cfg.MODEL.SEMANTIC_TOKENS.clone()
             prompt_cfg.AFFINITY = cfg.MODEL.AFFINITY.clone()
             prompt_cfg.freeze()
 
@@ -97,8 +97,8 @@ class ViT(nn.Module):
                     )
             else:
                 raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{cfg.MODEL.PROMPT.BACKEND}'")
-        if cfg.MODEL.SEMANTIC_BRANCH.ENABLE:
-            trainable_keys.append("semantic_side_branch")
+        if cfg.MODEL.SEMANTIC_TOKENS.ENABLE:
+            trainable_keys.append("semantic_token_projector")
 
         for k, p in self.enc.named_parameters():
             if not any(key in k for key in trainable_keys):
@@ -166,19 +166,14 @@ class ViT(nn.Module):
 
         self.r_similarity_head._runtime_token_sequence = None
         self.r_similarity_head._runtime_affinities = None
-        transformer = getattr(self.enc, "transformer", None)
-        self.r_similarity_head._runtime_semantic_state = (
-            getattr(transformer, "_last_semantic_side_state", None) if transformer is not None else None
-        )
+        transformer = self.enc.transformer
+        self.r_similarity_head._runtime_semantic_state = transformer._last_semantic_token_state
         x = self.r_similarity_head(x, class_ids=class_ids)
         logits_source = "r_similarity_head"
 
         if self.debug_trace_once and not self._debug_head_route_logged:
-            trace_id = getattr(self, "_debug_trace_id", "trace=NA")
-            prompt_path_info = None
-            transformer = getattr(self.enc, "transformer", None)
-            if transformer is not None:
-                prompt_path_info = getattr(transformer, "_last_prompt_path_info", None)
+            trace_id = self._debug_trace_id
+            prompt_path_info = transformer._last_prompt_path_info
             logger.info(
                 "[trace] %s node=C.vit_models.forward use_r_similarity_head=%s logits_source=%s logits_shape=%s "
                 "final_cls_or_pooled_feature_norm=%s prompt_path_info=%s",
@@ -229,10 +224,8 @@ class ViT(nn.Module):
 
         self.r_similarity_head._runtime_token_sequence = feats.detach() if torch.is_tensor(feats) else None
         self.r_similarity_head._runtime_affinities = affinities
-        transformer = getattr(self.enc, "transformer", None)
-        self.r_similarity_head._runtime_semantic_state = (
-            getattr(transformer, "_last_semantic_side_state", None) if transformer is not None else None
-        )
+        transformer = self.enc.transformer
+        self.r_similarity_head._runtime_semantic_state = transformer._last_semantic_token_state
 
         # 涓?forward 瀵归綈锛歟nc 杈撳嚭鍙兘鏄?[B, 1+N, D] 鎴?[B, D]锛屽彇 CLS 鍚庢帴澶撮儴
         feats = feats[:, 0] if feats.dim() == 3 else feats

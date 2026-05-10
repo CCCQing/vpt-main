@@ -7,7 +7,7 @@ MODEL:
 SOLVER:
   SCHEDULER: "cosine"
   PATIENCE: 300
-  LOSS: "softmax_cm"
+  MAIN_LOSS: "rsim"
   OPTIMIZER: "sgd"
   MOMENTUM: 0.9
   WEIGHT_DECAY: 0.0001

@@ -82,13 +82,17 @@ class Trainer():
         self.model = model
         self.device = device
 
-        self.affinity_aux_needed = False
+        self.cls_criterion = build_loss(self.cfg)
+        # loss 对象自己声明是否需要 affinity aux，trainer 不再硬编码具体辅助损失名。
+        self.affinity_aux_needed = bool(self.cls_criterion.requires_affinity_aux)
+        self._last_semantic_length = 0
 
         # 涓€涓负鐪熷嵆use_affinity
         self.use_affinity = cfg.MODEL.AFFINITY.ENABLE or self.affinity_aux_needed
         if self.use_affinity:
             self.affinity_cfg = {
                 "prompt_length": cfg.MODEL.PROMPT.NUM_TOKENS,
+                "semantic_length": cfg.MODEL.SEMANTIC_TOKENS.NUM_TOKENS if cfg.MODEL.SEMANTIC_TOKENS.ENABLE else 0,
                 "detach": cfg.MODEL.AFFINITY.DETACH,
             }
             self.affinity_vis = cfg.MODEL.AFFINITY.VIS
@@ -100,7 +104,6 @@ class Trainer():
         # ================== optimizer / scheduler / loss ==================
         self.optimizer = make_optimizer([self.model], cfg.SOLVER)
         self.scheduler = make_scheduler(self.optimizer, cfg.SOLVER)
-        self.cls_criterion = build_loss(self.cfg)
 
         # ================== Checkpointer ==================
         self.checkpointer = Checkpointer(
@@ -141,7 +144,7 @@ class Trainer():
         self._trace_iter = -1
         self._trace_stage = "init"
         self._trace_global_step = 0
-        self._trace_rank = int(getattr(cfg, "DIST_RANK", 0))
+        self._trace_rank = int(cfg.DIST_RANK)
 
         diag_cfg = cfg.SOLVER.DIAG
         self.diag_shuffle_raw_targets = diag_cfg.SHUFFLE_RAW_TARGETS
@@ -489,13 +492,46 @@ class Trainer():
     def _log_semantic_param_names_once(self):
         if self._debug_semantic_param_names_logged:
             return
-        names = [n for n, _ in self.model.named_parameters() if "semantic_side_branch" in n]
+        names = [n for n, _ in self.model.named_parameters() if "semantic_token_projector" in n]
         logger.info(
-            "[trace] semantic_side_branch param names (%d): %s",
+            "[trace] semantic_token_projector param names (%d): %s",
             len(names),
             names if len(names) <= 40 else names[:40] + ["..."],
         )
         self._debug_semantic_param_names_logged = True
+
+    def _semantic_source_for_stage(self, is_train: bool) -> str:
+        semantic_cfg = self.cfg.MODEL.SEMANTIC_TOKENS
+        source = semantic_cfg.TRAIN_SOURCE if is_train else semantic_cfg.EVAL_SOURCE
+        source = str(source).lower()
+        if source not in {"label", "class_mean", "none"}:
+            raise ValueError(
+                "Unsupported MODEL.SEMANTIC_TOKENS.{}_SOURCE='{}'; expected one of label/class_mean/none.".format(
+                    "TRAIN" if is_train else "EVAL",
+                    source,
+                )
+            )
+        return source
+
+    def _prepare_semantics_for_stage(self, attributes, dataset, batch_size: int, is_train: bool):
+        if not bool(self.cfg.MODEL.SEMANTIC_TOKENS.ENABLE):
+            return None
+        source = self._semantic_source_for_stage(is_train)
+        if source == "none":
+            return None
+        if source == "label":
+            if attributes is None:
+                raise ValueError("MODEL.SEMANTIC_TOKENS source='label' requires batch['attribute'].")
+            if not torch.is_tensor(attributes):
+                attributes = torch.from_numpy(attributes)
+            return attributes.to(self.device, non_blocking=True)
+        if dataset is None or not hasattr(dataset, "class_attributes") or dataset.class_attributes is None:
+            raise ValueError("MODEL.SEMANTIC_TOKENS source='class_mean' requires dataset.class_attributes.")
+        class_attributes = dataset.class_attributes
+        if not torch.is_tensor(class_attributes):
+            class_attributes = torch.from_numpy(class_attributes)
+        mean_attr = class_attributes.to(self.device, non_blocking=True).float().mean(dim=0)
+        return mean_attr.unsqueeze(0).expand(int(batch_size), -1)
 
     def _log_optimizer_param_groups(self):
         named = self._named_params()
@@ -514,7 +550,7 @@ class Trainer():
                 any("r_similarity_head" in n for n in names),
                 any("prompt_init_provider" in n for n in names),
                 any("prompt_update_layers" in n for n in names),
-                any(("semantic_side_branch" in n) or ("prototype_proj" in n) for n in names),
+                any(("semantic_token_projector" in n) or ("prototype_proj" in n) for n in names),
             )
 
     def _log_batch_stats_once(self, logits, targets):
@@ -712,8 +748,7 @@ class Trainer():
         约定：
         - aff_* : raw affinity / raw score
 
-        S 分支现在只保留 unified Qs-K(p+v)。需要 prompt/visual 切段时，
-        只在这里从 QsKpv_attn 临时派生语义中介的 p-v 归因矩阵。
+        语义 token 现在位于 ViT 主序列末尾；这里仅读取主干 Q/K 监测矩阵。
         """
         if affinities is None:
             return None
@@ -721,15 +756,18 @@ class Trainer():
         aff_qpqv = {}
         aff_kpkv = {}
         aff_qpkv = {}
-        aff_QsKpv = {}
-        aff_apvsem = {}
+        aff_qskv = {}
+        aff_qvks = {}
+        aff_qskp = {}
+        aff_qpks = {}
 
         raw_qpqv_shape = None
         raw_kpkv_shape = None
         raw_qpkv_shape = None
-        raw_qskpv_shape = None
-        raw_apvsem_shape = None
-        prompt_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS) if bool(self.cfg.MODEL.PROMPT.ENABLE) else 0
+        raw_qskv_shape = None
+        raw_qvks_shape = None
+        raw_qskp_shape = None
+        raw_qpks_shape = None
 
         for idx, affinity in enumerate(affinities):
             if not isinstance(affinity, dict):
@@ -762,25 +800,43 @@ class Trainer():
                 elif qpkv.dim() == 3:
                     aff_qpkv[idx] = qpkv
 
-            qskpv = affinity.get("QsKpv_raw")
-            if qskpv is not None:
-                if raw_qskpv_shape is None and torch.is_tensor(qskpv):
-                    raw_qskpv_shape = tuple(qskpv.shape)
-                if qskpv.dim() == 3:
-                    aff_QsKpv[idx] = qskpv.mean(dim=1)
-                elif qskpv.dim() == 2:
-                    aff_QsKpv[idx] = qskpv
+            qskv = affinity.get("QsKv_raw")
+            if qskv is not None:
+                if raw_qskv_shape is None and torch.is_tensor(qskv):
+                    raw_qskv_shape = tuple(qskv.shape)
+                if qskv.dim() == 4:
+                    aff_qskv[idx] = qskv.mean(dim=1)
+                elif qskv.dim() == 3:
+                    aff_qskv[idx] = qskv
 
-            qskpv_attn = affinity.get("QsKpv_attn")
-            if torch.is_tensor(qskpv_attn) and qskpv_attn.dim() == 3 and prompt_len > 0 and qskpv_attn.shape[-1] > prompt_len:
-                prompt_attn = qskpv_attn[..., :prompt_len]
-                visual_attn = qskpv_attn[..., prompt_len:]
-                apvsem = prompt_attn.unsqueeze(-1) * visual_attn.unsqueeze(-2)
-                if raw_apvsem_shape is None and torch.is_tensor(apvsem):
-                    raw_apvsem_shape = tuple(apvsem.shape)
-                aff_apvsem[idx] = apvsem.mean(dim=1)
+            qvks = affinity.get("QvKs_raw")
+            if qvks is not None:
+                if raw_qvks_shape is None and torch.is_tensor(qvks):
+                    raw_qvks_shape = tuple(qvks.shape)
+                if qvks.dim() == 4:
+                    aff_qvks[idx] = qvks.mean(dim=1)
+                elif qvks.dim() == 3:
+                    aff_qvks[idx] = qvks
 
-        if not aff_qpqv and not aff_kpkv and not aff_qpkv and not aff_QsKpv and not aff_apvsem:
+            qskp = affinity.get("QsKp_raw")
+            if qskp is not None:
+                if raw_qskp_shape is None and torch.is_tensor(qskp):
+                    raw_qskp_shape = tuple(qskp.shape)
+                if qskp.dim() == 4:
+                    aff_qskp[idx] = qskp.mean(dim=1)
+                elif qskp.dim() == 3:
+                    aff_qskp[idx] = qskp
+
+            qpks = affinity.get("QpKs_raw")
+            if qpks is not None:
+                if raw_qpks_shape is None and torch.is_tensor(qpks):
+                    raw_qpks_shape = tuple(qpks.shape)
+                if qpks.dim() == 4:
+                    aff_qpks[idx] = qpks.mean(dim=1)
+                elif qpks.dim() == 3:
+                    aff_qpks[idx] = qpks
+
+        if not aff_qpqv and not aff_kpkv and not aff_qpkv and not aff_qskv and not aff_qvks and not aff_qskp and not aff_qpks:
             return None
 
         out = {}
@@ -790,34 +846,44 @@ class Trainer():
             out["aff_kpkv"] = aff_kpkv
         if aff_qpkv:
             out["aff_qpkv"] = aff_qpkv
-        if aff_QsKpv:
-            out["aff_QsKpv"] = aff_QsKpv
-        if aff_apvsem:
-            out["aff_apvsem"] = aff_apvsem
+        if aff_qskv:
+            out["aff_qskv"] = aff_qskv
+        if aff_qvks:
+            out["aff_qvks"] = aff_qvks
+        if aff_qskp:
+            out["aff_qskp"] = aff_qskp
+        if aff_qpks:
+            out["aff_qpks"] = aff_qpks
 
         if self.debug_shapes and (not self._shape_debug_aux_logged):
             layer_keys = set()
-            for d in (aff_qpqv, aff_kpkv, aff_qpkv, aff_QsKpv, aff_apvsem):
+            for d in (aff_qpqv, aff_kpkv, aff_qpkv, aff_qskv, aff_qvks, aff_qskp, aff_qpks):
                 layer_keys.update(d.keys())
             sample_layer = sorted(layer_keys)[0] if len(layer_keys) > 0 else None
             qpqv_after = tuple(aff_qpqv[sample_layer].shape) if sample_layer is not None and sample_layer in aff_qpqv else None
             kpkv_after = tuple(aff_kpkv[sample_layer].shape) if sample_layer is not None and sample_layer in aff_kpkv else None
             qpkv_after = tuple(aff_qpkv[sample_layer].shape) if sample_layer is not None and sample_layer in aff_qpkv else None
-            qskpv_after = tuple(aff_QsKpv[sample_layer].shape) if sample_layer is not None and sample_layer in aff_QsKpv else None
-            apvsem_after = tuple(aff_apvsem[sample_layer].shape) if sample_layer is not None and sample_layer in aff_apvsem else None
+            qskv_after = tuple(aff_qskv[sample_layer].shape) if sample_layer is not None and sample_layer in aff_qskv else None
+            qvks_after = tuple(aff_qvks[sample_layer].shape) if sample_layer is not None and sample_layer in aff_qvks else None
+            qskp_after = tuple(aff_qskp[sample_layer].shape) if sample_layer is not None and sample_layer in aff_qskp else None
+            qpks_after = tuple(aff_qpks[sample_layer].shape) if sample_layer is not None and sample_layer in aff_qpks else None
             print(
-                "[SHAPE-DEBUG] trainer._extract_alignment_aux raw QpQv={} KpKv={} QpKv={} QsKpv={} derived_ApvSem={} "
-                "head_avg aff_qpqv={} aff_kpkv={} aff_qpkv={} aff_QsKpv={} aff_apvsem={} layer={}".format(
+                "[SHAPE-DEBUG] trainer._extract_alignment_aux raw QpQv={} KpKv={} QpKv={} QsKv={} QvKs={} QsKp={} QpKs={} "
+                "head_avg aff_qpqv={} aff_kpkv={} aff_qpkv={} aff_qskv={} aff_qvks={} aff_qskp={} aff_qpks={} layer={}".format(
                     raw_qpqv_shape,
                     raw_kpkv_shape,
                     raw_qpkv_shape,
-                    raw_qskpv_shape,
-                    raw_apvsem_shape,
+                    raw_qskv_shape,
+                    raw_qvks_shape,
+                    raw_qskp_shape,
+                    raw_qpks_shape,
                     qpqv_after,
                     kpkv_after,
                     qpkv_after,
-                    qskpv_after,
-                    apvsem_after,
+                    qskv_after,
+                    qvks_after,
+                    qskp_after,
+                    qpks_after,
                     sample_layer,
                 )
             )
@@ -896,6 +962,7 @@ class Trainer():
         if not isinstance(self._last_attn_weights, list) or len(self._last_attn_weights) == 0:
             return []
         prompt_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS) if bool(self.cfg.MODEL.PROMPT.ENABLE) else 0
+        semantic_len = int(self._last_semantic_length)
         out = []
         for li, weights in enumerate(self._last_attn_weights):
             if (not torch.is_tensor(weights)) or weights.dim() != 4 or local_idx >= weights.shape[0]:
@@ -903,14 +970,15 @@ class Trainer():
             sample = weights[local_idx].detach().cpu()
             mean_attn = sample.float().mean(dim=0)
             start_patch = 1 + prompt_len
-            n_patch = int(mean_attn.shape[-1] - start_patch)
+            end_patch = int(mean_attn.shape[-1] - semantic_len)
+            n_patch = int(end_patch - start_patch)
             if n_patch <= 0:
                 continue
             g = self._infer_grid(n_patch)
             out.append({
                 "layer": int(li),
-                "grid_map": mean_attn[0, start_patch:].view(g, g).numpy(),
-                "head_raw": sample[:, 0, start_patch:].numpy(),
+                "grid_map": mean_attn[0, start_patch:end_patch].view(g, g).numpy(),
+                "head_raw": sample[:, 0, start_patch:end_patch].numpy(),
             })
         return out
 
@@ -966,75 +1034,68 @@ class Trainer():
             })
         return out
 
-    def _vis_extract_qskpv_maps(self, local_idx: int, affinities: list) -> tuple:
-        if not isinstance(affinities, list) or len(affinities) == 0:
-            return [], []
-        prompt_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS)
-        visual_out = []
-        prompt_out = []
-        for li, aff in enumerate(affinities):
-            if not isinstance(aff, dict):
-                continue
-            raw = aff.get("QsKpv_raw", None)
-            vis = aff.get("QsKpv_vis", None)
-            if (not torch.is_tensor(raw)) or raw.dim() != 3 or local_idx >= raw.shape[0]:
-                continue
-            if (not torch.is_tensor(vis)) or vis.dim() != 3 or local_idx >= vis.shape[0]:
-                continue
-            raw_sample = raw[local_idx].detach().cpu()  # [H,P+V]
-            vis_sample = vis[local_idx].detach().cpu()  # [H,P+V]
-            if raw_sample.shape[-1] <= prompt_len:
-                continue
-            prompt_vis = vis_sample[:, :prompt_len]
-            visual_vis = vis_sample[:, prompt_len:]
-            prompt_raw = raw_sample[:, :prompt_len]
-            visual_raw = raw_sample[:, prompt_len:]
-            mean_visual = visual_vis.float().mean(dim=0)
-            n_patch = int(mean_visual.shape[-1])
-            if n_patch <= 0:
-                continue
-            g = self._infer_grid(n_patch)
-            visual_out.append({
-                "layer": int(li),
-                "grid_map": mean_visual.view(g, g).numpy(),
-                "head_raw": visual_raw.numpy(),
-                "head_vis": visual_vis.numpy(),
-            })
-            prompt_out.append({
-                "layer": int(li),
-                "prompt_raw_mean": prompt_raw.float().mean(dim=0).numpy(),
-                "prompt_vis_mean": prompt_vis.float().mean(dim=0).numpy(),
-                "head_raw": prompt_raw.numpy(),
-                "head_vis": prompt_vis.numpy(),
-            })
-        return visual_out, prompt_out
-
-    def _vis_extract_qskpv_apvsem_matrix_maps(self, local_idx: int, affinities: list) -> list:
+    def _vis_extract_affinity_to_visual_maps(self, local_idx: int, affinities: list, raw_key: str, vis_key: str, visual_axis: int) -> list:
         if not isinstance(affinities, list) or len(affinities) == 0:
             return []
-        prompt_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS)
         out = []
         for li, aff in enumerate(affinities):
             if not isinstance(aff, dict):
                 continue
-            attn = aff.get("QsKpv_attn", None)
-            if (not torch.is_tensor(attn)) or attn.dim() != 3 or local_idx >= attn.shape[0]:
+            raw = aff.get(raw_key, None)
+            vis = aff.get(vis_key, None)
+            if (not torch.is_tensor(raw)) or raw.dim() != 4 or local_idx >= raw.shape[0]:
                 continue
-            sample = attn[local_idx].detach().cpu()  # [H,P+V]
-            if sample.shape[-1] <= prompt_len:
+            if (not torch.is_tensor(vis)) or vis.dim() != 4 or local_idx >= vis.shape[0]:
                 continue
-            prompt_attn = sample[:, :prompt_len]
-            visual_attn = sample[:, prompt_len:]
-            raw = prompt_attn.unsqueeze(-1) * visual_attn.unsqueeze(-2)  # [H,P,V]
-            raw_min = raw.amin(dim=(-2, -1), keepdim=True)
-            raw_max = raw.amax(dim=(-2, -1), keepdim=True)
-            vis = (raw - raw_min) / (raw_max - raw_min).clamp_min(1e-12)
+            raw_sample = raw[local_idx].detach().cpu()
+            vis_sample = vis[local_idx].detach().cpu()
+            if visual_axis == 2:
+                mean_map = vis_sample.float().mean(dim=0).mean(dim=0)
+            elif visual_axis == 1:
+                mean_map = vis_sample.float().mean(dim=0).mean(dim=-1)
+            else:
+                raise ValueError(f"Unsupported visual_axis={visual_axis}")
+            n_patch = int(mean_map.shape[-1])
+            if n_patch <= 0:
+                continue
+            g = self._infer_grid(n_patch)
             out.append({
                 "layer": int(li),
-                "matrix_raw": raw.float().mean(dim=0).numpy(),
-                "matrix_vis": vis.float().mean(dim=0).numpy(),
-                "head_raw": raw.numpy(),
-                "head_vis": vis.numpy(),
+                "grid_map": mean_map.view(g, g).numpy(),
+                "head_raw": raw_sample.numpy(),
+                "head_vis": vis_sample.numpy(),
+            })
+        return out
+
+    def _vis_extract_prompt_response_maps(self, local_idx: int, affinities: list, raw_key: str, vis_key: str, prompt_axis: int) -> list:
+        if not isinstance(affinities, list) or len(affinities) == 0:
+            return []
+        out = []
+        for li, aff in enumerate(affinities):
+            if not isinstance(aff, dict):
+                continue
+            raw = aff.get(raw_key, None)
+            vis = aff.get(vis_key, None)
+            if (not torch.is_tensor(raw)) or raw.dim() != 4 or local_idx >= raw.shape[0]:
+                continue
+            if (not torch.is_tensor(vis)) or vis.dim() != 4 or local_idx >= vis.shape[0]:
+                continue
+            raw_sample = raw[local_idx].detach().cpu()
+            vis_sample = vis[local_idx].detach().cpu()
+            if prompt_axis == 2:
+                prompt_raw = raw_sample.float().mean(dim=0).mean(dim=0)
+                prompt_vis = vis_sample.float().mean(dim=0).mean(dim=0)
+            elif prompt_axis == 1:
+                prompt_raw = raw_sample.float().mean(dim=0).mean(dim=-1)
+                prompt_vis = vis_sample.float().mean(dim=0).mean(dim=-1)
+            else:
+                raise ValueError(f"Unsupported prompt_axis={prompt_axis}")
+            out.append({
+                "layer": int(li),
+                "prompt_raw_mean": prompt_raw.numpy(),
+                "prompt_vis_mean": prompt_vis.numpy(),
+                "head_raw": raw_sample.numpy(),
+                "head_vis": vis_sample.numpy(),
             })
         return out
 
@@ -1079,7 +1140,7 @@ class Trainer():
         ax.set_ylabel("Layer")
         ax.set_yticks(range(len(layers)))
         ax.set_yticklabels([f"L{li:02d}" for li in layers])
-        ax.set_title("Qs-K(p+v) prompt mean" + (" (vis)" if use_vis else " (raw mean)"))
+        ax.set_title("semantic/prompt affinity mean" + (" (vis)" if use_vis else " (raw mean)"))
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
         fig.tight_layout()
         fig.savefig(as_long_path(path), dpi=200)
@@ -1215,8 +1276,15 @@ class Trainer():
         qpqv_matrix_maps = self._vis_extract_prompt_visual_matrix_maps(local_idx, affinities, "QpQv_raw", "QpQv_vis") if prompt_enable else []
         kpkv_matrix_maps = self._vis_extract_prompt_visual_matrix_maps(local_idx, affinities, "KpKv_raw", "KpKv_vis") if prompt_enable else []
         qpkv_matrix_maps = self._vis_extract_prompt_visual_matrix_maps(local_idx, affinities, "QpKv_raw", "QpKv_vis") if prompt_enable else []
-        qskpv_visual_maps, qskpv_prompt_maps = self._vis_extract_qskpv_maps(local_idx, affinities) if prompt_enable else ([], [])
-        apvsem_matrix_maps = self._vis_extract_qskpv_apvsem_matrix_maps(local_idx, affinities) if prompt_enable else []
+        semantic_enable = int(self._last_semantic_length) > 0
+        qskv_overlay_maps = self._vis_extract_affinity_to_visual_maps(local_idx, affinities, "QsKv_raw", "QsKv_vis", visual_axis=2) if semantic_enable else []
+        qvks_overlay_maps = self._vis_extract_affinity_to_visual_maps(local_idx, affinities, "QvKs_raw", "QvKs_vis", visual_axis=1) if semantic_enable else []
+        qskv_matrix_maps = self._vis_extract_prompt_visual_matrix_maps(local_idx, affinities, "QsKv_raw", "QsKv_vis") if semantic_enable else []
+        qvks_matrix_maps = self._vis_extract_prompt_visual_matrix_maps(local_idx, affinities, "QvKs_raw", "QvKs_vis") if semantic_enable else []
+        qskp_matrix_maps = self._vis_extract_prompt_visual_matrix_maps(local_idx, affinities, "QsKp_raw", "QsKp_vis") if semantic_enable and prompt_enable else []
+        qpks_matrix_maps = self._vis_extract_prompt_visual_matrix_maps(local_idx, affinities, "QpKs_raw", "QpKs_vis") if semantic_enable and prompt_enable else []
+        qskp_prompt_maps = self._vis_extract_prompt_response_maps(local_idx, affinities, "QsKp_raw", "QsKp_vis", prompt_axis=2) if semantic_enable and prompt_enable else []
+        qpks_prompt_maps = self._vis_extract_prompt_response_maps(local_idx, affinities, "QpKs_raw", "QpKs_vis", prompt_axis=1) if semantic_enable and prompt_enable else []
 
         overlay_groups = [("CLS", self_maps)]
         matrix_groups = []
@@ -1225,13 +1293,22 @@ class Trainer():
                 ("QpQv", qpqv_overlay_maps),
                 ("KpKv", kpkv_overlay_maps),
                 ("QpKv", qpkv_overlay_maps),
-                ("QsKpvV", qskpv_visual_maps),
             ])
             matrix_groups.extend([
                 ("QpQv", qpqv_matrix_maps),
                 ("KpKv", kpkv_matrix_maps),
                 ("QpKv", qpkv_matrix_maps),
-                ("ApvSem", apvsem_matrix_maps),
+            ])
+        if semantic_enable:
+            overlay_groups.extend([
+                ("QsKv", qskv_overlay_maps),
+                ("QvKs", qvks_overlay_maps),
+            ])
+            matrix_groups.extend([
+                ("QsKv", qskv_matrix_maps),
+                ("QvKs", qvks_matrix_maps),
+                ("QsKp", qskp_matrix_maps),
+                ("QpKs", qpks_matrix_maps),
             ])
         self._vis_save_overlay_group_panel(
             os.path.join(sample_dir, "overlay_layers.png"),
@@ -1244,21 +1321,30 @@ class Trainer():
         )
         if prompt_enable:
             self._vis_save_matrix_group_panel(
-                os.path.join(sample_dir, "pv_matrix_layers.png"),
+                os.path.join(sample_dir, "affinity_matrix_layers.png"),
                 matrix_groups,
             )
             self._vis_save_matrix_group_raw(
-                os.path.join(sample_dir, "pv_matrix_layers.npz"),
+                os.path.join(sample_dir, "affinity_matrix_layers.npz"),
                 matrix_groups,
             )
             self._vis_save_prompt_matrix(
-                os.path.join(sample_dir, "qskpv_prompt_layers.png"),
-                qskpv_prompt_maps,
+                os.path.join(sample_dir, "qskp_prompt_layers.png"),
+                qskp_prompt_maps,
                 use_vis=True,
             )
             self._vis_save_prompt_raw(
-                os.path.join(sample_dir, "qskpv_prompt_layers.npz"),
-                qskpv_prompt_maps,
+                os.path.join(sample_dir, "qskp_prompt_layers.npz"),
+                qskp_prompt_maps,
+            )
+            self._vis_save_prompt_matrix(
+                os.path.join(sample_dir, "qpks_prompt_layers.png"),
+                qpks_prompt_maps,
+                use_vis=True,
+            )
+            self._vis_save_prompt_raw(
+                os.path.join(sample_dir, "qpks_prompt_layers.npz"),
+                qpks_prompt_maps,
             )
 
         # Group 2: rollout maps (CLS + prompt tokens).
@@ -1267,11 +1353,13 @@ class Trainer():
             if torch.is_tensor(roll) and local_idx < roll.shape[0]:
                 r = roll[local_idx].detach().cpu()
                 p_len = int(self.cfg.MODEL.PROMPT.NUM_TOKENS) if bool(self.cfg.MODEL.PROMPT.ENABLE) else 0
+                s_len = int(self._last_semantic_length)
                 start_patch = 1 + p_len
-                n_patch = int(max(0, r.shape[0] - start_patch))
+                end_patch = int(r.shape[0] - s_len)
+                n_patch = int(max(0, end_patch - start_patch))
                 if n_patch > 0:
                     g = self._infer_grid(n_patch)
-                    cls_map = r[0, start_patch:].view(g, g).numpy()
+                    cls_map = r[0, start_patch:end_patch].view(g, g).numpy()
                     cls_up = resize_map_torch(cls_map, (h, w))
                     if self.vis_save_images:
                         save_overlay(
@@ -1285,20 +1373,34 @@ class Trainer():
                         deep_idx = 1 + max(0, p_len - 1)
                         for name, sid in [("shallow_prompt", shallow_idx), ("deep_prompt", deep_idx)]:
                             if sid < r.shape[0]:
-                                pm = r[sid, start_patch:].view(g, g).numpy()
+                                pm = r[sid, start_patch:end_patch].view(g, g).numpy()
                                 pm_up = resize_map_torch(pm, (h, w))
                                 if self.vis_save_images:
                                     save_overlay(
                                         os.path.join(sample_dir, f"rollout_{name}.png"),
                                         img_u8,
                                         pm_up,
-                                        title=f"{name} rollout",
+                                            title=f"{name} rollout",
                                     )
+                    s_to_v_up = None
+                    if s_len > 0:
+                        s_start = end_patch
+                        s_rows = r[s_start:s_start + s_len, start_patch:end_patch]
+                        if s_rows.numel() > 0:
+                            s_map = s_rows.float().mean(dim=0).view(g, g).numpy()
+                            s_to_v_up = resize_map_torch(s_map, (h, w))
+                            if self.vis_save_images:
+                                save_overlay(
+                                    os.path.join(sample_dir, "rollout_s_to_v.png"),
+                                    img_u8,
+                                    s_to_v_up,
+                                    title="S-to-V rollout",
+                                )
                     if self.vis_save_raw:
-                        np.savez_compressed(
-                            as_long_path(os.path.join(sample_dir, "rollout_maps.npz")),
-                            cls=cls_up,
-                        )
+                        arrays = {"cls": cls_up}
+                        if s_to_v_up is not None:
+                            arrays["s_to_v"] = s_to_v_up
+                        np.savez_compressed(as_long_path(os.path.join(sample_dir, "rollout_maps.npz")), **arrays)
 
         self._vis_finalize_case(is_correct)
 
@@ -1357,9 +1459,21 @@ class Trainer():
         # =============================== 1. 输入搬到设备 ======================================
         inputs = inputs.to(self.device, non_blocking=True)    # (batchsize, 2048)
         targets = targets.to(self.device, non_blocking=True)  # (batchsize, )
-        if attributes is None:
-            raise ValueError("XLSA pipeline requires batch['attribute'] for semantic supervision.")
-        attributes = attributes.to(self.device, non_blocking=True)
+        semantics = self._prepare_semantics_for_stage(
+            attributes,
+            dataset,
+            batch_size=int(inputs.shape[0]),
+            is_train=is_train,
+        )
+        self._last_semantic_length = (
+            int(self.cfg.MODEL.SEMANTIC_TOKENS.NUM_TOKENS)
+            if torch.is_tensor(semantics)
+            else 0
+        )
+        affinity_cfg = None
+        if self.affinity_cfg is not None:
+            affinity_cfg = dict(self.affinity_cfg)
+            affinity_cfg["semantic_length"] = int(self._last_semantic_length)
 
         trace_id = self._make_trace_id()
         self._set_model_trace_context(trace_id)
@@ -1394,12 +1508,12 @@ class Trainer():
                 self._last_attn_weights = None
                 if self.affinity_vis:
                     outputs, attn_weights, affinities = self.model.forward_with_affinity(
-                        inputs, self.affinity_cfg, semantics=attributes, vis=True, class_ids=local_class_ids
+                        inputs, affinity_cfg, semantics=semantics, vis=True, class_ids=local_class_ids
                     )
                     self._last_attn_weights = attn_weights
                 else:
                     outputs, affinities = self.model.forward_with_affinity(
-                        inputs, self.affinity_cfg, semantics=attributes, class_ids=local_class_ids
+                        inputs, affinity_cfg, semantics=semantics, class_ids=local_class_ids
                     )
 
                 # 如果当前损失需要 affinity 辅助量，则从逐层 affinities 中抽取统一监测量。
@@ -1410,7 +1524,7 @@ class Trainer():
                     outputs = outputs if not isinstance(outputs, tuple) else outputs[0]
             else:
                 self._last_attn_weights = None
-                outputs = self.model(inputs, semantics=attributes, class_ids=local_class_ids)
+                outputs = self.model(inputs, semantics=semantics, class_ids=local_class_ids)
 
             r_head_runtime._runtime_targets = None
 
@@ -1463,22 +1577,26 @@ class Trainer():
                     aff_qpqv_dbg = aux_dbg.get("aff_qpqv")
                     aff_kpkv_dbg = aux_dbg.get("aff_kpkv")
                     aff_qpkv_dbg = aux_dbg.get("aff_qpkv")
-                    aff_QsKpv_dbg = aux_dbg.get("aff_QsKpv")
-                    aff_apvsem_dbg = aux_dbg.get("aff_apvsem")
+                    aff_qskv_dbg = aux_dbg.get("aff_qskv")
+                    aff_qvks_dbg = aux_dbg.get("aff_qvks")
+                    aff_qskp_dbg = aux_dbg.get("aff_qskp")
+                    aff_qpks_dbg = aux_dbg.get("aff_qpks")
                     sample_layer = None
                     layer_keys = set()
-                    for d in (aff_qpqv_dbg, aff_kpkv_dbg, aff_qpkv_dbg, aff_QsKpv_dbg, aff_apvsem_dbg):
+                    for d in (aff_qpqv_dbg, aff_kpkv_dbg, aff_qpkv_dbg, aff_qskv_dbg, aff_qvks_dbg, aff_qskp_dbg, aff_qpks_dbg):
                         if isinstance(d, dict):
                             layer_keys.update(d.keys())
                     if len(layer_keys) > 0:
                         sample_layer = sorted(layer_keys)[0]
                     print(
-                        "[SHAPE-DEBUG] trainer.loss_inputs aff_qpqv={} aff_kpkv={} aff_qpkv={} aff_QsKpv={} aff_apvsem={} layer={}".format(
+                        "[SHAPE-DEBUG] trainer.loss_inputs aff_qpqv={} aff_kpkv={} aff_qpkv={} aff_qskv={} aff_qvks={} aff_qskp={} aff_qpks={} layer={}".format(
                             tuple(aff_qpqv_dbg[sample_layer].shape) if isinstance(aff_qpqv_dbg, dict) and sample_layer in aff_qpqv_dbg else (tuple(aff_qpqv_dbg.shape) if torch.is_tensor(aff_qpqv_dbg) else None),
                             tuple(aff_kpkv_dbg[sample_layer].shape) if isinstance(aff_kpkv_dbg, dict) and sample_layer in aff_kpkv_dbg else (tuple(aff_kpkv_dbg.shape) if torch.is_tensor(aff_kpkv_dbg) else None),
                             tuple(aff_qpkv_dbg[sample_layer].shape) if isinstance(aff_qpkv_dbg, dict) and sample_layer in aff_qpkv_dbg else (tuple(aff_qpkv_dbg.shape) if torch.is_tensor(aff_qpkv_dbg) else None),
-                            tuple(aff_QsKpv_dbg[sample_layer].shape) if isinstance(aff_QsKpv_dbg, dict) and sample_layer in aff_QsKpv_dbg else (tuple(aff_QsKpv_dbg.shape) if torch.is_tensor(aff_QsKpv_dbg) else None),
-                            tuple(aff_apvsem_dbg[sample_layer].shape) if isinstance(aff_apvsem_dbg, dict) and sample_layer in aff_apvsem_dbg else (tuple(aff_apvsem_dbg.shape) if torch.is_tensor(aff_apvsem_dbg) else None),
+                            tuple(aff_qskv_dbg[sample_layer].shape) if isinstance(aff_qskv_dbg, dict) and sample_layer in aff_qskv_dbg else (tuple(aff_qskv_dbg.shape) if torch.is_tensor(aff_qskv_dbg) else None),
+                            tuple(aff_qvks_dbg[sample_layer].shape) if isinstance(aff_qvks_dbg, dict) and sample_layer in aff_qvks_dbg else (tuple(aff_qvks_dbg.shape) if torch.is_tensor(aff_qvks_dbg) else None),
+                            tuple(aff_qskp_dbg[sample_layer].shape) if isinstance(aff_qskp_dbg, dict) and sample_layer in aff_qskp_dbg else (tuple(aff_qskp_dbg.shape) if torch.is_tensor(aff_qskp_dbg) else None),
+                            tuple(aff_qpks_dbg[sample_layer].shape) if isinstance(aff_qpks_dbg, dict) and sample_layer in aff_qpks_dbg else (tuple(aff_qpks_dbg.shape) if torch.is_tensor(aff_qpks_dbg) else None),
                             sample_layer,
                         )
                     )
