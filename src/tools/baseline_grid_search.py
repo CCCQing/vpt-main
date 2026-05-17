@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from typing import Dict, List, Optional, Tuple
 
 
@@ -53,14 +54,8 @@ def _validate_choices(name: str, values: List[str], allowed: List[str]) -> None:
         raise ValueError(f"Unsupported {name}: {bad}. Expected values from {allowed}.")
 
 
-def _trial_name(idx: int, target: str, metric: str, detach: str, sem_weight: float) -> str:
-    return "exp{idx:03d}_target{target}_metric{metric}_detach{detach}_semw{semw}".format(
-        idx=idx,
-        target=target,
-        metric=metric,
-        detach=detach,
-        semw=_format_float_tag(sem_weight),
-    )
+def _trial_name(idx: int, tag: str) -> str:
+    return "exp{idx:03d}_{tag}".format(idx=idx, tag=tag)
 
 
 def _run_cmd(cmd: List[str], cwd: str, stdout_path: str) -> int:
@@ -75,6 +70,14 @@ def _run_cmd(cmd: List[str], cwd: str, stdout_path: str) -> int:
             errors="ignore",
         )
     return p.returncode
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def _find_run_dir(base_out: str) -> Optional[str]:
@@ -169,10 +172,8 @@ def _score_key(metrics: Dict[str, float]) -> Tuple[str, float]:
 def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
     keys = [
         "trial_name",
-        "sem_med_target",
-        "sem_med_metric",
-        "sem_med_detach",
-        "sem_med_weight",
+        "train_source",
+        "eval_source",
         "exit_code",
         "score_key",
         "score",
@@ -209,14 +210,14 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("sem_med_grid_search")
+    ap = argparse.ArgumentParser("spv_phase1_grid_search")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
-    ap.add_argument("--out-root", default="output/grid_sem_med_affinity")
-    ap.add_argument("--target-grid", default="QpKv,QpQv,KpKv")
+    ap.add_argument("--out-root", default="output/grid_spv_phase1_d_e")
+    ap.add_argument("--compose-grid", default="prob,raw_then_norm")
     ap.add_argument("--metric-grid", default="mse,kl,cosine")
-    ap.add_argument("--detach-grid", default="mediated,direct")
-    ap.add_argument("--sem-med-weight-grid", default="0.001,0.0005,0.0001")
+    ap.add_argument("--detach-grid", default="none,via_prompt,direct")
+    ap.add_argument("--weight-grid", default="0.001,0.0005,0.0001")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("opts", nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -225,131 +226,224 @@ def main() -> None:
     out_root = os.path.abspath(os.path.join(repo_root, args.out_root))
     os.makedirs(out_root, exist_ok=True)
 
-    target_grid = _parse_str_list(args.target_grid)
+    compose_grid = _parse_str_list(args.compose_grid)
     metric_grid = _parse_str_list(args.metric_grid)
     detach_grid = _parse_str_list(args.detach_grid)
-    sem_med_weight_grid = _parse_float_list(args.sem_med_weight_grid)
-    _validate_choices("SOLVER.SEM_MED.TARGET", target_grid, ["QpKv", "QpQv", "KpKv"])
-    _validate_choices("SOLVER.SEM_MED.METRIC", metric_grid, ["mse", "kl", "cosine"])
-    _validate_choices("SOLVER.SEM_MED.DETACH", detach_grid, ["mediated", "direct"])
-    total_trials = len(target_grid) * len(metric_grid) * len(detach_grid) * len(sem_med_weight_grid)
+    weight_grid = _parse_float_list(args.weight_grid)
+    _validate_choices("SOLVER.SPV.COMPOSE", compose_grid, ["prob", "raw_then_norm"])
+    _validate_choices("SOLVER.SPV.METRIC", metric_grid, ["mse", "kl", "cosine"])
+    _validate_choices("SOLVER.SPV.DETACH", detach_grid, ["none", "via_prompt", "direct"])
+
+    base_opts = [
+        "MODEL.PROMPT.ENABLE", "True",
+        "MODEL.PROMPT.BACKEND", "dynamic",
+        "MODEL.PROMPT.INIT_SOURCE", "distributor_mean",
+        "MODEL.PROMPT.DEEP", "True",
+        "MODEL.PROMPT.DISTRIBUTOR.ENABLE", "True",
+        "MODEL.SEMANTIC_TOKENS.ENABLE", "True",
+        "MODEL.SEMANTIC_TOKENS.TRAIN_SOURCE", "class_mean",
+        "MODEL.SEMANTIC_TOKENS.EVAL_SOURCE", "class_mean",
+        "MODEL.AFFINITY.ENABLE", "True",
+        "MODEL.AFFINITY.DETACH", "False",
+        "SOLVER.SPV.TARGET", "QpKv",
+        "SOLVER.SPV.NORM", "softmax",
+        "SOLVER.SPV.LAYERS", "[]",
+    ]
+    if args.opts:
+        base_opts.extend(args.opts)
+
+    trials: List[Dict[str, object]] = []
+    trials.append(
+        {
+            "group": "D_sem_med_mask",
+            "tag": "D_semmed_qpqv_kl_mediated_w1e-4_maskTrue",
+            "block_s_to_cls": True,
+            "sem_med_weight": 0.0001,
+            "sem_med_target": "QpQv",
+            "sem_med_metric": "kl",
+            "sem_med_detach": "mediated",
+            "spv_weight": 0.0,
+            "spv_compose": "",
+            "spv_target": "",
+            "spv_metric": "",
+            "spv_detach": "",
+            "opts": [
+                "MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS", "True",
+                "SOLVER.LOSS_SEM_MED_WEIGHT", "0.0001",
+                "SOLVER.SEM_MED.TARGET", "QpQv",
+                "SOLVER.SEM_MED.METRIC", "kl",
+                "SOLVER.SEM_MED.NORM", "softmax",
+                "SOLVER.SEM_MED.DETACH", "mediated",
+                "SOLVER.SEM_MED.LAYERS", "[]",
+                "SOLVER.LOSS_SPV_WEIGHT", "0.0",
+            ],
+        }
+    )
+    for compose in compose_grid:
+        for metric in metric_grid:
+            for detach in detach_grid:
+                for weight in weight_grid:
+                    weight_tag = _format_float_tag(weight)
+                    trials.append(
+                        {
+                            "group": "E_spv_grid",
+                            "tag": f"E_spv_{compose}_{metric}_{detach}_w{weight_tag}",
+                            "block_s_to_cls": False,
+                            "sem_med_weight": 0.0,
+                            "sem_med_target": "",
+                            "sem_med_metric": "",
+                            "sem_med_detach": "",
+                            "spv_weight": weight,
+                            "spv_compose": compose,
+                            "spv_target": "QpKv",
+                            "spv_metric": metric,
+                            "spv_detach": detach,
+                            "opts": [
+                                "MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS", "False",
+                                "SOLVER.LOSS_SEM_MED_WEIGHT", "0.0",
+                                "SOLVER.LOSS_SPV_WEIGHT", str(weight),
+                                "SOLVER.SPV.COMPOSE", compose,
+                                "SOLVER.SPV.TARGET", "QpKv",
+                                "SOLVER.SPV.METRIC", metric,
+                                "SOLVER.SPV.NORM", "softmax",
+                                "SOLVER.SPV.DETACH", detach,
+                                "SOLVER.SPV.LAYERS", "[]",
+                            ],
+                        }
+                    )
 
     search_space = {
         "config_file": args.config_file,
         "out_root": out_root,
-        "total_trials": total_trials,
-        "prompt_backend": "vpt_deep",
-        "prompt_init_source": "learned",
-        "prompt_distributor_enable": False,
-        "target_grid": target_grid,
-        "metric_grid": metric_grid,
-        "detach_grid": detach_grid,
-        "sem_med_weight_grid": sem_med_weight_grid,
+        "total_trials": len(trials),
+        "fixed_prompt_backend": "dynamic",
+        "fixed_prompt_init_source": "distributor_mean",
+        "fixed_prompt_distributor_enable": True,
+        "fixed_train_source": "class_mean",
+        "fixed_eval_source": "class_mean",
+        "D_trial": "sem_med QpQv/kl/mediated/0.0001 with BLOCK_S_TO_CLS=True",
+        "E_grid": {
+            "compose_grid": compose_grid,
+            "metric_grid": metric_grid,
+            "detach_grid": detach_grid,
+            "weight_grid": weight_grid,
+            "target": "QpKv",
+            "norm": "softmax",
+            "block_s_to_cls": False,
+            "sem_med_weight": 0.0,
+        },
         "extra_opts": args.opts,
     }
     with open(os.path.join(out_root, "search_space.json"), "w", encoding="utf-8") as f:
         json.dump(search_space, f, ensure_ascii=False, indent=2)
 
-    base_opts = [
-        "RUN_N_TIMES", "1",
-        "DATA.XLSA.PROTOCOL_MODE", "final_gzsl",
-        "MODEL.CLASSIFIER", "vspcn_baseline",
-        "MODEL.PROMPT.ENABLE", "True",
-        "MODEL.PROMPT.BACKEND", "vpt_deep",
-        "MODEL.PROMPT.INIT_SOURCE", "learned",
-        "MODEL.PROMPT.DEEP", "True",
-        "MODEL.PROMPT.DISTRIBUTOR.ENABLE", "False",
-        "MODEL.PROMPT.DISTRIBUTOR.DISABLE_SAMPLING", "True",
-        "MODEL.SEMANTIC_TOKENS.ENABLE", "True",
-        "SOLVER.MAIN_LOSS", "vspcn",
-        "SOLVER.SEM_MED.NORM", "softmax",
-    ]
-    if args.opts:
-        base_opts.extend(args.opts)
-
     rows: List[Dict[str, object]] = []
-    idx = 1
-    for target in target_grid:
-        for metric in metric_grid:
-            for detach in detach_grid:
-                for sem_med_weight in sem_med_weight_grid:
-                    trial_name = _trial_name(idx, target, metric, detach, sem_med_weight)
-                    trial_root = os.path.join(out_root, trial_name)
-                    os.makedirs(trial_root, exist_ok=True)
-                    stdout_path = os.path.join(trial_root, "launcher_stdout.txt")
+    grid_start = time.time()
+    total_trials = len(trials)
+    for idx, trial in enumerate(trials, start=1):
+        trial_name = _trial_name(idx, str(trial["tag"]))
+        trial_root = os.path.join(out_root, trial_name)
+        os.makedirs(trial_root, exist_ok=True)
+        stdout_path = os.path.join(trial_root, "launcher_stdout.txt")
+        trial_start = time.time()
+        print(f"[grid] start {idx}/{total_trials}: {trial_name}", flush=True)
 
-                    cmd = [
-                        sys.executable,
-                        "train.py",
-                        "--config-file",
-                        args.config_file,
-                        "OUTPUT_DIR",
-                        trial_root,
-                        "SOLVER.SEM_MED.TARGET",
-                        target,
-                        "SOLVER.SEM_MED.METRIC",
-                        metric,
-                        "SOLVER.SEM_MED.DETACH",
-                        detach,
-                        "SOLVER.LOSS_SEM_MED_WEIGHT",
-                        str(sem_med_weight),
-                    ] + base_opts
+        cmd = [
+            sys.executable,
+            "train.py",
+            "--config-file",
+            args.config_file,
+            "OUTPUT_DIR",
+            trial_root,
+        ] + base_opts + list(trial["opts"])
 
-                    row: Dict[str, object] = {
-                        "trial_name": trial_name,
-                        "sem_med_target": target,
-                        "sem_med_metric": metric,
-                        "sem_med_detach": detach,
-                        "sem_med_weight": sem_med_weight,
-                        "exit_code": -1,
-                        "run_dir": "",
-                    }
+        row: Dict[str, object] = {
+            "trial_name": trial_name,
+            "group": trial["group"],
+            "train_source": "class_mean",
+            "eval_source": "class_mean",
+            "block_s_to_cls": trial["block_s_to_cls"],
+            "sem_med_weight": trial["sem_med_weight"],
+            "sem_med_target": trial["sem_med_target"],
+            "sem_med_metric": trial["sem_med_metric"],
+            "sem_med_detach": trial["sem_med_detach"],
+            "spv_weight": trial["spv_weight"],
+            "spv_compose": trial["spv_compose"],
+            "spv_target": trial["spv_target"],
+            "spv_metric": trial["spv_metric"],
+            "spv_detach": trial["spv_detach"],
+            "exit_code": -1,
+            "run_dir": "",
+        }
 
-                    run_dir = _find_run_dir(trial_root)
-                    if run_dir is not None:
-                        log_path = os.path.join(run_dir, "logs.txt")
-                        metrics = _parse_metrics(log_path)
-                        score_key, score = _score_key(metrics)
-                        row.update(metrics)
-                        row["score_key"] = score_key
-                        row["score"] = score
-                        row["run_dir"] = run_dir
-                        row["exit_code"] = 0
-                        rows.append(row)
-                        idx += 1
-                        continue
+        run_dir = _find_run_dir(trial_root)
+        if run_dir is not None:
+            log_path = os.path.join(run_dir, "logs.txt")
+            metrics = _parse_metrics(log_path)
+            score_key, score = _score_key(metrics)
+            row.update(metrics)
+            row["score_key"] = score_key
+            row["score"] = score
+            row["run_dir"] = run_dir
+            row["exit_code"] = 0
+            rows.append(row)
+            elapsed = time.time() - trial_start
+            total_elapsed = time.time() - grid_start
+            avg_elapsed = total_elapsed / float(idx)
+            eta = avg_elapsed * float(total_trials - idx)
+            print(
+                f"[grid] skip existing {idx}/{total_trials}: {trial_name} "
+                f"trial_time={_format_duration(elapsed)} total_time={_format_duration(total_elapsed)} eta={_format_duration(eta)}",
+                flush=True,
+            )
+            continue
 
-                    if args.dry_run:
-                        row["score_key"] = "dry_run"
-                        row["score"] = ""
-                        rows.append(row)
-                        print(" ".join(cmd))
-                        idx += 1
-                        continue
+        if args.dry_run:
+            row["score_key"] = "dry_run"
+            row["score"] = ""
+            rows.append(row)
+            print(" ".join(cmd))
+            elapsed = time.time() - trial_start
+            total_elapsed = time.time() - grid_start
+            avg_elapsed = total_elapsed / float(idx)
+            eta = avg_elapsed * float(total_trials - idx)
+            print(
+                f"[grid] dry-run done {idx}/{total_trials}: {trial_name} "
+                f"trial_time={_format_duration(elapsed)} total_time={_format_duration(total_elapsed)} eta={_format_duration(eta)}",
+                flush=True,
+            )
+            continue
 
-                    code = _run_cmd(cmd, cwd=repo_root, stdout_path=stdout_path)
-                    row["exit_code"] = code
+        code = _run_cmd(cmd, cwd=repo_root, stdout_path=stdout_path)
+        row["exit_code"] = code
 
-                    run_dir = _find_run_dir(trial_root)
-                    if run_dir is not None:
-                        log_path = os.path.join(run_dir, "logs.txt")
-                        metrics = _parse_metrics(log_path)
-                        score_key, score = _score_key(metrics)
-                        row.update(metrics)
-                        row["score_key"] = score_key
-                        row["score"] = score
-                        row["run_dir"] = run_dir
-                    else:
-                        row["score_key"] = "missing_logs"
-                        row["score"] = ""
+        run_dir = _find_run_dir(trial_root)
+        if run_dir is not None:
+            log_path = os.path.join(run_dir, "logs.txt")
+            metrics = _parse_metrics(log_path)
+            score_key, score = _score_key(metrics)
+            row.update(metrics)
+            row["score_key"] = score_key
+            row["score"] = score
+            row["run_dir"] = run_dir
+        else:
+            row["score_key"] = "missing_logs"
+            row["score"] = ""
 
-                    rows.append(row)
+        rows.append(row)
+        elapsed = time.time() - trial_start
+        total_elapsed = time.time() - grid_start
+        avg_elapsed = total_elapsed / float(idx)
+        eta = avg_elapsed * float(total_trials - idx)
+        print(
+            f"[grid] done {idx}/{total_trials}: {trial_name} exit_code={code} "
+            f"trial_time={_format_duration(elapsed)} total_time={_format_duration(total_elapsed)} eta={_format_duration(eta)}",
+            flush=True,
+        )
 
-                    _write_summary_csv(os.path.join(out_root, "summary.csv"), rows)
-                    with open(os.path.join(out_root, "summary.json"), "w", encoding="utf-8") as f:
-                        json.dump(rows, f, ensure_ascii=False, indent=2)
-
-                    idx += 1
+        _write_summary_csv(os.path.join(out_root, "summary.csv"), rows)
+        with open(os.path.join(out_root, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(rows, f, ensure_ascii=False, indent=2)
 
     rows_sorted = sorted(
         rows,
@@ -363,7 +457,18 @@ def main() -> None:
         json.dump(rows_sorted, f, ensure_ascii=False, indent=2)
 
     topk = rows_sorted[:5]
-    print(json.dumps({"out_root": out_root, "total_trials": total_trials, "top5": topk}, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "out_root": out_root,
+                "total_trials": len(trials),
+                "total_time": _format_duration(time.time() - grid_start),
+                "top5": topk,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

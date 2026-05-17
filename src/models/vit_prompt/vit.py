@@ -196,6 +196,7 @@ class PromptedTransformer(Transformer):
 
         self.semantic_tokens_cfg = prompt_config.SEMANTIC_TOKENS
         self.semantic_tokens_enable = bool(self.semantic_tokens_cfg.ENABLE)
+        self.block_s_to_cls = bool(self.semantic_tokens_cfg.BLOCK_S_TO_CLS)
         self.prompt_enable = bool(prompt_config.ENABLE)
         self.prompt_backend = prompt_config.BACKEND.lower()
         if self.prompt_backend not in {"dynamic", "vpt_deep"}:
@@ -313,6 +314,11 @@ class PromptedTransformer(Transformer):
             ),
             dim=1,
         )
+
+    def _active_semantic_length(self, semantics) -> int:
+        if self.semantic_tokens_enable and torch.is_tensor(semantics):
+            return int(self.semantic_tokens_cfg.NUM_TOKENS)
+        return 0
 
     def incorporate_prompt(self, x, semantics=None):
         """构造输入层主序列，并在需要时注入输入 prompt。
@@ -489,9 +495,16 @@ class PromptedTransformer(Transformer):
         weights = None
         num_layers = self.vit_config.transformer["num_layers"]
         sem_state, semantic_input = None, None
+        semantic_length = self._active_semantic_length(semantics)
         for i in range(num_layers):
             if i == 0:
-                hidden_states, weights, _ = self.encoder.layer[i](hidden_states, None, self.num_tokens)
+                hidden_states, weights, _ = self.encoder.layer[i](
+                    hidden_states,
+                    None,
+                    self.num_tokens,
+                    semantic_length,
+                    self.block_s_to_cls,
+                )
                 if torch.is_tensor(hidden_states):
                     row_hidden_ok = torch.isfinite(hidden_states).flatten(1).all(dim=1)
                     if not bool(row_hidden_ok.all().item()):
@@ -525,7 +538,13 @@ class PromptedTransformer(Transformer):
 
                 hidden_states = self._replace_prompt_tokens(hidden_states, next_prompt)
 
-                hidden_states, weights, _ = self.encoder.layer[i](hidden_states, None, self.num_tokens)
+                hidden_states, weights, _ = self.encoder.layer[i](
+                    hidden_states,
+                    None,
+                    self.num_tokens,
+                    semantic_length,
+                    self.block_s_to_cls,
+                )
                 if torch.is_tensor(hidden_states):
                     row_hidden_ok = torch.isfinite(hidden_states).flatten(1).all(dim=1)
                     if not bool(row_hidden_ok.all().item()):
@@ -594,7 +613,13 @@ class PromptedTransformer(Transformer):
             encoded, attn_weights = self.forward_deep_prompt(
                 embedding_output, semantics)
         else:
-            encoded, attn_weights = self.encoder(embedding_output, None, effective_prompt_tokens)
+            encoded, attn_weights = self.encoder(
+                embedding_output,
+                None,
+                effective_prompt_tokens,
+                self._active_semantic_length(semantics),
+                self.block_s_to_cls,
+            )
 
         return encoded, attn_weights
 

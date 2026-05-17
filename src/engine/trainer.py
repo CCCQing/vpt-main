@@ -85,6 +85,8 @@ class Trainer():
         self.cls_criterion = build_loss(self.cfg)
         # loss 对象自己声明是否需要 affinity aux，trainer 不再硬编码具体辅助损失名。
         self.affinity_aux_needed = bool(self.cls_criterion.requires_affinity_aux)
+        if self.affinity_aux_needed and bool(cfg.MODEL.AFFINITY.DETACH):
+            raise ValueError("Affinity auxiliary losses require MODEL.AFFINITY.DETACH=False.")
         self._last_semantic_length = 0
 
         # 涓€涓负鐪熷嵆use_affinity
@@ -94,6 +96,7 @@ class Trainer():
                 "prompt_length": cfg.MODEL.PROMPT.NUM_TOKENS,
                 "semantic_length": cfg.MODEL.SEMANTIC_TOKENS.NUM_TOKENS if cfg.MODEL.SEMANTIC_TOKENS.ENABLE else 0,
                 "detach": cfg.MODEL.AFFINITY.DETACH,
+                "block_s_to_cls": cfg.MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS,
             }
             self.affinity_vis = cfg.MODEL.AFFINITY.VIS
         else:

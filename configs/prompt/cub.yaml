@@ -9,27 +9,29 @@ MODEL:
   CLASSIFIER: "vspcn_baseline"
   PROMPT:
     ENABLE: True
-    BACKEND: "vpt_deep"             # dynamic / vpt_deep
-    INIT_SOURCE: "learned"    # learned / distributor_mean
+    BACKEND: "dynamic"             # dynamic / vpt_deep
+    INIT_SOURCE: "distributor_mean"    # learned / distributor_mean
     DEEP: True
     NUM_TOKENS: 32
     DROPOUT: 0.0
     DISTRIBUTOR:
-      ENABLE: False
+      ENABLE: True
       DISABLE_SAMPLING: True
 
   SEMANTIC_TOKENS:
     ENABLE: True
     NUM_TOKENS: 1
     INPUT_DIM: 312
-    TRAIN_SOURCE: "class_mean"       # label / class_mean / none / random_fixed / label_shuffle / learned_token
-    EVAL_SOURCE: "class_mean"         # label / class_mean / none / random_fixed / label_shuffle / learned_token
+    TRAIN_SOURCE: "learned_token"       # label / class_mean / none / random_fixed / label_shuffle / learned_token
+    EVAL_SOURCE: "learned_token"         # label / class_mean / none / random_fixed / label_shuffle / learned_token
     RANDOM_SEED: 0
     RANDOM_STD: 1.0
     LEARNED_INIT_STD: 0.02
+    BLOCK_S_TO_CLS: False
 
   AFFINITY:
     ENABLE: True
+    DETACH: False
 
   R_SIMILARITY:
     ENABLE: True
@@ -49,11 +51,19 @@ SOLVER:
   MAIN_LOSS: "vspcn"         # vspcn / rsim / rsim_v2
   LOSS_VSPCN_AR_WEIGHT: 0.0005
   LOSS_SEM_MED_WEIGHT: 0.0001
+  LOSS_SPV_WEIGHT: 0.0
   SEM_MED:
     TARGET: "QpQv"           # QpKv / QpQv / KpKv
     METRIC: "kl"            # mse / kl / cosine
     NORM: "softmax"
-    DETACH: "none"       # mediated / direct / none
+    DETACH: "mediated"       # mediated / direct / none
+    LAYERS: []
+  SPV:
+    COMPOSE: "prob"           # prob / raw_then_norm
+    TARGET: "QpKv"           # QpKv / QpQv / KpKv
+    METRIC: "kl"             # mse / kl / cosine
+    NORM: "softmax"
+    DETACH: "none"           # via_prompt / direct / none
     LAYERS: []
   LOSS_CM_WEIGHT: 0.05
   LOSS_CONS_WEIGHT: 0.00
@@ -72,7 +82,7 @@ SOLVER:
     WRONG_SAMPLES: 2
     ROLLOUT: True
     SEMANTIC_ABLATION:
-      ENABLE: False
-      DELTA_ASV: False
-      ATTENTION_MASS: False
+      ENABLE: True
+      DELTA_ASV: True
+      ATTENTION_MASS: True
       DELTA_REFERENCE_SOURCE: "class_mean"

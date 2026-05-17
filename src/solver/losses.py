@@ -130,7 +130,7 @@ def _compute_consistency_loss_from_rhead_cache(model: Optional[nn.Module], dist_
     return (1.0 - (d * t).sum(dim=-1)).mean()
 
 
-def _normalize_semantic_mediated_affinity(x: torch.Tensor, norm_type: str) -> torch.Tensor:
+def _normalize_affinity_for_aux_loss(x: torch.Tensor, norm_type: str, cfg_name: str) -> torch.Tensor:
     """
     对亲和矩阵做归一化，供 semantic-mediated loss 对齐使用。
 
@@ -138,7 +138,7 @@ def _normalize_semantic_mediated_affinity(x: torch.Tensor, norm_type: str) -> to
     """
     norm_type = str(norm_type).lower()
     if norm_type != "softmax":
-        raise ValueError(f"Unsupported SOLVER.SEM_MED.NORM='{norm_type}'. The first version only supports softmax.")
+        raise ValueError(f"Unsupported {cfg_name}.NORM='{norm_type}'. The first version only supports softmax.")
     return F.softmax(x, dim=-1)
 
 
@@ -234,8 +234,8 @@ def _compute_semantic_mediated_affinity_loss(aux: Optional[Dict[str, Any]], cfg)
             )
 
         mediated = torch.bmm(qskp.transpose(1, 2), qskv)
-        mediated_norm = _normalize_semantic_mediated_affinity(mediated, norm_type)
-        direct_norm = _normalize_semantic_mediated_affinity(apv, norm_type)
+        mediated_norm = _normalize_affinity_for_aux_loss(mediated, norm_type, "SOLVER.SEM_MED")
+        direct_norm = _normalize_affinity_for_aux_loss(apv, norm_type, "SOLVER.SEM_MED")
 
         if detach_mode == "mediated":
             loss_i = _semantic_mediated_distance(direct_norm, mediated_norm.detach(), metric)
@@ -249,6 +249,113 @@ def _compute_semantic_mediated_affinity_loss(aux: Optional[Dict[str, Any]], cfg)
                 )
             else:
                 loss_i = _semantic_mediated_distance(direct_norm, mediated_norm, metric)
+        layer_losses.append(loss_i)
+
+    return torch.stack(layer_losses).mean()
+
+
+def _compute_semantic_prompt_visual_cycle_loss(aux: Optional[Dict[str, Any]], cfg) -> torch.Tensor:
+    """
+    L_spv checks whether semantic -> prompt -> visual can reconstruct semantic -> visual.
+
+    Compose modes:
+        prob:
+            P_s2v_via_p = softmax(QsKp) @ softmax(Apv)
+        raw_then_norm:
+            P_s2v_via_p = softmax(QsKp @ Apv)
+
+    Shapes after trainer head-mean:
+        QsKp: [B, S, P]
+        QsKv: [B, S, V]
+        Apv : [B, P, V]
+    """
+    if not isinstance(aux, Dict):
+        raise RuntimeError("Semantic prompt-visual cycle loss requires affinity aux dict.")
+
+    target = str(cfg.SOLVER.SPV.TARGET)
+    target_map = {
+        "QpKv": "aff_qpkv",
+        "QpQv": "aff_qpqv",
+        "KpKv": "aff_kpkv",
+    }
+    if target not in target_map:
+        raise ValueError(f"Unsupported SOLVER.SPV.TARGET='{target}'. Expected QpKv / QpQv / KpKv.")
+
+    required_keys = ["aff_qskp", "aff_qskv", target_map[target]]
+    missing = [k for k in required_keys if k not in aux or not isinstance(aux[k], Dict)]
+    if missing:
+        raise RuntimeError(f"Semantic prompt-visual cycle loss missing aux keys: {missing}.")
+
+    qskp_layers = aux["aff_qskp"]
+    qskv_layers = aux["aff_qskv"]
+    apv_layers = aux[target_map[target]]
+
+    shared_layers = sorted(set(qskp_layers.keys()) & set(qskv_layers.keys()) & set(apv_layers.keys()))
+    requested_layers = list(cfg.SOLVER.SPV.LAYERS)
+    if requested_layers:
+        requested_layers = [int(x) for x in requested_layers]
+        shared_layers = [x for x in shared_layers if x in requested_layers]
+    if not shared_layers:
+        raise RuntimeError("Semantic prompt-visual cycle loss found no shared layers.")
+
+    metric = str(cfg.SOLVER.SPV.METRIC).lower()
+    norm_type = str(cfg.SOLVER.SPV.NORM).lower()
+    compose_mode = str(cfg.SOLVER.SPV.COMPOSE).lower()
+    detach_mode = str(cfg.SOLVER.SPV.DETACH).lower()
+    if compose_mode not in {"prob", "raw_then_norm"}:
+        raise ValueError(f"Unsupported SOLVER.SPV.COMPOSE='{compose_mode}'. Expected prob / raw_then_norm.")
+    if detach_mode not in {"via_prompt", "direct", "none"}:
+        raise ValueError(f"Unsupported SOLVER.SPV.DETACH='{detach_mode}'. Expected via_prompt / direct / none.")
+
+    layer_losses = []
+    for layer_idx in shared_layers:
+        qskp = qskp_layers[layer_idx]
+        qskv = qskv_layers[layer_idx]
+        apv = apv_layers[layer_idx]
+        if qskp.dim() != 3 or qskv.dim() != 3 or apv.dim() != 3:
+            raise RuntimeError(
+                "Semantic prompt-visual cycle loss expects [B,S,P], [B,S,V], [B,P,V], got {}, {}, {} at layer {}.".format(
+                    tuple(qskp.shape),
+                    tuple(qskv.shape),
+                    tuple(apv.shape),
+                    int(layer_idx),
+                )
+            )
+        if qskp.shape[0] != qskv.shape[0] or qskp.shape[0] != apv.shape[0]:
+            raise RuntimeError(f"Semantic prompt-visual cycle loss batch mismatch at layer {layer_idx}.")
+        if qskp.shape[1] != qskv.shape[1]:
+            raise RuntimeError(f"Semantic token count mismatch between QsKp and QsKv at layer {layer_idx}.")
+        if qskp.shape[2] != apv.shape[1] or qskv.shape[2] != apv.shape[2]:
+            raise RuntimeError(
+                "Semantic prompt-visual cycle shape mismatch at layer {}: QsKp={}, QsKv={}, Apv={}.".format(
+                    int(layer_idx),
+                    tuple(qskp.shape),
+                    tuple(qskv.shape),
+                    tuple(apv.shape),
+                )
+            )
+
+        if compose_mode == "prob":
+            qskp_norm = _normalize_affinity_for_aux_loss(qskp, norm_type, "SOLVER.SPV")
+            apv_norm = _normalize_affinity_for_aux_loss(apv, norm_type, "SOLVER.SPV")
+            via_prompt = torch.bmm(qskp_norm, apv_norm)
+        else:
+            via_prompt_raw = torch.bmm(qskp, apv)
+            via_prompt = _normalize_affinity_for_aux_loss(via_prompt_raw, norm_type, "SOLVER.SPV")
+        direct_norm = _normalize_affinity_for_aux_loss(qskv, norm_type, "SOLVER.SPV")
+
+        if detach_mode == "via_prompt":
+            loss_i = _semantic_mediated_distance(direct_norm, via_prompt.detach(), metric)
+        elif detach_mode == "direct":
+            loss_i = _semantic_mediated_distance(via_prompt, direct_norm.detach(), metric)
+        else:
+            if metric == "kl":
+                loss_i = 0.5 * (
+                    _semantic_mediated_distance(direct_norm, via_prompt.detach(), metric)
+                    + _semantic_mediated_distance(via_prompt, direct_norm.detach(), metric)
+                )
+            else:
+                loss_i = _semantic_mediated_distance(via_prompt, direct_norm, metric)
         layer_losses.append(loss_i)
 
     return torch.stack(layer_losses).mean()
@@ -505,6 +612,30 @@ class SemanticMediatedAffinityAuxLoss(nn.Module):
         return _compute_semantic_mediated_affinity_loss(aux, self.cfg)
 
 
+class SemanticPromptVisualCycleAuxLoss(nn.Module):
+    """
+    语义-提示-视觉路径一致性辅助损失。
+    只负责计算 L_spv，不参与分类主损失逻辑。
+    """
+    def __init__(self, cfg=None):
+        """读取 semantic prompt-visual cycle loss 的权重和配置。"""
+        super().__init__()
+        self.name = "spv_loss"
+        self.requires_affinity_aux = True
+        self.spv_weight = float(cfg.SOLVER.LOSS_SPV_WEIGHT)
+        self.cfg = cfg
+
+    @property
+    def weight(self) -> float:
+        """返回当前辅助损失权重，供 CompositeLoss 判断是否启用。"""
+        return self.spv_weight
+
+    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """从模型输出中取 aux，并计算 semantic -> prompt -> visual cycle loss。"""
+        _, aux = _extract_logits_and_aux(pred_logits, kwargs)
+        return _compute_semantic_prompt_visual_cycle_loss(aux, self.cfg)
+
+
 class CompositeLoss(nn.Module):
     """
     组合式 loss：main_loss 负责分类主线，aux_losses 只负责各自的辅助约束。
@@ -667,6 +798,11 @@ def _sem_med_enabled(cfg) -> bool:
     return float(cfg.SOLVER.LOSS_SEM_MED_WEIGHT) > 0
 
 
+def _spv_enabled(cfg) -> bool:
+    """判断 semantic prompt-visual cycle 辅助损失是否启用。"""
+    return float(cfg.SOLVER.LOSS_SPV_WEIGHT) > 0
+
+
 def _build_aux_losses(cfg):
     """
     根据各辅助损失权重构建辅助损失列表。
@@ -676,6 +812,8 @@ def _build_aux_losses(cfg):
     aux_losses = []
     if _sem_med_enabled(cfg):
         aux_losses.append(SemanticMediatedAffinityAuxLoss(cfg))
+    if _spv_enabled(cfg):
+        aux_losses.append(SemanticPromptVisualCycleAuxLoss(cfg))
     return aux_losses
 
 

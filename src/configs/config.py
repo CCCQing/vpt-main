@@ -63,11 +63,12 @@ _C.MODEL.SEMANTIC_TOKENS.NUM_TOKENS = 1
 _C.MODEL.SEMANTIC_TOKENS.INPUT_DIM = 312
 _C.MODEL.SEMANTIC_TOKENS.TRAIN_SOURCE = "label"       # label / class_mean / none / random_fixed / label_shuffle / learned_token
 _C.MODEL.SEMANTIC_TOKENS.EVAL_SOURCE = "none"         # label / class_mean / none / random_fixed / label_shuffle / learned_token
-# BEGIN SEMANTIC_ABLATION_EXPERIMENT
+# BEGIN SEMANTIC_ABLATION_EXPERIMENT                    # 语义替换实验+att mass统计  ΔAsv
 _C.MODEL.SEMANTIC_TOKENS.RANDOM_SEED = 0
 _C.MODEL.SEMANTIC_TOKENS.RANDOM_STD = 1.0
 _C.MODEL.SEMANTIC_TOKENS.LEARNED_INIT_STD = 0.02
 # END SEMANTIC_ABLATION_EXPERIMENT
+_C.MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS = False
 
 _C.MODEL.CONSISTENCY = CfgNode()
 _C.MODEL.CONSISTENCY.ENABLE = False
@@ -88,6 +89,7 @@ _C.SOLVER.MAIN_LOSS = "vspcn"                          # vspcn / rsim / rsim_v2
 _C.SOLVER.LOSS_CM_WEIGHT = 0.05
 _C.SOLVER.LOSS_VSPCN_AR_WEIGHT = 0.0005
 _C.SOLVER.LOSS_SEM_MED_WEIGHT = 0.0
+_C.SOLVER.LOSS_SPV_WEIGHT = 0.0
 
 _C.SOLVER.SEM_MED = CfgNode()
 _C.SOLVER.SEM_MED.TARGET = "KpKv"                 # QpKv / QpQv / KpKv
@@ -95,6 +97,14 @@ _C.SOLVER.SEM_MED.METRIC = "cosine"                  # mse / kl / cosine
 _C.SOLVER.SEM_MED.NORM = "softmax"                # first version only supports softmax
 _C.SOLVER.SEM_MED.DETACH = "mediated"             # mediated / direct / none
 _C.SOLVER.SEM_MED.LAYERS = []                     # empty means all shared layers
+
+_C.SOLVER.SPV = CfgNode()
+_C.SOLVER.SPV.COMPOSE = "prob"                    # prob (softmax(QsKp) @ softmax(Apv) 对齐 softmax(QsKv))/ raw_then_norm(softmax(QsKp @ Apv) 对齐 softmax(QsKv))
+_C.SOLVER.SPV.TARGET = "QpKv"                     # QpKv / QpQv / KpKv
+_C.SOLVER.SPV.METRIC = "kl"                       # mse / kl / cosine
+_C.SOLVER.SPV.NORM = "softmax"                    # "none"raw affinity 直接相乘
+_C.SOLVER.SPV.DETACH = "none"                     # via_prompt / direct / none
+_C.SOLVER.SPV.LAYERS = []                         # empty means all shared layers
 
 _C.SOLVER.RSIM_V2 = CfgNode()
 _C.SOLVER.RSIM_V2.ALIGN_MODE = "ar"                  # ar / cm

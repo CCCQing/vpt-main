@@ -131,7 +131,7 @@ class Attention(nn.Module):
 
         return query_layer, key_layer, value_layer
 
-    def _scaled_attention(self, query_layer, key_layer, value_layer):
+    def _scaled_attention(self, query_layer, key_layer, value_layer, semantic_length: int = 0, block_s_to_cls: bool = False):
         """
         缩放点积注意力的核心计算部分。
 
@@ -154,6 +154,15 @@ class Attention(nn.Module):
         """
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        semantic_length = int(semantic_length)
+        if block_s_to_cls and semantic_length > 0:
+            if attention_scores.size(-1) <= semantic_length:
+                raise ValueError(
+                    f"Cannot apply S->CLS attention mask with semantic_length={semantic_length} "
+                    f"and sequence length={attention_scores.size(-1)}."
+                )
+            semantic_slice = slice(attention_scores.size(-2) - semantic_length, attention_scores.size(-2))
+            attention_scores[:, :, semantic_slice, 0] = torch.finfo(attention_scores.dtype).min
 
         attention_probs = self.softmax(attention_scores) # B, num_head, num_patches(query), num_patches(key) # 行归一化
         weights = attention_probs if self.vis else None     # 用于可视化
@@ -176,23 +185,29 @@ class Attention(nn.Module):
         x_max = x.amax(dim=-1, keepdim=True)
         denom = (x_max - x_min).clamp_min(1e-12)
         return (x - x_min) / denom
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, semantic_length: int = 0, block_s_to_cls: bool = False):
         """
         对整段序列执行标准 self-attention 前向。
 
         返回 attention 输出及（可选）注意力权重，兼容原有调用路径。
         """
         query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
-        return self._scaled_attention(query_layer, key_layer, value_layer)
+        return self._scaled_attention(query_layer, key_layer, value_layer, semantic_length, block_s_to_cls)
 
-    def forward_with_projections(self, hidden_states):
+    def forward_with_projections(self, hidden_states, semantic_length: int = 0, block_s_to_cls: bool = False):
         """
         在返回 self-attention 输出的同时，额外暴露多头形式的 q/k。
 
         供亲和矩阵等附加分支复用，避免重复线性映射计算。
         """
         query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
-        attention_output, weights = self._scaled_attention(query_layer, key_layer, value_layer)
+        attention_output, weights = self._scaled_attention(
+            query_layer,
+            key_layer,
+            value_layer,
+            semantic_length,
+            block_s_to_cls,
+        )
         if self.debug_shapes and (not self._shape_debug_forward_proj_logged):
             print(
                 "[SHAPE-DEBUG] Attention.forward_with_projections q_proj={} k_proj={} v_proj={}".format(
@@ -371,11 +386,18 @@ class Block(nn.Module):
         self.ffn = Mlp(config)                  # 段2的两层 MLP（D→H→D，通常 H≈4D），完成通道内的非线性变换
         self.attn = Attention(config, vis)      # 段1的多头自注意力
         self.debug_shapes = False
-    def forward(self, x, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
+    def forward(
+        self,
+        x,
+        semantics: torch.Tensor = None,
+        num_prompt_tokens: int = 0,
+        semantic_length: int = 0,
+        block_s_to_cls: bool = False,
+    ):
         # 段1：注意力 + 残差
         h = x  # 残差分支
         x = self.attention_norm(x)  # LN
-        x, weights = self.attn(x)   # MHSA（输出同形状）; weights 仅在 vis=True 时非 None
+        x, weights = self.attn(x, semantic_length, block_s_to_cls)   # MHSA（输出同形状）; weights 仅在 vis=True 时非 None
         x = x + h                   # 残差相加
 
         # 段2：FFN + 残差
@@ -419,7 +441,11 @@ class Block(nn.Module):
         h = x
         x_norm = self.attention_norm(x)
         # 同时拿到 MHSA 输出 + 多头形式的 q_proj / k_proj
-        x, weights, q_proj, k_proj = self.attn.forward_with_projections(x_norm)
+        x, weights, q_proj, k_proj = self.attn.forward_with_projections(
+            x_norm,
+            affinity_config.get("semantic_length", 0),
+            affinity_config.get("block_s_to_cls", False),
+        )
         x = x + h
 
         # --- FFN 分支 + 残差 ---
@@ -493,12 +519,19 @@ class Encoder(nn.Module):
             layer = Block(config, vis)  # 每层都是同结构的 Transformer Block（内部是 LN→MHSA→残差；LN→MLP→残差）
             self.layer.append(copy.deepcopy(layer))
         # 本实现的 Block 属于 Pre-LN（在每个子层前 LN），额外的末端 LN（有些论文称 final LN）有助于稳定训练并改善表征
-    def forward(self, hidden_states, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
+    def forward(
+        self,
+        hidden_states,
+        semantics: torch.Tensor = None,
+        num_prompt_tokens: int = 0,
+        semantic_length: int = 0,
+        block_s_to_cls: bool = False,
+    ):
         """常规前向：返回编码结果与（可选）各层注意力权重。"""
         attn_weights = []
         for layer_block in self.layer:
             hidden_states, weights, semantics = layer_block(hidden_states, semantics,
-                    num_prompt_tokens)  # hidden_states为(B, 1+N, D)D 为 hidden_size
+                    num_prompt_tokens, semantic_length, block_s_to_cls)  # hidden_states为(B, 1+N, D)D 为 hidden_size
             if self.vis:
                 attn_weights.append(weights)    # 把每层的 weights 保存到列表里否则返回空列表
         encoded = self.encoder_norm(hidden_states)  # 对最后一层输出再做一次 LayerNorm，得到 encoded
