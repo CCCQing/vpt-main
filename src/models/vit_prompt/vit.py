@@ -197,6 +197,8 @@ class PromptedTransformer(Transformer):
         self.semantic_tokens_cfg = prompt_config.SEMANTIC_TOKENS
         self.semantic_tokens_enable = bool(self.semantic_tokens_cfg.ENABLE)
         self.block_s_to_cls = bool(self.semantic_tokens_cfg.BLOCK_S_TO_CLS)
+        self.affinity_evolution_cfg = prompt_config.AFFINITY_EVOLUTION
+        self.affinity_evolution_enable = bool(self.affinity_evolution_cfg.ENABLE)
         self.prompt_enable = bool(prompt_config.ENABLE)
         self.prompt_backend = prompt_config.BACKEND.lower()
         if self.prompt_backend not in {"dynamic", "vpt_deep"}:
@@ -235,6 +237,11 @@ class PromptedTransformer(Transformer):
         self.prompt_embeddings = None
         self.deep_prompt_embeddings = None
         self.prompt_update_layers = nn.ModuleList()
+        self.affinity_evolution_prompt_norm = nn.Identity()
+        self.affinity_evolution_semantic_norm = nn.Identity()
+        self.affinity_evolution_prompt_gamma = None
+        self.affinity_evolution_semantic_gamma = None
+        self._affinity_evolution_scale_logged = False
 
         # 运行期 debug 配置
         self.debug_shapes = bool(self.prompt_config.DEBUG_SHAPES)
@@ -258,6 +265,8 @@ class PromptedTransformer(Transformer):
                 )
 
         # 把 shape debug 开关同步到语义分支与编码器各层
+        self._validate_affinity_evolution_config()
+
         if self.semantic_token_projector is not None:
             self.semantic_token_projector.debug_shapes = bool(self.debug_shapes)
         for layer_block in self.encoder.layer:
@@ -271,19 +280,46 @@ class PromptedTransformer(Transformer):
         num_layers = config.transformer["num_layers"]
         hidden_size = config.hidden_size
         if self.prompt_enable and self.prompt_backend == "dynamic":
-            self.prompt_update_layers = nn.ModuleList([Linear(hidden_size, hidden_size) for _ in range(num_layers - 1)])
+            if self.affinity_evolution_enable:
+                self.affinity_evolution_prompt_norm = LayerNorm(hidden_size, eps=1e-6)
+                self.affinity_evolution_semantic_norm = LayerNorm(hidden_size, eps=1e-6)
+                self.affinity_evolution_prompt_gamma = nn.Parameter(
+                    torch.full((num_layers - 1,), float(self.affinity_evolution_cfg.PROMPT_GAMMA_INIT))
+                )
+                self.affinity_evolution_semantic_gamma = nn.Parameter(
+                    torch.full((num_layers - 1,), float(self.affinity_evolution_cfg.SEMANTIC_GAMMA_INIT))
+                )
+                logger.info(
+                    "[affinity-evolution] enable=%s prompt=%s semantic=%s prompt_target=%s semantic_target=%s "
+                    "prompt_lambda=%.6g semantic_lambda=%.6g prompt_gamma_init=%.6g semantic_gamma_init=%.6g "
+                    "prompt_detach=%s semantic_detach=%s semantic_compose=%s",
+                    True,
+                    bool(self.affinity_evolution_cfg.PROMPT_ENABLE),
+                    bool(self.affinity_evolution_cfg.SEMANTIC_ENABLE),
+                    str(self.affinity_evolution_cfg.PROMPT_TARGET),
+                    str(self.affinity_evolution_cfg.SEMANTIC_TARGET),
+                    float(self.affinity_evolution_cfg.PROMPT_LAMBDA),
+                    float(self.affinity_evolution_cfg.SEMANTIC_LAMBDA),
+                    float(self.affinity_evolution_cfg.PROMPT_GAMMA_INIT),
+                    float(self.affinity_evolution_cfg.SEMANTIC_GAMMA_INIT),
+                    str(self.affinity_evolution_cfg.PROMPT_DETACH),
+                    str(self.affinity_evolution_cfg.SEMANTIC_DETACH),
+                    str(self.affinity_evolution_cfg.SEMANTIC_COMPOSE),
+                )
+            else:
+                self.prompt_update_layers = nn.ModuleList([Linear(hidden_size, hidden_size) for _ in range(num_layers - 1)])
 
-            evolve_mode = self.prompt_config.EVOLVE_INIT_MODE.lower()
-            if evolve_mode != "identity":
-                raise ValueError(f"Unsupported PROMPT.EVOLVE_INIT_MODE: {self.prompt_config.EVOLVE_INIT_MODE}")
-            self.evolve_init_mode = evolve_mode
+                evolve_mode = self.prompt_config.EVOLVE_INIT_MODE.lower()
+                if evolve_mode != "identity":
+                    raise ValueError(f"Unsupported PROMPT.EVOLVE_INIT_MODE: {self.prompt_config.EVOLVE_INIT_MODE}")
+                self.evolve_init_mode = evolve_mode
 
-            with torch.no_grad():
-                for layer in self.prompt_update_layers:
-                    eye = torch.eye(hidden_size, device=layer.weight.device, dtype=layer.weight.dtype)
-                    layer.weight.copy_(eye)
-                    if layer.bias is not None:
-                        layer.bias.zero_()
+                with torch.no_grad():
+                    for layer in self.prompt_update_layers:
+                        eye = torch.eye(hidden_size, device=layer.weight.device, dtype=layer.weight.dtype)
+                        layer.weight.copy_(eye)
+                        if layer.bias is not None:
+                            layer.bias.zero_()
             if self.prompt_init_source == "learned":
                 prompt_dim = config.hidden_size
                 val = math.sqrt(6.0 / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
@@ -299,6 +335,206 @@ class PromptedTransformer(Transformer):
                 total_d_layer = config.transformer["num_layers"] - 1
                 self.deep_prompt_embeddings = nn.Parameter(torch.zeros(total_d_layer, num_tokens, prompt_dim))
                 nn.init.uniform_(self.deep_prompt_embeddings.data, -val, val)
+
+    def _validate_affinity_evolution_config(self):
+        if not self.affinity_evolution_enable:
+            return
+        if not self.prompt_enable:
+            raise ValueError("MODEL.AFFINITY_EVOLUTION.ENABLE requires MODEL.PROMPT.ENABLE=True.")
+        if self.prompt_backend != "dynamic":
+            raise ValueError("MODEL.AFFINITY_EVOLUTION.ENABLE currently supports only MODEL.PROMPT.BACKEND='dynamic'.")
+        if not bool(self.prompt_config.DEEP):
+            raise ValueError("MODEL.AFFINITY_EVOLUTION.ENABLE requires MODEL.PROMPT.DEEP=True.")
+        if not self.semantic_tokens_enable:
+            raise ValueError("MODEL.AFFINITY_EVOLUTION.ENABLE requires MODEL.SEMANTIC_TOKENS.ENABLE=True.")
+        if int(self.semantic_tokens_cfg.NUM_TOKENS) <= 0:
+            raise ValueError("MODEL.AFFINITY_EVOLUTION.ENABLE requires semantic token length > 0.")
+        if int(self.prompt_config.NUM_TOKENS) <= 0:
+            raise ValueError("MODEL.AFFINITY_EVOLUTION.ENABLE requires prompt token length > 0.")
+
+        valid_targets = {"QpKv", "QpQv", "KpKv"}
+        if str(self.affinity_evolution_cfg.PROMPT_TARGET) not in valid_targets:
+            raise ValueError(f"Unsupported AFFINITY_EVOLUTION.PROMPT_TARGET='{self.affinity_evolution_cfg.PROMPT_TARGET}'")
+        if str(self.affinity_evolution_cfg.SEMANTIC_TARGET) not in valid_targets:
+            raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_TARGET='{self.affinity_evolution_cfg.SEMANTIC_TARGET}'")
+        if str(self.affinity_evolution_cfg.PROMPT_DETACH) not in {"mediated", "direct", "none"}:
+            raise ValueError(f"Unsupported AFFINITY_EVOLUTION.PROMPT_DETACH='{self.affinity_evolution_cfg.PROMPT_DETACH}'")
+        if str(self.affinity_evolution_cfg.SEMANTIC_DETACH) not in {"via_prompt", "direct", "none"}:
+            raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_DETACH='{self.affinity_evolution_cfg.SEMANTIC_DETACH}'")
+        if str(self.affinity_evolution_cfg.SEMANTIC_COMPOSE) not in {"prob", "raw_then_norm"}:
+            raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_COMPOSE='{self.affinity_evolution_cfg.SEMANTIC_COMPOSE}'")
+        if float(self.affinity_evolution_cfg.PROMPT_LAMBDA) < 0.0:
+            raise ValueError("AFFINITY_EVOLUTION.PROMPT_LAMBDA must be >= 0.")
+        if float(self.affinity_evolution_cfg.SEMANTIC_LAMBDA) < 0.0:
+            raise ValueError("AFFINITY_EVOLUTION.SEMANTIC_LAMBDA must be >= 0.")
+
+    def _make_affinity_evolution_config(self, affinity_config=None):
+        if affinity_config is None:
+            return {
+                "prompt_length": int(self.num_tokens),
+                "semantic_length": int(self.semantic_tokens_cfg.NUM_TOKENS),
+                "detach": False,
+                "block_s_to_cls": bool(self.block_s_to_cls),
+            }
+        cfg = dict(affinity_config)
+        cfg["prompt_length"] = int(self.num_tokens)
+        cfg["semantic_length"] = int(self.semantic_tokens_cfg.NUM_TOKENS)
+        cfg["detach"] = False
+        cfg["block_s_to_cls"] = bool(self.block_s_to_cls)
+        return cfg
+
+    @staticmethod
+    def _mean_head_affinity(affinity: Dict[str, torch.Tensor], key: str) -> torch.Tensor:
+        raw = affinity[key]
+        if raw.dim() != 4:
+            raise ValueError(f"Affinity '{key}' must have shape [B,H,*,*], got {tuple(raw.shape)}.")
+        return raw.mean(dim=1)
+
+    @staticmethod
+    def _affinity_evolution_tensor_stats(name: str, tensor: torch.Tensor) -> Dict[str, float]:
+        if not torch.isfinite(tensor).all():
+            raise ValueError(f"Affinity evolution tensor '{name}' contains NaN or Inf.")
+        t = tensor.detach().float()
+        return {
+            f"{name}_mean": float(t.mean().item()),
+            f"{name}_std": float(t.std(unbiased=False).item()),
+            f"{name}_min": float(t.min().item()),
+            f"{name}_max": float(t.max().item()),
+        }
+
+    def _check_affinity_evolution_scales(
+        self,
+        layer_idx: int,
+        apv_prompt: torch.Tensor,
+        sem_pv: torch.Tensor,
+        qskp: torch.Tensor,
+        qskv: torch.Tensor,
+        apv_semantic: torch.Tensor,
+    ) -> None:
+        stats = {}
+        stats.update(self._affinity_evolution_tensor_stats("apv_prompt", apv_prompt))
+        stats.update(self._affinity_evolution_tensor_stats("sem_pv", sem_pv))
+        stats.update(self._affinity_evolution_tensor_stats("qskp", qskp))
+        stats.update(self._affinity_evolution_tensor_stats("qskv", qskv))
+        stats.update(self._affinity_evolution_tensor_stats("apv_semantic", apv_semantic))
+
+        sem_std = stats["sem_pv_std"]
+        apv_std = stats["apv_prompt_std"]
+        if sem_std > apv_std * 100.0 or apv_std > sem_std * 100.0:
+            logger.warning(
+                "[affinity-evolution-scale] layer=%d large scale gap: apv_prompt_std=%.6g sem_pv_std=%.6g",
+                int(layer_idx),
+                apv_std,
+                sem_std,
+            )
+
+        if not self._affinity_evolution_scale_logged:
+            logger.info(
+                "[affinity-evolution-scale] layer=%d "
+                "apv_prompt(mean=%.6g,std=%.6g,min=%.6g,max=%.6g) "
+                "sem_pv(mean=%.6g,std=%.6g,min=%.6g,max=%.6g) "
+                "qskp(mean=%.6g,std=%.6g,min=%.6g,max=%.6g) "
+                "qskv(mean=%.6g,std=%.6g,min=%.6g,max=%.6g) "
+                "apv_semantic(mean=%.6g,std=%.6g,min=%.6g,max=%.6g)",
+                int(layer_idx),
+                stats["apv_prompt_mean"], stats["apv_prompt_std"], stats["apv_prompt_min"], stats["apv_prompt_max"],
+                stats["sem_pv_mean"], stats["sem_pv_std"], stats["sem_pv_min"], stats["sem_pv_max"],
+                stats["qskp_mean"], stats["qskp_std"], stats["qskp_min"], stats["qskp_max"],
+                stats["qskv_mean"], stats["qskv_std"], stats["qskv_min"], stats["qskv_max"],
+                stats["apv_semantic_mean"], stats["apv_semantic_std"], stats["apv_semantic_min"], stats["apv_semantic_max"],
+            )
+            self._affinity_evolution_scale_logged = True
+
+    def _replace_prompt_and_semantic_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        prompt_tokens: torch.Tensor,
+        semantic_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        semantic_length = int(semantic_tokens.shape[1])
+        return torch.cat(
+            (
+                hidden_states[:, :1, :],
+                prompt_tokens,
+                hidden_states[:, 1 + self.num_tokens:-semantic_length, :],
+                semantic_tokens,
+            ),
+            dim=1,
+        )
+
+    def _apply_affinity_evolution(
+        self,
+        hidden_states: torch.Tensor,
+        prev_affinity: Dict[str, torch.Tensor],
+        layer_idx: int,
+    ) -> torch.Tensor:
+        semantic_length = int(self.semantic_tokens_cfg.NUM_TOKENS)
+        if semantic_length <= 0:
+            raise ValueError("Affinity evolution requires semantic_length > 0.")
+
+        prev_prompt = hidden_states[:, 1:1 + self.num_tokens, :]
+        prev_visual = hidden_states[:, 1 + self.num_tokens:-semantic_length, :]
+        prev_semantic = hidden_states[:, -semantic_length:, :]
+
+        prompt_target_key = f"{self.affinity_evolution_cfg.PROMPT_TARGET}_raw"
+        semantic_target_key = f"{self.affinity_evolution_cfg.SEMANTIC_TARGET}_raw"
+        apv_prompt = self._mean_head_affinity(prev_affinity, prompt_target_key)
+        apv_semantic = self._mean_head_affinity(prev_affinity, semantic_target_key)
+        qskp = self._mean_head_affinity(prev_affinity, "QsKp_raw")
+        qskv = self._mean_head_affinity(prev_affinity, "QsKv_raw")
+
+        next_prompt = prev_prompt
+        sem_pv = torch.bmm(qskp.transpose(1, 2), qskv)
+        self._check_affinity_evolution_scales(layer_idx, apv_prompt, sem_pv, qskp, qskv, apv_semantic)
+        if bool(self.affinity_evolution_cfg.PROMPT_ENABLE):
+            prompt_detach = str(self.affinity_evolution_cfg.PROMPT_DETACH)
+            if prompt_detach == "mediated":
+                sem_pv = sem_pv.detach()
+            elif prompt_detach == "direct":
+                apv_prompt = apv_prompt.detach()
+            elif prompt_detach != "none":
+                raise ValueError(f"Unsupported AFFINITY_EVOLUTION.PROMPT_DETACH='{prompt_detach}'")
+            prompt_logits = apv_prompt + float(self.affinity_evolution_cfg.PROMPT_LAMBDA) * sem_pv
+            prompt_route = torch.softmax(prompt_logits, dim=-1)
+            delta_prompt = torch.bmm(prompt_route, prev_visual)
+            gamma_prompt = self.affinity_evolution_prompt_gamma[layer_idx - 1].view(1, 1, 1)
+            next_prompt = prev_prompt + gamma_prompt * self.affinity_evolution_prompt_norm(delta_prompt - prev_prompt)
+            next_prompt = self.prompt_dropout(next_prompt)
+
+        next_semantic = prev_semantic
+        if bool(self.affinity_evolution_cfg.SEMANTIC_ENABLE):
+            semantic_detach = str(self.affinity_evolution_cfg.SEMANTIC_DETACH)
+            semantic_lambda = float(self.affinity_evolution_cfg.SEMANTIC_LAMBDA)
+            compose = str(self.affinity_evolution_cfg.SEMANTIC_COMPOSE)
+            if compose == "prob":
+                via_prompt = torch.bmm(torch.softmax(qskp, dim=-1), torch.softmax(apv_semantic, dim=-1))
+                direct = torch.softmax(qskv, dim=-1)
+                if semantic_detach == "via_prompt":
+                    via_prompt = via_prompt.detach()
+                elif semantic_detach == "direct":
+                    direct = direct.detach()
+                elif semantic_detach != "none":
+                    raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_DETACH='{semantic_detach}'")
+                semantic_route = direct + semantic_lambda * via_prompt
+                semantic_route = semantic_route / semantic_route.sum(dim=-1, keepdim=True)
+            elif compose == "raw_then_norm":
+                via_prompt = torch.bmm(qskp, apv_semantic)
+                direct = qskv
+                if semantic_detach == "via_prompt":
+                    via_prompt = via_prompt.detach()
+                elif semantic_detach == "direct":
+                    direct = direct.detach()
+                elif semantic_detach != "none":
+                    raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_DETACH='{semantic_detach}'")
+                semantic_route = torch.softmax(direct + semantic_lambda * via_prompt, dim=-1)
+            else:
+                raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_COMPOSE='{compose}'")
+            delta_semantic = torch.bmm(semantic_route, prev_visual)
+            gamma_semantic = self.affinity_evolution_semantic_gamma[layer_idx - 1].view(1, 1, 1)
+            next_semantic = prev_semantic + gamma_semantic * self.affinity_evolution_semantic_norm(delta_semantic - prev_semantic)
+
+        return self._replace_prompt_and_semantic_tokens(hidden_states, next_prompt, next_semantic)
+
     def _replace_prompt_tokens(self, hidden_states: torch.Tensor, prompt_tokens: torch.Tensor) -> torch.Tensor:
         """把主序列中的 prompt 区段替换成新 prompt。
 
@@ -416,6 +652,7 @@ class PromptedTransformer(Transformer):
             "prompt_enable": bool(self.prompt_enable),
             "prompt_backend": self.prompt_backend,
             "prompt_init_source": self.prompt_init_source,
+            "affinity_evolution_enable": bool(self.affinity_evolution_enable),
             "semantic_tokens_enable": bool(self.semantic_tokens_enable),
             "semantic_token_shape": tuple(semantic_tokens.shape),
             "actual_token_shape_entering_backbone": tuple(x.shape),
@@ -490,6 +727,16 @@ class PromptedTransformer(Transformer):
         - 每一层 transformer block 执行后，再让语义分支读取当前 prompt / visual
           并更新自己的 sem_state
         """
+        if self.affinity_evolution_enable:
+            if self._active_semantic_length(semantics) <= 0:
+                raise ValueError("Affinity evolution requires semantic tensor input for every forward pass.")
+            encoded, attn_weights, _ = self.forward_deep_prompt_with_affinity(
+                embedding_output,
+                self._make_affinity_evolution_config(),
+                semantics,
+            )
+            return encoded, attn_weights
+
         attn_weights: list = []
         hidden_states = embedding_output
         weights = None
@@ -569,33 +816,47 @@ class PromptedTransformer(Transformer):
         weights = None
         num_layers = self.vit_config.transformer["num_layers"]
         sem_state, semantic_input = None, None
+        if self.affinity_evolution_enable and self._active_semantic_length(semantics) <= 0:
+            raise ValueError("Affinity evolution requires semantic tensor input for every forward pass.")
+        effective_affinity_config = (
+            self._make_affinity_evolution_config(affinity_config)
+            if self.affinity_evolution_enable
+            else affinity_config
+        )
+        prev_affinity = None
         for i in range(num_layers):
             if i == 0:
                 hidden_states, weights, affinity, _ = self.encoder.layer[i].forward_with_affinity(
-                    hidden_states, affinity_config, None, self.num_tokens
+                    hidden_states, effective_affinity_config, None, self.num_tokens
                 )
             else:
-                prev_prompt = hidden_states[:, 1:1 + self.num_tokens, :]
-                if self.prompt_backend == "dynamic":
-                    next_prompt = self.prompt_update_layers[i - 1](prev_prompt)
-                    next_prompt = self.prompt_dropout(next_prompt)
-                elif self.prompt_backend == "vpt_deep":
-                    if self.deep_prompt_embeddings is None:
-                        raise ValueError("VPT deep prompt backend requires deep_prompt_embeddings when PROMPT.DEEP=True")
-                    next_prompt = self.prompt_dropout(
-                        self.prompt_proj(self.deep_prompt_embeddings[i - 1]).expand(hidden_states.shape[0], -1, -1)
-                    )
+                if self.prompt_backend == "dynamic" and self.affinity_evolution_enable:
+                    if prev_affinity is None:
+                        raise RuntimeError("Affinity evolution requires previous-layer affinity.")
+                    hidden_states = self._apply_affinity_evolution(hidden_states, prev_affinity, i)
                 else:
-                    raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{self.prompt_backend}'")
+                    prev_prompt = hidden_states[:, 1:1 + self.num_tokens, :]
+                    if self.prompt_backend == "dynamic":
+                        next_prompt = self.prompt_update_layers[i - 1](prev_prompt)
+                        next_prompt = self.prompt_dropout(next_prompt)
+                    elif self.prompt_backend == "vpt_deep":
+                        if self.deep_prompt_embeddings is None:
+                            raise ValueError("VPT deep prompt backend requires deep_prompt_embeddings when PROMPT.DEEP=True")
+                        next_prompt = self.prompt_dropout(
+                            self.prompt_proj(self.deep_prompt_embeddings[i - 1]).expand(hidden_states.shape[0], -1, -1)
+                        )
+                    else:
+                        raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{self.prompt_backend}'")
 
-                hidden_states = self._replace_prompt_tokens(hidden_states, next_prompt)
+                    hidden_states = self._replace_prompt_tokens(hidden_states, next_prompt)
 
                 hidden_states, weights, affinity, _ = self.encoder.layer[i].forward_with_affinity(
-                    hidden_states, affinity_config, None, self.num_tokens
+                    hidden_states, effective_affinity_config, None, self.num_tokens
                 )
             if self.encoder.vis:
                 attn_weights.append(weights)
             affinities.append(affinity)
+            prev_affinity = affinity
 
         encoded = self.encoder.encoder_norm(hidden_states)
         return encoded, attn_weights, affinities

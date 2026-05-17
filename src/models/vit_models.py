@@ -36,6 +36,7 @@ class ViT(nn.Module):
             prompt_cfg.DEBUG_SHAPES = cfg.SOLVER.DEBUG_SHAPES
             prompt_cfg.SEMANTIC_TOKENS = cfg.MODEL.SEMANTIC_TOKENS.clone()
             prompt_cfg.AFFINITY = cfg.MODEL.AFFINITY.clone()
+            prompt_cfg.AFFINITY_EVOLUTION = cfg.MODEL.AFFINITY_EVOLUTION.clone()
             prompt_cfg.freeze()
 
         adapter_cfg = None
@@ -59,24 +60,21 @@ class ViT(nn.Module):
         trainable_keys = []
         if cfg.MODEL.PROMPT.ENABLE:
             prompt_backend = cfg.MODEL.PROMPT.BACKEND.lower()
+            affinity_evolution_enable = bool(cfg.MODEL.AFFINITY_EVOLUTION.ENABLE)
             if prompt_backend == "dynamic":
                 prompt_init_source = cfg.MODEL.PROMPT.INIT_SOURCE.lower()
                 if prompt_init_source == "learned":
-                    trainable_keys.extend([
-                        "prompt_embeddings",
-                        "prompt_update_layers",
-                        "prompt_proj",
-                    ])
+                    trainable_keys.extend(["prompt_embeddings", "prompt_proj"])
                 elif prompt_init_source == "distributor_mean":
-                    trainable_keys.extend([
-                        "prompt_init_provider",
-                        "prompt_update_layers",
-                        "prompt_proj",
-                    ])
+                    trainable_keys.extend(["prompt_init_provider", "prompt_proj"])
                 else:
                     raise ValueError(
                         f"Unsupported MODEL.PROMPT.INIT_SOURCE='{cfg.MODEL.PROMPT.INIT_SOURCE}'"
                     )
+                if affinity_evolution_enable:
+                    trainable_keys.append("affinity_evolution")
+                else:
+                    trainable_keys.append("prompt_update_layers")
             elif prompt_backend == "vpt_deep":
                 prompt_init_source = cfg.MODEL.PROMPT.INIT_SOURCE.lower()
                 if prompt_init_source == "learned":
