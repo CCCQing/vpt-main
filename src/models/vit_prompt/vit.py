@@ -292,7 +292,7 @@ class PromptedTransformer(Transformer):
                 logger.info(
                     "[affinity-evolution] enable=%s prompt=%s semantic=%s prompt_target=%s semantic_target=%s "
                     "prompt_lambda=%.6g semantic_lambda=%.6g prompt_gamma_init=%.6g semantic_gamma_init=%.6g "
-                    "prompt_detach=%s semantic_detach=%s semantic_compose=%s",
+                    "prompt_detach=%s semantic_detach=%s semantic_compose=%s teacher_student_route=True",
                     True,
                     bool(self.affinity_evolution_cfg.PROMPT_ENABLE),
                     bool(self.affinity_evolution_cfg.SEMANTIC_ENABLE),
@@ -363,10 +363,10 @@ class PromptedTransformer(Transformer):
             raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_DETACH='{self.affinity_evolution_cfg.SEMANTIC_DETACH}'")
         if str(self.affinity_evolution_cfg.SEMANTIC_COMPOSE) not in {"prob", "raw_then_norm"}:
             raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_COMPOSE='{self.affinity_evolution_cfg.SEMANTIC_COMPOSE}'")
-        if float(self.affinity_evolution_cfg.PROMPT_LAMBDA) < 0.0:
-            raise ValueError("AFFINITY_EVOLUTION.PROMPT_LAMBDA must be >= 0.")
-        if float(self.affinity_evolution_cfg.SEMANTIC_LAMBDA) < 0.0:
-            raise ValueError("AFFINITY_EVOLUTION.SEMANTIC_LAMBDA must be >= 0.")
+        if not 0.0 <= float(self.affinity_evolution_cfg.PROMPT_LAMBDA) <= 1.0:
+            raise ValueError("AFFINITY_EVOLUTION.PROMPT_LAMBDA must be in [0, 1].")
+        if not 0.0 <= float(self.affinity_evolution_cfg.SEMANTIC_LAMBDA) <= 1.0:
+            raise ValueError("AFFINITY_EVOLUTION.SEMANTIC_LAMBDA must be in [0, 1].")
 
     def _make_affinity_evolution_config(self, affinity_config=None):
         if affinity_config is None:
@@ -445,6 +445,53 @@ class PromptedTransformer(Transformer):
             )
             self._affinity_evolution_scale_logged = True
 
+    @staticmethod
+    def _teacher_student_route(
+        student: torch.Tensor,
+        teacher: torch.Tensor,
+        correction_lambda: float,
+    ) -> torch.Tensor:
+        # teacher 只提供前向修正方向；梯度仍从 student 路径回传。
+        return student + correction_lambda * (teacher.detach() - student).detach()
+
+    def _build_prompt_evolution_route(
+        self,
+        direct: torch.Tensor,
+        mediated: torch.Tensor,
+    ) -> torch.Tensor:
+        prompt_detach = str(self.affinity_evolution_cfg.PROMPT_DETACH)
+        prompt_lambda = float(self.affinity_evolution_cfg.PROMPT_LAMBDA)
+
+        if prompt_detach == "mediated":
+            # direct 学生被 semantic-mediated teacher 拉向语义中介路径。
+            return self._teacher_student_route(direct, mediated, prompt_lambda)
+        if prompt_detach == "direct":
+            # semantic-mediated 学生被 direct teacher 拉向主干直接亲和路径。
+            return self._teacher_student_route(mediated, direct, prompt_lambda)
+        if prompt_detach == "none":
+            # 无 teacher 固定方向时，两条概率路径共同参与前向和反向。
+            return (1.0 - prompt_lambda) * direct + prompt_lambda * mediated
+        raise ValueError(f"Unsupported AFFINITY_EVOLUTION.PROMPT_DETACH='{prompt_detach}'")
+
+    def _build_semantic_evolution_route(
+        self,
+        direct: torch.Tensor,
+        via_prompt: torch.Tensor,
+    ) -> torch.Tensor:
+        semantic_detach = str(self.affinity_evolution_cfg.SEMANTIC_DETACH)
+        semantic_lambda = float(self.affinity_evolution_cfg.SEMANTIC_LAMBDA)
+
+        if semantic_detach == "via_prompt":
+            # direct 学生被 semantic->prompt->visual teacher 修正。
+            return self._teacher_student_route(direct, via_prompt, semantic_lambda)
+        if semantic_detach == "direct":
+            # via_prompt 学生被 semantic->visual direct teacher 修正。
+            return self._teacher_student_route(via_prompt, direct, semantic_lambda)
+        if semantic_detach == "none":
+            # 无 teacher 固定方向时，direct 与 via_prompt 做概率插值。
+            return (1.0 - semantic_lambda) * direct + semantic_lambda * via_prompt
+        raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_DETACH='{semantic_detach}'")
+
     def _replace_prompt_and_semantic_tokens(
         self,
         hidden_states: torch.Tensor,
@@ -487,15 +534,10 @@ class PromptedTransformer(Transformer):
         sem_pv = torch.bmm(qskp.transpose(1, 2), qskv)
         self._check_affinity_evolution_scales(layer_idx, apv_prompt, sem_pv, qskp, qskv, apv_semantic)
         if bool(self.affinity_evolution_cfg.PROMPT_ENABLE):
-            prompt_detach = str(self.affinity_evolution_cfg.PROMPT_DETACH)
-            if prompt_detach == "mediated":
-                sem_pv = sem_pv.detach()
-            elif prompt_detach == "direct":
-                apv_prompt = apv_prompt.detach()
-            elif prompt_detach != "none":
-                raise ValueError(f"Unsupported AFFINITY_EVOLUTION.PROMPT_DETACH='{prompt_detach}'")
-            prompt_logits = apv_prompt + float(self.affinity_evolution_cfg.PROMPT_LAMBDA) * sem_pv
-            prompt_route = torch.softmax(prompt_logits, dim=-1)
+            # 先把两条 prompt->visual 路径变成概率路由，再按 detach 字段选择 teacher/student。
+            direct_prompt = torch.softmax(apv_prompt, dim=-1)
+            mediated_prompt = torch.softmax(sem_pv, dim=-1)
+            prompt_route = self._build_prompt_evolution_route(direct_prompt, mediated_prompt)
             delta_prompt = torch.bmm(prompt_route, prev_visual)
             gamma_prompt = self.affinity_evolution_prompt_gamma[layer_idx - 1].view(1, 1, 1)
             next_prompt = prev_prompt + gamma_prompt * self.affinity_evolution_prompt_norm(delta_prompt - prev_prompt)
@@ -503,32 +545,19 @@ class PromptedTransformer(Transformer):
 
         next_semantic = prev_semantic
         if bool(self.affinity_evolution_cfg.SEMANTIC_ENABLE):
-            semantic_detach = str(self.affinity_evolution_cfg.SEMANTIC_DETACH)
-            semantic_lambda = float(self.affinity_evolution_cfg.SEMANTIC_LAMBDA)
             compose = str(self.affinity_evolution_cfg.SEMANTIC_COMPOSE)
             if compose == "prob":
+                # prob: 每一段先转成概率，再组合 semantic->prompt->visual 路由。
                 via_prompt = torch.bmm(torch.softmax(qskp, dim=-1), torch.softmax(apv_semantic, dim=-1))
                 direct = torch.softmax(qskv, dim=-1)
-                if semantic_detach == "via_prompt":
-                    via_prompt = via_prompt.detach()
-                elif semantic_detach == "direct":
-                    direct = direct.detach()
-                elif semantic_detach != "none":
-                    raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_DETACH='{semantic_detach}'")
-                semantic_route = direct + semantic_lambda * via_prompt
-                semantic_route = semantic_route / semantic_route.sum(dim=-1, keepdim=True)
             elif compose == "raw_then_norm":
+                # raw_then_norm: 先做原始三元路径乘法，再整体 softmax 成 semantic->visual 路由。
                 via_prompt = torch.bmm(qskp, apv_semantic)
-                direct = qskv
-                if semantic_detach == "via_prompt":
-                    via_prompt = via_prompt.detach()
-                elif semantic_detach == "direct":
-                    direct = direct.detach()
-                elif semantic_detach != "none":
-                    raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_DETACH='{semantic_detach}'")
-                semantic_route = torch.softmax(direct + semantic_lambda * via_prompt, dim=-1)
+                via_prompt = torch.softmax(via_prompt, dim=-1)
+                direct = torch.softmax(qskv, dim=-1)
             else:
                 raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_COMPOSE='{compose}'")
+            semantic_route = self._build_semantic_evolution_route(direct, via_prompt)
             delta_semantic = torch.bmm(semantic_route, prev_visual)
             gamma_semantic = self.affinity_evolution_semantic_gamma[layer_idx - 1].view(1, 1, 1)
             next_semantic = prev_semantic + gamma_semantic * self.affinity_evolution_semantic_norm(delta_semantic - prev_semantic)

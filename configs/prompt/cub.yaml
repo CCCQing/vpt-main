@@ -39,12 +39,12 @@ MODEL:
     SEMANTIC_ENABLE: True
     PROMPT_TARGET: "QpQv"
     SEMANTIC_TARGET: "QpKv"
-    PROMPT_LAMBDA: 0.1
-    SEMANTIC_LAMBDA: 0.1
+    PROMPT_LAMBDA: 0.0
+    SEMANTIC_LAMBDA: 0.0
     PROMPT_GAMMA_INIT: 0.0
     SEMANTIC_GAMMA_INIT: 0.0
-    PROMPT_DETACH: "none"
-    SEMANTIC_DETACH: "none"
+    PROMPT_DETACH: "mediated"
+    SEMANTIC_DETACH: "direct"
     SEMANTIC_COMPOSE: "prob"
 
   R_SIMILARITY:
@@ -66,6 +66,7 @@ SOLVER:
   LOSS_VSPCN_AR_WEIGHT: 0.0005
   LOSS_SEM_MED_WEIGHT: 0.0
   LOSS_SPV_WEIGHT: 0.0
+  LOSS_ROUTE_TS_WEIGHT: 0.0001
   SEM_MED:
     TARGET: "QpQv"           # QpKv / QpQv / KpKv
     METRIC: "kl"            # mse / kl / cosine
@@ -78,6 +79,11 @@ SOLVER:
     METRIC: "kl"             # mse / kl / cosine
     NORM: "softmax"
     DETACH: "none"           # via_prompt / direct / none
+    LAYERS: []
+  ROUTE_TS:
+    PROMPT_ENABLE: True
+    SEMANTIC_ENABLE: True
+    METRIC: "kl"             # mse / kl / cosine
     LAYERS: []
   LOSS_CM_WEIGHT: 0.05
   LOSS_CONS_WEIGHT: 0.00

@@ -54,8 +54,25 @@ def _validate_choices(name: str, values: List[str], allowed: List[str]) -> None:
         raise ValueError(f"Unsupported {name}: {bad}. Expected values from {allowed}.")
 
 
+def _validate_no_output_dir_override(opts: List[str]) -> None:
+    bad = [item for item in opts if item.strip().upper() == "OUTPUT_DIR"]
+    if bad:
+        raise ValueError("Do not pass OUTPUT_DIR through extra opts; the grid launcher owns per-trial OUTPUT_DIR.")
+
+
 def _trial_name(idx: int, tag: str) -> str:
     return "exp{idx:03d}_{tag}".format(idx=idx, tag=tag)
+
+
+def _trial_tag(prefix: str, params: Dict[str, object]) -> str:
+    parts = [prefix]
+    for name, value in params.items():
+        if isinstance(value, float):
+            value_str = _format_float_tag(value)
+        else:
+            value_str = str(value).replace(".", "p")
+        parts.append(f"{name}_{value_str}")
+    return "_".join(parts)
 
 
 def _run_cmd(cmd: List[str], cwd: str, stdout_path: str) -> int:
@@ -172,8 +189,8 @@ def _score_key(metrics: Dict[str, float]) -> Tuple[str, float]:
 def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
     keys = [
         "trial_name",
-        "train_source",
-        "eval_source",
+        "group",
+        "route_ts_weight",
         "exit_code",
         "score_key",
         "score",
@@ -210,14 +227,11 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("spv_phase1_grid_search")
+    ap = argparse.ArgumentParser("route_ts_weight_grid_search")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
-    ap.add_argument("--out-root", default="output/grid_spv_phase1_d_e")
-    ap.add_argument("--compose-grid", default="prob,raw_then_norm")
-    ap.add_argument("--metric-grid", default="mse,kl,cosine")
-    ap.add_argument("--detach-grid", default="none,via_prompt,direct")
-    ap.add_argument("--weight-grid", default="0.001,0.0005,0.0001")
+    ap.add_argument("--out-root", default="output/grid_route_ts_weight")
+    ap.add_argument("--weight-grid", default="0,0.00001,0.0001")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("opts", nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -226,112 +240,34 @@ def main() -> None:
     out_root = os.path.abspath(os.path.join(repo_root, args.out_root))
     os.makedirs(out_root, exist_ok=True)
 
-    compose_grid = _parse_str_list(args.compose_grid)
-    metric_grid = _parse_str_list(args.metric_grid)
-    detach_grid = _parse_str_list(args.detach_grid)
     weight_grid = _parse_float_list(args.weight_grid)
-    _validate_choices("SOLVER.SPV.COMPOSE", compose_grid, ["prob", "raw_then_norm"])
-    _validate_choices("SOLVER.SPV.METRIC", metric_grid, ["mse", "kl", "cosine"])
-    _validate_choices("SOLVER.SPV.DETACH", detach_grid, ["none", "via_prompt", "direct"])
-
-    base_opts = [
-        "MODEL.PROMPT.ENABLE", "True",
-        "MODEL.PROMPT.BACKEND", "dynamic",
-        "MODEL.PROMPT.INIT_SOURCE", "distributor_mean",
-        "MODEL.PROMPT.DEEP", "True",
-        "MODEL.PROMPT.DISTRIBUTOR.ENABLE", "True",
-        "MODEL.SEMANTIC_TOKENS.ENABLE", "True",
-        "MODEL.SEMANTIC_TOKENS.TRAIN_SOURCE", "class_mean",
-        "MODEL.SEMANTIC_TOKENS.EVAL_SOURCE", "class_mean",
-        "MODEL.AFFINITY.ENABLE", "True",
-        "MODEL.AFFINITY.DETACH", "False",
-        "SOLVER.SPV.TARGET", "QpKv",
-        "SOLVER.SPV.NORM", "softmax",
-        "SOLVER.SPV.LAYERS", "[]",
-    ]
+    # 保持 yaml 的模型与损失设置不动；这里只扫 route teacher-student loss 权重。
+    base_opts = []
     if args.opts:
+        _validate_no_output_dir_override(args.opts)
         base_opts.extend(args.opts)
 
     trials: List[Dict[str, object]] = []
-    trials.append(
-        {
-            "group": "D_sem_med_mask",
-            "tag": "D_semmed_qpqv_kl_mediated_w1e-4_maskTrue",
-            "block_s_to_cls": True,
-            "sem_med_weight": 0.0001,
-            "sem_med_target": "QpQv",
-            "sem_med_metric": "kl",
-            "sem_med_detach": "mediated",
-            "spv_weight": 0.0,
-            "spv_compose": "",
-            "spv_target": "",
-            "spv_metric": "",
-            "spv_detach": "",
-            "opts": [
-                "MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS", "True",
-                "SOLVER.LOSS_SEM_MED_WEIGHT", "0.0001",
-                "SOLVER.SEM_MED.TARGET", "QpQv",
-                "SOLVER.SEM_MED.METRIC", "kl",
-                "SOLVER.SEM_MED.NORM", "softmax",
-                "SOLVER.SEM_MED.DETACH", "mediated",
-                "SOLVER.SEM_MED.LAYERS", "[]",
-                "SOLVER.LOSS_SPV_WEIGHT", "0.0",
-            ],
-        }
-    )
-    for compose in compose_grid:
-        for metric in metric_grid:
-            for detach in detach_grid:
-                for weight in weight_grid:
-                    weight_tag = _format_float_tag(weight)
-                    trials.append(
-                        {
-                            "group": "E_spv_grid",
-                            "tag": f"E_spv_{compose}_{metric}_{detach}_w{weight_tag}",
-                            "block_s_to_cls": False,
-                            "sem_med_weight": 0.0,
-                            "sem_med_target": "",
-                            "sem_med_metric": "",
-                            "sem_med_detach": "",
-                            "spv_weight": weight,
-                            "spv_compose": compose,
-                            "spv_target": "QpKv",
-                            "spv_metric": metric,
-                            "spv_detach": detach,
-                            "opts": [
-                                "MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS", "False",
-                                "SOLVER.LOSS_SEM_MED_WEIGHT", "0.0",
-                                "SOLVER.LOSS_SPV_WEIGHT", str(weight),
-                                "SOLVER.SPV.COMPOSE", compose,
-                                "SOLVER.SPV.TARGET", "QpKv",
-                                "SOLVER.SPV.METRIC", metric,
-                                "SOLVER.SPV.NORM", "softmax",
-                                "SOLVER.SPV.DETACH", detach,
-                                "SOLVER.SPV.LAYERS", "[]",
-                            ],
-                        }
-                    )
+    for weight in weight_grid:
+        params = {"LOSS_ROUTE_TS_WEIGHT": weight}
+        trials.append(
+            {
+                "group": "route_ts_weight",
+                "tag": _trial_tag("route_ts", params),
+                "route_ts_weight": weight,
+                "opts": [
+                    "SOLVER.LOSS_ROUTE_TS_WEIGHT", str(weight),
+                ],
+            }
+        )
 
     search_space = {
         "config_file": args.config_file,
         "out_root": out_root,
         "total_trials": len(trials),
-        "fixed_prompt_backend": "dynamic",
-        "fixed_prompt_init_source": "distributor_mean",
-        "fixed_prompt_distributor_enable": True,
-        "fixed_train_source": "class_mean",
-        "fixed_eval_source": "class_mean",
-        "D_trial": "sem_med QpQv/kl/mediated/0.0001 with BLOCK_S_TO_CLS=True",
-        "E_grid": {
-            "compose_grid": compose_grid,
-            "metric_grid": metric_grid,
-            "detach_grid": detach_grid,
-            "weight_grid": weight_grid,
-            "target": "QpKv",
-            "norm": "softmax",
-            "block_s_to_cls": False,
-            "sem_med_weight": 0.0,
-        },
+        "sweep": "SOLVER.LOSS_ROUTE_TS_WEIGHT",
+        "weight_grid": weight_grid,
+        "note": "All other settings come from the yaml config unless passed through extra opts.",
         "extra_opts": args.opts,
     }
     with open(os.path.join(out_root, "search_space.json"), "w", encoding="utf-8") as f:
@@ -360,18 +296,7 @@ def main() -> None:
         row: Dict[str, object] = {
             "trial_name": trial_name,
             "group": trial["group"],
-            "train_source": "class_mean",
-            "eval_source": "class_mean",
-            "block_s_to_cls": trial["block_s_to_cls"],
-            "sem_med_weight": trial["sem_med_weight"],
-            "sem_med_target": trial["sem_med_target"],
-            "sem_med_metric": trial["sem_med_metric"],
-            "sem_med_detach": trial["sem_med_detach"],
-            "spv_weight": trial["spv_weight"],
-            "spv_compose": trial["spv_compose"],
-            "spv_target": trial["spv_target"],
-            "spv_metric": trial["spv_metric"],
-            "spv_detach": trial["spv_detach"],
+            "route_ts_weight": trial["route_ts_weight"],
             "exit_code": -1,
             "run_dir": "",
         }

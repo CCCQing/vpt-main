@@ -142,7 +142,12 @@ def _normalize_affinity_for_aux_loss(x: torch.Tensor, norm_type: str, cfg_name: 
     return F.softmax(x, dim=-1)
 
 
-def _semantic_mediated_distance(student: torch.Tensor, teacher: torch.Tensor, metric: str) -> torch.Tensor:
+def _semantic_mediated_distance(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    metric: str,
+    cfg_name: str = "SOLVER.SEM_MED.METRIC",
+) -> torch.Tensor:
     """
     计算两个归一化亲和矩阵之间的距离。
 
@@ -157,7 +162,7 @@ def _semantic_mediated_distance(student: torch.Tensor, teacher: torch.Tensor, me
         return (1.0 - F.cosine_similarity(student_flat, teacher_flat, dim=-1)).mean()
     if metric == "kl":
         return F.kl_div(torch.log(student.clamp_min(1e-8)), teacher, reduction="batchmean")
-    raise ValueError(f"Unsupported SOLVER.SEM_MED.METRIC='{metric}'. Expected mse / kl / cosine.")
+    raise ValueError(f"Unsupported {cfg_name}='{metric}'. Expected mse / kl / cosine.")
 
 
 def _compute_semantic_mediated_affinity_loss(aux: Optional[Dict[str, Any]], cfg) -> torch.Tensor:
@@ -238,17 +243,17 @@ def _compute_semantic_mediated_affinity_loss(aux: Optional[Dict[str, Any]], cfg)
         direct_norm = _normalize_affinity_for_aux_loss(apv, norm_type, "SOLVER.SEM_MED")
 
         if detach_mode == "mediated":
-            loss_i = _semantic_mediated_distance(direct_norm, mediated_norm.detach(), metric)
+            loss_i = _semantic_mediated_distance(direct_norm, mediated_norm.detach(), metric, "SOLVER.SEM_MED.METRIC")
         elif detach_mode == "direct":
-            loss_i = _semantic_mediated_distance(mediated_norm, direct_norm.detach(), metric)
+            loss_i = _semantic_mediated_distance(mediated_norm, direct_norm.detach(), metric, "SOLVER.SEM_MED.METRIC")
         else:
             if metric == "kl":
                 loss_i = 0.5 * (
-                    _semantic_mediated_distance(direct_norm, mediated_norm.detach(), metric)
-                    + _semantic_mediated_distance(mediated_norm, direct_norm.detach(), metric)
+                    _semantic_mediated_distance(direct_norm, mediated_norm.detach(), metric, "SOLVER.SEM_MED.METRIC")
+                    + _semantic_mediated_distance(mediated_norm, direct_norm.detach(), metric, "SOLVER.SEM_MED.METRIC")
                 )
             else:
-                loss_i = _semantic_mediated_distance(direct_norm, mediated_norm, metric)
+                loss_i = _semantic_mediated_distance(direct_norm, mediated_norm, metric, "SOLVER.SEM_MED.METRIC")
         layer_losses.append(loss_i)
 
     return torch.stack(layer_losses).mean()
@@ -345,20 +350,165 @@ def _compute_semantic_prompt_visual_cycle_loss(aux: Optional[Dict[str, Any]], cf
         direct_norm = _normalize_affinity_for_aux_loss(qskv, norm_type, "SOLVER.SPV")
 
         if detach_mode == "via_prompt":
-            loss_i = _semantic_mediated_distance(direct_norm, via_prompt.detach(), metric)
+            loss_i = _semantic_mediated_distance(direct_norm, via_prompt.detach(), metric, "SOLVER.SPV.METRIC")
         elif detach_mode == "direct":
-            loss_i = _semantic_mediated_distance(via_prompt, direct_norm.detach(), metric)
+            loss_i = _semantic_mediated_distance(via_prompt, direct_norm.detach(), metric, "SOLVER.SPV.METRIC")
         else:
             if metric == "kl":
                 loss_i = 0.5 * (
-                    _semantic_mediated_distance(direct_norm, via_prompt.detach(), metric)
-                    + _semantic_mediated_distance(via_prompt, direct_norm.detach(), metric)
+                    _semantic_mediated_distance(direct_norm, via_prompt.detach(), metric, "SOLVER.SPV.METRIC")
+                    + _semantic_mediated_distance(via_prompt, direct_norm.detach(), metric, "SOLVER.SPV.METRIC")
                 )
             else:
-                loss_i = _semantic_mediated_distance(via_prompt, direct_norm, metric)
+                loss_i = _semantic_mediated_distance(via_prompt, direct_norm, metric, "SOLVER.SPV.METRIC")
         layer_losses.append(loss_i)
 
     return torch.stack(layer_losses).mean()
+
+
+def _compute_route_teacher_student_loss(aux: Optional[Dict[str, Any]], cfg) -> torch.Tensor:
+    """
+    轻量 route teacher-student 对齐损失。
+
+    该损失只约束当前 AFFINITY_EVOLUTION 实际使用的 teacher/student 路径：
+    - prompt: direct(Apv) 与 mediated(QsKp^T @ QsKv)
+    - semantic: direct(QsKv) 与 via_prompt(QsKp @ Apv)
+    """
+    if not isinstance(aux, Dict):
+        raise RuntimeError("Route teacher-student loss requires affinity aux dict.")
+    if not bool(cfg.MODEL.AFFINITY_EVOLUTION.ENABLE):
+        raise RuntimeError("Route teacher-student loss requires MODEL.AFFINITY_EVOLUTION.ENABLE=True.")
+
+    prompt_enable = bool(cfg.SOLVER.ROUTE_TS.PROMPT_ENABLE)
+    semantic_enable = bool(cfg.SOLVER.ROUTE_TS.SEMANTIC_ENABLE)
+    if not prompt_enable and not semantic_enable:
+        raise ValueError("SOLVER.ROUTE_TS requires PROMPT_ENABLE or SEMANTIC_ENABLE to be True.")
+
+    target_map = {
+        "QpKv": "aff_qpkv",
+        "QpQv": "aff_qpqv",
+        "KpKv": "aff_kpkv",
+    }
+    prompt_target = str(cfg.MODEL.AFFINITY_EVOLUTION.PROMPT_TARGET)
+    semantic_target = str(cfg.MODEL.AFFINITY_EVOLUTION.SEMANTIC_TARGET)
+
+    prompt_detach = str(cfg.MODEL.AFFINITY_EVOLUTION.PROMPT_DETACH).lower()
+    semantic_detach = str(cfg.MODEL.AFFINITY_EVOLUTION.SEMANTIC_DETACH).lower()
+    compose_mode = str(cfg.MODEL.AFFINITY_EVOLUTION.SEMANTIC_COMPOSE).lower()
+    if prompt_enable and prompt_detach not in {"mediated", "direct"}:
+        raise ValueError("SOLVER.ROUTE_TS prompt loss requires AFFINITY_EVOLUTION.PROMPT_DETACH to be mediated or direct.")
+    if semantic_enable and semantic_detach not in {"via_prompt", "direct"}:
+        raise ValueError("SOLVER.ROUTE_TS semantic loss requires AFFINITY_EVOLUTION.SEMANTIC_DETACH to be via_prompt or direct.")
+    if semantic_enable and compose_mode not in {"prob", "raw_then_norm"}:
+        raise ValueError(f"Unsupported MODEL.AFFINITY_EVOLUTION.SEMANTIC_COMPOSE='{compose_mode}'. Expected prob / raw_then_norm.")
+
+    required_keys = {"aff_qskp", "aff_qskv"}
+    if prompt_enable:
+        required_keys.add(target_map[prompt_target])
+    if semantic_enable:
+        required_keys.add(target_map[semantic_target])
+    missing = [k for k in sorted(required_keys) if k not in aux or not isinstance(aux[k], Dict)]
+    if missing:
+        raise RuntimeError(f"Route teacher-student loss missing aux keys: {missing}.")
+
+    layer_sets = [set(aux[k].keys()) for k in sorted(required_keys)]
+    shared_layers = sorted(set.intersection(*layer_sets))
+    requested_layers = list(cfg.SOLVER.ROUTE_TS.LAYERS)
+    if requested_layers:
+        requested_layers = [int(x) for x in requested_layers]
+        shared_layers = [x for x in shared_layers if x in requested_layers]
+    if not shared_layers:
+        raise RuntimeError("Route teacher-student loss found no shared layers.")
+
+    metric = str(cfg.SOLVER.ROUTE_TS.METRIC).lower()
+    route_losses = []
+    for layer_idx in shared_layers:
+        qskp = aux["aff_qskp"][layer_idx]
+        qskv = aux["aff_qskv"][layer_idx]
+        if qskp.dim() != 3 or qskv.dim() != 3:
+            raise RuntimeError(
+                "Route teacher-student loss expects QsKp/QsKv shapes [B,S,P]/[B,S,V], got {}, {} at layer {}.".format(
+                    tuple(qskp.shape),
+                    tuple(qskv.shape),
+                    int(layer_idx),
+                )
+            )
+        if qskp.shape[0] != qskv.shape[0] or qskp.shape[1] != qskv.shape[1]:
+            raise RuntimeError(f"Route teacher-student QsKp/QsKv shape mismatch at layer {layer_idx}.")
+
+        if prompt_enable:
+            apv_prompt = aux[target_map[prompt_target]][layer_idx]
+            if apv_prompt.dim() != 3:
+                raise RuntimeError(f"Route teacher-student prompt target must be [B,P,V] at layer {layer_idx}, got {tuple(apv_prompt.shape)}.")
+            if qskp.shape[0] != apv_prompt.shape[0] or qskp.shape[2] != apv_prompt.shape[1] or qskv.shape[2] != apv_prompt.shape[2]:
+                raise RuntimeError(
+                    "Route teacher-student prompt shape mismatch at layer {}: QsKp={}, QsKv={}, Apv={}.".format(
+                        int(layer_idx),
+                        tuple(qskp.shape),
+                        tuple(qskv.shape),
+                        tuple(apv_prompt.shape),
+                    )
+                )
+            mediated_prompt = _normalize_affinity_for_aux_loss(
+                torch.bmm(qskp.transpose(1, 2), qskv),
+                "softmax",
+                "SOLVER.ROUTE_TS",
+            )
+            direct_prompt = _normalize_affinity_for_aux_loss(apv_prompt, "softmax", "SOLVER.ROUTE_TS")
+            if prompt_detach == "mediated":
+                student_prompt, teacher_prompt = direct_prompt, mediated_prompt
+            else:
+                student_prompt, teacher_prompt = mediated_prompt, direct_prompt
+            # teacher 路径 stopgrad，只让 student 承担显式对齐梯度。
+            route_losses.append(
+                _semantic_mediated_distance(
+                    student_prompt,
+                    teacher_prompt.detach(),
+                    metric,
+                    "SOLVER.ROUTE_TS.METRIC",
+                )
+            )
+
+        if semantic_enable:
+            apv_semantic = aux[target_map[semantic_target]][layer_idx]
+            if apv_semantic.dim() != 3:
+                raise RuntimeError(f"Route teacher-student semantic target must be [B,P,V] at layer {layer_idx}, got {tuple(apv_semantic.shape)}.")
+            if qskp.shape[0] != apv_semantic.shape[0] or qskp.shape[2] != apv_semantic.shape[1] or qskv.shape[2] != apv_semantic.shape[2]:
+                raise RuntimeError(
+                    "Route teacher-student semantic shape mismatch at layer {}: QsKp={}, QsKv={}, Apv={}.".format(
+                        int(layer_idx),
+                        tuple(qskp.shape),
+                        tuple(qskv.shape),
+                        tuple(apv_semantic.shape),
+                    )
+                )
+            if compose_mode == "prob":
+                via_prompt = torch.bmm(
+                    _normalize_affinity_for_aux_loss(qskp, "softmax", "SOLVER.ROUTE_TS"),
+                    _normalize_affinity_for_aux_loss(apv_semantic, "softmax", "SOLVER.ROUTE_TS"),
+                )
+            else:
+                via_prompt = _normalize_affinity_for_aux_loss(
+                    torch.bmm(qskp, apv_semantic),
+                    "softmax",
+                    "SOLVER.ROUTE_TS",
+                )
+            direct_semantic = _normalize_affinity_for_aux_loss(qskv, "softmax", "SOLVER.ROUTE_TS")
+            if semantic_detach == "via_prompt":
+                student_semantic, teacher_semantic = direct_semantic, via_prompt
+            else:
+                student_semantic, teacher_semantic = via_prompt, direct_semantic
+            # teacher 路径 stopgrad，只让 student 承担显式对齐梯度。
+            route_losses.append(
+                _semantic_mediated_distance(
+                    student_semantic,
+                    teacher_semantic.detach(),
+                    metric,
+                    "SOLVER.ROUTE_TS.METRIC",
+                )
+            )
+
+    return torch.stack(route_losses).mean()
 
 
 class SoftmaxCMLoss(nn.Module):
@@ -636,6 +786,32 @@ class SemanticPromptVisualCycleAuxLoss(nn.Module):
         return _compute_semantic_prompt_visual_cycle_loss(aux, self.cfg)
 
 
+class RouteTeacherStudentAuxLoss(nn.Module):
+    """
+    evolution route 的轻量 teacher-student 对齐损失。
+
+    它复用 MODEL.AFFINITY_EVOLUTION 的 route 来源配置，
+    只额外提供一个很小的显式对齐梯度。
+    """
+    def __init__(self, cfg=None):
+        """读取 route teacher-student loss 的权重和开关。"""
+        super().__init__()
+        self.name = "route_ts_loss"
+        self.requires_affinity_aux = True
+        self.route_ts_weight = float(cfg.SOLVER.LOSS_ROUTE_TS_WEIGHT)
+        self.cfg = cfg
+
+    @property
+    def weight(self) -> float:
+        """返回当前辅助损失权重，供 CompositeLoss 判断是否启用。"""
+        return self.route_ts_weight
+
+    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """从模型输出中取 aux，并计算 route teacher-student loss。"""
+        _, aux = _extract_logits_and_aux(pred_logits, kwargs)
+        return _compute_route_teacher_student_loss(aux, self.cfg)
+
+
 class CompositeLoss(nn.Module):
     """
     组合式 loss：main_loss 负责分类主线，aux_losses 只负责各自的辅助约束。
@@ -803,6 +979,11 @@ def _spv_enabled(cfg) -> bool:
     return float(cfg.SOLVER.LOSS_SPV_WEIGHT) > 0
 
 
+def _route_ts_enabled(cfg) -> bool:
+    """判断 route teacher-student 辅助损失是否启用。"""
+    return float(cfg.SOLVER.LOSS_ROUTE_TS_WEIGHT) > 0
+
+
 def _build_aux_losses(cfg):
     """
     根据各辅助损失权重构建辅助损失列表。
@@ -814,6 +995,8 @@ def _build_aux_losses(cfg):
         aux_losses.append(SemanticMediatedAffinityAuxLoss(cfg))
     if _spv_enabled(cfg):
         aux_losses.append(SemanticPromptVisualCycleAuxLoss(cfg))
+    if _route_ts_enabled(cfg):
+        aux_losses.append(RouteTeacherStudentAuxLoss(cfg))
     return aux_losses
 
 

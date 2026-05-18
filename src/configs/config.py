@@ -86,12 +86,12 @@ _C.MODEL.AFFINITY_EVOLUTION.PROMPT_ENABLE = True
 _C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_ENABLE = True
 _C.MODEL.AFFINITY_EVOLUTION.PROMPT_TARGET = "QpQv"      # QpKv / QpQv / KpKv
 _C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_TARGET = "QpKv"    # QpKv / QpQv / KpKv
-_C.MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA = 0.0
-_C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA = 0.0
+_C.MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA = 0.0     # teacher correction 强度，范围 [0, 1]
+_C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA = 0.0   # teacher correction 强度，范围 [0, 1]
 _C.MODEL.AFFINITY_EVOLUTION.PROMPT_GAMMA_INIT = 0.0
 _C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_GAMMA_INIT = 0.0
-_C.MODEL.AFFINITY_EVOLUTION.PROMPT_DETACH = "none"       # mediated / direct / none
-_C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_DETACH = "none"     # via_prompt / direct / none
+_C.MODEL.AFFINITY_EVOLUTION.PROMPT_DETACH = "none"       # mediated / direct / none；非 none 时表示 teacher 选择
+_C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_DETACH = "none"     # via_prompt / direct / none；非 none 时表示 teacher 选择
 _C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_COMPOSE = "prob"    # prob / raw_then_norm
 
 _C.MODEL.ADAPTER = CfgNode()
@@ -104,6 +104,7 @@ _C.SOLVER.LOSS_CM_WEIGHT = 0.05
 _C.SOLVER.LOSS_VSPCN_AR_WEIGHT = 0.0005
 _C.SOLVER.LOSS_SEM_MED_WEIGHT = 0.0
 _C.SOLVER.LOSS_SPV_WEIGHT = 0.0
+_C.SOLVER.LOSS_ROUTE_TS_WEIGHT = 0.0
 
 _C.SOLVER.SEM_MED = CfgNode()
 _C.SOLVER.SEM_MED.TARGET = "KpKv"                 # QpKv / QpQv / KpKv
@@ -119,6 +120,12 @@ _C.SOLVER.SPV.METRIC = "kl"                       # mse / kl / cosine
 _C.SOLVER.SPV.NORM = "softmax"                    # "none"raw affinity 直接相乘
 _C.SOLVER.SPV.DETACH = "none"                     # via_prompt / direct / none
 _C.SOLVER.SPV.LAYERS = []                         # empty means all shared layers
+
+_C.SOLVER.ROUTE_TS = CfgNode()
+_C.SOLVER.ROUTE_TS.PROMPT_ENABLE = True           # 对 prompt evolution 的 student/teacher route 做显式对齐
+_C.SOLVER.ROUTE_TS.SEMANTIC_ENABLE = True         # 对 semantic evolution 的 student/teacher route 做显式对齐
+_C.SOLVER.ROUTE_TS.METRIC = "kl"                  # mse / kl / cosine
+_C.SOLVER.ROUTE_TS.LAYERS = []                    # empty means all shared layers
 
 _C.SOLVER.RSIM_V2 = CfgNode()
 _C.SOLVER.RSIM_V2.ALIGN_MODE = "ar"                  # ar / cm
