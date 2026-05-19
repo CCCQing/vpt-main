@@ -48,6 +48,15 @@ def _parse_str_list(raw: str) -> List[str]:
     return vals
 
 
+def _parse_bool(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError(f"Expected boolean string true / false, got '{raw}'.")
+
+
 def _validate_choices(name: str, values: List[str], allowed: List[str]) -> None:
     bad = [v for v in values if v not in allowed]
     if bad:
@@ -58,6 +67,17 @@ def _validate_no_output_dir_override(opts: List[str]) -> None:
     bad = [item for item in opts if item.strip().upper() == "OUTPUT_DIR"]
     if bad:
         raise ValueError("Do not pass OUTPUT_DIR through extra opts; the grid launcher owns per-trial OUTPUT_DIR.")
+
+
+def _validate_extra_opts(opts: List[str]) -> None:
+    _validate_no_output_dir_override(opts)
+    if len(opts) % 2 != 0:
+        if len(opts) == 1 and ("/" in opts[0] or "\\" in opts[0]):
+            raise ValueError(
+                "Output directory must be passed with --out-root, e.g. "
+                f"--out-root {opts[0]}. Positional arguments are reserved for KEY VALUE config overrides."
+            )
+        raise ValueError("Extra config overrides must be KEY VALUE pairs.")
 
 
 def _trial_name(idx: int, tag: str) -> str:
@@ -190,7 +210,8 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
     keys = [
         "trial_name",
         "group",
-        "route_ts_weight",
+        "route_ts_prompt_weight",
+        "route_ts_semantic_weight",
         "exit_code",
         "score_key",
         "score",
@@ -227,11 +248,18 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("route_ts_weight_grid_search")
+    ap = argparse.ArgumentParser("route_ts_split_weight_grid_search")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
-    ap.add_argument("--out-root", default="output/grid_route_ts_weight")
-    ap.add_argument("--weight-grid", default="0,0.00001,0.0001")
+    ap.add_argument("--out-root", default="output/grid_route_ts_split_weight_dynamic_learned")
+    ap.add_argument("--prompt-backend", default="dynamic", choices=["dynamic", "vpt_deep"])
+    ap.add_argument("--prompt-init-source", default="learned", choices=["learned", "distributor_mean"])
+    ap.add_argument("--distributor-enable", default="false", choices=["true", "false"])
+    ap.add_argument("--affinity-evolution-enable", default="true", choices=["true", "false"])
+    ap.add_argument("--vis-save-raw", default="true", choices=["true", "false"])
+    ap.add_argument("--vis-save-images", default="false", choices=["true", "false"])
+    ap.add_argument("--prompt-weight-grid", default="0,0.00001,0.001")
+    ap.add_argument("--semantic-weight-grid", default="0,0.0001,0.001")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("opts", nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -240,33 +268,65 @@ def main() -> None:
     out_root = os.path.abspath(os.path.join(repo_root, args.out_root))
     os.makedirs(out_root, exist_ok=True)
 
-    weight_grid = _parse_float_list(args.weight_grid)
-    # 保持 yaml 的模型与损失设置不动；这里只扫 route teacher-student loss 权重。
-    base_opts = []
+    prompt_weight_grid = _parse_float_list(args.prompt_weight_grid)
+    semantic_weight_grid = _parse_float_list(args.semantic_weight_grid)
+    distributor_enable = _parse_bool(args.distributor_enable)
+    affinity_evolution_enable = _parse_bool(args.affinity_evolution_enable)
+    vis_save_raw = _parse_bool(args.vis_save_raw)
+    vis_save_images = _parse_bool(args.vis_save_images)
+    # 固定为 learned P0 + affinity evolution：不使用 distributor，也不走 prompt_update_layers。
+    base_opts = [
+        "MODEL.PROMPT.BACKEND", args.prompt_backend,
+        "MODEL.PROMPT.INIT_SOURCE", args.prompt_init_source,
+        "MODEL.PROMPT.DISTRIBUTOR.ENABLE", str(distributor_enable),
+        "MODEL.AFFINITY_EVOLUTION.ENABLE", str(affinity_evolution_enable),
+        "SOLVER.VIS.SAVE_RAW", str(vis_save_raw),
+        "SOLVER.VIS.SAVE_IMAGES", str(vis_save_images),
+    ]
     if args.opts:
-        _validate_no_output_dir_override(args.opts)
+        _validate_extra_opts(args.opts)
         base_opts.extend(args.opts)
 
     trials: List[Dict[str, object]] = []
-    for weight in weight_grid:
-        params = {"LOSS_ROUTE_TS_WEIGHT": weight}
-        trials.append(
-            {
-                "group": "route_ts_weight",
-                "tag": _trial_tag("route_ts", params),
-                "route_ts_weight": weight,
-                "opts": [
-                    "SOLVER.LOSS_ROUTE_TS_WEIGHT", str(weight),
-                ],
+    for prompt_weight in prompt_weight_grid:
+        for semantic_weight in semantic_weight_grid:
+            params = {
+                "LOSS_ROUTE_TS_PROMPT_WEIGHT": prompt_weight,
+                "LOSS_ROUTE_TS_SEMANTIC_WEIGHT": semantic_weight,
             }
-        )
+            trials.append(
+                {
+                    "group": "route_ts_split_weight",
+                    "tag": _trial_tag("route_ts", params),
+                    "route_ts_prompt_weight": prompt_weight,
+                    "route_ts_semantic_weight": semantic_weight,
+                    "opts": [
+                        "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", str(prompt_weight),
+                        "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", str(semantic_weight),
+                    ],
+                }
+            )
 
     search_space = {
         "config_file": args.config_file,
         "out_root": out_root,
         "total_trials": len(trials),
-        "sweep": "SOLVER.LOSS_ROUTE_TS_WEIGHT",
-        "weight_grid": weight_grid,
+        "sweep": [
+            "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT",
+            "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT",
+        ],
+        "prompt_weight_grid": prompt_weight_grid,
+        "semantic_weight_grid": semantic_weight_grid,
+        "fixed_prompt_setting": {
+            "MODEL.PROMPT.BACKEND": args.prompt_backend,
+            "MODEL.PROMPT.INIT_SOURCE": args.prompt_init_source,
+            "MODEL.PROMPT.DISTRIBUTOR.ENABLE": distributor_enable,
+            "MODEL.AFFINITY_EVOLUTION.ENABLE": affinity_evolution_enable,
+        },
+        "visualization_setting": {
+            "SOLVER.VIS.SAVE_RAW": vis_save_raw,
+            "SOLVER.VIS.SAVE_IMAGES": vis_save_images,
+        },
         "note": "All other settings come from the yaml config unless passed through extra opts.",
         "extra_opts": args.opts,
     }
@@ -296,7 +356,8 @@ def main() -> None:
         row: Dict[str, object] = {
             "trial_name": trial_name,
             "group": trial["group"],
-            "route_ts_weight": trial["route_ts_weight"],
+            "route_ts_prompt_weight": trial["route_ts_prompt_weight"],
+            "route_ts_semantic_weight": trial["route_ts_semantic_weight"],
             "exit_code": -1,
             "run_dir": "",
         }

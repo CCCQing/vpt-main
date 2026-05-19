@@ -366,7 +366,7 @@ def _compute_semantic_prompt_visual_cycle_loss(aux: Optional[Dict[str, Any]], cf
     return torch.stack(layer_losses).mean()
 
 
-def _compute_route_teacher_student_loss(aux: Optional[Dict[str, Any]], cfg) -> torch.Tensor:
+def _compute_route_teacher_student_loss(aux: Optional[Dict[str, Any]], cfg, route_side: str) -> torch.Tensor:
     """
     轻量 route teacher-student 对齐损失。
 
@@ -378,11 +378,15 @@ def _compute_route_teacher_student_loss(aux: Optional[Dict[str, Any]], cfg) -> t
         raise RuntimeError("Route teacher-student loss requires affinity aux dict.")
     if not bool(cfg.MODEL.AFFINITY_EVOLUTION.ENABLE):
         raise RuntimeError("Route teacher-student loss requires MODEL.AFFINITY_EVOLUTION.ENABLE=True.")
+    if route_side not in {"prompt", "semantic"}:
+        raise ValueError(f"Unsupported route teacher-student side='{route_side}'. Expected prompt / semantic.")
 
-    prompt_enable = bool(cfg.SOLVER.ROUTE_TS.PROMPT_ENABLE)
-    semantic_enable = bool(cfg.SOLVER.ROUTE_TS.SEMANTIC_ENABLE)
-    if not prompt_enable and not semantic_enable:
-        raise ValueError("SOLVER.ROUTE_TS requires PROMPT_ENABLE or SEMANTIC_ENABLE to be True.")
+    prompt_enable = route_side == "prompt"
+    semantic_enable = route_side == "semantic"
+    if prompt_enable and not bool(cfg.SOLVER.ROUTE_TS.PROMPT_ENABLE):
+        raise ValueError("SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT > 0 requires SOLVER.ROUTE_TS.PROMPT_ENABLE=True.")
+    if semantic_enable and not bool(cfg.SOLVER.ROUTE_TS.SEMANTIC_ENABLE):
+        raise ValueError("SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT > 0 requires SOLVER.ROUTE_TS.SEMANTIC_ENABLE=True.")
 
     target_map = {
         "QpKv": "aff_qpkv",
@@ -786,30 +790,56 @@ class SemanticPromptVisualCycleAuxLoss(nn.Module):
         return _compute_semantic_prompt_visual_cycle_loss(aux, self.cfg)
 
 
-class RouteTeacherStudentAuxLoss(nn.Module):
+class RouteTeacherStudentPromptAuxLoss(nn.Module):
     """
-    evolution route 的轻量 teacher-student 对齐损失。
+    prompt evolution route 的轻量 teacher-student 对齐损失。
 
     它复用 MODEL.AFFINITY_EVOLUTION 的 route 来源配置，
-    只额外提供一个很小的显式对齐梯度。
+    只对 prompt route 额外提供显式对齐梯度。
     """
     def __init__(self, cfg=None):
-        """读取 route teacher-student loss 的权重和开关。"""
+        """读取 prompt route teacher-student loss 的权重和开关。"""
         super().__init__()
-        self.name = "route_ts_loss"
+        self.name = "route_ts_prompt_loss"
         self.requires_affinity_aux = True
-        self.route_ts_weight = float(cfg.SOLVER.LOSS_ROUTE_TS_WEIGHT)
+        self.route_ts_prompt_weight = float(cfg.SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT)
         self.cfg = cfg
 
     @property
     def weight(self) -> float:
         """返回当前辅助损失权重，供 CompositeLoss 判断是否启用。"""
-        return self.route_ts_weight
+        return self.route_ts_prompt_weight
 
     def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
-        """从模型输出中取 aux，并计算 route teacher-student loss。"""
+        """从模型输出中取 aux，并计算 prompt route teacher-student loss。"""
         _, aux = _extract_logits_and_aux(pred_logits, kwargs)
-        return _compute_route_teacher_student_loss(aux, self.cfg)
+        return _compute_route_teacher_student_loss(aux, self.cfg, "prompt")
+
+
+class RouteTeacherStudentSemanticAuxLoss(nn.Module):
+    """
+    semantic evolution route 的轻量 teacher-student 对齐损失。
+
+    它复用 MODEL.AFFINITY_EVOLUTION 的 route 来源配置，
+    只对 semantic route 额外提供显式对齐梯度。
+    """
+    def __init__(self, cfg=None):
+        """读取 semantic route teacher-student loss 的权重和开关。"""
+        super().__init__()
+        self.name = "route_ts_semantic_loss"
+        self.requires_affinity_aux = True
+        self.route_ts_semantic_weight = float(cfg.SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT)
+        self.cfg = cfg
+
+    @property
+    def weight(self) -> float:
+        """返回当前辅助损失权重，供 CompositeLoss 判断是否启用。"""
+        return self.route_ts_semantic_weight
+
+    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """从模型输出中取 aux，并计算 semantic route teacher-student loss。"""
+        _, aux = _extract_logits_and_aux(pred_logits, kwargs)
+        return _compute_route_teacher_student_loss(aux, self.cfg, "semantic")
 
 
 class CompositeLoss(nn.Module):
@@ -979,9 +1009,14 @@ def _spv_enabled(cfg) -> bool:
     return float(cfg.SOLVER.LOSS_SPV_WEIGHT) > 0
 
 
-def _route_ts_enabled(cfg) -> bool:
-    """判断 route teacher-student 辅助损失是否启用。"""
-    return float(cfg.SOLVER.LOSS_ROUTE_TS_WEIGHT) > 0
+def _route_ts_prompt_enabled(cfg) -> bool:
+    """判断 prompt route teacher-student 辅助损失是否启用。"""
+    return float(cfg.SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT) > 0
+
+
+def _route_ts_semantic_enabled(cfg) -> bool:
+    """判断 semantic route teacher-student 辅助损失是否启用。"""
+    return float(cfg.SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT) > 0
 
 
 def _build_aux_losses(cfg):
@@ -995,8 +1030,10 @@ def _build_aux_losses(cfg):
         aux_losses.append(SemanticMediatedAffinityAuxLoss(cfg))
     if _spv_enabled(cfg):
         aux_losses.append(SemanticPromptVisualCycleAuxLoss(cfg))
-    if _route_ts_enabled(cfg):
-        aux_losses.append(RouteTeacherStudentAuxLoss(cfg))
+    if _route_ts_prompt_enabled(cfg):
+        aux_losses.append(RouteTeacherStudentPromptAuxLoss(cfg))
+    if _route_ts_semantic_enabled(cfg):
+        aux_losses.append(RouteTeacherStudentSemanticAuxLoss(cfg))
     return aux_losses
 
 
