@@ -21,7 +21,7 @@ _C.DIST_RANK = 0
 # ==========================================================
 _C.MODEL = CfgNode()
 _C.MODEL.WEIGHT_PATH = ""
-_C.MODEL.MODEL_ROOT = "D:\\postgraduate1\\project\\vpt-main\\weights\\official"
+_C.MODEL.MODEL_ROOT = "weights/official"
 _C.MODEL.TYPE = "vit"
 _C.MODEL.CLASSIFIER = "r_similarity"        # r_similarity r_similarity_v2 vspcn_baseline
 
@@ -185,7 +185,7 @@ _C.SOLVER.DBG_TRAINABLE = False
 _C.DATA = CfgNode()
 _C.DATA_ROOT = ""
 _C.DATA.NAME = "CUB"
-_C.DATA.DATAPATH = "D:\\postgraduate1\\project\\datasets\\CUB\\CUB_200_2011"
+_C.DATA.DATAPATH = "datasets/CUB/CUB_200_2011"
 _C.DATA.FEATURE = "sup_vitb16_224"
 _C.DATA.NUMBER_CLASSES = 200
 _C.DATA.CLASS_WEIGHTS_TYPE = "none"
@@ -196,8 +196,8 @@ _C.DATA.PIN_MEMORY = True
 
 _C.DATA.XLSA = CfgNode()
 _C.DATA.XLSA.ENABLED = True
-_C.DATA.XLSA.RES101_PATH = "D:\\postgraduate1\\project\\datasets\\xlsa17\\xlsa17\\data\\CUB\\res101.mat"
-_C.DATA.XLSA.SPLIT_PATH = "D:\\postgraduate1\\project\\datasets\\xlsa17\\xlsa17\\data\\CUB\\att_splits.mat"
+_C.DATA.XLSA.RES101_PATH = "datasets/xlsa17/xlsa17/data/CUB/res101.mat"
+_C.DATA.XLSA.SPLIT_PATH = "datasets/xlsa17/xlsa17/data/CUB/att_splits.mat"
 _C.DATA.XLSA.PROTOCOL_MODE = "dev"     #dev / final_zsl / final_gzsl
 _C.DIST_BACKEND = "gloo"
 _C.DIST_INIT_PATH = "env://"
