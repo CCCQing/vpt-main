@@ -210,6 +210,8 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
     keys = [
         "trial_name",
         "group",
+        "prompt_lambda",
+        "semantic_lambda",
         "route_ts_prompt_weight",
         "route_ts_semantic_weight",
         "exit_code",
@@ -248,16 +250,18 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("route_ts_split_weight_grid_search")
+    ap = argparse.ArgumentParser("lambda_route_ts_dynamic_learned_grid_search")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
-    ap.add_argument("--out-root", default="output/grid_route_ts_split_weight_dynamic_learned")
+    ap.add_argument("--out-root", default="output/grid_lambda_route_ts_dynamic_learned")
     ap.add_argument("--prompt-backend", default="dynamic", choices=["dynamic", "vpt_deep"])
     ap.add_argument("--prompt-init-source", default="learned", choices=["learned", "distributor_mean"])
     ap.add_argument("--distributor-enable", default="false", choices=["true", "false"])
     ap.add_argument("--affinity-evolution-enable", default="true", choices=["true", "false"])
     ap.add_argument("--vis-save-raw", default="true", choices=["true", "false"])
     ap.add_argument("--vis-save-images", default="false", choices=["true", "false"])
+    ap.add_argument("--prompt-lambda-grid", default="0,0.1,0.2")
+    ap.add_argument("--semantic-lambda-grid", default="0,0.1,0.2")
     ap.add_argument("--prompt-weight-grid", default="0,0.00001,0.001")
     ap.add_argument("--semantic-weight-grid", default="0,0.0001,0.001")
     ap.add_argument("--dry-run", action="store_true")
@@ -268,13 +272,15 @@ def main() -> None:
     out_root = os.path.abspath(os.path.join(repo_root, args.out_root))
     os.makedirs(out_root, exist_ok=True)
 
+    prompt_lambda_grid = _parse_float_list(args.prompt_lambda_grid)
+    semantic_lambda_grid = _parse_float_list(args.semantic_lambda_grid)
     prompt_weight_grid = _parse_float_list(args.prompt_weight_grid)
     semantic_weight_grid = _parse_float_list(args.semantic_weight_grid)
     distributor_enable = _parse_bool(args.distributor_enable)
     affinity_evolution_enable = _parse_bool(args.affinity_evolution_enable)
     vis_save_raw = _parse_bool(args.vis_save_raw)
     vis_save_images = _parse_bool(args.vis_save_images)
-    # 固定为 learned P0 + affinity evolution：不使用 distributor，也不走 prompt_update_layers。
+    # Fixed learned P0 + affinity evolution: no distributor and no old prompt_update_layers.
     base_opts = [
         "MODEL.PROMPT.BACKEND", args.prompt_backend,
         "MODEL.PROMPT.INIT_SOURCE", args.prompt_init_source,
@@ -288,33 +294,46 @@ def main() -> None:
         base_opts.extend(args.opts)
 
     trials: List[Dict[str, object]] = []
-    for prompt_weight in prompt_weight_grid:
-        for semantic_weight in semantic_weight_grid:
-            params = {
-                "LOSS_ROUTE_TS_PROMPT_WEIGHT": prompt_weight,
-                "LOSS_ROUTE_TS_SEMANTIC_WEIGHT": semantic_weight,
-            }
-            trials.append(
-                {
-                    "group": "route_ts_split_weight",
-                    "tag": _trial_tag("route_ts", params),
-                    "route_ts_prompt_weight": prompt_weight,
-                    "route_ts_semantic_weight": semantic_weight,
-                    "opts": [
-                        "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", str(prompt_weight),
-                        "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", str(semantic_weight),
-                    ],
-                }
-            )
+    for prompt_lambda in prompt_lambda_grid:
+        for semantic_lambda in semantic_lambda_grid:
+            for prompt_weight in prompt_weight_grid:
+                for semantic_weight in semantic_weight_grid:
+                    params = {
+                        "PROMPT_LAMBDA": prompt_lambda,
+                        "SEMANTIC_LAMBDA": semantic_lambda,
+                        "LOSS_ROUTE_TS_PROMPT_WEIGHT": prompt_weight,
+                        "LOSS_ROUTE_TS_SEMANTIC_WEIGHT": semantic_weight,
+                    }
+                    trials.append(
+                        {
+                            "group": "lambda_route_ts_dynamic_learned",
+                            "tag": _trial_tag("lambda_route_ts", params),
+                            "prompt_lambda": prompt_lambda,
+                            "semantic_lambda": semantic_lambda,
+                            "route_ts_prompt_weight": prompt_weight,
+                            "route_ts_semantic_weight": semantic_weight,
+                            "opts": [
+                                "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA", str(prompt_lambda),
+                                "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA", str(semantic_lambda),
+                                "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", str(prompt_weight),
+                                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", str(semantic_weight),
+                            ],
+                        }
+                    )
 
     search_space = {
         "config_file": args.config_file,
         "out_root": out_root,
         "total_trials": len(trials),
         "sweep": [
+            "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA",
+            "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA",
             "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT",
             "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT",
         ],
+        "prompt_lambda_grid": prompt_lambda_grid,
+        "semantic_lambda_grid": semantic_lambda_grid,
+        "lambda_policy": "PROMPT_LAMBDA and SEMANTIC_LAMBDA are swept independently.",
         "prompt_weight_grid": prompt_weight_grid,
         "semantic_weight_grid": semantic_weight_grid,
         "fixed_prompt_setting": {
@@ -356,6 +375,8 @@ def main() -> None:
         row: Dict[str, object] = {
             "trial_name": trial_name,
             "group": trial["group"],
+            "prompt_lambda": trial["prompt_lambda"],
+            "semantic_lambda": trial["semantic_lambda"],
             "route_ts_prompt_weight": trial["route_ts_prompt_weight"],
             "route_ts_semantic_weight": trial["route_ts_semantic_weight"],
             "exit_code": -1,
