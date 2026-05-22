@@ -18,6 +18,7 @@ vit_prompt 主干实现。
    - 旧版 anchor/free token、复杂 readout 等语义建模结构已不再使用。
 """
 import math
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -183,6 +184,373 @@ class SemanticTokenProjector(nn.Module):
         """
         return sem_state
 
+    def finalize_state(self, encoded: torch.Tensor, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        # linear 旧路径只缓存输入/输出语义 token，便于和 orthogonal 路径统一读取。
+        final_tokens = encoded[:, -self.num_tokens:, :]
+        input_tokens = state["semantic_token"]
+        state["input_tokens"] = input_tokens
+        state["final_tokens"] = final_tokens
+        state["semantic_input"] = input_tokens[:, 0, :]
+        state["semantic_output"] = final_tokens[:, 0, :]
+        state["semantic_delta"] = final_tokens[:, 0, :] - input_tokens[:, 0, :]
+        return state
+
+
+class OrthogonalSemanticTokenizer(nn.Module):
+    """CUB 8 组正交语义 tokenizer。
+
+    每组属性生成一个 semantic token；数值属性走 W_i 行空间，文本 residual 和 slot 身份只走 W_i 正交补。
+    """
+
+    MANUAL_CUB8_GROUPS = (
+        ("wing_color", "primary_color", "wing_shape", "wing_pattern"),
+        ("upper_tail_color", "under_tail_color", "tail_shape", "tail_pattern"),
+        ("bill_color", "eye_color", "bill_shape", "bill_length"),
+        ("crown_color", "forehead_color", "head_pattern"),
+        ("throat_color", "breast_color", "size", "breast_pattern"),
+        ("belly_color", "underparts_color", "belly_pattern"),
+        ("nape_color", "back_color", "back_pattern"),
+        ("upperparts_color", "leg_color", "shape"),
+    )
+
+    def __init__(self, hidden_size: int, semantic_tokens_cfg) -> None:
+        super().__init__()
+        self.hidden_size = int(hidden_size)
+        self.num_tokens = int(semantic_tokens_cfg.NUM_TOKENS)
+        self.input_dim = int(semantic_tokens_cfg.INPUT_DIM)
+        self.ortho_cfg = semantic_tokens_cfg.ORTHO
+        self.group_mode = str(self.ortho_cfg.GROUP_MODE)
+        self.text_mode = str(self.ortho_cfg.TEXT_MODE)
+        self.debug_shapes = False
+        self._shape_debug_init_logged = False
+
+        if self.input_dim != 312:
+            raise ValueError("Orthogonal semantic tokenizer requires MODEL.SEMANTIC_TOKENS.INPUT_DIM=312.")
+        if self.group_mode not in {"manual_cub8", "equal", "prefix"}:
+            raise ValueError("ORTHO.GROUP_MODE must be one of manual_cub8 / equal / prefix.")
+        if self.num_tokens <= 0:
+            raise ValueError("MODEL.SEMANTIC_TOKENS.NUM_TOKENS must be positive.")
+        if self.num_tokens > self.input_dim:
+            raise ValueError("MODEL.SEMANTIC_TOKENS.NUM_TOKENS must not exceed MODEL.SEMANTIC_TOKENS.INPUT_DIM.")
+        if self.group_mode == "manual_cub8" and self.num_tokens != len(self.MANUAL_CUB8_GROUPS):
+            raise ValueError("ORTHO.GROUP_MODE='manual_cub8' requires MODEL.SEMANTIC_TOKENS.NUM_TOKENS=8.")
+        if self.text_mode not in {"none", "null_residual", "text_null_static"}:
+            raise ValueError("ORTHO.TEXT_MODE must be one of none / null_residual / text_null_static.")
+        if bool(self.ortho_cfg.CODEBOOK_TRAINABLE):
+            raise ValueError("Orthogonal semantic tokenizer first version requires ORTHO.CODEBOOK_TRAINABLE=False.")
+
+        raw_names, prefixes = self._load_attributes(str(self.ortho_cfg.ATTRIBUTES_PATH))
+        groups = self._build_groups(prefixes)
+        self.group_lengths = [int(idx.numel()) for idx in groups]
+        self.register_buffer("segment_lengths", torch.as_tensor(self.group_lengths, dtype=torch.long))
+
+        for group_id, indices in enumerate(groups):
+            self.register_buffer(f"group_indices_{group_id}", indices)
+            codebook = self._make_row_orthogonal_codebook(
+                rows=int(indices.numel()),
+                cols=self.hidden_size,
+                seed=int(self.ortho_cfg.CODEBOOK_SEED) + group_id,
+            )
+            self.register_buffer(f"codebook_{group_id}", codebook)
+
+        self.slot_embeddings = nn.Parameter(torch.zeros(self.num_tokens, self.hidden_size))
+        nn.init.normal_(self.slot_embeddings, mean=0.0, std=0.02)
+
+        if self.text_mode != "none":
+            # 每组一个文本强度 gate；TEXT_MODE=none 时不引入这组可训练参数。
+            self.text_gate = nn.Parameter(torch.full((self.num_tokens,), float(self.ortho_cfg.TEXT_GATE_INIT)))
+            text_embeddings = self._load_text_embeddings(str(self.ortho_cfg.TEXT_EMBED_PATH), raw_names)
+            self.register_buffer("text_embeddings", text_embeddings)
+            self._register_text_null_buffers(groups)
+        else:
+            self.register_buffer("text_gate", torch.zeros(self.num_tokens))
+
+        logger.info(
+            "[semantic-tokenizer] tokenizer=orthogonal group_mode=%s text_mode=%s group_lengths=%s codebook_trainable=%s",
+            self.group_mode,
+            self.text_mode,
+            self.group_lengths,
+            False,
+        )
+
+    @staticmethod
+    def _attribute_prefix(raw_name: str) -> str:
+        if raw_name.startswith("has_"):
+            raw_name = raw_name[len("has_"):]
+        if "::" not in raw_name:
+            raise ValueError(f"Attribute name does not contain '::': {raw_name}")
+        return raw_name.split("::", 1)[0]
+
+    def _load_attributes(self, path: str) -> Tuple[List[str], List[str]]:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"ORTHO.ATTRIBUTES_PATH not found: {path}")
+        raw_names: List[str] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    raise ValueError(f"Empty attribute line at {path}:{line_no}")
+                parts = stripped.split(maxsplit=1)
+                if len(parts) != 2:
+                    raise ValueError(f"Expected '<index> <attribute_name>' at {path}:{line_no}, got: {stripped}")
+                expected_index = len(raw_names) + 1
+                if int(parts[0]) != expected_index:
+                    raise ValueError(
+                        f"Attribute index mismatch at {path}:{line_no}: expected {expected_index}, got {parts[0]}"
+                    )
+                raw_names.append(parts[1])
+        if len(raw_names) != self.input_dim:
+            raise ValueError(f"Expected {self.input_dim} attributes, got {len(raw_names)} from {path}")
+        return raw_names, [self._attribute_prefix(name) for name in raw_names]
+
+    def _build_groups(self, prefixes: List[str]) -> List[torch.Tensor]:
+        if self.group_mode == "manual_cub8":
+            return self._build_manual_groups(prefixes)
+        if self.group_mode == "equal":
+            return self._build_equal_groups()
+        if self.group_mode == "prefix":
+            return self._build_prefix_groups(prefixes)
+        raise ValueError(f"Unsupported ORTHO.GROUP_MODE='{self.group_mode}'")
+
+    def _build_manual_groups(self, prefixes: List[str]) -> List[torch.Tensor]:
+        groups: List[torch.Tensor] = []
+        used = set()
+        for group_prefixes in self.MANUAL_CUB8_GROUPS:
+            group_ids = [idx for idx, prefix in enumerate(prefixes) if prefix in group_prefixes]
+            if not group_ids:
+                raise ValueError(f"Manual CUB8 group has no attributes: {group_prefixes}")
+            overlap = used.intersection(group_ids)
+            if overlap:
+                raise ValueError(f"Manual CUB8 groups overlap at indices: {sorted(overlap)}")
+            used.update(group_ids)
+            groups.append(torch.as_tensor(group_ids, dtype=torch.long))
+        expected = set(range(self.input_dim))
+        if used != expected:
+            missing = sorted(expected - used)
+            extra = sorted(used - expected)
+            raise ValueError(f"Manual CUB8 groups must cover all attributes exactly once; missing={missing}, extra={extra}")
+        return groups
+
+    def _build_equal_groups(self) -> List[torch.Tensor]:
+        groups: List[torch.Tensor] = []
+        base = self.input_dim // self.num_tokens
+        remainder = self.input_dim % self.num_tokens
+        start = 0
+        for group_id in range(self.num_tokens):
+            length = base + (1 if group_id < remainder else 0)
+            end = start + length
+            groups.append(torch.arange(start, end, dtype=torch.long))
+            start = end
+        if start != self.input_dim:
+            raise ValueError(f"Equal groups must cover {self.input_dim} attributes, got {start}.")
+        return groups
+
+    def _build_prefix_groups(self, prefixes: List[str]) -> List[torch.Tensor]:
+        prefix_groups: List[List[int]] = []
+        prefix_to_group: Dict[str, List[int]] = {}
+        for idx, prefix in enumerate(prefixes):
+            if prefix not in prefix_to_group:
+                prefix_to_group[prefix] = []
+                prefix_groups.append(prefix_to_group[prefix])
+            prefix_to_group[prefix].append(idx)
+
+        units = [list(group) for group in prefix_groups]
+        while len(units) < self.num_tokens:
+            # 当 k 大于前缀数时，只拆分最大的前缀组；这样尽量保留 prefix 语义，又能服从 NUM_TOKENS。
+            split_idx = max(range(len(units)), key=lambda idx: len(units[idx]))
+            unit = units[split_idx]
+            if len(unit) <= 1:
+                raise ValueError("Prefix grouping cannot create more non-empty groups from singleton attributes.")
+            mid = len(unit) // 2
+            units[split_idx:split_idx + 1] = [unit[:mid], unit[mid:]]
+
+        # prefix 模式保留属性顺序，同时用动态规划把 unit 切成尽量均衡的 k 组。
+        prefix_sizes = [len(group) for group in units]
+        prefix_sums = [0]
+        for size in prefix_sizes:
+            prefix_sums.append(prefix_sums[-1] + size)
+
+        target = float(self.input_dim) / float(self.num_tokens)
+        num_prefixes = len(units)
+        dp = [[math.inf for _ in range(num_prefixes + 1)] for _ in range(self.num_tokens + 1)]
+        prev = [[-1 for _ in range(num_prefixes + 1)] for _ in range(self.num_tokens + 1)]
+        dp[0][0] = 0.0
+
+        for group_id in range(1, self.num_tokens + 1):
+            min_end = group_id
+            max_end = num_prefixes - (self.num_tokens - group_id)
+            for end in range(min_end, max_end + 1):
+                for start in range(group_id - 1, end):
+                    if not math.isfinite(dp[group_id - 1][start]):
+                        continue
+                    group_size = prefix_sums[end] - prefix_sums[start]
+                    cost = dp[group_id - 1][start] + (float(group_size) - target) ** 2
+                    if cost < dp[group_id][end]:
+                        dp[group_id][end] = cost
+                        prev[group_id][end] = start
+
+        if not math.isfinite(dp[self.num_tokens][num_prefixes]):
+            raise ValueError("Prefix grouping failed to produce a valid deterministic partition.")
+
+        boundaries: List[Tuple[int, int]] = []
+        end = num_prefixes
+        for group_id in range(self.num_tokens, 0, -1):
+            start = prev[group_id][end]
+            if start < 0:
+                raise ValueError("Prefix grouping reconstruction failed.")
+            boundaries.append((start, end))
+            end = start
+        boundaries.reverse()
+
+        groups: List[torch.Tensor] = []
+        for start, end in boundaries:
+            group_ids: List[int] = []
+            for prefix_group in units[start:end]:
+                group_ids.extend(prefix_group)
+            groups.append(torch.as_tensor(group_ids, dtype=torch.long))
+
+        if len(groups) != self.num_tokens:
+            raise ValueError(f"Prefix grouping produced {len(groups)} groups; expected {self.num_tokens}.")
+        covered = torch.cat(groups).tolist()
+        if covered != list(range(self.input_dim)):
+            raise ValueError("Prefix groups must preserve and cover the original 312 attribute order exactly.")
+        return groups
+
+    @staticmethod
+    def _make_row_orthogonal_codebook(rows: int, cols: int, seed: int) -> torch.Tensor:
+        if rows > cols:
+            raise ValueError(f"Cannot create row-orthogonal codebook with rows={rows} > cols={cols}")
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+        raw = torch.randn(cols, rows, generator=generator)
+        q, _ = torch.qr(raw)
+        return q.t().contiguous()
+
+    def _load_text_embeddings(self, path: str, raw_names: List[str]) -> torch.Tensor:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"ORTHO.TEXT_EMBED_PATH not found: {path}")
+        payload = torch.load(path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise TypeError(f"Text embedding cache must be a dict, got {type(payload)}")
+        if "raw_attribute_names" not in payload or "embeddings" not in payload:
+            raise KeyError("Text embedding cache must contain raw_attribute_names and embeddings.")
+        if list(payload["raw_attribute_names"]) != list(raw_names):
+            raise ValueError("Text embedding cache raw_attribute_names do not match ORTHO.ATTRIBUTES_PATH order.")
+        embeddings = payload["embeddings"]
+        if not torch.is_tensor(embeddings):
+            raise TypeError("Text embedding cache embeddings must be a torch.Tensor.")
+        expected_shape = (self.input_dim, self.hidden_size)
+        if tuple(embeddings.shape) != expected_shape:
+            raise ValueError(f"Expected text embeddings shape {expected_shape}, got {tuple(embeddings.shape)}")
+        return embeddings.float().contiguous()
+
+    @staticmethod
+    def _null_project(x: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
+        # W_i 行空间承载数值属性；文本和 slot 身份投到正交补，避免直接改变属性回投。
+        return x - torch.matmul(torch.matmul(x, codebook.t()), codebook)
+
+    def _register_text_null_buffers(self, groups: List[torch.Tensor]) -> None:
+        for group_id, indices in enumerate(groups):
+            codebook = getattr(self, f"codebook_{group_id}")
+            text_group = self.text_embeddings.index_select(0, indices)
+            text_null = self._null_project(text_group, codebook)
+            self.register_buffer(f"text_null_{group_id}", text_null.contiguous())
+            self.register_buffer(f"text_static_{group_id}", text_null.mean(dim=0).contiguous())
+
+    def _group_indices(self, group_id: int) -> torch.Tensor:
+        return getattr(self, f"group_indices_{group_id}")
+
+    def _codebook(self, group_id: int) -> torch.Tensor:
+        return getattr(self, f"codebook_{group_id}")
+
+    def init_state(self, semantics: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if semantics.dim() == 3 and semantics.shape[1] == 1:
+            semantics = semantics[:, 0, :]
+        if semantics.dim() != 2:
+            raise ValueError(f"OrthogonalSemanticTokenizer expects [B,312] or [B,1,312], got {tuple(semantics.shape)}")
+        if int(semantics.shape[-1]) != self.input_dim:
+            raise ValueError(f"Semantic input dim mismatch: expected {self.input_dim}, got {int(semantics.shape[-1])}")
+
+        semantics = semantics.to(device=device, dtype=torch.float32)
+        batch_size = int(semantics.shape[0])
+        tokens: List[torch.Tensor] = []
+        for group_id in range(self.num_tokens):
+            indices = self._group_indices(group_id).to(device=device)
+            codebook = self._codebook(group_id).to(device=device)
+            attrs = semantics.index_select(dim=1, index=indices)
+            numeric_token = torch.matmul(attrs, codebook)
+
+            slot = self.slot_embeddings[group_id].to(device=device).view(1, -1).expand(batch_size, -1)
+            slot_null = self._null_project(slot, codebook)
+            token = numeric_token + slot_null
+
+            if self.text_mode == "null_residual":
+                # 按属性置信度加权文本 null residual，只改变正交补信息。
+                text_null = getattr(self, f"text_null_{group_id}").to(device=device)
+                text_residual = torch.matmul(attrs, text_null)
+                token = token + self.text_gate[group_id] * text_residual
+            elif self.text_mode == "text_null_static":
+                # 静态文本组描述只作为 slot 的语义背景，同样不进入属性行空间。
+                text_static = getattr(self, f"text_static_{group_id}").to(device=device).view(1, -1)
+                token = token + self.text_gate[group_id] * text_static
+
+            tokens.append(token)
+        semantic_tokens = torch.stack(tokens, dim=1)
+
+        if self.debug_shapes and (not self._shape_debug_init_logged):
+            print(
+                "[SHAPE-DEBUG] OrthogonalSemanticTokenizer.init_state semantics={} tokens={} group_lengths={}".format(
+                    tuple(semantics.shape),
+                    tuple(semantic_tokens.shape),
+                    self.group_lengths,
+                )
+            )
+            self._shape_debug_init_logged = True
+
+        state = {
+            "tokenizer": "orthogonal",
+            "semantic_token": semantic_tokens,
+            "input_tokens": semantic_tokens,
+            "input_attributes": semantics,
+            "segment_lengths": self.segment_lengths.to(device=device),
+        }
+        return semantic_tokens, state
+
+    def decode_attributes(self, semantic_tokens: torch.Tensor) -> torch.Tensor:
+        decoded = semantic_tokens.new_zeros((semantic_tokens.shape[0], self.input_dim))
+        for group_id in range(self.num_tokens):
+            indices = self._group_indices(group_id).to(device=semantic_tokens.device)
+            codebook = self._codebook(group_id).to(device=semantic_tokens.device)
+            values = torch.matmul(semantic_tokens[:, group_id, :], codebook.t())
+            decoded.index_copy_(dim=1, index=indices, source=values)
+        return decoded
+
+    def _split_delta(self, token_delta: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        semantic_parts: List[torch.Tensor] = []
+        null_parts: List[torch.Tensor] = []
+        for group_id in range(self.num_tokens):
+            codebook = self._codebook(group_id).to(device=token_delta.device)
+            delta_i = token_delta[:, group_id, :]
+            semantic_delta = torch.matmul(torch.matmul(delta_i, codebook.t()), codebook)
+            semantic_parts.append(semantic_delta)
+            null_parts.append(delta_i - semantic_delta)
+        return torch.stack(semantic_parts, dim=1), torch.stack(null_parts, dim=1)
+
+    def finalize_state(self, encoded: torch.Tensor, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        final_tokens = encoded[:, -self.num_tokens:, :]
+        input_tokens = state["input_tokens"]
+        token_delta = final_tokens - input_tokens
+        semantic_delta_part, null_delta_part = self._split_delta(token_delta)
+        state["final_tokens"] = final_tokens
+        state["decoded_attributes"] = self.decode_attributes(final_tokens)
+        state["token_delta"] = token_delta
+        state["semantic_delta_part"] = semantic_delta_part
+        state["null_delta_part"] = null_delta_part
+        state["semantic_input"] = input_tokens
+        state["semantic_output"] = final_tokens
+        state["semantic_delta"] = token_delta
+        return state
+
 class PromptedTransformer(Transformer):
     """PromptedTransformer 主入口。
 
@@ -196,6 +564,9 @@ class PromptedTransformer(Transformer):
 
         self.semantic_tokens_cfg = prompt_config.SEMANTIC_TOKENS
         self.semantic_tokens_enable = bool(self.semantic_tokens_cfg.ENABLE)
+        self.semantic_tokenizer = str(self.semantic_tokens_cfg.TOKENIZER).lower()
+        if self.semantic_tokenizer not in {"linear", "orthogonal"}:
+            raise ValueError(f"Unsupported MODEL.SEMANTIC_TOKENS.TOKENIZER='{self.semantic_tokens_cfg.TOKENIZER}'")
         self.block_s_to_cls = bool(self.semantic_tokens_cfg.BLOCK_S_TO_CLS)
         self.affinity_evolution_cfg = prompt_config.AFFINITY_EVOLUTION
         self.affinity_evolution_enable = bool(self.affinity_evolution_cfg.ENABLE)
@@ -215,10 +586,22 @@ class PromptedTransformer(Transformer):
         self._last_semantic_token_state = None
 
         if self.semantic_tokens_enable:
-            self.semantic_token_projector = SemanticTokenProjector(
-                hidden_size=int(config.hidden_size),
-                semantic_tokens_cfg=self.semantic_tokens_cfg,
-            )
+            if self.semantic_tokenizer == "linear":
+                self.semantic_token_projector = SemanticTokenProjector(
+                    hidden_size=int(config.hidden_size),
+                    semantic_tokens_cfg=self.semantic_tokens_cfg,
+                )
+            elif self.semantic_tokenizer == "orthogonal":
+                if str(self.semantic_tokens_cfg.TRAIN_SOURCE).lower() != "class_mean":
+                    raise ValueError("TOKENIZER='orthogonal' requires MODEL.SEMANTIC_TOKENS.TRAIN_SOURCE='class_mean'.")
+                if str(self.semantic_tokens_cfg.EVAL_SOURCE).lower() != "class_mean":
+                    raise ValueError("TOKENIZER='orthogonal' requires MODEL.SEMANTIC_TOKENS.EVAL_SOURCE='class_mean'.")
+                self.semantic_token_projector = OrthogonalSemanticTokenizer(
+                    hidden_size=int(config.hidden_size),
+                    semantic_tokens_cfg=self.semantic_tokens_cfg,
+                )
+            else:
+                raise ValueError(f"Unsupported MODEL.SEMANTIC_TOKENS.TOKENIZER='{self.semantic_tokens_cfg.TOKENIZER}'")
         else:
             self.semantic_token_projector = None
 
@@ -268,7 +651,8 @@ class PromptedTransformer(Transformer):
         self._validate_affinity_evolution_config()
 
         if self.semantic_token_projector is not None:
-            self.semantic_token_projector.debug_shapes = bool(self.debug_shapes)
+            # orthogonal tokenizer 允许单独打开语义 token 形状调试。
+            self.semantic_token_projector.debug_shapes = bool(self.debug_shapes) or bool(self.semantic_tokens_cfg.ORTHO.DEBUG)
         for layer_block in self.encoder.layer:
             setattr(layer_block, "debug_shapes", bool(self.debug_shapes))
             if hasattr(layer_block, "attn"):
@@ -737,6 +1121,17 @@ class PromptedTransformer(Transformer):
         )
         return sem_state, semantic_input
 
+    def _finalize_semantic_token_state(self, encoded: torch.Tensor) -> None:
+        # ViT 编码结束后，用最后 k 个 semantic tokens 解码并缓存观测量。
+        if self._last_semantic_token_state is None:
+            return
+        if self.semantic_token_projector is None:
+            return
+        self._last_semantic_token_state = self.semantic_token_projector.finalize_state(
+            encoded=encoded,
+            state=self._last_semantic_token_state,
+        )
+
     def _update_semantic_tokens(self, sem_state, hidden_states, layer_idx: int, num_layers: int):
         """
         从主序列中切出当前层 prompt / visual token，
@@ -911,6 +1306,7 @@ class PromptedTransformer(Transformer):
                 self.block_s_to_cls,
             )
 
+        self._finalize_semantic_token_state(encoded)
         return encoded, attn_weights
 
     def forward_with_affinity(self, x, affinity_config, semantics=None):
@@ -936,6 +1332,7 @@ class PromptedTransformer(Transformer):
                 embedding_output, effective_affinity_config, None, effective_prompt_tokens
             )
 
+        self._finalize_semantic_token_state(encoded)
         return encoded, attn_weights, affinities
 
 class PromptedVisionTransformer(VisionTransformer):

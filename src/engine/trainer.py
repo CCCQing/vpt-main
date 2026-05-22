@@ -525,6 +525,8 @@ class Trainer():
         semantic_cfg = self.cfg.MODEL.SEMANTIC_TOKENS
         source = semantic_cfg.TRAIN_SOURCE if is_train else semantic_cfg.EVAL_SOURCE
         source = str(source).lower()
+        if str(semantic_cfg.TOKENIZER).lower() == "orthogonal" and source != "class_mean":
+            raise ValueError("MODEL.SEMANTIC_TOKENS.TOKENIZER='orthogonal' requires TRAIN_SOURCE=class_mean and EVAL_SOURCE=class_mean.")
         # BEGIN SEMANTIC_ABLATION_EXPERIMENT
         valid_sources = {"label", "class_mean", "none", "random_fixed", "label_shuffle", "learned_token"}
         # END SEMANTIC_ABLATION_EXPERIMENT
