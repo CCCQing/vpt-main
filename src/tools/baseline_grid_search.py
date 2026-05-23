@@ -109,6 +109,12 @@ def _run_cmd(cmd: List[str], cwd: str, stdout_path: str) -> int:
     return p.returncode
 
 
+def _read_tail(path: str, max_lines: int = 60) -> str:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+    return "".join(lines[-max_lines:])
+
+
 def _format_duration(seconds: float) -> str:
     total = max(0, int(round(seconds)))
     hours = total // 3600
@@ -210,6 +216,15 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
     keys = [
         "trial_name",
         "group",
+        "semantic_mode",
+        "semantic_tokenizer",
+        "semantic_group_mode",
+        "semantic_text_mode",
+        "semantic_num_tokens",
+        "prompt_backend",
+        "prompt_init_source",
+        "prompt_distributor_enable",
+        "route_setting",
         "prompt_lambda",
         "semantic_lambda",
         "route_ts_prompt_weight",
@@ -250,20 +265,19 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("lambda_route_ts_dynamic_learned_grid_search")
+    ap = argparse.ArgumentParser("semantic_tokenizer_text_mode_grid_search")
     ap.add_argument("--repo-root", default=".")
+    ap.add_argument("--python-bin", default=sys.executable)
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
-    ap.add_argument("--out-root", default="output/grid_lambda_route_ts_dynamic_learned")
-    ap.add_argument("--prompt-backend", default="dynamic", choices=["dynamic", "vpt_deep"])
-    ap.add_argument("--prompt-init-source", default="learned", choices=["learned", "distributor_mean"])
-    ap.add_argument("--distributor-enable", default="false", choices=["true", "false"])
+    ap.add_argument("--out-root", default="output/grid_semantic_tokenizer_equal_manual_route_ts")
     ap.add_argument("--affinity-evolution-enable", default="true", choices=["true", "false"])
     ap.add_argument("--vis-save-raw", default="true", choices=["true", "false"])
     ap.add_argument("--vis-save-images", default="false", choices=["true", "false"])
-    ap.add_argument("--prompt-lambda-grid", default="0,0.1,0.2")
-    ap.add_argument("--semantic-lambda-grid", default="0,0.1,0.2")
-    ap.add_argument("--prompt-weight-grid", default="0,0.00001,0.001")
-    ap.add_argument("--semantic-weight-grid", default="0,0.0001,0.001")
+    ap.add_argument(
+        "--semantic-modes",
+        default="equal_none,equal_null_residual,equal_text_init_codebook,manual_cub8_null_residual,manual_cub8_text_init_codebook",
+    )
+    ap.add_argument("--distributor-grid", default="false,true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("opts", nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -272,75 +286,205 @@ def main() -> None:
     out_root = os.path.abspath(os.path.join(repo_root, args.out_root))
     os.makedirs(out_root, exist_ok=True)
 
-    prompt_lambda_grid = _parse_float_list(args.prompt_lambda_grid)
-    semantic_lambda_grid = _parse_float_list(args.semantic_lambda_grid)
-    prompt_weight_grid = _parse_float_list(args.prompt_weight_grid)
-    semantic_weight_grid = _parse_float_list(args.semantic_weight_grid)
-    distributor_enable = _parse_bool(args.distributor_enable)
+    semantic_modes = _parse_str_list(args.semantic_modes)
+    allowed_semantic_modes = [
+        "equal_none",
+        "equal_null_residual",
+        "equal_text_init_codebook",
+        "manual_cub8_null_residual",
+        "manual_cub8_text_init_codebook",
+    ]
+    _validate_choices("semantic mode", semantic_modes, allowed_semantic_modes)
+    distributor_grid = [_parse_bool(x) for x in _parse_str_list(args.distributor_grid)]
     affinity_evolution_enable = _parse_bool(args.affinity_evolution_enable)
     vis_save_raw = _parse_bool(args.vis_save_raw)
     vis_save_images = _parse_bool(args.vis_save_images)
-    # Fixed learned P0 + affinity evolution: no distributor and no old prompt_update_layers.
     base_opts = [
-        "MODEL.PROMPT.BACKEND", args.prompt_backend,
-        "MODEL.PROMPT.INIT_SOURCE", args.prompt_init_source,
-        "MODEL.PROMPT.DISTRIBUTOR.ENABLE", str(distributor_enable),
+        "MODEL.PROMPT.BACKEND", "dynamic",
         "MODEL.AFFINITY_EVOLUTION.ENABLE", str(affinity_evolution_enable),
         "SOLVER.VIS.SAVE_RAW", str(vis_save_raw),
         "SOLVER.VIS.SAVE_IMAGES", str(vis_save_images),
+        "MODEL.SEMANTIC_TOKENS.ENABLE", "True",
+        "MODEL.SEMANTIC_TOKENS.TRAIN_SOURCE", "class_mean",
+        "MODEL.SEMANTIC_TOKENS.EVAL_SOURCE", "class_mean",
     ]
     if args.opts:
         _validate_extra_opts(args.opts)
         base_opts.extend(args.opts)
 
+    semantic_mode_specs = {
+        "equal_none": {
+            "semantic_tokenizer": "orthogonal",
+            "semantic_group_mode": "equal",
+            "semantic_text_mode": "none",
+            "semantic_num_tokens": 8,
+            "opts": [
+                "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
+                "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
+                "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "equal",
+                "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "none",
+            ],
+        },
+        "equal_null_residual": {
+            "semantic_tokenizer": "orthogonal",
+            "semantic_group_mode": "equal",
+            "semantic_text_mode": "null_residual",
+            "semantic_num_tokens": 8,
+            "opts": [
+                "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
+                "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
+                "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "equal",
+                "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "null_residual",
+            ],
+        },
+        "equal_text_init_codebook": {
+            "semantic_tokenizer": "orthogonal",
+            "semantic_group_mode": "equal",
+            "semantic_text_mode": "text_init_codebook",
+            "semantic_num_tokens": 8,
+            "opts": [
+                "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
+                "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
+                "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "equal",
+                "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "text_init_codebook",
+            ],
+        },
+        "manual_cub8_null_residual": {
+            "semantic_tokenizer": "orthogonal",
+            "semantic_group_mode": "manual_cub8",
+            "semantic_text_mode": "null_residual",
+            "semantic_num_tokens": 8,
+            "opts": [
+                "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
+                "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
+                "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "manual_cub8",
+                "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "null_residual",
+            ],
+        },
+        "manual_cub8_text_init_codebook": {
+            "semantic_tokenizer": "orthogonal",
+            "semantic_group_mode": "manual_cub8",
+            "semantic_text_mode": "text_init_codebook",
+            "semantic_num_tokens": 8,
+            "opts": [
+                "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
+                "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
+                "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "manual_cub8",
+                "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "text_init_codebook",
+            ],
+        },
+    }
+    route_setting_specs = {
+        "route_off": {
+            "prompt_lambda": 0.0,
+            "semantic_lambda": 0.0,
+            "route_ts_prompt_weight": 0.0,
+            "route_ts_semantic_weight": 0.0,
+            "opts": [
+                "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA", "0",
+                "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA", "0",
+                "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", "0",
+                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", "0",
+            ],
+        },
+        "route_best": {
+            "prompt_lambda": 0.1,
+            "semantic_lambda": 0.2,
+            "route_ts_prompt_weight": 1e-3,
+            "route_ts_semantic_weight": 0.0,
+            "opts": [
+                "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA", "0.1",
+                "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA", "0.2",
+                "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", "0.001",
+                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", "0",
+            ],
+        },
+    }
+
     trials: List[Dict[str, object]] = []
-    for prompt_lambda in prompt_lambda_grid:
-        for semantic_lambda in semantic_lambda_grid:
-            for prompt_weight in prompt_weight_grid:
-                for semantic_weight in semantic_weight_grid:
-                    params = {
-                        "PROMPT_LAMBDA": prompt_lambda,
-                        "SEMANTIC_LAMBDA": semantic_lambda,
-                        "LOSS_ROUTE_TS_PROMPT_WEIGHT": prompt_weight,
-                        "LOSS_ROUTE_TS_SEMANTIC_WEIGHT": semantic_weight,
+    for route_setting, route_spec in route_setting_specs.items():
+        for distributor_enable in distributor_grid:
+            prompt_init_source = "distributor_mean" if distributor_enable else "learned"
+            prompt_setting = "dynamic_distributor_mean" if distributor_enable else "dynamic_learned"
+            for semantic_mode in semantic_modes:
+                spec = semantic_mode_specs[semantic_mode]
+                params = {
+                    "route": route_setting,
+                    "prompt": prompt_setting,
+                    "semantic": semantic_mode,
+                }
+                trials.append(
+                    {
+                        "group": "semantic_tokenizer_text_modes_route_ts",
+                        "tag": _trial_tag("semantic_mode", params),
+                        "semantic_mode": semantic_mode,
+                        "semantic_tokenizer": spec["semantic_tokenizer"],
+                        "semantic_group_mode": spec["semantic_group_mode"],
+                        "semantic_text_mode": spec["semantic_text_mode"],
+                        "semantic_num_tokens": spec["semantic_num_tokens"],
+                        "prompt_backend": "dynamic",
+                        "prompt_init_source": prompt_init_source,
+                        "prompt_distributor_enable": distributor_enable,
+                        "route_setting": route_setting,
+                        "prompt_lambda": route_spec["prompt_lambda"],
+                        "semantic_lambda": route_spec["semantic_lambda"],
+                        "route_ts_prompt_weight": route_spec["route_ts_prompt_weight"],
+                        "route_ts_semantic_weight": route_spec["route_ts_semantic_weight"],
+                        "opts": [
+                            "MODEL.PROMPT.INIT_SOURCE", prompt_init_source,
+                            "MODEL.PROMPT.DISTRIBUTOR.ENABLE", str(distributor_enable),
+                        ] + list(spec["opts"]) + list(route_spec["opts"]),
                     }
-                    trials.append(
-                        {
-                            "group": "lambda_route_ts_dynamic_learned",
-                            "tag": _trial_tag("lambda_route_ts", params),
-                            "prompt_lambda": prompt_lambda,
-                            "semantic_lambda": semantic_lambda,
-                            "route_ts_prompt_weight": prompt_weight,
-                            "route_ts_semantic_weight": semantic_weight,
-                            "opts": [
-                                "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA", str(prompt_lambda),
-                                "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA", str(semantic_lambda),
-                                "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", str(prompt_weight),
-                                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", str(semantic_weight),
-                            ],
-                        }
-                    )
+                )
 
     search_space = {
         "config_file": args.config_file,
+        "python_bin": args.python_bin,
         "out_root": out_root,
         "total_trials": len(trials),
         "sweep": [
+            "MODEL.PROMPT.INIT_SOURCE",
+            "MODEL.PROMPT.DISTRIBUTOR.ENABLE",
+            "MODEL.SEMANTIC_TOKENS.TOKENIZER",
+            "MODEL.SEMANTIC_TOKENS.NUM_TOKENS",
+            "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE",
+            "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE",
             "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA",
             "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA",
             "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT",
             "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT",
         ],
-        "prompt_lambda_grid": prompt_lambda_grid,
-        "semantic_lambda_grid": semantic_lambda_grid,
-        "lambda_policy": "PROMPT_LAMBDA and SEMANTIC_LAMBDA are swept independently.",
-        "prompt_weight_grid": prompt_weight_grid,
-        "semantic_weight_grid": semantic_weight_grid,
+        "semantic_modes": semantic_modes,
+        "distributor_grid": distributor_grid,
+        "route_settings": {
+            name: {
+                "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA": spec["prompt_lambda"],
+                "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA": spec["semantic_lambda"],
+                "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT": spec["route_ts_prompt_weight"],
+                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT": spec["route_ts_semantic_weight"],
+            }
+            for name, spec in route_setting_specs.items()
+        },
         "fixed_prompt_setting": {
-            "MODEL.PROMPT.BACKEND": args.prompt_backend,
-            "MODEL.PROMPT.INIT_SOURCE": args.prompt_init_source,
-            "MODEL.PROMPT.DISTRIBUTOR.ENABLE": distributor_enable,
+            "MODEL.PROMPT.BACKEND": "dynamic",
             "MODEL.AFFINITY_EVOLUTION.ENABLE": affinity_evolution_enable,
+            "distributor_false": {
+                "MODEL.PROMPT.INIT_SOURCE": "learned",
+                "MODEL.PROMPT.DISTRIBUTOR.ENABLE": False,
+            },
+            "distributor_true": {
+                "MODEL.PROMPT.INIT_SOURCE": "distributor_mean",
+                "MODEL.PROMPT.DISTRIBUTOR.ENABLE": True,
+            },
+        },
+        "semantic_mode_specs": {
+            name: {
+                "semantic_tokenizer": spec["semantic_tokenizer"],
+                "semantic_group_mode": spec["semantic_group_mode"],
+                "semantic_text_mode": spec["semantic_text_mode"],
+                "semantic_num_tokens": spec["semantic_num_tokens"],
+            }
+            for name, spec in semantic_mode_specs.items()
         },
         "visualization_setting": {
             "SOLVER.VIS.SAVE_RAW": vis_save_raw,
@@ -364,7 +508,7 @@ def main() -> None:
         print(f"[grid] start {idx}/{total_trials}: {trial_name}", flush=True)
 
         cmd = [
-            sys.executable,
+            args.python_bin,
             "train.py",
             "--config-file",
             args.config_file,
@@ -375,6 +519,15 @@ def main() -> None:
         row: Dict[str, object] = {
             "trial_name": trial_name,
             "group": trial["group"],
+            "semantic_mode": trial["semantic_mode"],
+            "semantic_tokenizer": trial["semantic_tokenizer"],
+            "semantic_group_mode": trial["semantic_group_mode"],
+            "semantic_text_mode": trial["semantic_text_mode"],
+            "semantic_num_tokens": trial["semantic_num_tokens"],
+            "prompt_backend": trial["prompt_backend"],
+            "prompt_init_source": trial["prompt_init_source"],
+            "prompt_distributor_enable": trial["prompt_distributor_enable"],
+            "route_setting": trial["route_setting"],
             "prompt_lambda": trial["prompt_lambda"],
             "semantic_lambda": trial["semantic_lambda"],
             "route_ts_prompt_weight": trial["route_ts_prompt_weight"],
@@ -423,6 +576,9 @@ def main() -> None:
 
         code = _run_cmd(cmd, cwd=repo_root, stdout_path=stdout_path)
         row["exit_code"] = code
+        if code != 0:
+            print(f"[grid] failure stdout tail for {trial_name}:", flush=True)
+            print(_read_tail(stdout_path), flush=True)
 
         run_dir = _find_run_dir(trial_root)
         if run_dir is not None:

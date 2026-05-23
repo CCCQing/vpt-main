@@ -234,36 +234,55 @@ class OrthogonalSemanticTokenizer(nn.Module):
             raise ValueError("MODEL.SEMANTIC_TOKENS.NUM_TOKENS must not exceed MODEL.SEMANTIC_TOKENS.INPUT_DIM.")
         if self.group_mode == "manual_cub8" and self.num_tokens != len(self.MANUAL_CUB8_GROUPS):
             raise ValueError("ORTHO.GROUP_MODE='manual_cub8' requires MODEL.SEMANTIC_TOKENS.NUM_TOKENS=8.")
-        if self.text_mode not in {"none", "null_residual", "text_null_static"}:
-            raise ValueError("ORTHO.TEXT_MODE must be one of none / null_residual / text_null_static.")
+        if self.text_mode not in {"none", "null_residual", "text_init_codebook"}:
+            raise ValueError("ORTHO.TEXT_MODE must be one of none / null_residual / text_init_codebook.")
         if bool(self.ortho_cfg.CODEBOOK_TRAINABLE):
             raise ValueError("Orthogonal semantic tokenizer first version requires ORTHO.CODEBOOK_TRAINABLE=False.")
 
         raw_names, prefixes = self._load_attributes(str(self.ortho_cfg.ATTRIBUTES_PATH))
         groups = self._build_groups(prefixes)
         self.group_lengths = [int(idx.numel()) for idx in groups]
+        self.max_group_len = max(self.group_lengths)
         self.register_buffer("segment_lengths", torch.as_tensor(self.group_lengths, dtype=torch.long))
 
+        text_codebook = None
+        if self.text_mode == "text_init_codebook":
+            # text_init_codebook: 文本只用于初始化全局正交码表 W，不作为 forward residual 输入。
+            text_embeddings = self._load_text_embeddings(str(self.ortho_cfg.TEXT_EMBED_PATH), raw_names)
+            text_codebook = self._make_text_init_codebook(text_embeddings)
+
+        group_indices = torch.full((self.num_tokens, self.max_group_len), -1, dtype=torch.long)
+        codebooks = []
         for group_id, indices in enumerate(groups):
-            self.register_buffer(f"group_indices_{group_id}", indices)
-            codebook = self._make_row_orthogonal_codebook(
-                rows=int(indices.numel()),
-                cols=self.hidden_size,
-                seed=int(self.ortho_cfg.CODEBOOK_SEED) + group_id,
-            )
-            self.register_buffer(f"codebook_{group_id}", codebook)
+            group_indices[group_id, :int(indices.numel())] = indices
+            if self.text_mode == "text_init_codebook":
+                codebook = text_codebook.index_select(0, indices)
+            else:
+                codebook = self._make_row_orthogonal_codebook(
+                    rows=int(indices.numel()),
+                    cols=self.hidden_size,
+                    seed=int(self.ortho_cfg.CODEBOOK_SEED) + group_id,
+                )
+            padded_codebook = codebook.new_zeros((self.max_group_len, self.hidden_size))
+            padded_codebook[:int(indices.numel()), :] = codebook
+            codebooks.append(padded_codebook)
+        self.register_buffer("group_indices", group_indices)
+        self.register_buffer("codebooks", torch.stack(codebooks, dim=0))
 
-        self.slot_embeddings = nn.Parameter(torch.zeros(self.num_tokens, self.hidden_size))
-        nn.init.normal_(self.slot_embeddings, mean=0.0, std=0.02)
-
-        if self.text_mode != "none":
-            # 每组一个文本强度 gate；TEXT_MODE=none 时不引入这组可训练参数。
+        if self.text_mode == "null_residual":
+            # null_residual 使用每个 semantic slot 一个标量 gate 控制文本补空间残差强度。
+            # TEXT_GATE_INIT 通常设为 0，使初始 token 严格退化为纯数值主路径 a_i @ W_i。
             self.text_gate = nn.Parameter(torch.full((self.num_tokens,), float(self.ortho_cfg.TEXT_GATE_INIT)))
+            # 文本 embedding 是离线生成的属性名向量，顺序必须和 attributes.txt 的 312 个属性完全一致。
+            # 训练时不调用文本 encoder，只加载缓存矩阵，避免把文本模型引入训练图。
             text_embeddings = self._load_text_embeddings(str(self.ortho_cfg.TEXT_EMBED_PATH), raw_names)
             self.register_buffer("text_embeddings", text_embeddings)
+            # 预先为每个语义组缓存每个属性各自的 null-space 文本向量。
             self._register_text_null_buffers(groups)
         else:
+            # none / text_init_codebook 都不在 forward 中动态注入文本 residual。
             self.register_buffer("text_gate", torch.zeros(self.num_tokens))
+            self.register_buffer("text_nulls", torch.zeros(self.num_tokens, self.hidden_size))
 
         logger.info(
             "[semantic-tokenizer] tokenizer=orthogonal group_mode=%s text_mode=%s group_lengths=%s codebook_trainable=%s",
@@ -426,7 +445,26 @@ class OrthogonalSemanticTokenizer(nn.Module):
         q, _ = torch.qr(raw)
         return q.t().contiguous()
 
+    def _make_text_init_codebook(self, text_embeddings: torch.Tensor) -> torch.Tensor:
+        # 用 312 个属性名文本向量初始化全局 row-orthogonal 语义码表 W。
+        # forward 阶段只使用切分后的 W_i 做 a_i @ W_i，不再读取原始文本向量。
+        if tuple(text_embeddings.shape) != (self.input_dim, self.hidden_size):
+            raise ValueError(
+                f"text_init_codebook expects text embeddings shape {(self.input_dim, self.hidden_size)}, "
+                f"got {tuple(text_embeddings.shape)}"
+            )
+        q, _ = torch.qr(text_embeddings.float().t())
+        codebook = q.t().contiguous()
+        if tuple(codebook.shape) != (self.input_dim, self.hidden_size):
+            raise ValueError(
+                f"text_init_codebook produced codebook shape {tuple(codebook.shape)}, "
+                f"expected {(self.input_dim, self.hidden_size)}"
+            )
+        return codebook
+
     def _load_text_embeddings(self, path: str, raw_names: List[str]) -> torch.Tensor:
+        # 读取离线文本缓存；这里故意严格检查顺序，避免属性名文本和 312 维数值属性错位。
+        # 若顺序错位，null_residual 会把错误属性的文本残差加到当前属性组上，实验解释会失效。
         if not os.path.isfile(path):
             raise FileNotFoundError(f"ORTHO.TEXT_EMBED_PATH not found: {path}")
         payload = torch.load(path, map_location="cpu")
@@ -446,22 +484,22 @@ class OrthogonalSemanticTokenizer(nn.Module):
 
     @staticmethod
     def _null_project(x: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
-        # W_i 行空间承载数值属性；文本和 slot 身份投到正交补，避免直接改变属性回投。
+        # W_i 行空间承载数值属性；文本投到正交补，避免直接改变属性回投。
         return x - torch.matmul(torch.matmul(x, codebook.t()), codebook)
 
     def _register_text_null_buffers(self, groups: List[torch.Tensor]) -> None:
+        text_nulls = []
         for group_id, indices in enumerate(groups):
-            codebook = getattr(self, f"codebook_{group_id}")
+            length = int(indices.numel())
+            codebook = self.codebooks[group_id, :length, :]
+            # text_group: 当前 semantic slot 覆盖的属性名文本向量，形状 [group_attr_count, hidden]。
             text_group = self.text_embeddings.index_select(0, indices)
+            # text_null: 把文本向量投到 W_i 的正交补。
+            # 这样输入 token 回投到属性行空间时，文本部分理论上不改变 numeric_token_i @ W_i^T。
             text_null = self._null_project(text_group, codebook)
-            self.register_buffer(f"text_null_{group_id}", text_null.contiguous())
-            self.register_buffer(f"text_static_{group_id}", text_null.mean(dim=0).contiguous())
-
-    def _group_indices(self, group_id: int) -> torch.Tensor:
-        return getattr(self, f"group_indices_{group_id}")
-
-    def _codebook(self, group_id: int) -> torch.Tensor:
-        return getattr(self, f"codebook_{group_id}")
+            # null_residual 使用该组文本整体的 null-space 残差；不再用属性置信度对文本向量加权。
+            text_nulls.append(text_null.mean(dim=0).contiguous())
+        self.register_buffer("text_nulls", torch.stack(text_nulls, dim=0))
 
     def init_state(self, semantics: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if semantics.dim() == 3 and semantics.shape[1] == 1:
@@ -474,25 +512,24 @@ class OrthogonalSemanticTokenizer(nn.Module):
         semantics = semantics.to(device=device, dtype=torch.float32)
         batch_size = int(semantics.shape[0])
         tokens: List[torch.Tensor] = []
+        # a_i @ W_i
         for group_id in range(self.num_tokens):
-            indices = self._group_indices(group_id).to(device=device)
-            codebook = self._codebook(group_id).to(device=device)
+            length = int(self.segment_lengths[group_id].item())
+            indices = self.group_indices[group_id, :length].to(device=device)
+            codebook = self.codebooks[group_id, :length, :].to(device=device)
             attrs = semantics.index_select(dim=1, index=indices)
             numeric_token = torch.matmul(attrs, codebook)
-
-            slot = self.slot_embeddings[group_id].to(device=device).view(1, -1).expand(batch_size, -1)
-            slot_null = self._null_project(slot, codebook)
-            token = numeric_token + slot_null
+            token = numeric_token
 
             if self.text_mode == "null_residual":
-                # 按属性置信度加权文本 null residual，只改变正交补信息。
-                text_null = getattr(self, f"text_null_{group_id}").to(device=device)
-                text_residual = torch.matmul(attrs, text_null)
-                token = token + self.text_gate[group_id] * text_residual
-            elif self.text_mode == "text_null_static":
-                # 静态文本组描述只作为 slot 的语义背景，同样不进入属性行空间。
-                text_static = getattr(self, f"text_static_{group_id}").to(device=device).view(1, -1)
-                token = token + self.text_gate[group_id] * text_static
+                # null_residual:
+                # text_null_i 是该组属性文本在 W_i 正交补中的整体残差。
+                # 它不与属性置信度 attrs 相乘，因此文本路径只提供组级文本补充信息。
+                # 置信度只作用于主路径 a_i @ W_i。
+                text_null_i = self.text_nulls[group_id].to(device=device).view(1, -1)
+                # text_gate[group_id] 控制该语义组文本残差的注入强度；
+                # 若初始化为 0，训练初始等价于 numeric_token。
+                token = token + self.text_gate[group_id] * text_null_i
 
             tokens.append(token)
         semantic_tokens = torch.stack(tokens, dim=1)
@@ -519,8 +556,9 @@ class OrthogonalSemanticTokenizer(nn.Module):
     def decode_attributes(self, semantic_tokens: torch.Tensor) -> torch.Tensor:
         decoded = semantic_tokens.new_zeros((semantic_tokens.shape[0], self.input_dim))
         for group_id in range(self.num_tokens):
-            indices = self._group_indices(group_id).to(device=semantic_tokens.device)
-            codebook = self._codebook(group_id).to(device=semantic_tokens.device)
+            length = int(self.segment_lengths[group_id].item())
+            indices = self.group_indices[group_id, :length].to(device=semantic_tokens.device)
+            codebook = self.codebooks[group_id, :length, :].to(device=semantic_tokens.device)
             values = torch.matmul(semantic_tokens[:, group_id, :], codebook.t())
             decoded.index_copy_(dim=1, index=indices, source=values)
         return decoded
@@ -529,7 +567,8 @@ class OrthogonalSemanticTokenizer(nn.Module):
         semantic_parts: List[torch.Tensor] = []
         null_parts: List[torch.Tensor] = []
         for group_id in range(self.num_tokens):
-            codebook = self._codebook(group_id).to(device=token_delta.device)
+            length = int(self.segment_lengths[group_id].item())
+            codebook = self.codebooks[group_id, :length, :].to(device=token_delta.device)
             delta_i = token_delta[:, group_id, :]
             semantic_delta = torch.matmul(torch.matmul(delta_i, codebook.t()), codebook)
             semantic_parts.append(semantic_delta)
