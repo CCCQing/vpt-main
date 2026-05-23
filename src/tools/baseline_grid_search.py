@@ -381,10 +381,10 @@ def main() -> None:
             "route_ts_prompt_weight": 0.0,
             "route_ts_semantic_weight": 0.0,
             "opts": [
-                "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA", "0",
-                "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA", "0",
-                "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", "0",
-                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", "0",
+                "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA", "0.0",
+                "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA", "0.0",
+                "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", "0.0",
+                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", "0.0",
             ],
         },
         "route_best": {
@@ -396,7 +396,7 @@ def main() -> None:
                 "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA", "0.1",
                 "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA", "0.2",
                 "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", "0.001",
-                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", "0",
+                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", "0.0",
             ],
         },
     }
