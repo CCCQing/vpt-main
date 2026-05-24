@@ -704,8 +704,13 @@ class PromptedTransformer(Transformer):
         hidden_size = config.hidden_size
         if self.prompt_enable and self.prompt_backend == "dynamic":
             if self.affinity_evolution_enable:
+                # affinity evolution 打开时，不再创建旧的 prompt_update_layers 线性演化层。
+                # 层间状态更新完全由上一层 affinity 构造的 visual 路由完成。
+                # LayerNorm 只作用在 residual(delta - current) 上，用来控制路由聚合量的尺度。
                 self.affinity_evolution_prompt_norm = LayerNorm(hidden_size, eps=1e-6)
                 self.affinity_evolution_semantic_norm = LayerNorm(hidden_size, eps=1e-6)
+                # 每个层间间隔一个可学习 scalar gate；ViT-B/16 有 12 层，因此这里通常是 11 个 gamma。
+                # gamma 初始化为 0 时，训练开始等价于不做显式 affinity evolution，再由梯度逐步打开。
                 self.affinity_evolution_prompt_gamma = nn.Parameter(
                     torch.full((num_layers - 1,), float(self.affinity_evolution_cfg.PROMPT_GAMMA_INIT))
                 )
@@ -874,7 +879,10 @@ class PromptedTransformer(Transformer):
         teacher: torch.Tensor,
         correction_lambda: float,
     ) -> torch.Tensor:
-        # teacher 只提供前向修正方向；梯度仍从 student 路径回传。
+        # teacher-student 修正的核心：
+        # 1. 前向：route = student + lambda * stopgrad(teacher - student)，lambda 越大越靠近 teacher。
+        # 2. 反向：修正项整体 detach，梯度主要沿 student 路径回传，不把 teacher 当作被优化目标。
+        # 3. lambda=0 时完全退回 student；lambda=1 时前向接近 teacher，但梯度仍来自 student。
         return student + correction_lambda * (teacher.detach() - student).detach()
 
     def _build_prompt_evolution_route(
@@ -886,13 +894,15 @@ class PromptedTransformer(Transformer):
         prompt_lambda = float(self.affinity_evolution_cfg.PROMPT_LAMBDA)
 
         if prompt_detach == "mediated":
-            # direct 学生被 semantic-mediated teacher 拉向语义中介路径。
+            # prompt evolution: direct Apv 是 student，semantic-mediated A_sem_pv 是 teacher。
+            # 作用：让 prompt->visual 路由向“语义共同激活的 prompt-visual 关系”靠拢。
             return self._teacher_student_route(direct, mediated, prompt_lambda)
         if prompt_detach == "direct":
-            # semantic-mediated 学生被 direct teacher 拉向主干直接亲和路径。
+            # prompt evolution: semantic-mediated 是 student，direct Apv 是 teacher。
+            # 作用：保留语义中介结构，但用 ViT 内部直接 prompt-visual 亲和校正前向方向。
             return self._teacher_student_route(mediated, direct, prompt_lambda)
         if prompt_detach == "none":
-            # 无 teacher 固定方向时，两条概率路径共同参与前向和反向。
+            # 不指定 teacher：direct 和 mediated 都参与前向与反向，lambda 是普通插值系数。
             return (1.0 - prompt_lambda) * direct + prompt_lambda * mediated
         raise ValueError(f"Unsupported AFFINITY_EVOLUTION.PROMPT_DETACH='{prompt_detach}'")
 
@@ -905,13 +915,15 @@ class PromptedTransformer(Transformer):
         semantic_lambda = float(self.affinity_evolution_cfg.SEMANTIC_LAMBDA)
 
         if semantic_detach == "via_prompt":
-            # direct 学生被 semantic->prompt->visual teacher 修正。
+            # semantic evolution: direct QsKv 是 student，semantic->prompt->visual 是 teacher。
+            # 作用：让语义 token 的 visual 聚合受 prompt 中介路径约束。
             return self._teacher_student_route(direct, via_prompt, semantic_lambda)
         if semantic_detach == "direct":
-            # via_prompt 学生被 semantic->visual direct teacher 修正。
+            # semantic evolution: via_prompt 是 student，direct QsKv 是 teacher。
+            # 作用：使用 prompt 中介构造语义路由，但用直接 semantic->visual 路由校正前向方向。
             return self._teacher_student_route(via_prompt, direct, semantic_lambda)
         if semantic_detach == "none":
-            # 无 teacher 固定方向时，direct 与 via_prompt 做概率插值。
+            # 不指定 teacher：direct 和 via_prompt 都参与前向与反向，lambda 是普通插值系数。
             return (1.0 - semantic_lambda) * direct + semantic_lambda * via_prompt
         raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_DETACH='{semantic_detach}'")
 
@@ -921,6 +933,8 @@ class PromptedTransformer(Transformer):
         prompt_tokens: torch.Tensor,
         semantic_tokens: torch.Tensor,
     ) -> torch.Tensor:
+        # affinity evolution 的主序列固定为 [CLS | PROMPT | VISUAL | SEMANTIC]。
+        # 这里只替换 PROMPT 和 SEMANTIC 两段，CLS 与 VISUAL 保持上一层 ViT block 的输出。
         semantic_length = int(semantic_tokens.shape[1])
         return torch.cat(
             (
@@ -942,10 +956,15 @@ class PromptedTransformer(Transformer):
         if semantic_length <= 0:
             raise ValueError("Affinity evolution requires semantic_length > 0.")
 
+        # 当前层间更新使用“上一层 block 输出后的状态”作为输入。
+        # 切分规则必须与主序列布局一致：[CLS | PROMPT | VISUAL | SEMANTIC]。
         prev_prompt = hidden_states[:, 1:1 + self.num_tokens, :]
         prev_visual = hidden_states[:, 1 + self.num_tokens:-semantic_length, :]
         prev_semantic = hidden_states[:, -semantic_length:, :]
 
+        # 读取上一层真实 self-attention 投影产生的 raw affinity，并先对多头求均值。
+        # apv_prompt 用于 prompt evolution，apv_semantic 用于 semantic evolution；
+        # qskp/qskv 则提供语义 token 到 prompt/visual 的两条基础路径。
         prompt_target_key = f"{self.affinity_evolution_cfg.PROMPT_TARGET}_raw"
         semantic_target_key = f"{self.affinity_evolution_cfg.SEMANTIC_TARGET}_raw"
         apv_prompt = self._mean_head_affinity(prev_affinity, prompt_target_key)
@@ -954,6 +973,9 @@ class PromptedTransformer(Transformer):
         qskv = self._mean_head_affinity(prev_affinity, "QsKv_raw")
 
         next_prompt = prev_prompt
+        # sem_pv = QsKp^T @ QsKv，得到 semantic-mediated prompt->visual 路由证据。
+        # 直观含义：如果某个 prompt 和某个 visual patch 被同一语义 token 共同激活，
+        # 那么它们在语义中介意义下相关。
         sem_pv = torch.bmm(qskp.transpose(1, 2), qskv)
         self._check_affinity_evolution_scales(layer_idx, apv_prompt, sem_pv, qskp, qskv, apv_semantic)
         if bool(self.affinity_evolution_cfg.PROMPT_ENABLE):
@@ -961,6 +983,8 @@ class PromptedTransformer(Transformer):
             direct_prompt = torch.softmax(apv_prompt, dim=-1)
             mediated_prompt = torch.softmax(sem_pv, dim=-1)
             prompt_route = self._build_prompt_evolution_route(direct_prompt, mediated_prompt)
+            # prompt_route @ prev_visual 把上一层 visual token 按路由聚合回 prompt 空间。
+            # gamma_prompt 控制显式路由 residual 的注入强度。
             delta_prompt = torch.bmm(prompt_route, prev_visual)
             gamma_prompt = self.affinity_evolution_prompt_gamma[layer_idx - 1].view(1, 1, 1)
             next_prompt = prev_prompt + gamma_prompt * self.affinity_evolution_prompt_norm(delta_prompt - prev_prompt)
@@ -981,6 +1005,8 @@ class PromptedTransformer(Transformer):
             else:
                 raise ValueError(f"Unsupported AFFINITY_EVOLUTION.SEMANTIC_COMPOSE='{compose}'")
             semantic_route = self._build_semantic_evolution_route(direct, via_prompt)
+            # semantic_route @ prev_visual 把上一层 visual evidence 聚合回 semantic token。
+            # gamma_semantic 控制语义 token 的层间显式更新幅度。
             delta_semantic = torch.bmm(semantic_route, prev_visual)
             gamma_semantic = self.affinity_evolution_semantic_gamma[layer_idx - 1].view(1, 1, 1)
             next_semantic = prev_semantic + gamma_semantic * self.affinity_evolution_semantic_norm(delta_semantic - prev_semantic)
@@ -1289,6 +1315,8 @@ class PromptedTransformer(Transformer):
         prev_affinity = None
         for i in range(num_layers):
             if i == 0:
+                # 第 0 层没有“上一层 affinity”，因此直接跑 ViT block 并导出本层 affinity。
+                # 这份 affinity 会在进入第 1 层前作为 evolution 路由来源。
                 hidden_states, weights, affinity, _ = self.encoder.layer[i].forward_with_affinity(
                     hidden_states, effective_affinity_config, None, self.num_tokens
                 )
@@ -1296,6 +1324,8 @@ class PromptedTransformer(Transformer):
                 if self.prompt_backend == "dynamic" and self.affinity_evolution_enable:
                     if prev_affinity is None:
                         raise RuntimeError("Affinity evolution requires previous-layer affinity.")
+                    # 从第 1 层开始：先用上一层 affinity 更新 prompt/semantic，
+                    # 再把替换后的 [CLS | PROMPT | VISUAL | SEMANTIC] 送入当前 ViT block。
                     hidden_states = self._apply_affinity_evolution(hidden_states, prev_affinity, i)
                 else:
                     prev_prompt = hidden_states[:, 1:1 + self.num_tokens, :]
@@ -1319,6 +1349,7 @@ class PromptedTransformer(Transformer):
             if self.encoder.vis:
                 attn_weights.append(weights)
             affinities.append(affinity)
+            # 保存当前层 raw affinity，供下一层进入前执行 affinity evolution。
             prev_affinity = affinity
 
         encoded = self.encoder.encoder_norm(hidden_states)
