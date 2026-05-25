@@ -515,6 +515,76 @@ def _compute_route_teacher_student_loss(aux: Optional[Dict[str, Any]], cfg, rout
     return torch.stack(route_losses).mean()
 
 
+def _compute_attribute_reconstruction_loss(kwargs: Optional[Dict[str, Any]], cfg) -> torch.Tensor:
+    """
+    语义属性重建损失 L_attr。
+
+    当前 orthogonal semantic tokenizer 会把输入属性 a_mean 编成 semantic tokens，
+    这些 token 在 ViT 主序列中与 prompt / visual patch 交互后，再被固定 codebook 解码为:
+        decoded_attributes = â_x, shape [B, 312]
+
+    本损失用当前图像真实类别属性 a_y 监督 â_x:
+        L_attr = MSE(â_x, a_y)
+
+    设计边界:
+    - 只读 model.get_runtime_semantic_state()["decoded_attributes"]；
+    - 只支持 orthogonal tokenizer 这类能解码回属性空间的路径；
+    - a_y 来自 dataloader 的 batch["attribute"]，不对目标属性反传梯度。
+    """
+    if not isinstance(kwargs, Dict):
+        raise RuntimeError("Attribute reconstruction loss requires loss kwargs.")
+
+    metric = str(cfg.SOLVER.ATTR.METRIC).lower()
+    if metric != "mse":
+        raise ValueError(f"Unsupported SOLVER.ATTR.METRIC='{metric}'. First version only supports mse.")
+
+    if "model" not in kwargs:
+        raise RuntimeError("Attribute reconstruction loss requires kwargs['model'].")
+    if "target_attributes" not in kwargs:
+        raise RuntimeError("Attribute reconstruction loss requires kwargs['target_attributes'].")
+
+    model = kwargs["model"]
+    target_attributes = kwargs["target_attributes"]
+    if model is None:
+        raise RuntimeError("Attribute reconstruction loss requires a non-None model reference.")
+    if not torch.is_tensor(target_attributes):
+        raise RuntimeError("Attribute reconstruction loss requires tensor target_attributes from batch['attribute'].")
+
+    sem_state = model.get_runtime_semantic_state()
+    if not isinstance(sem_state, Dict):
+        raise RuntimeError("Attribute reconstruction loss requires runtime semantic state dict.")
+    if "decoded_attributes" not in sem_state:
+        raise RuntimeError(
+            "Attribute reconstruction loss requires semantic_state['decoded_attributes']; "
+            "use MODEL.SEMANTIC_TOKENS.TOKENIZER='orthogonal'."
+        )
+
+    decoded_attributes = sem_state["decoded_attributes"]
+    if not torch.is_tensor(decoded_attributes):
+        raise RuntimeError("semantic_state['decoded_attributes'] must be a tensor.")
+    if decoded_attributes.dim() != 2 or target_attributes.dim() != 2:
+        raise RuntimeError(
+            "Attribute reconstruction loss expects decoded/target attributes as [B,A], got {} and {}.".format(
+                tuple(decoded_attributes.shape),
+                tuple(target_attributes.shape),
+            )
+        )
+    if tuple(decoded_attributes.shape) != tuple(target_attributes.shape):
+        raise RuntimeError(
+            "Attribute reconstruction loss shape mismatch: decoded_attributes={} target_attributes={}.".format(
+                tuple(decoded_attributes.shape),
+                tuple(target_attributes.shape),
+            )
+        )
+
+    target = target_attributes.to(
+        device=decoded_attributes.device,
+        dtype=decoded_attributes.dtype,
+        non_blocking=True,
+    ).detach()
+    return F.mse_loss(decoded_attributes, target, reduction="mean")
+
+
 class SoftmaxCMLoss(nn.Module):
     """
     当前主线使用的分类损失。
@@ -628,8 +698,7 @@ class SoftmaxCMLoss(nn.Module):
 
         # Optional ablation 1: anchor-token consistency to class anchor h_y.
         if self.anchor_cons_weight > 0 and model is not None:
-            r_head = model.r_similarity_head
-            sem_state = r_head._runtime_semantic_state
+            sem_state = model.get_runtime_semantic_state()
             if isinstance(sem_state, dict):
                 sem_vec = sem_state.get("sem_state")
                 semantic_input = sem_state.get("semantic_input")
@@ -642,8 +711,7 @@ class SoftmaxCMLoss(nn.Module):
 
         # Optional ablation 2: free-token KD to semantic increment direction.
         if self.free_kd_weight > 0 and model is not None:
-            r_head = model.r_similarity_head
-            sem_state = r_head._runtime_semantic_state
+            sem_state = model.get_runtime_semantic_state()
             if isinstance(sem_state, dict):
                 sem_vec = sem_state.get("sem_state")
                 delta_sem = sem_state.get("semantic_delta")
@@ -842,6 +910,36 @@ class RouteTeacherStudentSemanticAuxLoss(nn.Module):
         return _compute_route_teacher_student_loss(aux, self.cfg, "semantic")
 
 
+class AttributeReconstructionAuxLoss(nn.Module):
+    """
+    ViT 交互后语义属性重建辅助损失。
+
+    该损失不依赖 affinity aux，而是读取 runtime semantic state 中的
+    decoded_attributes，把它约束到当前图像真实类别属性 a_y。
+    """
+    def __init__(self, cfg=None):
+        """读取属性重建损失权重和度量方式。"""
+        super().__init__()
+        self.name = "attr_loss"
+        self.requires_affinity_aux = False
+        self.attr_weight = float(cfg.SOLVER.LOSS_ATTR_WEIGHT)
+        self.cfg = cfg
+
+    @property
+    def weight(self) -> float:
+        """返回当前辅助损失权重，供 CompositeLoss 判断是否启用。"""
+        return self.attr_weight
+
+    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        """
+        计算 L_attr = MSE(â_x, a_y)。
+
+        pred_logits / targets / per_cls_weights 由 CompositeLoss 统一传入；
+        这里真正使用的是 kwargs 中的 model runtime state 和 target_attributes。
+        """
+        return _compute_attribute_reconstruction_loss(kwargs, self.cfg)
+
+
 class CompositeLoss(nn.Module):
     """
     组合式 loss：main_loss 负责分类主线，aux_losses 只负责各自的辅助约束。
@@ -1019,11 +1117,17 @@ def _route_ts_semantic_enabled(cfg) -> bool:
     return float(cfg.SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT) > 0
 
 
+def _attr_reconstruction_enabled(cfg) -> bool:
+    """判断 ViT 交互后语义属性重建损失是否启用。"""
+    return float(cfg.SOLVER.LOSS_ATTR_WEIGHT) > 0
+
+
 def _build_aux_losses(cfg):
     """
     根据各辅助损失权重构建辅助损失列表。
 
-    当前只有 semantic-mediated affinity loss，后续新增辅助项也放这里。
+    affinity 类辅助损失会要求 trainer 导出逐层 affinity aux；
+    属性重建损失只读取 runtime semantic state，不额外要求 affinity aux。
     """
     aux_losses = []
     if _sem_med_enabled(cfg):
@@ -1034,6 +1138,8 @@ def _build_aux_losses(cfg):
         aux_losses.append(RouteTeacherStudentPromptAuxLoss(cfg))
     if _route_ts_semantic_enabled(cfg):
         aux_losses.append(RouteTeacherStudentSemanticAuxLoss(cfg))
+    if _attr_reconstruction_enabled(cfg):
+        aux_losses.append(AttributeReconstructionAuxLoss(cfg))
     return aux_losses
 
 

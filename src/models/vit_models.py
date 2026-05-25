@@ -45,6 +45,30 @@ class ViT(nn.Module):
         self.r_similarity_head = None
         self.debug_trace_once = cfg.SOLVER.DEBUG_TRACE_ONCE
         self._debug_head_route_logged = False
+        self.clear_runtime_state()
+
+    def clear_runtime_state(self):
+        """
+        清空一次 forward 产生的模型级运行时状态。
+
+        这些状态来自 ViT 主干 / semantic tokenizer / affinity monitor，
+        不属于分类头内部计算，因此统一挂在 ViT model 上。
+        """
+        self._runtime_token_sequence = None
+        self._runtime_affinities = None
+        self._runtime_semantic_state = None
+
+    def get_runtime_semantic_state(self):
+        """返回最近一次 forward 产生的 semantic runtime state。"""
+        return self._runtime_semantic_state
+
+    def get_runtime_affinities(self):
+        """返回最近一次 forward_with_affinity 产生的逐层 affinity。"""
+        return self._runtime_affinities
+
+    def get_runtime_token_sequence(self):
+        """返回最近一次 forward_with_affinity 的最终 token 序列。"""
+        return self._runtime_token_sequence
 
     def build_backbone(self, prompt_cfg, cfg, adapter_cfg, load_pretrain, vis):
 
@@ -143,8 +167,9 @@ class ViT(nn.Module):
             cfg=self.cfg,
         ).to(device)
 
-    def forward(self, x, return_feature=False, semantics=None, class_ids=None):
+    def forward(self, x, return_feature=False, semantics=None, class_ids=None, runtime_targets=None):
 
+        self.clear_runtime_state()
         x = self.enc(x, semantics=semantics)  # batch_size x self.feat_dim
         self._last_bad_enc_rows = None
         if torch.is_tensor(x) and x.dim() == 2:
@@ -162,11 +187,14 @@ class ViT(nn.Module):
         if self.r_similarity_head is None:
             raise ValueError("r_similarity_head must be attached before ViT.forward is used.")
 
-        self.r_similarity_head._runtime_token_sequence = None
-        self.r_similarity_head._runtime_affinities = None
         transformer = self.enc.transformer
-        self.r_similarity_head._runtime_semantic_state = transformer._last_semantic_token_state
-        x = self.r_similarity_head(x, class_ids=class_ids)
+        self._runtime_semantic_state = transformer._last_semantic_token_state
+        x = self.r_similarity_head(
+            x,
+            class_ids=class_ids,
+            semantic_state=self._runtime_semantic_state,
+            runtime_targets=runtime_targets,
+        )
         logits_source = "r_similarity_head"
 
         if self.debug_trace_once and not self._debug_head_route_logged:
@@ -198,7 +226,7 @@ class ViT(nn.Module):
         x = self.enc(x)  # batch_size x self.feat_dim
         return x
 
-    def forward_with_affinity(self, x, affinity_config, semantics=None, vis=False, class_ids=None):
+    def forward_with_affinity(self, x, affinity_config, semantics=None, vis=False, class_ids=None, runtime_targets=None):
         """
         甯︿翰鍜岃緭鍑虹殑鍓嶅悜鎺ュ彛锛氫笌 enc/backbone 鐨?forward_with_affinity 骞宠銆?
 
@@ -206,6 +234,7 @@ class ViT(nn.Module):
           - vis=False: logits, affinities
           - vis=True:  logits, attn_weights, affinities
         """
+        self.clear_runtime_state()
         if vis:
             feats, attn_weights, affinities = self.enc.forward_with_affinity(
                 x, affinity_config, semantics=semantics, vis=vis
@@ -216,18 +245,23 @@ class ViT(nn.Module):
             )
             attn_weights = None
 
-        # Cache token-level runtime context for scoring heads that need late visual tokens / affinities.
+        # ViT 主模型缓存 token / affinity / semantic state，loss 和可视化从 model 明确接口读取。
         if self.r_similarity_head is None:
             raise ValueError("r_similarity_head must be attached before ViT.forward_with_affinity is used.")
 
-        self.r_similarity_head._runtime_token_sequence = feats.detach() if torch.is_tensor(feats) else None
-        self.r_similarity_head._runtime_affinities = affinities
         transformer = self.enc.transformer
-        self.r_similarity_head._runtime_semantic_state = transformer._last_semantic_token_state
+        self._runtime_token_sequence = feats.detach() if torch.is_tensor(feats) else None
+        self._runtime_affinities = affinities
+        self._runtime_semantic_state = transformer._last_semantic_token_state
 
         # 涓?forward 瀵归綈锛歟nc 杈撳嚭鍙兘鏄?[B, 1+N, D] 鎴?[B, D]锛屽彇 CLS 鍚庢帴澶撮儴
         feats = feats[:, 0] if feats.dim() == 3 else feats
-        logits = self.r_similarity_head(feats, class_ids=class_ids)
+        logits = self.r_similarity_head(
+            feats,
+            class_ids=class_ids,
+            semantic_state=self._runtime_semantic_state,
+            runtime_targets=runtime_targets,
+        )
 
         if not vis:
             return logits, affinities

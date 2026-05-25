@@ -1782,23 +1782,29 @@ class Trainer():
                     use_eval_space=(not is_train),
                 )
 
-            # 把 runtime targets 暂存到 r_head，供某些动态评分模式使用
-            model_ref_for_runtime = self._model_ref(self.model)
-            r_head_runtime = model_ref_for_runtime.r_similarity_head
-            if r_head_runtime is None:
-                raise ValueError("Current ViT XLSA pipeline requires r_similarity_head to be attached.")
-            r_head_runtime._runtime_targets = effective_targets.detach() if is_train else None
+            # consistency 等分类头内部缓存需要 raw global target 时，由 forward 显式传入。
+            # 不再通过外部写 r_similarity_head._runtime_targets 暂存状态。
+            runtime_targets = effective_targets.detach() if is_train else None
 
             if self.use_affinity:
                 self._last_attn_weights = None
                 if self.affinity_vis:
                     outputs, attn_weights, affinities = self.model.forward_with_affinity(
-                        inputs, affinity_cfg, semantics=semantics, vis=True, class_ids=local_class_ids
+                        inputs,
+                        affinity_cfg,
+                        semantics=semantics,
+                        vis=True,
+                        class_ids=local_class_ids,
+                        runtime_targets=runtime_targets,
                     )
                     self._last_attn_weights = attn_weights
                 else:
                     outputs, affinities = self.model.forward_with_affinity(
-                        inputs, affinity_cfg, semantics=semantics, class_ids=local_class_ids
+                        inputs,
+                        affinity_cfg,
+                        semantics=semantics,
+                        class_ids=local_class_ids,
+                        runtime_targets=runtime_targets,
                     )
 
                 # 如果当前损失需要 affinity 辅助量，则从逐层 affinities 中抽取统一监测量。
@@ -1809,9 +1815,12 @@ class Trainer():
                     outputs = outputs if not isinstance(outputs, tuple) else outputs[0]
             else:
                 self._last_attn_weights = None
-                outputs = self.model(inputs, semantics=semantics, class_ids=local_class_ids)
-
-            r_head_runtime._runtime_targets = None
+                outputs = self.model(
+                    inputs,
+                    semantics=semantics,
+                    class_ids=local_class_ids,
+                    runtime_targets=runtime_targets,
+                )
 
             # 3. 准备用于 loss 的 outputs / targets / weights
             loss_outputs = outputs
@@ -1893,6 +1902,9 @@ class Trainer():
                 "model": model_ref,
                 "raw_targets": targets,
                 "epoch": int(self._trace_epoch + 1),
+                # 属性重建辅助损失使用 batch 真实类别属性 a_y 作为监督目标。
+                # attributes 来自 xlsa_dataset.__getitem__ 返回的 class_attributes[label]。
+                "target_attributes": attributes.to(self.device, non_blocking=True).float() if torch.is_tensor(attributes) else None,
             }
             # 常规分类损失（如 SoftmaxLoss），只需 outputs / targets / class_weights。
             loss = self.cls_criterion(
@@ -2203,11 +2215,7 @@ class Trainer():
         total_logits = []
         total_targets = []
         model_ref = self._model_ref(self.model)
-        r_head_eval = model_ref.r_similarity_head
-
-        # 清理
-        if r_head_eval is not None:
-            r_head_eval._runtime_targets = None
+        model_ref.clear_runtime_state()
         if self._vis_split_enabled(prefix):
             self._vis_init_epoch(prefix)
 
@@ -2270,8 +2278,7 @@ class Trainer():
 
             # visualization：当前 split 若启用，就积累 trend 并保存若干样本图
             if self._vis_split_enabled(prefix):
-                r_head_vis = model_ref.r_similarity_head
-                affinities_vis = r_head_vis._runtime_affinities if r_head_vis is not None else None
+                affinities_vis = model_ref.get_runtime_affinities()
                 attn_weights_vis = self._last_attn_weights
                 if torch.is_tensor(logits):
                     bsz = int(logits.shape[0])

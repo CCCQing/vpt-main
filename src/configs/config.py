@@ -72,7 +72,7 @@ _C.MODEL.SEMANTIC_TOKENS.LEARNED_INIT_STD = 0.02
 _C.MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS = False
 _C.MODEL.SEMANTIC_TOKENS.ORTHO = CfgNode()
 _C.MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE = "manual_cub8"  # manual_cub8 / equal / prefix
-_C.MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE = "none"          # none /
+_C.MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE = "none"          # none / null_residual / text_init_codebook
 
 _C.MODEL.SEMANTIC_TOKENS.ORTHO.ATTRIBUTES_PATH = "datasets/CUB/attributes.txt"
 _C.MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_EMBED_PATH = "datasets/xlsa17/xlsa17/data/CUB/cub_attributes_sbert_all_mpnet_base_v2.pt"
@@ -117,6 +117,7 @@ _C.SOLVER.LOSS_SEM_MED_WEIGHT = 0.0
 _C.SOLVER.LOSS_SPV_WEIGHT = 0.0
 _C.SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT = 0.0
 _C.SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT = 0.0
+_C.SOLVER.LOSS_ATTR_WEIGHT = 0.0
 
 _C.SOLVER.SEM_MED = CfgNode()
 _C.SOLVER.SEM_MED.TARGET = "KpKv"                 # QpKv / QpQv / KpKv
@@ -138,6 +139,9 @@ _C.SOLVER.ROUTE_TS.PROMPT_ENABLE = True           # 对 prompt evolution 的 stu
 _C.SOLVER.ROUTE_TS.SEMANTIC_ENABLE = True         # 对 semantic evolution 的 student/teacher route 做显式对齐
 _C.SOLVER.ROUTE_TS.METRIC = "kl"                  # mse / kl / cosine
 _C.SOLVER.ROUTE_TS.LAYERS = []                    # empty means all shared layers
+
+_C.SOLVER.ATTR = CfgNode()
+_C.SOLVER.ATTR.METRIC = "mse"                     # 第一版只支持 mse：约束 ViT 交互后的 decoded attributes 接近真实类别属性
 
 _C.SOLVER.RSIM_V2 = CfgNode()
 _C.SOLVER.RSIM_V2.ALIGN_MODE = "ar"                  # ar / cm

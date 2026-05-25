@@ -1312,7 +1312,7 @@ class PromptedTransformer(Transformer):
             if self.affinity_evolution_enable
             else affinity_config
         )
-        prev_affinity = None
+        prev_affinity = None    # 第 0 层之前没有上一层 affinity，所以先是 None 层结束后，把当前层 affinity 存起来，给下一层用
         for i in range(num_layers):
             if i == 0:
                 # 第 0 层没有“上一层 affinity”，因此直接跑 ViT block 并导出本层 affinity。

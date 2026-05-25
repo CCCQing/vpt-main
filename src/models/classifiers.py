@@ -89,10 +89,6 @@ class RSimilarityClassifier(nn.Module):
         self._last_bad_visual_rows = None
         self._last_bad_sim_rows = None
         self._last_semantic_all_finite = None
-        self._runtime_targets = None
-        self._runtime_token_sequence = None
-        self._runtime_affinities = None
-        self._runtime_semantic_state = None
 
     def _project_class_prototypes(self) -> torch.Tensor:
         """将原始类别属性投影到 hidden_size，得到类别 prototype bank。"""
@@ -138,14 +134,14 @@ class RSimilarityClassifier(nn.Module):
         if not bool(row_sim_ok.all().item()):
             self._last_bad_sim_rows = (~row_sim_ok).nonzero(as_tuple=False).view(-1).detach().cpu().tolist()
 
-    def _cache_semantic_branch_state(self, active_global_to_local):
+    def _cache_semantic_branch_state(self, active_global_to_local, semantic_state, runtime_targets):
         """
         把 semantic token 分支的运行时状态转存为 loss 可读缓存。
 
         主要供 consistency / AGR 等语义增量相关损失使用。
         """
-        runtime_targets_global = self._runtime_targets if torch.is_tensor(self._runtime_targets) else None
-        sem_state = self._runtime_semantic_state if isinstance(self._runtime_semantic_state, dict) else None
+        runtime_targets_global = runtime_targets if torch.is_tensor(runtime_targets) else None
+        sem_state = semantic_state if isinstance(semantic_state, dict) else None
         if sem_state is None:
             return
 
@@ -182,11 +178,12 @@ class RSimilarityClassifier(nn.Module):
             target = self.consistency_head(attr_y)
             self._loss_last_consistency_target = F.normalize(target, dim=-1) if self.use_cosine else target
 
-    def forward(self, cls_feat: torch.Tensor, class_ids=None) -> torch.Tensor:
+    def forward(self, cls_feat: torch.Tensor, class_ids=None, semantic_state=None, runtime_targets=None) -> torch.Tensor:
         """
         根据 CLS 特征和 active class prototypes 计算分类 logits。
 
         同时缓存 visual/semantic input 与 repr，供后续 loss 复用。
+        semantic_state / runtime_targets 由 ViT.forward 显式传入，不再通过外部写分类头临时字段。
         """
         active_class_ids, active_global_to_local = self._resolve_active_class_space(class_ids, device=cls_feat.device)
         semantic_input = self._project_class_prototypes().index_select(0, active_class_ids)
@@ -253,7 +250,7 @@ class RSimilarityClassifier(nn.Module):
         self._loss_last_semantic_delta = None
         self._loss_last_semantic_final = None
         self._loss_last_semantic_anchor = None
-        self._cache_semantic_branch_state(active_global_to_local)
+        self._cache_semantic_branch_state(active_global_to_local, semantic_state, runtime_targets)
         return logits
 
 
@@ -295,10 +292,6 @@ class VSPCNBaselineClassifier(nn.Module):
         self._loss_last_semantic_input = None
         self._loss_last_semantic_repr = None
         self._loss_last_logit_scale = None
-        self._runtime_targets = None
-        self._runtime_token_sequence = None
-        self._runtime_affinities = None
-        self._runtime_semantic_state = None
         self._last_bad_feat_rows = None
         self._last_bad_visual_rows = None
         self._last_bad_sim_rows = None
@@ -320,11 +313,12 @@ class VSPCNBaselineClassifier(nn.Module):
             raise ValueError("Active class space is empty.")
         return active_ids
 
-    def forward(self, cls_feat: torch.Tensor, class_ids=None) -> torch.Tensor:
+    def forward(self, cls_feat: torch.Tensor, class_ids=None, semantic_state=None, runtime_targets=None) -> torch.Tensor:
         """
         执行 VSPCN baseline 分类前向。
 
         输出 logits，并缓存 CLS 特征与 prototype，供 AR loss 使用。
+        semantic_state / runtime_targets 仅用于统一分类头接口，本分类头不读取。
         """
         active_class_ids = self._resolve_active_class_space(class_ids, device=cls_feat.device)
         semantic_input = self._project_class_prototypes().index_select(0, active_class_ids)
@@ -420,10 +414,6 @@ class RSimilarityClassifierV2(nn.Module):
         self._loss_last_consistency_target = None
         self._loss_last_semantic_final = None
         self._loss_last_semantic_anchor = None
-        self._runtime_targets = None
-        self._runtime_token_sequence = None
-        self._runtime_affinities = None
-        self._runtime_semantic_state = None
         self._last_bad_feat_rows = None
         self._last_bad_visual_rows = None
         self._last_bad_sim_rows = None
@@ -445,11 +435,12 @@ class RSimilarityClassifierV2(nn.Module):
             raise ValueError("Active class space is empty.")
         return active_ids
 
-    def forward(self, cls_feat: torch.Tensor, class_ids=None) -> torch.Tensor:
+    def forward(self, cls_feat: torch.Tensor, class_ids=None, semantic_state=None, runtime_targets=None) -> torch.Tensor:
         """
         执行 RSimilarity v2 分类前向。
 
         SCORE_MODE=dot 时做点积分类；SCORE_MODE=cosine 时做归一化相似度分类。
+        semantic_state / runtime_targets 仅用于统一分类头接口，本分类头不读取。
         """
         active_class_ids = self._resolve_active_class_space(class_ids, device=cls_feat.device)
         semantic_input = self._project_class_prototypes().index_select(0, active_class_ids)
