@@ -57,6 +57,7 @@ class ViT(nn.Module):
         self._runtime_token_sequence = None
         self._runtime_affinities = None
         self._runtime_semantic_state = None
+        self._runtime_prompt_distribution_stats = None
 
     def get_runtime_semantic_state(self):
         """返回最近一次 forward 产生的 semantic runtime state。"""
@@ -69,6 +70,10 @@ class ViT(nn.Module):
     def get_runtime_token_sequence(self):
         """返回最近一次 forward_with_affinity 的最终 token 序列。"""
         return self._runtime_token_sequence
+
+    def get_runtime_prompt_distribution_stats(self):
+        """返回最近一次 forward 产生的 prompt distribution 统计量。"""
+        return self._runtime_prompt_distribution_stats
 
     def build_backbone(self, prompt_cfg, cfg, adapter_cfg, load_pretrain, vis):
 
@@ -189,6 +194,7 @@ class ViT(nn.Module):
 
         transformer = self.enc.transformer
         self._runtime_semantic_state = transformer._last_semantic_token_state
+        self._runtime_prompt_distribution_stats = transformer._last_prompt_distribution_stats
         x = self.r_similarity_head(
             x,
             class_ids=class_ids,
@@ -253,6 +259,7 @@ class ViT(nn.Module):
         self._runtime_token_sequence = feats.detach() if torch.is_tensor(feats) else None
         self._runtime_affinities = affinities
         self._runtime_semantic_state = transformer._last_semantic_token_state
+        self._runtime_prompt_distribution_stats = transformer._last_prompt_distribution_stats
 
         # 涓?forward 瀵归綈锛歟nc 杈撳嚭鍙兘鏄?[B, 1+N, D] 鎴?[B, D]锛屽彇 CLS 鍚庢帴澶撮儴
         feats = feats[:, 0] if feats.dim() == 3 else feats

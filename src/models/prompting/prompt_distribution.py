@@ -1,325 +1,456 @@
-﻿"""
-Pre-ViT prompt distribution modules for ZSL/GZSL.
+#!/usr/bin/env python3
+"""Prompt distribution modules used before prompted ViT.
 
-鍦?ViT 缂栫爜鍣?*涔嬪墠* 鏋勯€犳彁绀哄垎甯冪殑妯″潡銆?
-
-鏁翠綋鎬濊矾锛?
-- 瀵规棭鏈熺殑瑙嗚 token `V_raw` 鍋氭睜鍖栵紝寰楀埌涓€涓綆缁寸殑瑙嗚缁熻鍚戦噺 `h_v`锛?
-- 鐢ㄤ竴涓€滃悗楠屽ご鈥濅及璁￠珮鏂悗楠?q(z|x) 鐨勫潎鍊?mu 涓?log 鏂瑰樊 logvar锛屽苟浣跨敤閲嶅弬鏁板寲鎶€宸ч噰鏍?z锛?
-- 灏嗛殣鍙橀噺 z锛堝彲浠ヤ笌璇箟灞炴€ф嫾鎺ワ級瑙ｇ爜涓轰竴缁?prompt tokens锛?
-  杩欎簺 prompt tokens 浼氬湪杈撳叆搴忓垪缁村害涓婁笌 [CLS]銆乸atch tokens 杩涜鎷兼帴閫佸叆 ViT銆?
-
-璁捐鐩爣锛?
-- 鑳藉鐩存帴鎻掑叆鐜版湁 VPT 鐨?prompt 娉ㄥ叆娴佺▼锛圼CLS] + prompt + patch锛夛紝
-  ViT 鍙渶瑕佺煡閬?prompt_len锛岃€屼笉闇€瑕佺煡閬?prompt 鏄浣曠敱鍒嗗竷鐢熸垚鐨勩€?
+The public class name is intentionally kept as ``PreViTPromptDistributor`` so
+the existing backbone builder can keep the same construction entry.
 """
+
 from __future__ import annotations
 
-import math
+import os
+from urllib.parse import urlparse
 from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 
-def _reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """
-    浣跨敤閲嶅弬鏁板寲鎶€宸т粠楂樻柉鍚庨獙涓噰鏍凤細
-        z = mu + sigma * eps,
-        鍏朵腑 sigma = exp(0.5 * logvar), eps ~ N(0, I)
-
-    杩欐牱閲囨牱 z 鐨勮繃绋嬪 mu銆乴ogvar 鏄彲瀵肩殑锛屾柟渚垮仛 KL 绾︽潫銆?
-    """
-    std = torch.exp(0.5 * logvar)        # 鏍囧噯宸?sigma锛屼繚鎸侀潪璐?
-    eps = torch.randn_like(std)          # 涓?std 鍚屽舰鐘剁殑鏍囧噯姝ｆ€佸櫔澹?
-    return mu + eps * std               # 閲囨牱寰楀埌 z
+_ALLOWED_SOURCES = {
+    "vit_cls_prepass",
+    "cnn_torchvision",
+    "clip_frozen",
+    "dinov2_small",
+    "token_mlp",
+}
 
 
-class VisualStatsEncoder(nn.Module):
-    """
-    灏嗗師濮嬭瑙?token 搴忓垪 V_raw 缂栫爜涓轰竴涓叏灞€缁熻鍚戦噺 h_v 鐨勬ā鍧椼€?
+def prompt_kl_loss(mu: torch.Tensor, logvar: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+    """KL(q(z|x) || N(0, I)) for diagonal Gaussian prompt statistics."""
+    kl = 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(dim=-1)
+    if reduction == "mean":
+        return kl.mean()
+    if reduction == "sum":
+        return kl.sum()
+    if reduction == "none":
+        return kl
+    raise ValueError(f"Unsupported prompt KL reduction: {reduction}")
 
-    鏀寔鐨勬睜鍖栨ā寮忥細
-    - "gap"   : global average pooling锛屽叏灞€骞冲潎姹犲寲锛?
-    - "gem"   : generalized mean pooling锛屽甫鍙涔犳寚鏁扮殑骞夸箟鍧囧€兼睜鍖栵紱
-    - "attnpool": 鍗曟煡璇㈢殑娉ㄦ剰鍔涙睜鍖栵紙绫讳技 CLIP 鐨?AttentionPool2d 鎬濊矾锛夛紱
-    - "gated" : gated sum锛岀粰姣忎釜 token 瀛︿竴涓?gate锛屽啀鍔犳潈姹傚拰褰掍竴鍖栥€?
-    """
 
-    def __init__(self, dim: int, pool: str = "gap"):
-        """
-        鍙傛暟锛?
-            dim  : 姣忎釜瑙嗚 token 鐨勭淮搴?D锛?
-            pool : 姹犲寲绫诲瀷瀛楃涓诧紝瑙佷笂銆?
-        """
+class _VectorStatsHead(nn.Module):
+    """Map one visual vector [B,D_in] to Gaussian stats [B,2*D]."""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int) -> None:
         super().__init__()
-        self.pool = pool
-        if pool == "attnpool":
-            # 娉ㄦ剰鍔涙睜鍖栦腑浣跨敤鐨?query 鍚戦噺锛岀淮搴︿笌 token 鐩稿悓
-            self.query = nn.Parameter(torch.randn(dim))
-        elif pool == "gem":
-            # GeM 鐨勬寚鏁?p锛屽彲瀛︿範锛屽垵濮嬪寲涓?3.0锛堝父瑙佺殑缁忛獙鍊硷級
-            self.p = nn.Parameter(torch.ones(1) * 3.0)
-        elif pool == "gated":
-            # Gated pooling 浣跨敤鐨?gate 绾挎€у眰锛氬姣忎釜 token 杈撳嚭涓€涓爣閲?gate
-            self.gate = nn.Linear(dim, 1)
-        elif pool != "gap":
-            # 闈炴硶鐨勬睜鍖栫被鍨嬬粰鍑烘姤閿?
-            raise ValueError(f"Unsupported pooling mode: {pool}")
+        self.net = nn.Sequential(
+            nn.Linear(int(in_dim), int(hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(hidden_dim), int(out_dim) * 2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 2:
+            raise ValueError(f"Vector stats head expects [B,D], got {tuple(x.shape)}")
+        return self.net(x)
+
+
+class _TokenStatsHead(nn.Module):
+    """ViaPT-style lightweight token MLP: [B,N,768] -> [B,2*768]."""
+
+    def __init__(self, dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.token_down = nn.Sequential(
+            nn.Linear(int(dim), int(hidden_dim)),
+            nn.GELU(),
+        )
+        self.stats_out = nn.Linear(int(hidden_dim), int(dim) * 2)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        """
-        杈撳叆锛?
-            tokens: [B, L, D]锛孊 涓?batch 澶у皬锛孡 涓?token 鏁帮紝D 涓洪€氶亾缁村害銆?
-
-        杈撳嚭锛?
-            h_v: [B, D]锛屾瘡涓牱鏈搴斾竴涓叏灞€瑙嗚缁熻鍚戦噺銆?
-        """
-        if self.pool == "gap":
-            # 绠€鍗曠殑 Token 缁村钩鍧?
-            return tokens.mean(dim=1)
-
-        if self.pool == "gem":
-            # GeM: (1/L * sum(x^p))^(1/p)
-            # 杩欓噷浣跨敤涓€涓叡浜殑 p 鍙傛暟锛屽苟瀵硅緭鍏ュ仛 clamp 闃叉鏁板€奸棶棰?
-            p = torch.clamp(self.p, min=1e-3)
-            # 鍏堝 token 缁存眰骞冲潎锛屽啀鍋?1/p 娆″箓
-            return torch.pow(tokens.clamp(min=1e-6).mean(dim=1), 1.0 / p)
-
-        if self.pool == "attnpool":
-            # 鍗曟煡璇㈡敞鎰忓姏姹犲寲锛?
-            # 瀵规瘡涓?token 璁＄畻涓?query 鐨勭偣绉紝鍋?softmax 寰楁潈閲嶏紝鍐嶆寜鏉冮噸鍔犳潈姹傚拰
-            q = self.query.to(tokens.dtype)                 # 淇濊瘉涓?tokens 鐨?dtype 涓€鑷达紙鍏煎 AMP锛?
-            # [B, L, D] @ [D] -> [B, L]
-            attn = torch.matmul(tokens, q) / math.sqrt(tokens.size(-1))
-            weights = attn.softmax(dim=1)                   # 鍦?token 缁村害鍋?softmax
-            # 鎸夋潈閲嶅 tokens 鍔犳潈姹傚拰锛歴um_l w_l * token_l
-            return torch.einsum("bl, bld -> bd", weights, tokens)
-
-        if self.pool == "gated":
-            # Gated pooling:
-            # 鐢ㄤ竴灞傜嚎鎬у眰浜х敓 gate锛屽啀缁忚繃 sigmoid 鏄犲皠鍒?(0,1)
-            gates = torch.sigmoid(self.gate(tokens))        # [B, L, 1]
-            # 瀵规瘡涓?token 涔樹笂 gate 绯绘暟
-            gated_tokens = tokens * gates                   # [B, L, D]
-            # 褰掍竴鍖栧洜瀛愶細鎵€鏈?gate 鐨勫拰锛岄槻姝㈠叏 0 鐢?clamp
-            denom = gates.sum(dim=1).clamp(min=1e-6)        # [B, 1]
-            # 鍔犳潈鍜岄櫎浠ュ洜瀛?-> 绫讳技鈥滃姞鏉冨钩鍧団€?
-            return gated_tokens.sum(dim=1) / denom          # [B, D]
-
-        # 鐞嗚涓婁笉搴旇鍒拌繖閲岋紝鍥犱负闈炴硶妯″紡鍦?__init__ 涓凡缁忔姏寮傚父
-        raise ValueError(f"Unsupported pooling mode: {self.pool}")
+        if tokens.dim() != 3:
+            raise ValueError(f"Token stats head expects [B,N,D], got {tuple(tokens.shape)}")
+        pooled = self.token_down(tokens).mean(dim=1)
+        return self.stats_out(pooled)
 
 
-class PosteriorHead(nn.Module):
-    """
-    鍚庨獙鎺ㄦ柇澶达紙amortized posterior head锛夛細
+class FrozenTorchvisionCNN(nn.Module):
+    """Frozen torchvision feature extractor with explicit local-cache semantics."""
 
-    杈撳叆涓€涓粺璁″悜閲?h锛堜緥濡?h_v锛夛紝杈撳嚭涓よ矾锛?
-        - mu     : 楂樻柉鍚庨獙鐨勫潎鍊煎悜閲?
-        - logvar : 楂樻柉鍚庨獙瀵硅鍗忔柟宸殑 log 鏂瑰樊
+    _SUPPORTED = {"efficientnet_b0", "mobilenet_v3_small"}
+    _OUT_DIMS = {"efficientnet_b0": 1280, "mobilenet_v3_small": 576}
 
-    鍐呴儴缁撴瀯涓轰袱涓嫭绔嬬殑 MLP锛坢u_head 鍜?logvar_head锛夛紝鍏变韩杈撳叆 h銆?
-    """
-
-    def __init__(self, in_dim: int, hidden_dim: int, latent_dim: int):
-        """
-        鍙傛暟锛?
-            in_dim    : 杈撳叆缁熻鍚戦噺 h 鐨勭淮搴︼紱
-            hidden_dim: 涓棿闅愯棌灞傜淮搴︼紱
-            latent_dim: 娼滃彉閲?z 鐨勭淮搴︺€?
-        """
+    def __init__(self, name: str, allow_download: bool) -> None:
         super().__init__()
-        # 鍧囧€煎垎鏀?
-        self.mu_head = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, latent_dim),
-        )
-        # log 鏂瑰樊鍒嗘敮
-        self.logvar_head = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, latent_dim),
-        )
+        if name not in self._SUPPORTED:
+            raise ValueError(f"Unsupported CNN_NAME='{name}'. Expected one of {sorted(self._SUPPORTED)}")
+        self.name = str(name)
+        self.out_dim = int(self._OUT_DIMS[name])
 
-    def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        杈撳叆锛?
-            h: [B, in_dim] 瑙嗚缁熻鍚戦噺
+        import torchvision.models as tv_models
 
-        杈撳嚭锛?
-            mu:     [B, latent_dim]
-            logvar: [B, latent_dim]
-        """
-        return self.mu_head(h), self.logvar_head(h)
+        weights = tv_models.get_model_weights(name).DEFAULT
+        if allow_download:
+            self.model = tv_models.get_model(name, weights=weights)
+        else:
+            self.model = tv_models.get_model(name, weights=None)
+            weight_path = self._torchvision_cache_path(weights.url)
+            if not os.path.isfile(weight_path):
+                raise FileNotFoundError(
+                    "cnn_torchvision requires cached torchvision weights when EXTERNAL_ALLOW_DOWNLOAD=False: "
+                    f"{weight_path}"
+                )
+            state_dict = torch.load(weight_path, map_location="cpu")
+            self.model.load_state_dict(state_dict)
+        self.features = self.model.features
+        self._freeze()
+
+    @staticmethod
+    def _torchvision_cache_path(url: str) -> str:
+        file_name = os.path.basename(urlparse(url).path)
+        return os.path.join(torch.hub.get_dir(), "checkpoints", file_name)
+
+    def _freeze(self) -> None:
+        self.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def train(self, mode: bool = True):
+        super().train(False)
+        self._freeze()
+        return self
+
+    def forward(self, raw_image: torch.Tensor) -> torch.Tensor:
+        if raw_image.dim() != 4:
+            raise ValueError(f"cnn_torchvision expects raw_image [B,3,H,W], got {tuple(raw_image.shape)}")
+        with torch.no_grad():
+            feat = self.features(raw_image)
+            vec = feat.mean(dim=(-2, -1))
+        return vec
 
 
-class PromptGenerator(nn.Module):
-    """
-    灏嗘綔鍙橀噺 z锛堜互鍙婂彲閫夌殑璇箟灞炴€у悜閲忥級瑙ｇ爜涓轰竴缁?prompt tokens 鐨勬ā鍧椼€?
+class _LocalTorchModuleImageEncoder(nn.Module):
+    """Strict local image encoder loader for CLIP-like or DINO-like frozen modules."""
 
-    Args:
-        latent_dim:  闅愬彉閲?z 鐨勭淮搴︼紱
-        prompt_dim:  杈撳嚭鐨?prompt token 缁村害锛屽簲涓?ViT 鐨?hidden_size 涓€鑷达紱
-        prompt_len:  闇€瑕佺敓鎴愮殑 prompt token 涓暟锛?
-        hidden_dim:  瑙ｇ爜鍣ㄥ唴閮ㄧ殑闅愯棌灞傜淮搴︼紱
-        semantic_dim: 鑻ヤ笉涓?None锛屽垯琛ㄧず灏嗚涔夊睘鎬ф嫾鎺ュ埌 z 涓婅繘琛屾潯浠剁敓鎴愶紝
-                      璇箟鍚戦噺鐨勭淮搴︺€?
-    """
-
-    def __init__(
-        self,
-        latent_dim: int,
-        prompt_dim: int,
-        prompt_len: int,
-        hidden_dim: int,
-    ):
+    def __init__(self, local_dir: str, file_name: str, source_name: str, normalize_output: bool) -> None:
         super().__init__()
-        self.prompt_len = prompt_len
-        self.fusion = nn.Linear(latent_dim, hidden_dim)
-        # 鍚庣画 MLP锛歨idden -> hidden -> (prompt_len * prompt_dim)
-        self.mlp = nn.Sequential(
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, prompt_len * prompt_dim),
-        )
-        self.prompt_dim = prompt_dim
+        if not local_dir:
+            raise ValueError(f"{source_name} requires a non-empty local directory.")
+        path = os.path.join(local_dir, file_name)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"{source_name} local weight file not found: {path}")
+        self.encoder = self._load_module(path)
+        self.source_name = str(source_name)
+        self.normalize_output = bool(normalize_output)
+        self._freeze()
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        杈撳叆锛?
-            z:         [B, latent_dim] 娼滃彉閲忔牱鏈紱
-            semantics: [B, semantic_dim] 鎴?None锛岃涔夋潯浠跺悜閲忋€?
+    @staticmethod
+    def _load_module(path: str) -> nn.Module:
+        try:
+            module = torch.jit.load(path, map_location="cpu")
+        except RuntimeError:
+            module = torch.load(path, map_location="cpu")
+        if not isinstance(module, nn.Module):
+            raise TypeError(f"Local encoder file must load as nn.Module, got {type(module)} from {path}")
+        return module
 
-        杈撳嚭锛?
-            prompts: [B, prompt_len, prompt_dim] 鐢熸垚鐨勬彁绀?tokens銆?
-        """
-        h = self.fusion(z)                       # [B, hidden_dim]
-        # MLP 瑙ｇ爜鍒?(prompt_len * prompt_dim)
-        prompts = self.mlp(h)                        # [B, prompt_len * prompt_dim]
-        # 鍐?reshape 鎴?[B, L_p, D]
-        prompts = prompts.view(-1, self.prompt_len, self.prompt_dim)
-        return prompts
+    def _freeze(self) -> None:
+        self.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def train(self, mode: bool = True):
+        super().train(False)
+        self._freeze()
+        return self
+
+    @staticmethod
+    def _extract_vector(out) -> torch.Tensor:
+        if torch.is_tensor(out):
+            if out.dim() == 2:
+                return out
+            if out.dim() == 3:
+                return out[:, 0, :]
+            raise ValueError(f"Frozen local encoder returned unsupported tensor shape {tuple(out.shape)}")
+        if isinstance(out, dict):
+            for key in ("image_embeds", "pooler_output", "last_hidden_state", "x_norm_clstoken"):
+                if key in out:
+                    return _LocalTorchModuleImageEncoder._extract_vector(out[key])
+        if isinstance(out, (tuple, list)):
+            if len(out) == 0:
+                raise ValueError("Frozen local encoder returned an empty tuple/list.")
+            return _LocalTorchModuleImageEncoder._extract_vector(out[0])
+        raise TypeError(f"Frozen local encoder returned unsupported output type {type(out)}")
+
+    def forward(self, raw_image: torch.Tensor) -> torch.Tensor:
+        if raw_image.dim() != 4:
+            raise ValueError(f"{self.source_name} expects raw_image [B,3,H,W], got {tuple(raw_image.shape)}")
+        with torch.no_grad():
+            vec = self._extract_vector(self.encoder(raw_image))
+            if self.normalize_output:
+                vec = torch.nn.functional.normalize(vec, dim=-1)
+        return vec
 
 
 class PreViTPromptDistributor(nn.Module):
-    """
-    灏嗘棭鏈熻瑙?tokens锛堜互鍙婂彲閫夌殑璇箟灞炴€э級鏄犲皠涓?prompt tokens 鐨勭鍒扮灏佽妯″潡銆?
+    """Generate ViaPT-style instance/domain prompt tokens from a visual source."""
 
-    鍏稿瀷璋冪敤鏂瑰紡锛?
-        prompts, stats = module(V_raw, S_raw)
-
-    鍏朵腑锛?
-        - V_raw: [B, L, D]锛屼负 ViT patch+pos 缂栫爜鍚庣殑瑙嗚 tokens锛堝彲鍙彇绗竴灞傛垨鑻ュ共灞傝緭鍑猴級锛?
-        - S_raw: [B, d_s] 鎴?[B, T, d_s]锛屼负鍘熷璇箟灞炴€э紙鍙€夛級锛?
-        - prompts: [B, prompt_len, D]锛屽彲鐩存帴鎷煎埌 ViT 鐨勮緭鍏ュ簭鍒楅噷锛?
-        - stats: dict锛屽寘鍚?mu/logvar/z/h_v锛岀敤浜庡仛 KL 姝ｅ垯鎴栧垎鏋愩€?
-    """
+    _CLIP_OUT_DIMS = {
+        "mobileclip_s0": 512,
+        "tinyclip_vit8m": 512,
+    }
 
     def __init__(
         self,
         dim: int,
         prompt_len: int,
-        latent_dim: int,
         hidden_dim: int,
-        pool: str = "gap",
-    ):
-        """
-        鍙傛暟锛?
-            dim               : 瑙嗚 token 鐨勯€氶亾缁村害 D锛堝嵆 ViT hidden_size锛夛紱
-            prompt_len        : 鐢熸垚鐨?prompt token 涓暟锛?
-            latent_dim        : 娼滃彉閲?z 缁村害锛?
-            hidden_dim        : 鍚庨獙澶翠笌鐢熸垚鍣ㄤ腑鐨勯殣钘忕淮搴︼紱
-            pool              : 瑙嗚姹犲寲鏂瑰紡锛屼紶缁?VisualStatsEncoder锛?
-            semantic_dim      : 鍘熷璇箟灞炴€х淮搴︼紙鑻ユ湁锛夛紱
-            semantic_proj_dim : 鑻ヤ笉涓?None锛屽垯鍏堝皢璇箟浠?semantic_dim 鏄犲皠鍒拌缁村害锛?
-                                鍐嶄笌 z 鎷兼帴杩涘叆 PromptGenerator銆?
-        """
+        source: str,
+        instance_tokens: int,
+        domain_tokens: int,
+        logvar_min: float = -10.0,
+        logvar_max: float = 5.0,
+        eval_sample_mode: str = "mean",
+        use_slot_embed: bool = False,
+        cnn_name: str = "efficientnet_b0",
+        clip_name: str = "mobileclip_s0",
+        clip_local_dir: str = "",
+        dino_local_dir: str = "",
+        external_allow_download: bool = False,
+        debug_preprocess_shapes: bool = False,
+    ) -> None:
         super().__init__()
-        # Debug/ablation switch: if True, bypass reparameterized sampling and use z=mu.
-        self.disable_sampling = False
-        # 鍦ㄥ仛缁熻鍓嶅厛瀵?V_raw 鍋?LayerNorm锛岀浉褰撲簬 鈥淟N(V_raw)鈥?鐨勬楠?
-        self.norm = nn.LayerNorm(dim)
-        # 瑙嗚缁熻缂栫爜鍣細LN 鍚庣殑 V_raw -> h_v
-        self.visual_encoder = VisualStatsEncoder(dim, pool=pool)
-        # 鍚庨獙澶达細h_v -> (mu, logvar)
-        self.posterior = PosteriorHead(dim, hidden_dim, latent_dim)
-        # 鎻愮ず鐢熸垚鍣細z (+ 璇箟) -> prompt tokens
-        self.prompt_generator = PromptGenerator(
-            latent_dim=latent_dim,
-            prompt_dim=dim,
-            prompt_len=prompt_len,
-            hidden_dim=hidden_dim,
-        )
+        self.dim = int(dim)
+        self.prompt_len = int(prompt_len)
+        self.hidden_dim = int(hidden_dim)
+        self.source = str(source)
+        self.instance_tokens = int(instance_tokens)
+        self.domain_tokens = int(domain_tokens)
+        self.logvar_min = float(logvar_min)
+        self.logvar_max = float(logvar_max)
+        self.eval_sample_mode = str(eval_sample_mode)
+        self.use_slot_embed = bool(use_slot_embed)
+        self.debug_preprocess_shapes = bool(debug_preprocess_shapes)
+        self._debug_shapes_logged = False
 
+        if self.dim != 768:
+            raise ValueError(f"PreViTPromptDistributor currently requires dim=768, got {self.dim}")
+        if self.instance_tokens + self.domain_tokens != self.prompt_len:
+            raise ValueError(
+                "DISTRIBUTOR.INSTANCE_TOKENS + DISTRIBUTOR.DOMAIN_TOKENS must equal MODEL.PROMPT.NUM_TOKENS."
+            )
+        if self.source not in _ALLOWED_SOURCES:
+            raise ValueError(f"Unsupported DISTRIBUTOR.SOURCE='{self.source}'. Expected {sorted(_ALLOWED_SOURCES)}")
+        if self.eval_sample_mode not in {"mean", "fixed_eps"}:
+            raise ValueError("DISTRIBUTOR.EVAL_SAMPLE_MODE must be 'mean' or 'fixed_eps'.")
+        if self.logvar_min > self.logvar_max:
+            raise ValueError("DISTRIBUTOR.LOGVAR_MIN must be <= LOGVAR_MAX.")
+
+        self.frozen_encoder = None
+        self.stats_head = None
+        if self.source == "vit_cls_prepass":
+            self.stats_head = _VectorStatsHead(768, self.hidden_dim, self.dim)
+        elif self.source == "cnn_torchvision":
+            self.frozen_encoder = FrozenTorchvisionCNN(cnn_name, bool(external_allow_download))
+            self.stats_head = _VectorStatsHead(self.frozen_encoder.out_dim, self.hidden_dim, self.dim)
+        elif self.source == "clip_frozen":
+            if clip_name not in self._CLIP_OUT_DIMS:
+                raise ValueError(f"Unsupported CLIP_NAME='{clip_name}'. Expected one of {sorted(self._CLIP_OUT_DIMS)}")
+            file_name = f"{clip_name}.pt"
+            self.frozen_encoder = _LocalTorchModuleImageEncoder(
+                clip_local_dir,
+                file_name=file_name,
+                source_name="clip_frozen",
+                normalize_output=True,
+            )
+            self.stats_head = _VectorStatsHead(self._CLIP_OUT_DIMS[clip_name], self.hidden_dim, self.dim)
+        elif self.source == "dinov2_small":
+            self.frozen_encoder = _LocalTorchModuleImageEncoder(
+                dino_local_dir,
+                file_name="dinov2_small.pt",
+                source_name="dinov2_small",
+                normalize_output=False,
+            )
+            self.stats_head = _VectorStatsHead(384, self.hidden_dim, self.dim)
+        elif self.source == "token_mlp":
+            self.stats_head = _TokenStatsHead(self.dim, self.hidden_dim)
+
+        self.domain_prompt = nn.Parameter(torch.zeros(1, self.domain_tokens, self.dim))
+        nn.init.normal_(self.domain_prompt, mean=0.0, std=0.02)
+        if self.use_slot_embed:
+            self.slot_embed = nn.Parameter(torch.zeros(1, self.instance_tokens, self.dim))
+            nn.init.normal_(self.slot_embed, mean=0.0, std=0.02)
+        self.register_buffer("fixed_eps", torch.randn(1, self.instance_tokens, self.dim))
+        self._freeze_external_encoder()
+
+    def _freeze_external_encoder(self) -> None:
+        if self.frozen_encoder is None:
+            return
+        self.frozen_encoder.eval()
+        for param in self.frozen_encoder.parameters():
+            param.requires_grad = False
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self._freeze_external_encoder()
+        return self
+
+    def _encode_visual(
+        self,
+        raw_image: Optional[torch.Tensor],
+        vit_patch_tokens: Optional[torch.Tensor],
+        vit_image_tokens: Optional[torch.Tensor],
+        vit_cls: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.source == "vit_cls_prepass":
+            if vit_cls is None:
+                raise ValueError("SOURCE='vit_cls_prepass' requires vit_cls from PromptedTransformer prepass.")
+            visual_input = vit_cls
+            return visual_input, self.stats_head(visual_input)
+
+        if self.source == "cnn_torchvision":
+            if raw_image is None:
+                raise ValueError("SOURCE='cnn_torchvision' requires raw_image.")
+            visual_input = self.frozen_encoder(raw_image)
+            return visual_input, self.stats_head(visual_input)
+
+        if self.source == "clip_frozen":
+            if raw_image is None:
+                raise ValueError("SOURCE='clip_frozen' requires raw_image.")
+            visual_input = self.frozen_encoder(raw_image)
+            return visual_input, self.stats_head(visual_input)
+
+        if self.source == "dinov2_small":
+            if raw_image is None:
+                raise ValueError("SOURCE='dinov2_small' requires raw_image.")
+            visual_input = self.frozen_encoder(raw_image)
+            return visual_input, self.stats_head(visual_input)
+
+        if self.source == "token_mlp":
+            if vit_image_tokens is None:
+                raise ValueError("SOURCE='token_mlp' requires vit_image_tokens.")
+            visual_input = vit_image_tokens
+            return visual_input, self.stats_head(visual_input)
+
+        raise ValueError(f"Unsupported DISTRIBUTOR.SOURCE='{self.source}'")
+
+    def _sample_instance_prompt(self, mu: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+        if self.training:
+            eps = torch.randn(
+                mu.shape[0],
+                self.instance_tokens,
+                self.dim,
+                device=mu.device,
+                dtype=mu.dtype,
+            )
+        elif self.eval_sample_mode == "mean":
+            eps = torch.zeros(
+                mu.shape[0],
+                self.instance_tokens,
+                self.dim,
+                device=mu.device,
+                dtype=mu.dtype,
+            )
+        elif self.eval_sample_mode == "fixed_eps":
+            eps = self.fixed_eps.to(device=mu.device, dtype=mu.dtype).expand(mu.shape[0], -1, -1)
+        else:
+            raise ValueError(f"Unsupported EVAL_SAMPLE_MODE='{self.eval_sample_mode}'")
+        instance_prompt = mu[:, None, :] + std[:, None, :] * eps
+        if self.use_slot_embed:
+            instance_prompt = instance_prompt + self.slot_embed.to(device=mu.device, dtype=mu.dtype)
+        return instance_prompt
+
+    def _debug_shapes(
+        self,
+        raw_image: Optional[torch.Tensor],
+        vit_patch_tokens: Optional[torch.Tensor],
+        vit_image_tokens: Optional[torch.Tensor],
+        vit_cls: Optional[torch.Tensor],
+        visual_input: torch.Tensor,
+        stats_out: torch.Tensor,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        std: torch.Tensor,
+        instance_prompt: torch.Tensor,
+        domain_prompt: torch.Tensor,
+        prompt_tokens: torch.Tensor,
+    ) -> None:
+        if not self.debug_preprocess_shapes or self._debug_shapes_logged:
+            return
+        print(
+            "[PROMPT-DIST-SHAPE] source={} raw_image={} vit_patch_tokens={} vit_image_tokens={} vit_cls={} "
+            "visual_input={} stats_out={} mu={} logvar={} std={} instance_prompt={} domain_prompt={} prompt_tokens={}".format(
+                self.source,
+                tuple(raw_image.shape) if torch.is_tensor(raw_image) else None,
+                tuple(vit_patch_tokens.shape) if torch.is_tensor(vit_patch_tokens) else None,
+                tuple(vit_image_tokens.shape) if torch.is_tensor(vit_image_tokens) else None,
+                tuple(vit_cls.shape) if torch.is_tensor(vit_cls) else None,
+                tuple(visual_input.shape),
+                tuple(stats_out.shape),
+                tuple(mu.shape),
+                tuple(logvar.shape),
+                tuple(std.shape),
+                tuple(instance_prompt.shape),
+                tuple(domain_prompt.shape),
+                tuple(prompt_tokens.shape),
+            )
+        )
+        self._debug_shapes_logged = True
 
     def forward(
-        self, V_raw: torch.Tensor
+        self,
+        raw_image: Optional[torch.Tensor] = None,
+        vit_patch_tokens: Optional[torch.Tensor] = None,
+        vit_image_tokens: Optional[torch.Tensor] = None,
+        vit_cls: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """
-        杈撳叆锛?
-            V_raw: [B, L, D]锛岃瑙?tokens锛堥€氬父鏄?ViT 鐨?patch+pos 缂栫爜杈撳嚭锛夛紱
-            S_raw: [B, d_s] 鎴?[B, T, d_s]锛堝彲閫夛級锛屽師濮嬭涔夊睘鎬с€?
+        visual_input, stats_out = self._encode_visual(raw_image, vit_patch_tokens, vit_image_tokens, vit_cls)
+        if tuple(stats_out.shape) != (visual_input.shape[0], self.dim * 2):
+            raise ValueError(f"stats_out must be [B,{self.dim * 2}], got {tuple(stats_out.shape)}")
 
-        杈撳嚭锛?
-            prompts: [B, prompt_len, D]锛岀敓鎴愮殑 prompt tokens锛?
-            stats:   dict锛屽寘鍚嫢骞蹭腑闂撮噺锛?
-                     - "mu"   : [B, latent_dim]锛岄珮鏂悗楠屽潎鍊硷紱
-                     - "logvar": [B, latent_dim]锛宭og 鏂瑰樊锛?
-                     - "z"    : [B, latent_dim]锛岄噰鏍峰緱鍒扮殑娼滃彉閲忥紱
-                     - "h_v"  : [B, D]锛岃瑙夌粺璁″悜閲忋€?
-        """
-        # 1) 瀵硅瑙?tokens 鍋?LN
-        V_norm = self.norm(V_raw)                  # [B, L, D]
-        # 2) 瑙嗚姹犲寲锛屽緱鍒?h_v
-        h_v = self.visual_encoder(V_norm)          # [B, D]
-        # 3) 鍚庨獙澶磋緭鍑?mu 涓?logvar
-        mu, logvar = self.posterior(h_v)           # 鍚勪负 [B, latent_dim]
-        # 4) 閲嶅弬鏁板寲閲囨牱 z
-        if self.disable_sampling:
-            z = mu
-        else:
-            z = _reparameterize(mu, logvar)            # [B, latent_dim]
+        mu, logvar = stats_out.chunk(2, dim=-1)
+        logvar = logvar.clamp(min=self.logvar_min, max=self.logvar_max)
+        std = torch.exp(0.5 * logvar)
+        instance_prompt = self._sample_instance_prompt(mu, std)
+        domain_prompt = self.domain_prompt.to(device=mu.device, dtype=mu.dtype).expand(mu.shape[0], -1, -1)
+        prompt_tokens = torch.cat((instance_prompt, domain_prompt), dim=1)
+        if tuple(prompt_tokens.shape) != (mu.shape[0], self.prompt_len, self.dim):
+            raise ValueError(f"prompt_tokens must be [B,{self.prompt_len},{self.dim}], got {tuple(prompt_tokens.shape)}")
 
-        prompts = self.prompt_generator(z)  # [B, prompt_len, D]
+        self._debug_shapes(
+            raw_image,
+            vit_patch_tokens,
+            vit_image_tokens,
+            vit_cls,
+            visual_input,
+            stats_out,
+            mu,
+            logvar,
+            std,
+            instance_prompt,
+            domain_prompt,
+            prompt_tokens,
+        )
+        stats = {
+            "visual_source": self.source,
+            "visual_input": visual_input,
+            "visual_input_shape": tuple(visual_input.shape),
+            "stats_out": stats_out,
+            "mu": mu,
+            "logvar": logvar,
+            "std": std,
+            "instance_prompt": instance_prompt,
+            "domain_prompt": domain_prompt,
+            "prompt_tokens": prompt_tokens,
+        }
+        return prompt_tokens, stats
 
-        # 7) 鎵撳寘涓棿缁熻閲忥紝渚夸簬鍦ㄥ閮ㄦ瀯閫?KL loss 鎴栧彲瑙嗗寲
-        stats = {"mu": mu, "logvar": logvar, "z": z, "h_v": h_v}
-        return prompts, stats
-
-
-__all__ = [
-    "PreViTPromptDistributor",
-    "VisualStatsEncoder",
-    "PosteriorHead",
-    "PromptGenerator",
-    "generate_prompt_init",
-]
 
 def generate_prompt_init(
     distributor: PreViTPromptDistributor,
     V_raw: torch.Tensor,
     reduce: str = "mean",
 ) -> torch.Tensor:
-    """鍒╃敤棰?ViT 鎻愮ず鍒嗗竷妯″潡鐢熸垚涓€娆℃€х殑 prompt 鍒濆鍖栧紶閲忋€?
-
-    Args:
-        distributor: 棰勫厛鏋勫缓濂界殑 ``PreViTPromptDistributor`` 瀹炰緥銆?
-        V_raw: 褰㈢姸 (B, L, D) 鐨勬棭鏈熻瑙?token锛堝惈浣嶇疆缂栫爜锛夛紝閫氬父鍙?
-            鍙栬缁冮泦鐨勪竴涓?batch 杩涜鍒濆鍖栥€?
-        S_raw: 锛堝彲閫夛級褰㈢姸 (B, M, d_sem) 鐨勮涔夊睘鎬ф垨绫诲師鍨嬨€?
-        reduce: 灏?batch 缁村悎骞朵负鍗曚釜鍒濆鍖栧悜閲忕殑鏂瑰紡锛岀洰鍓嶆敮鎸?"mean"
-            鍜?"first"锛屽垎鍒〃绀哄 batch 骞冲潎鎴栧彇绗竴鏉℃牱鏈€?
-
-    Returns:
-        prompt_init: 褰㈢姸 (1, prompt_len, D) 鐨勫紶閲忥紝鍙洿鎺ヤ紶缁?
-            ``PromptedVisionTransformer(prompt_init=...)`` 鐢ㄤ簬涓€娆℃€у垵濮嬪寲銆?
-    """
+    """Compatibility helper for one-shot prompt initialization from ViT tokens."""
     with torch.no_grad():
-        prompts, _ = distributor(V_raw)
+        prompts, _ = distributor(vit_image_tokens=V_raw)
         if reduce == "first":
             prompts = prompts[:1]
         elif reduce == "mean":
@@ -329,4 +460,8 @@ def generate_prompt_init(
         return prompts.detach()
 
 
-
+__all__ = [
+    "PreViTPromptDistributor",
+    "prompt_kl_loss",
+    "generate_prompt_init",
+]

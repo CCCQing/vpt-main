@@ -669,6 +669,7 @@ class PromptedTransformer(Transformer):
         self.debug_shapes = bool(self.prompt_config.DEBUG_SHAPES)
         self._shape_debug_incorporate_logged = False
         self._last_prompt_path_info = {}
+        self._last_prompt_distribution_stats = None
 
         if prompt_init is not None:
             raise ValueError("Static prompt initialization has been removed; prompt_init must be None.")
@@ -1034,6 +1035,40 @@ class PromptedTransformer(Transformer):
             return int(self.semantic_tokens_cfg.NUM_TOKENS)
         return 0
 
+    def _build_vit_cls_prepass(self, x_base: torch.Tensor) -> torch.Tensor:
+        """Run frozen ViT once without prompt/semantic tokens to get CLS."""
+        was_training = self.encoder.training
+        self.encoder.eval()
+        with torch.no_grad():
+            encoded, _ = self.encoder(
+                x_base,
+                None,
+                num_prompt_tokens=0,
+                semantic_length=0,
+                block_s_to_cls=False,
+            )
+        if was_training:
+            self.encoder.train(True)
+        return encoded[:, 0, :].detach()
+
+    def _call_prompt_init_provider(self, raw_image: torch.Tensor, patch_tokens: torch.Tensor, x_base: torch.Tensor):
+        """Call the prompt distributor through the unified visual-source API."""
+        if self.prompt_init_provider is None:
+            raise ValueError("prompt_init_provider is required for INIT_SOURCE='distributor_mean'.")
+        vit_image_tokens = x_base[:, 1:, :]
+        vit_cls = None
+        if str(self.prompt_init_provider.source) == "vit_cls_prepass":
+            vit_cls = self._build_vit_cls_prepass(x_base)
+        provider_out = self.prompt_init_provider(
+            raw_image=raw_image,
+            vit_patch_tokens=patch_tokens,
+            vit_image_tokens=vit_image_tokens,
+            vit_cls=vit_cls,
+        )
+        if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
+            raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
+        return provider_out
+
     def incorporate_prompt(self, x, semantics=None):
         """构造输入层主序列，并在需要时注入输入 prompt。
 
@@ -1052,6 +1087,7 @@ class PromptedTransformer(Transformer):
 
         B = x.shape[0]
         self._last_semantic_token_state = None
+        self._last_prompt_distribution_stats = None
 
         # 提取 patch token，但此时还没有 CLS / pos / prompt
         patch_tokens = self.embeddings.forward_patches(x)  # (B, n_patches, hidden_dim)
@@ -1066,10 +1102,8 @@ class PromptedTransformer(Transformer):
                     prompt_tokens = self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)
                 elif self.prompt_init_source == "distributor_mean":
                     # distributor_mean：输入 prompt 由实例条件均值 mu 生成
-                    provider_out = self.prompt_init_provider(patch_tokens)
-                    if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
-                        raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
-                    prompt_tokens, provider_stats = provider_out
+                    prompt_tokens, provider_stats = self._call_prompt_init_provider(x, patch_tokens, x_base)
+                    self._last_prompt_distribution_stats = provider_stats
                     expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
                     got_shape = tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None
                     if (not torch.is_tensor(prompt_tokens)) or tuple(prompt_tokens.shape) != expected_shape:
@@ -1083,10 +1117,8 @@ class PromptedTransformer(Transformer):
                     prompt_tokens = self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)
                 elif self.prompt_init_source == "distributor_mean":
                     # vpt_deep 下也允许只替换输入 prompt 来源，而不改后续 deep prompt 承接方式
-                    provider_out = self.prompt_init_provider(patch_tokens)
-                    if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
-                        raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
-                    prompt_tokens, provider_stats = provider_out
+                    prompt_tokens, provider_stats = self._call_prompt_init_provider(x, patch_tokens, x_base)
+                    self._last_prompt_distribution_stats = provider_stats
                     expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
                     got_shape = tuple(prompt_tokens.shape) if torch.is_tensor(prompt_tokens) else None
                     if (not torch.is_tensor(prompt_tokens)) or tuple(prompt_tokens.shape) != expected_shape:
@@ -1135,6 +1167,11 @@ class PromptedTransformer(Transformer):
             "semantic_token_shape": tuple(semantic_tokens.shape),
             "actual_token_shape_entering_backbone": tuple(x.shape),
             "visual_feature_norm": float(patch_tokens.float().norm(dim=-1).mean().item()),
+            "prompt_distribution_source": (
+                self._last_prompt_distribution_stats.get("visual_source")
+                if isinstance(self._last_prompt_distribution_stats, dict)
+                else None
+            ),
         }
 
         return x, semantics

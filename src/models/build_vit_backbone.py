@@ -74,12 +74,24 @@ def build_vit_sup_models(
             prompt_provider = PreViTPromptDistributor(
                 dim=m2featdim[model_type],
                 prompt_len=prompt_cfg.NUM_TOKENS,
-                latent_dim=dist_cfg.LATENT_DIM,
-                hidden_dim=dist_cfg.HIDDEN_DIM,
-                pool=dist_cfg.POOL,
+                hidden_dim=dist_cfg.STATS_HIDDEN_DIM,
+                source=dist_cfg.SOURCE,
+                instance_tokens=dist_cfg.INSTANCE_TOKENS,
+                domain_tokens=dist_cfg.DOMAIN_TOKENS,
+                logvar_min=dist_cfg.LOGVAR_MIN,
+                logvar_max=dist_cfg.LOGVAR_MAX,
+                eval_sample_mode=dist_cfg.EVAL_SAMPLE_MODE,
+                use_slot_embed=dist_cfg.USE_SLOT_EMBED,
+                cnn_name=dist_cfg.CNN_NAME,
+                clip_name=dist_cfg.CLIP_NAME,
+                clip_local_dir=dist_cfg.CLIP_LOCAL_DIR,
+                dino_local_dir=dist_cfg.DINO_LOCAL_DIR,
+                external_allow_download=dist_cfg.EXTERNAL_ALLOW_DOWNLOAD,
+                debug_preprocess_shapes=dist_cfg.DEBUG_PREPROCESS_SHAPES,
             )
         if prompt_provider is not None:
-            prompt_provider.disable_sampling = bool(dist_cfg.DISABLE_SAMPLING)
+            if bool(dist_cfg.DISABLE_SAMPLING):
+                raise ValueError("DISTRIBUTOR.DISABLE_SAMPLING is deprecated by EVAL_SAMPLE_MODE and cannot be enabled.")
 
     if prompt_cfg is not None:
         model = PromptedVisionTransformer(

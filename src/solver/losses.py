@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any, Dict, Optional
 
+from ..models.prompting.prompt_distribution import prompt_kl_loss
+
 
 def _extract_logits_and_aux(pred_logits: Any, kwargs: Optional[Dict[str, Any]]):
     """
@@ -940,6 +942,40 @@ class AttributeReconstructionAuxLoss(nn.Module):
         return _compute_attribute_reconstruction_loss(kwargs, self.cfg)
 
 
+def _compute_prompt_kl_aux_loss(kwargs: Optional[Dict[str, Any]]) -> torch.Tensor:
+    """Read prompt distribution stats from model runtime cache and compute KL."""
+    if not isinstance(kwargs, Dict):
+        raise RuntimeError("Prompt KL loss requires loss kwargs.")
+    if "model" not in kwargs:
+        raise RuntimeError("Prompt KL loss requires kwargs['model'].")
+    model = kwargs["model"]
+    if not hasattr(model, "get_runtime_prompt_distribution_stats"):
+        raise RuntimeError("Prompt KL loss requires model.get_runtime_prompt_distribution_stats().")
+    stats = model.get_runtime_prompt_distribution_stats()
+    if not isinstance(stats, Dict):
+        raise RuntimeError("Prompt KL loss requires runtime prompt distribution stats dict.")
+    if "mu" not in stats or "logvar" not in stats:
+        raise RuntimeError("Prompt KL loss requires stats['mu'] and stats['logvar'].")
+    return prompt_kl_loss(stats["mu"], stats["logvar"], reduction="mean")
+
+
+class PromptKLAuxLoss(nn.Module):
+    """KL regularizer for the Gaussian prompt distribution q(z|x)."""
+
+    def __init__(self, cfg=None):
+        super().__init__()
+        self.name = "prompt_kl_loss"
+        self.requires_affinity_aux = False
+        self.prompt_kl_weight = float(cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT)
+
+    @property
+    def weight(self) -> float:
+        return self.prompt_kl_weight
+
+    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        return _compute_prompt_kl_aux_loss(kwargs)
+
+
 class CompositeLoss(nn.Module):
     """
     组合式 loss：main_loss 负责分类主线，aux_losses 只负责各自的辅助约束。
@@ -1122,6 +1158,11 @@ def _attr_reconstruction_enabled(cfg) -> bool:
     return float(cfg.SOLVER.LOSS_ATTR_WEIGHT) > 0
 
 
+def _prompt_kl_enabled(cfg) -> bool:
+    """判断 prompt distribution KL 是否启用。"""
+    return float(cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT) > 0
+
+
 def _build_aux_losses(cfg):
     """
     根据各辅助损失权重构建辅助损失列表。
@@ -1140,6 +1181,8 @@ def _build_aux_losses(cfg):
         aux_losses.append(RouteTeacherStudentSemanticAuxLoss(cfg))
     if _attr_reconstruction_enabled(cfg):
         aux_losses.append(AttributeReconstructionAuxLoss(cfg))
+    if _prompt_kl_enabled(cfg):
+        aux_losses.append(PromptKLAuxLoss(cfg))
     return aux_losses
 
 

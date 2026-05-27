@@ -267,11 +267,11 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("semantic_tokenizer_attr_weight_selected_grid_search")
+    ap = argparse.ArgumentParser("semantic_tokenizer_attr_weight_remaining_grid_search")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--python-bin", default=sys.executable)
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
-    ap.add_argument("--out-root", default="output/grid_semantic_tokenizer_attr_weight_selected")
+    ap.add_argument("--out-root", default="output/grid_semantic_tokenizer_attr_weight_remaining")
     ap.add_argument("--affinity-evolution-enable", default="true", choices=["true", "false"])
     ap.add_argument("--vis-save-raw", default="true", choices=["true", "false"])
     ap.add_argument("--vis-save-images", default="false", choices=["true", "false"])
@@ -392,72 +392,88 @@ def main() -> None:
 
     base_settings = [
         {
-            "base_setting": "distributor_route_off_equal_none",
+            "base_setting": "distributor_route_off_manual_cub8_null_residual",
+            "semantic_mode": "manual_cub8_null_residual",
+            "route_setting": "route_off",
+            "prompt_setting": "dynamic_distributor_mean",
+            "prompt_init_source": "distributor_mean",
+            "prompt_distributor_enable": True,
+        },
+        {
+            "base_setting": "distributor_route_off_manual_cub8_text_init_codebook",
+            "semantic_mode": "manual_cub8_text_init_codebook",
+            "route_setting": "route_off",
+            "prompt_setting": "dynamic_distributor_mean",
+            "prompt_init_source": "distributor_mean",
+            "prompt_distributor_enable": True,
+        },
+        {
+            "base_setting": "distributor_route_best_equal_none",
             "semantic_mode": "equal_none",
-            "route_setting": "route_off",
-            "prompt_setting": "dynamic_distributor_mean",
-            "prompt_init_source": "distributor_mean",
-            "prompt_distributor_enable": True,
-        },
-        {
-            "base_setting": "distributor_route_off_equal_text_init_codebook",
-            "semantic_mode": "equal_text_init_codebook",
-            "route_setting": "route_off",
-            "prompt_setting": "dynamic_distributor_mean",
-            "prompt_init_source": "distributor_mean",
-            "prompt_distributor_enable": True,
-        },
-        {
-            "base_setting": "distributor_route_off_equal_null_residual",
-            "semantic_mode": "equal_null_residual",
-            "route_setting": "route_off",
-            "prompt_setting": "dynamic_distributor_mean",
-            "prompt_init_source": "distributor_mean",
-            "prompt_distributor_enable": True,
-        },
-        {
-            "base_setting": "distributor_route_best_equal_text_init_codebook",
-            "semantic_mode": "equal_text_init_codebook",
             "route_setting": "route_best",
             "prompt_setting": "dynamic_distributor_mean",
             "prompt_init_source": "distributor_mean",
             "prompt_distributor_enable": True,
         },
         {
-            "base_setting": "distributor_route_best_equal_null_residual",
-            "semantic_mode": "equal_null_residual",
+            "base_setting": "distributor_route_best_manual_cub8_null_residual",
+            "semantic_mode": "manual_cub8_null_residual",
             "route_setting": "route_best",
             "prompt_setting": "dynamic_distributor_mean",
             "prompt_init_source": "distributor_mean",
             "prompt_distributor_enable": True,
         },
         {
-            "base_setting": "learned_route_best_manual_cub8_text_init_codebook",
+            "base_setting": "distributor_route_best_manual_cub8_text_init_codebook",
             "semantic_mode": "manual_cub8_text_init_codebook",
             "route_setting": "route_best",
-            "prompt_setting": "dynamic_learned",
-            "prompt_init_source": "learned",
-            "prompt_distributor_enable": False,
+            "prompt_setting": "dynamic_distributor_mean",
+            "prompt_init_source": "distributor_mean",
+            "prompt_distributor_enable": True,
         },
         {
-            "base_setting": "learned_route_off_equal_none",
-            "semantic_mode": "equal_none",
+            "base_setting": "learned_route_off_equal_null_residual",
+            "semantic_mode": "equal_null_residual",
             "route_setting": "route_off",
             "prompt_setting": "dynamic_learned",
             "prompt_init_source": "learned",
             "prompt_distributor_enable": False,
         },
         {
-            "base_setting": "learned_route_best_equal_none",
-            "semantic_mode": "equal_none",
+            "base_setting": "learned_route_off_equal_text_init_codebook",
+            "semantic_mode": "equal_text_init_codebook",
+            "route_setting": "route_off",
+            "prompt_setting": "dynamic_learned",
+            "prompt_init_source": "learned",
+            "prompt_distributor_enable": False,
+        },
+        {
+            "base_setting": "learned_route_off_manual_cub8_null_residual",
+            "semantic_mode": "manual_cub8_null_residual",
+            "route_setting": "route_off",
+            "prompt_setting": "dynamic_learned",
+            "prompt_init_source": "learned",
+            "prompt_distributor_enable": False,
+        },
+        {
+            "base_setting": "learned_route_off_manual_cub8_text_init_codebook",
+            "semantic_mode": "manual_cub8_text_init_codebook",
+            "route_setting": "route_off",
+            "prompt_setting": "dynamic_learned",
+            "prompt_init_source": "learned",
+            "prompt_distributor_enable": False,
+        },
+        {
+            "base_setting": "learned_route_best_equal_null_residual",
+            "semantic_mode": "equal_null_residual",
             "route_setting": "route_best",
             "prompt_setting": "dynamic_learned",
             "prompt_init_source": "learned",
             "prompt_distributor_enable": False,
         },
         {
-            "base_setting": "learned_route_best_equal_text_init_codebook",
-            "semantic_mode": "equal_text_init_codebook",
+            "base_setting": "learned_route_best_manual_cub8_null_residual",
+            "semantic_mode": "manual_cub8_null_residual",
             "route_setting": "route_best",
             "prompt_setting": "dynamic_learned",
             "prompt_init_source": "learned",
@@ -478,7 +494,7 @@ def main() -> None:
             }
             trials.append(
                 {
-                    "group": "semantic_tokenizer_attr_weight_selected",
+                    "group": "semantic_tokenizer_attr_weight_remaining",
                     "tag": _trial_tag("attr", params),
                     "base_setting": base["base_setting"],
                     "semantic_mode": semantic_mode,
