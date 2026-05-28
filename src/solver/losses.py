@@ -997,8 +997,8 @@ class SemanticGraphAuxLoss(nn.Module):
     该损失不依赖 affinity aux，而是读取:
     - model runtime stats 中的 mu；
     - trainer 传入的 targets_global；
-    - dataset.class_attributes 或 CLASS_ATTR_PATH；
-    - ATTR_NAME_EMBED_PATH 中的属性名文本 embedding。
+    - dataset.class_attributes；
+    - trainer 或 dataset 显式传入的 attr_name_embeddings。
     """
 
     def __init__(self, cfg=None):
@@ -1027,8 +1027,8 @@ class SemanticGraphAuxLoss(nn.Module):
         if not isinstance(stats, Dict) or "mu" not in stats:
             raise RuntimeError("Semantic graph loss requires runtime prompt distribution stats['mu'].")
 
-        # class_attributes 优先由 trainer 从 dataset.class_attributes 传入；
-        # attr_name_embeddings 通常由 SemanticGraphLossComputer 按配置路径读取。
+        # class_attributes 必须由 trainer 从 dataset.class_attributes 传入；
+        # attr_name_embeddings 必须由 trainer 或 dataset 显式传入，loss 内部不读路径。
         return self.computer(
             mu=stats["mu"],
             targets_global=kwargs["targets_global"],

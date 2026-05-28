@@ -13,13 +13,20 @@ distributor.forward() 接收 label。
 
 from __future__ import annotations
 
-import os
+import math
 from typing import Optional
 
-import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+
+_FIXED_GRAPH_RHO = 0.5
+_FIXED_TARGET_MIX_ALPHA = 0.1
+_FIXED_OT_EPS = 0.05
+_FIXED_OT_ITERS = 20
+_FIXED_OT_PRIOR_ETA = 1.0
+_FIXED_OT_ALPHA = 0.5
+_FIXED_OT_DELTA = 1e-8
+_PROMPT_TAU_INIT = 0.07
 
 
 def _row_normalize(x: torch.Tensor) -> torch.Tensor:
@@ -40,44 +47,13 @@ def _kl_target_pred(target: torch.Tensor, pred: torch.Tensor, eps: float) -> tor
     return (target * (target.log() - pred.log())).sum(dim=-1).mean()
 
 
-def _load_tensor_file(path: str, expected_name: str) -> torch.Tensor:
-    """
-    严格读取语义图所需张量。
-
-    支持:
-    - .npy
-    - .pt/.pth tensor
-    - .pt/.pth dict，其中常见键包括 embeddings / class_attributes / attributes。
-    """
-    if not path:
-        raise ValueError(f"MODEL.SEMANTIC_GRAPH.{expected_name} must be set.")
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"MODEL.SEMANTIC_GRAPH.{expected_name} not found: {path}")
-
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".npy":
-        obj = np.load(path)
-    else:
-        obj = torch.load(path, map_location="cpu")
-
-    if isinstance(obj, dict):
-        for key in ("class_attributes", "attributes", "att", "embeddings", "tensor"):
-            if key in obj:
-                obj = obj[key]
-                break
-    if isinstance(obj, np.ndarray):
-        obj = torch.from_numpy(obj)
-    if not torch.is_tensor(obj):
-        raise TypeError(f"{expected_name} must load as tensor/ndarray/dict tensor, got {type(obj)} from {path}")
-    return obj.float()
-
-
-class SemanticGraphLossComputer(nn.Module):
+class SemanticGraphLossComputer(torch.nn.Module):
     """
     构造语义图并计算指定 graph loss。
 
-    该类作为 nn.Module 是因为 SEMANTIC_BANK_SOURCE="learned_proj" 时会产生
-    一个可训练的 312->768 投影；trainer 已把 cls_criterion 加入 optimizer。
+    该类不再包含可训练语义投影。语义 bank 固定为:
+        A_sem = A_conf @ E_attr
+    即用类别属性置信度对属性名文本 embedding 做加权求和。
     """
 
     def __init__(self, cfg) -> None:
@@ -88,32 +64,25 @@ class SemanticGraphLossComputer(nn.Module):
         self.attr_dim = int(graph_cfg.ATTR_DIM)
         self.text_dim = int(graph_cfg.TEXT_DIM)
         self.loss_type = str(graph_cfg.LOSS_TYPE).lower()
-        self.bank_source = str(graph_cfg.SEMANTIC_BANK_SOURCE).lower()
-        if self.bank_source not in {"asem", "learned_proj"}:
-            raise ValueError("MODEL.SEMANTIC_GRAPH.SEMANTIC_BANK_SOURCE must be asem or learned_proj.")
-        if self.bank_source == "learned_proj":
-            # learned_proj 只用于构造全类 semantic bank S=f_s(A_conf)，
-            # 不改变数据集属性本身，也不参与 distributor.forward。
-            self.semantic_proj = nn.Linear(self.attr_dim, self.text_dim)
+        # 用一个可学习 scale 取代手动搜索 TAU_PROMPT。
+        # 初始值等价于原来的 /0.07，即 scale=1/0.07。
+        self.prompt_logit_scale = torch.nn.Parameter(torch.tensor(math.log(1.0 / _PROMPT_TAU_INIT)))
         self._debug_logged = False
 
-    def _load_or_prepare_class_attributes(
+    def _prepare_class_attributes(
         self,
         class_attributes: Optional[torch.Tensor],
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
         """
-        读取类别属性矩阵 A_conf。
+        准备类别属性矩阵 A_conf。
 
-        优先使用 trainer 从 dataset.class_attributes 传入的 [C,A]；
-        若数据集没有提供，再读取 MODEL.SEMANTIC_GRAPH.CLASS_ATTR_PATH。
+        这里不再从路径兜底读取。semantic graph loss 与语义分支共用
+        dataloader 已经加载好的 dataset.class_attributes，来源是 XLSA att_splits.mat::att。
         """
         if class_attributes is None:
-            class_attributes = _load_tensor_file(
-                str(self.cfg.MODEL.SEMANTIC_GRAPH.CLASS_ATTR_PATH),
-                "CLASS_ATTR_PATH",
-            )
+            raise RuntimeError("Semantic graph loss requires dataset.class_attributes from dataloader.")
         if not torch.is_tensor(class_attributes):
             class_attributes = torch.as_tensor(class_attributes)
         class_attributes = class_attributes.to(device=device, dtype=dtype)
@@ -126,23 +95,6 @@ class SemanticGraphLossComputer(nn.Module):
                 )
             )
         return class_attributes
-
-    def _load_attr_embeddings(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """读取属性名文本 embedding E_attr，期望形状为 [ATTR_DIM, TEXT_DIM]。"""
-        embeddings = _load_tensor_file(
-            str(self.cfg.MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH),
-            "ATTR_NAME_EMBED_PATH",
-        )
-        embeddings = embeddings.to(device=device, dtype=dtype)
-        if tuple(embeddings.shape) != (self.attr_dim, self.text_dim):
-            raise RuntimeError(
-                "Semantic graph attr name embeddings must be [{},{}], got {}.".format(
-                    self.attr_dim,
-                    self.text_dim,
-                    tuple(embeddings.shape),
-                )
-            )
-        return embeddings
 
     def _build_graphs(
         self,
@@ -168,7 +120,7 @@ class SemanticGraphLossComputer(nn.Module):
         elif graph_source == "acssc":
             graph = acssc
         elif graph_source == "fuse":
-            rho = float(graph_cfg.RHO)
+            rho = _FIXED_GRAPH_RHO
             graph = rho * acc + (1.0 - rho) * acssc
         else:
             raise ValueError("MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE must be acc / acssc / fuse.")
@@ -195,7 +147,7 @@ class SemanticGraphLossComputer(nn.Module):
 
     def _build_target(self, graph: torch.Tensor, targets_global: torch.Tensor) -> torch.Tensor:
         """
-        从语义图中取每个样本对应的目标分布 T_y。
+        从语义图中取每个样本对应的目标分布 T_y即把“类别-类别语义图”变成“当前 batch 每个样本的监督分布 target”
 
         流程:
         1. 取 G[y] 得到该类到所有类的相似度；
@@ -204,26 +156,23 @@ class SemanticGraphLossComputer(nn.Module):
         4. 与 one-hot(y) 按 TARGET_MIX_ALPHA 混合。
         """
         graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
-        eps = float(graph_cfg.OT_DELTA)
+        eps = _FIXED_OT_DELTA
+        # 取每个样本所属类别在图里的那一行 targets_global 告诉你 batch 里每个样本的真类 y
         rows = graph.index_select(0, targets_global)
         topk = int(graph_cfg.TOPK)
         if topk <= 0 or topk > self.num_classes:
             raise ValueError("MODEL.SEMANTIC_GRAPH.TOPK must be in [1, NUM_CLASSES].")
+        # 只保留 top-k 语义近邻 非 top-k 类在后续 softmax 中概率约等于 0
         values, indices = torch.topk(rows, k=topk, dim=-1)
         masked = torch.full_like(rows, float("-inf"))
         masked.scatter_(1, indices, values)
         target_sem = F.softmax(masked / float(graph_cfg.TAU_ACC), dim=-1)
 
-        alpha = float(graph_cfg.TARGET_MIX_ALPHA)
+        alpha = _FIXED_TARGET_MIX_ALPHA
+        #  和 one-hot 真类分布混合 alpha=0：纯 one-ho alpha=1：纯语义分布
         onehot = F.one_hot(targets_global, num_classes=self.num_classes).to(dtype=target_sem.dtype)
         target = (1.0 - alpha) * onehot + alpha * target_sem
         return _normalize_prob(target, eps).detach()
-
-    def _semantic_bank(self, class_attributes: torch.Tensor, asem: torch.Tensor) -> torch.Tensor:
-        """返回 acc_hidden / OT 节点项使用的全类语义 bank S。"""
-        if self.bank_source == "asem":
-            return asem
-        return self.semantic_proj(class_attributes)
 
     def _sinkhorn(self, cost: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -233,19 +182,15 @@ class SemanticGraphLossComputer(nn.Module):
         - 源边界 a 是 batch 内均匀分布；
         - 目标边界 b 是当前 batch 的语义 target 均值。
         """
-        graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
-        if str(graph_cfg.OT_BALANCED_MODE).lower() != "batch_semantic_mean":
-            raise ValueError("MODEL.SEMANTIC_GRAPH.OT_BALANCED_MODE currently supports only batch_semantic_mean.")
-
-        eps = float(graph_cfg.OT_EPS)
-        delta = float(graph_cfg.OT_DELTA)
+        eps = _FIXED_OT_EPS
+        delta = _FIXED_OT_DELTA
         batch_size = int(cost.shape[0])
         a = torch.full((batch_size,), 1.0 / float(batch_size), device=cost.device, dtype=cost.dtype)
         b = _normalize_prob(target.mean(dim=0), delta)
         kernel = torch.exp(-cost / eps).clamp_min(delta)
         u = torch.ones_like(a)
         v = torch.ones_like(b)
-        for _ in range(int(graph_cfg.OT_ITERS)):
+        for _ in range(_FIXED_OT_ITERS):
             u = a / kernel.matmul(v).clamp_min(delta)
             v = b / kernel.t().matmul(u).clamp_min(delta)
         plan = u[:, None] * kernel * v[None, :]
@@ -267,8 +212,7 @@ class SemanticGraphLossComputer(nn.Module):
 
         使用矩阵化公式，避免四重 Python 循环。
         """
-        graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
-        delta = float(graph_cfg.OT_DELTA)
+        delta = _FIXED_OT_DELTA
         rp = _row_normalize(mu).matmul(_row_normalize(mu).t())
         a = _normalize_prob(plan.sum(dim=1), delta)
         b = _normalize_prob(plan.sum(dim=0), delta)
@@ -324,9 +268,9 @@ class SemanticGraphLossComputer(nn.Module):
 
         输入:
         - mu: prompt distribution center，[B,768]
-        - targets_global: 全局类别 id，[B]
+        - targets_global: 全局类别 id，[B],当前 batch 里每个样本属于哪个类
         - class_attributes: 可选 [200,312]，优先来自 dataset.class_attributes
-        - attr_name_embeddings: 可选 [312,768]，默认从配置路径读取
+        - attr_name_embeddings: [312,768]，由 trainer 或 dataset 显式传入
         """
         if self.loss_type == "none":
             return mu.sum() * 0.0
@@ -334,62 +278,71 @@ class SemanticGraphLossComputer(nn.Module):
             raise RuntimeError(f"Semantic graph loss expects mu [B,{self.text_dim}], got {tuple(mu.shape)}.")
 
         graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
-        eps = float(graph_cfg.OT_DELTA)
+        eps = _FIXED_OT_DELTA
+        # 输入校验与标准化
         targets_global = self._validate_targets(targets_global, mu.device)
-        class_attributes = self._load_or_prepare_class_attributes(class_attributes, mu.device, mu.dtype)
+        class_attributes = self._prepare_class_attributes(class_attributes, mu.device, mu.dtype)
         if attr_name_embeddings is None:
-            attr_name_embeddings = self._load_attr_embeddings(mu.device, mu.dtype)
-        else:
-            attr_name_embeddings = attr_name_embeddings.to(device=mu.device, dtype=mu.dtype)
+            raise RuntimeError("Semantic graph loss requires attr_name_embeddings from trainer or dataset.")
+        attr_name_embeddings = attr_name_embeddings.to(device=mu.device, dtype=mu.dtype)
+        if tuple(attr_name_embeddings.shape) != (self.attr_dim, self.text_dim):
+            raise RuntimeError(
+                "Semantic graph attr name embeddings must be [{},{}], got {}.".format(
+                    self.attr_dim,
+                    self.text_dim,
+                    tuple(attr_name_embeddings.shape),
+                )
+            )
+        # asem：[200,312] x [312,768] = [200,768] 用配方权重把 312 个属性向量加权混合
         acc, acssc, graph, asem = self._build_graphs(class_attributes, attr_name_embeddings)
         target = self._build_target(graph, targets_global)
 
-        bank = self._semantic_bank(class_attributes, asem)
+        # 固定语义 bank：每个类别的属性置信度加权属性名文本 embedding。
+        # shape: [200,312] @ [312,768] -> [200,768]
+        bank = asem
+        prompt_scale = self.prompt_logit_scale.exp()
         extra = ""
         if self.loss_type == "acc_hidden":
             # 方案 A：把 mu 直接和 200 个语义原型比较，监督其全类分布。
-            logits = _row_normalize(mu).matmul(_row_normalize(bank).t()) / float(graph_cfg.TAU_PROMPT)
+            logits = _row_normalize(mu).matmul(_row_normalize(bank).t()) * prompt_scale
             pred = F.softmax(logits, dim=-1)
             loss = _kl_target_pred(target, pred, eps)
         elif self.loss_type == "rel_kl":
             # 方案 B：只约束 batch 内 prompt 关系图与语义关系图一致。
             rp = _row_normalize(mu).matmul(_row_normalize(mu).t())
             rs = graph.index_select(0, targets_global).index_select(1, targets_global)
-            pred = F.softmax(rp / float(graph_cfg.TAU_PROMPT), dim=-1)
-            sem = F.softmax(rs / float(graph_cfg.TAU_SEM), dim=-1)
+            pred = F.softmax(rp * prompt_scale, dim=-1)
+            sem = F.softmax(rs / float(graph_cfg.TAU_ACC), dim=-1)
             loss = _kl_target_pred(sem.detach(), pred, eps)
         elif self.loss_type == "rel_all":
             # 方案 C：先经 batch 内 prompt 关系传播，再对齐到全类语义 target。
             rp = _row_normalize(mu).matmul(_row_normalize(mu).t())
-            pred_batch = F.softmax(rp / float(graph_cfg.TAU_PROMPT), dim=-1)
+            pred_batch = F.softmax(rp * prompt_scale, dim=-1)
             pred_all = _normalize_prob(pred_batch.matmul(target), eps)
             loss = _kl_target_pred(target, pred_all, eps)
         elif self.loss_type == "ot":
             # 方案 D：用 OT 学习 batch prompt 到全类语义节点的软匹配。
             cost = self._node_cost(mu, bank)
             plan = self._sinkhorn(cost, target)
-            if bool(graph_cfg.OT_DETACH_PLAN):
-                plan = plan.detach()
+            plan = plan.detach()
             loss = (plan * cost).sum()
             extra = "M={} Pi={}".format(tuple(cost.shape), tuple(plan.shape))
         elif self.loss_type == "gw":
             # 方案 E：在 OT plan 下对齐 prompt 图结构与语义类图结构。
             cost = self._node_cost(mu, bank)
             plan = self._sinkhorn(cost, target)
-            if bool(graph_cfg.OT_DETACH_PLAN):
-                plan = plan.detach()
+            plan = plan.detach()
             loss = self._gw_term(mu, graph, plan)
             extra = "M={} Pi={} Rp={}".format(tuple(cost.shape), tuple(plan.shape), (mu.shape[0], mu.shape[0]))
         elif self.loss_type == "fgw":
             # 方案 F：节点 cost + 语义先验 cost + GW 结构项的融合版本。
             cost = self._node_cost(mu, bank)
-            prior_cost = cost - float(graph_cfg.OT_PRIOR_ETA) * torch.log(target + eps)
+            prior_cost = cost - _FIXED_OT_PRIOR_ETA * torch.log(target + eps)
             plan = self._sinkhorn(prior_cost, target)
-            if bool(graph_cfg.OT_DETACH_PLAN):
-                plan = plan.detach()
+            plan = plan.detach()
             node_loss = (plan * prior_cost).sum()
             gw_loss = self._gw_term(mu, graph, plan)
-            alpha = float(graph_cfg.OT_ALPHA)
+            alpha = _FIXED_OT_ALPHA
             loss = (1.0 - alpha) * node_loss + alpha * gw_loss
             extra = "M={} Pi={} node={} gw={}".format(
                 tuple(prior_cost.shape),

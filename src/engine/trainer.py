@@ -67,6 +67,52 @@ from ..utils.vis_pipeline import (
 logger = logging.get_logger("visual_prompt")
 
 
+def _load_semantic_graph_attr_name_embeddings(cfg: CfgNode) -> torch.Tensor:
+    """
+    Trainer 侧一次性读取属性名文本 embedding。
+
+    这样 SemanticGraphLossComputer 只消费张量，不再读路径；
+    后续如果 dataset 自带 attr_name_embeddings，也可以在 batch 侧优先使用 dataset 的版本。
+    """
+    graph_cfg = cfg.MODEL.SEMANTIC_GRAPH
+    path = str(graph_cfg.ATTR_NAME_EMBED_PATH)
+    if not path:
+        raise ValueError("MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH must be set when semantic graph loss is enabled.")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH not found: {path}")
+
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".npy":
+        payload = np.load(path)
+    else:
+        payload = torch.load(path, map_location="cpu")
+
+    if isinstance(payload, dict):
+        for key in ("embeddings", "tensor"):
+            if key in payload:
+                payload = payload[key]
+                break
+    if isinstance(payload, np.ndarray):
+        payload = torch.from_numpy(payload)
+    if not torch.is_tensor(payload):
+        raise TypeError(f"ATTR_NAME_EMBED_PATH must load as tensor/ndarray/dict tensor, got {type(payload)} from {path}")
+
+    embeddings = payload.float().contiguous()
+    expected_shape = (int(graph_cfg.ATTR_DIM), int(graph_cfg.TEXT_DIM))
+    if tuple(embeddings.shape) != expected_shape:
+        raise ValueError(f"Expected attr_name_embeddings shape {expected_shape}, got {tuple(embeddings.shape)} from {path}")
+    return embeddings
+
+
+def _semantic_graph_loss_enabled(cfg: CfgNode) -> bool:
+    """Trainer 侧判断是否需要预加载属性名文本 embedding。"""
+    return (
+        bool(cfg.MODEL.SEMANTIC_GRAPH.ENABLE)
+        and float(cfg.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT) > 0
+        and str(cfg.MODEL.SEMANTIC_GRAPH.LOSS_TYPE).lower() != "none"
+    )
+
+
 class Trainer():
     """
     训练/评测主调度器。
@@ -88,6 +134,11 @@ class Trainer():
         if self.affinity_aux_needed and bool(cfg.MODEL.AFFINITY.DETACH):
             raise ValueError("Affinity auxiliary losses require MODEL.AFFINITY.DETACH=False.")
         self._last_semantic_length = 0
+        self.semantic_graph_attr_name_embeddings = (
+            _load_semantic_graph_attr_name_embeddings(cfg)
+            if _semantic_graph_loss_enabled(cfg)
+            else None
+        )
 
         # 涓€涓负鐪熷嵆use_affinity
         self.use_affinity = cfg.MODEL.AFFINITY.ENABLE or self.affinity_aux_needed
@@ -105,8 +156,7 @@ class Trainer():
 
         # solver related
         # ================== optimizer / scheduler / loss ==================
-        # loss 内部可能包含可训练辅助投影（例如 semantic graph 的 learned_proj bank）。
-        # 因此 optimizer 需要同时接收 model 和 cls_criterion；否则 learned_proj 会定义出来但不会更新。
+        # semantic graph loss 内部有 1 个可学习 prompt_logit_scale 标量。
         self.optimizer = make_optimizer([self.model, self.cls_criterion], cfg.SOLVER)
         self.scheduler = make_scheduler(self.optimizer, cfg.SOLVER)
 
@@ -115,7 +165,6 @@ class Trainer():
             self.model,
             save_dir=cfg.OUTPUT_DIR,
             save_to_disk=True,
-            # 同步保存 loss 内部可训练参数，主要服务 SEMANTIC_BANK_SOURCE="learned_proj"。
             cls_criterion=self.cls_criterion,
         )
 
@@ -1905,14 +1954,24 @@ class Trainer():
             dataset_class_attributes = None
             if dataset is not None and hasattr(dataset, "class_attributes"):
                 # XLSA/CUB 下这里通常是 [200,312] 的全局类别属性矩阵。
-                # semantic graph loss 优先使用它，避免每个 batch 从磁盘重复读取 CLASS_ATTR_PATH。
+                # semantic graph loss 直接复用 dataloader 已加载的全类属性矩阵；
+                # 不再提供路径兜底，避免和语义分支的数据来源分叉。
                 dataset_class_attributes = dataset.class_attributes
+            dataset_attr_name_embeddings = None
+            if dataset is not None and hasattr(dataset, "attr_name_embeddings"):
+                dataset_attr_name_embeddings = dataset.attr_name_embeddings
+            attr_name_embeddings = (
+                dataset_attr_name_embeddings
+                if dataset_attr_name_embeddings is not None
+                else self.semantic_graph_attr_name_embeddings
+            )
             loss_kwargs = {
                 "model": model_ref,
                 "raw_targets": targets,
                 # semantic graph 使用全局类别 id；不能使用 local-output remap 后的 loss_targets。
                 "targets_global": effective_targets.detach(),
                 "class_attributes": dataset_class_attributes,
+                "attr_name_embeddings": attr_name_embeddings,
                 "epoch": int(self._trace_epoch + 1),
                 # 属性重建辅助损失使用 batch 真实类别属性 a_y 作为监督目标。
                 # attributes 来自 xlsa_dataset.__getitem__ 返回的 class_attributes[label]。

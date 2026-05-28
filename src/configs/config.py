@@ -103,29 +103,15 @@ _C.MODEL.CONSISTENCY.DIST = "cosine"
 
 _C.MODEL.SEMANTIC_GRAPH = CfgNode()
 _C.MODEL.SEMANTIC_GRAPH.ENABLE = False                  # 是否启用 prompt distribution 语义图辅助约束
-_C.MODEL.SEMANTIC_GRAPH.CLASS_ATTR_PATH = ""            # 类别属性矩阵备用路径；dataset.class_attributes 可用时优先用 dataset
-_C.MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH = ""       # 属性名文本 embedding 路径，期望 [312,768] 或 dict["embeddings"]
+_C.MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH = "datasets/xlsa17/xlsa17/data/CUB/cub_attributes_sbert_all_mpnet_base_v2.pt" # 属性名文本 embedding 路径；默认与 ORTHO.TEXT_EMBED_PATH 指向同一缓存
 _C.MODEL.SEMANTIC_GRAPH.NUM_CLASSES = 200               # CUB 全局类别数；语义图 G 的尺寸为 [NUM_CLASSES, NUM_CLASSES]
 _C.MODEL.SEMANTIC_GRAPH.ATTR_DIM = 312                  # CUB 属性维度
 _C.MODEL.SEMANTIC_GRAPH.TEXT_DIM = 768                  # 属性名文本 embedding 维度，也对应 prompt mu 维度
 _C.MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE = "fuse"           # 语义图来源：acc=属性置信图；acssc=属性文本语义图；fuse=rho 融合
-_C.MODEL.SEMANTIC_GRAPH.RHO = 0.5                       # fuse 时 Acc 权重；G=rho*Acc+(1-rho)*Acssc
-_C.MODEL.SEMANTIC_GRAPH.RHO_SWEEP = []                  # 预留搜索位置；当前代码不自动展开 sweep
 _C.MODEL.SEMANTIC_GRAPH.TOPK = 20                       # 从 G[y] 中保留的语义相近类别数
 _C.MODEL.SEMANTIC_GRAPH.TAU_ACC = 0.07                  # 构造语义 target T_y 时的 softmax 温度
-_C.MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA = 0.1          # target=(1-alpha)*onehot+alpha*semantic_target
 _C.MODEL.SEMANTIC_GRAPH.LOSS_TYPE = "none"              # 候选：none / acc_hidden / rel_kl / rel_all / ot / gw / fgw
 _C.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT = 0.0               # 语义图辅助损失总权重；0 表示不参与训练
-_C.MODEL.SEMANTIC_GRAPH.TAU_PROMPT = 0.07               # prompt 关系分布 softmax 温度
-_C.MODEL.SEMANTIC_GRAPH.TAU_SEM = 0.07                  # semantic 关系分布 softmax 温度
-_C.MODEL.SEMANTIC_GRAPH.SEMANTIC_BANK_SOURCE = "asem"   # 语义 bank 来源：asem=A_conf@E_attr；learned_proj=可训练 312->768
-_C.MODEL.SEMANTIC_GRAPH.OT_EPS = 0.05                   # Sinkhorn 熵正则强度；越大 plan 越平滑
-_C.MODEL.SEMANTIC_GRAPH.OT_ITERS = 20                   # Sinkhorn 迭代次数
-_C.MODEL.SEMANTIC_GRAPH.OT_PRIOR_ETA = 1.0              # FGW 中语义先验 -eta*log(T) 的强度
-_C.MODEL.SEMANTIC_GRAPH.OT_ALPHA = 0.5                  # FGW 节点项与结构项平衡：alpha 越大越重视 GW 结构
-_C.MODEL.SEMANTIC_GRAPH.OT_DELTA = 1e-8                 # 概率 clamp 下界，避免 log(0) 和除 0
-_C.MODEL.SEMANTIC_GRAPH.OT_BALANCED_MODE = "batch_semantic_mean" # OT 目标边界构造；当前只支持 batch_semantic_mean
-_C.MODEL.SEMANTIC_GRAPH.OT_DETACH_PLAN = True           # 是否 detach Sinkhorn plan；True 时主要让 cost 对 mu 反传
 _C.MODEL.SEMANTIC_GRAPH.DEBUG = False                   # 打印一次 A_conf/E_attr/G/T/OT plan 等调试形状
 
 _C.MODEL.AFFINITY = CfgNode()

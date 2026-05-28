@@ -367,7 +367,7 @@ class PreViTPromptDistributor(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         将不同 SOURCE 的视觉输入统一转换为:
-        - visual_input: 原始统计输入，供 debug/后续诊断保存；
+        - visual_input: 原始统计输入，供 debug/后续诊断保存；  patch_tokens不含 CLS，不含 position embedding image_tokens含 position embedding
         - stats_out: [B, 2*768]，前半是 mu，后半是 logvar。
         """
         if self.source == "vit_cls_prepass":

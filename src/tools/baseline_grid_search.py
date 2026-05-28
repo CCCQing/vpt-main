@@ -24,6 +24,18 @@ def _parse_float_list(raw: str) -> List[float]:
     return vals
 
 
+def _parse_int_list(raw: str) -> List[int]:
+    vals = []
+    for item in raw.split(","):
+        s = item.strip()
+        if not s:
+            continue
+        vals.append(int(s))
+    if not vals:
+        raise ValueError("Empty integer grid value list.")
+    return vals
+
+
 def _format_float_tag(x: float) -> str:
     if x == 0:
         return "0"
@@ -216,21 +228,19 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
     keys = [
         "trial_name",
         "group",
-        "base_setting",
-        "semantic_mode",
-        "semantic_tokenizer",
-        "semantic_group_mode",
-        "semantic_text_mode",
-        "semantic_num_tokens",
         "prompt_backend",
         "prompt_init_source",
         "prompt_distributor_enable",
-        "route_setting",
-        "prompt_lambda",
-        "semantic_lambda",
-        "route_ts_prompt_weight",
-        "route_ts_semantic_weight",
-        "attr_weight",
+        "distributor_source",
+        "stats_hidden_dim",
+        "instance_tokens",
+        "domain_tokens",
+        "semantic_graph_enable",
+        "graph_source",
+        "graph_topk",
+        "graph_loss_type",
+        "graph_loss_weight",
+        "prompt_kl_weight",
         "exit_code",
         "score_key",
         "score",
@@ -267,15 +277,19 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser("semantic_tokenizer_attr_weight_remaining_grid_search")
+    ap = argparse.ArgumentParser("prompt_distribution_semantic_graph_grid_search")
     ap.add_argument("--repo-root", default=".")
     ap.add_argument("--python-bin", default=sys.executable)
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
-    ap.add_argument("--out-root", default="output/grid_semantic_tokenizer_attr_weight_remaining")
-    ap.add_argument("--affinity-evolution-enable", default="true", choices=["true", "false"])
+    ap.add_argument("--out-root", default="output/grid_prompt_distribution_semantic_graph")
+    ap.add_argument("--sources", default="token_mlp,vit_cls_prepass")
+    ap.add_argument("--graph-sources", default="acc,acssc,fuse")
+    ap.add_argument("--topks", default="5,10")
+    ap.add_argument("--loss-types", default="acc_hidden,rel_kl,rel_all,ot,fgw")
+    ap.add_argument("--loss-weights", default="1e-4,1e-3")
+    ap.add_argument("--prompt-kl-weight", default="0.0")
     ap.add_argument("--vis-save-raw", default="true", choices=["true", "false"])
     ap.add_argument("--vis-save-images", default="false", choices=["true", "false"])
-    ap.add_argument("--attr-weights", default="1e-5,1e-4,1e-3")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("opts", nargs=argparse.REMAINDER)
     args = ap.parse_args()
@@ -284,242 +298,91 @@ def main() -> None:
     out_root = os.path.abspath(os.path.join(repo_root, args.out_root))
     os.makedirs(out_root, exist_ok=True)
 
-    attr_weights = _parse_float_list(args.attr_weights)
-    affinity_evolution_enable = _parse_bool(args.affinity_evolution_enable)
+    sources = _parse_str_list(args.sources)
+    graph_sources = _parse_str_list(args.graph_sources)
+    topks = _parse_int_list(args.topks)
+    loss_types = _parse_str_list(args.loss_types)
+    loss_weights = _parse_float_list(args.loss_weights)
+    prompt_kl_weight = float(args.prompt_kl_weight)
     vis_save_raw = _parse_bool(args.vis_save_raw)
     vis_save_images = _parse_bool(args.vis_save_images)
+    _validate_choices("MODEL.PROMPT.DISTRIBUTOR.SOURCE", sources, ["token_mlp", "vit_cls_prepass"])
+    _validate_choices("MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE", graph_sources, ["acc", "acssc", "fuse"])
+    _validate_choices("MODEL.SEMANTIC_GRAPH.LOSS_TYPE", loss_types, ["acc_hidden", "rel_kl", "rel_all", "ot", "fgw"])
+
     base_opts = [
         "MODEL.PROMPT.BACKEND", "dynamic",
-        "MODEL.AFFINITY_EVOLUTION.ENABLE", str(affinity_evolution_enable),
-        "SOLVER.VIS.SAVE_RAW", str(vis_save_raw),
-        "SOLVER.VIS.SAVE_IMAGES", str(vis_save_images),
+        "MODEL.PROMPT.INIT_SOURCE", "distributor_mean",
+        "MODEL.PROMPT.NUM_TOKENS", "32",
+        "MODEL.PROMPT.DISTRIBUTOR.ENABLE", "True",
+        "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM", "8",
+        "MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS", "16",
+        "MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS", "16",
+        "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE", "mean",
+        "MODEL.SEMANTIC_GRAPH.ENABLE", "True",
+        "SOLVER.LOSS_PROMPT_KL_WEIGHT", str(prompt_kl_weight),
         "MODEL.SEMANTIC_TOKENS.ENABLE", "True",
         "MODEL.SEMANTIC_TOKENS.TRAIN_SOURCE", "class_mean",
         "MODEL.SEMANTIC_TOKENS.EVAL_SOURCE", "class_mean",
+        "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
+        "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
+        "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "manual_cub8",
+        "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "null_residual",
+        "MODEL.AFFINITY_EVOLUTION.ENABLE", "True",
+        "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA", "0.0",
+        "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA", "0.0",
+        "SOLVER.LOSS_ATTR_WEIGHT", "0.001",
+        "SOLVER.ATTR.METRIC", "mse",
+        "SOLVER.LOSS_SEM_MED_WEIGHT", "0.0",
+        "SOLVER.LOSS_SPV_WEIGHT", "0.0",
+        "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", "0.0",
+        "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", "0.0",
+        "SOLVER.VIS.SAVE_RAW", str(vis_save_raw),
+        "SOLVER.VIS.SAVE_IMAGES", str(vis_save_images),
     ]
     if args.opts:
         _validate_extra_opts(args.opts)
         base_opts.extend(args.opts)
 
-    semantic_mode_specs = {
-        "equal_none": {
-            "semantic_tokenizer": "orthogonal",
-            "semantic_group_mode": "equal",
-            "semantic_text_mode": "none",
-            "semantic_num_tokens": 8,
-            "opts": [
-                "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
-                "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
-                "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "equal",
-                "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "none",
-            ],
-        },
-        "equal_null_residual": {
-            "semantic_tokenizer": "orthogonal",
-            "semantic_group_mode": "equal",
-            "semantic_text_mode": "null_residual",
-            "semantic_num_tokens": 8,
-            "opts": [
-                "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
-                "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
-                "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "equal",
-                "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "null_residual",
-            ],
-        },
-        "equal_text_init_codebook": {
-            "semantic_tokenizer": "orthogonal",
-            "semantic_group_mode": "equal",
-            "semantic_text_mode": "text_init_codebook",
-            "semantic_num_tokens": 8,
-            "opts": [
-                "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
-                "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
-                "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "equal",
-                "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "text_init_codebook",
-            ],
-        },
-        "manual_cub8_null_residual": {
-            "semantic_tokenizer": "orthogonal",
-            "semantic_group_mode": "manual_cub8",
-            "semantic_text_mode": "null_residual",
-            "semantic_num_tokens": 8,
-            "opts": [
-                "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
-                "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
-                "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "manual_cub8",
-                "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "null_residual",
-            ],
-        },
-        "manual_cub8_text_init_codebook": {
-            "semantic_tokenizer": "orthogonal",
-            "semantic_group_mode": "manual_cub8",
-            "semantic_text_mode": "text_init_codebook",
-            "semantic_num_tokens": 8,
-            "opts": [
-                "MODEL.SEMANTIC_TOKENS.TOKENIZER", "orthogonal",
-                "MODEL.SEMANTIC_TOKENS.NUM_TOKENS", "8",
-                "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE", "manual_cub8",
-                "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE", "text_init_codebook",
-            ],
-        },
-    }
-    route_setting_specs = {
-        "route_off": {
-            "prompt_lambda": 0.0,
-            "semantic_lambda": 0.0,
-            "route_ts_prompt_weight": 0.0,
-            "route_ts_semantic_weight": 0.0,
-            "opts": [
-                "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA", "0.0",
-                "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA", "0.0",
-                "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", "0.0",
-                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", "0.0",
-            ],
-        },
-        "route_best": {
-            "prompt_lambda": 0.1,
-            "semantic_lambda": 0.2,
-            "route_ts_prompt_weight": 1e-3,
-            "route_ts_semantic_weight": 0.0,
-            "opts": [
-                "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA", "0.1",
-                "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA", "0.2",
-                "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT", "0.001",
-                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT", "0.0",
-            ],
-        },
-    }
-
-    base_settings = [
-        {
-            "base_setting": "distributor_route_off_manual_cub8_null_residual",
-            "semantic_mode": "manual_cub8_null_residual",
-            "route_setting": "route_off",
-            "prompt_setting": "dynamic_distributor_mean",
-            "prompt_init_source": "distributor_mean",
-            "prompt_distributor_enable": True,
-        },
-        {
-            "base_setting": "distributor_route_off_manual_cub8_text_init_codebook",
-            "semantic_mode": "manual_cub8_text_init_codebook",
-            "route_setting": "route_off",
-            "prompt_setting": "dynamic_distributor_mean",
-            "prompt_init_source": "distributor_mean",
-            "prompt_distributor_enable": True,
-        },
-        {
-            "base_setting": "distributor_route_best_equal_none",
-            "semantic_mode": "equal_none",
-            "route_setting": "route_best",
-            "prompt_setting": "dynamic_distributor_mean",
-            "prompt_init_source": "distributor_mean",
-            "prompt_distributor_enable": True,
-        },
-        {
-            "base_setting": "distributor_route_best_manual_cub8_null_residual",
-            "semantic_mode": "manual_cub8_null_residual",
-            "route_setting": "route_best",
-            "prompt_setting": "dynamic_distributor_mean",
-            "prompt_init_source": "distributor_mean",
-            "prompt_distributor_enable": True,
-        },
-        {
-            "base_setting": "distributor_route_best_manual_cub8_text_init_codebook",
-            "semantic_mode": "manual_cub8_text_init_codebook",
-            "route_setting": "route_best",
-            "prompt_setting": "dynamic_distributor_mean",
-            "prompt_init_source": "distributor_mean",
-            "prompt_distributor_enable": True,
-        },
-        {
-            "base_setting": "learned_route_off_equal_null_residual",
-            "semantic_mode": "equal_null_residual",
-            "route_setting": "route_off",
-            "prompt_setting": "dynamic_learned",
-            "prompt_init_source": "learned",
-            "prompt_distributor_enable": False,
-        },
-        {
-            "base_setting": "learned_route_off_equal_text_init_codebook",
-            "semantic_mode": "equal_text_init_codebook",
-            "route_setting": "route_off",
-            "prompt_setting": "dynamic_learned",
-            "prompt_init_source": "learned",
-            "prompt_distributor_enable": False,
-        },
-        {
-            "base_setting": "learned_route_off_manual_cub8_null_residual",
-            "semantic_mode": "manual_cub8_null_residual",
-            "route_setting": "route_off",
-            "prompt_setting": "dynamic_learned",
-            "prompt_init_source": "learned",
-            "prompt_distributor_enable": False,
-        },
-        {
-            "base_setting": "learned_route_off_manual_cub8_text_init_codebook",
-            "semantic_mode": "manual_cub8_text_init_codebook",
-            "route_setting": "route_off",
-            "prompt_setting": "dynamic_learned",
-            "prompt_init_source": "learned",
-            "prompt_distributor_enable": False,
-        },
-        {
-            "base_setting": "learned_route_best_equal_null_residual",
-            "semantic_mode": "equal_null_residual",
-            "route_setting": "route_best",
-            "prompt_setting": "dynamic_learned",
-            "prompt_init_source": "learned",
-            "prompt_distributor_enable": False,
-        },
-        {
-            "base_setting": "learned_route_best_manual_cub8_null_residual",
-            "semantic_mode": "manual_cub8_null_residual",
-            "route_setting": "route_best",
-            "prompt_setting": "dynamic_learned",
-            "prompt_init_source": "learned",
-            "prompt_distributor_enable": False,
-        },
-    ]
-
     trials: List[Dict[str, object]] = []
-    for base in base_settings:
-        semantic_mode = str(base["semantic_mode"])
-        route_setting = str(base["route_setting"])
-        spec = semantic_mode_specs[semantic_mode]
-        route_spec = route_setting_specs[route_setting]
-        for attr_weight in attr_weights:
-            params = {
-                "base": base["base_setting"],
-                "attr_weight": attr_weight,
-            }
-            trials.append(
-                {
-                    "group": "semantic_tokenizer_attr_weight_remaining",
-                    "tag": _trial_tag("attr", params),
-                    "base_setting": base["base_setting"],
-                    "semantic_mode": semantic_mode,
-                    "semantic_tokenizer": spec["semantic_tokenizer"],
-                    "semantic_group_mode": spec["semantic_group_mode"],
-                    "semantic_text_mode": spec["semantic_text_mode"],
-                    "semantic_num_tokens": spec["semantic_num_tokens"],
-                    "prompt_backend": "dynamic",
-                    "prompt_init_source": base["prompt_init_source"],
-                    "prompt_distributor_enable": base["prompt_distributor_enable"],
-                    "route_setting": route_setting,
-                    "prompt_lambda": route_spec["prompt_lambda"],
-                    "semantic_lambda": route_spec["semantic_lambda"],
-                    "route_ts_prompt_weight": route_spec["route_ts_prompt_weight"],
-                    "route_ts_semantic_weight": route_spec["route_ts_semantic_weight"],
-                    "attr_weight": attr_weight,
-                    "opts": [
-                        "MODEL.PROMPT.INIT_SOURCE", str(base["prompt_init_source"]),
-                        "MODEL.PROMPT.DISTRIBUTOR.ENABLE", str(base["prompt_distributor_enable"]),
-                    ] + list(spec["opts"]) + list(route_spec["opts"]) + [
-                        "SOLVER.LOSS_ATTR_WEIGHT", str(attr_weight),
-                        "SOLVER.ATTR.METRIC", "mse",
-                    ],
-                }
-            )
+    for source in sources:
+        for graph_source in graph_sources:
+            for topk in topks:
+                for loss_type in loss_types:
+                    for loss_weight in loss_weights:
+                        params = {
+                            "src": source,
+                            "graph": graph_source,
+                            "topk": topk,
+                            "loss": loss_type,
+                            "w": loss_weight,
+                        }
+                        trials.append(
+                            {
+                                "group": "prompt_distribution_semantic_graph",
+                                "tag": _trial_tag("semgraph", params),
+                                "prompt_backend": "dynamic",
+                                "prompt_init_source": "distributor_mean",
+                                "prompt_distributor_enable": True,
+                                "distributor_source": source,
+                                "stats_hidden_dim": 8,
+                                "instance_tokens": 16,
+                                "domain_tokens": 16,
+                                "semantic_graph_enable": True,
+                                "graph_source": graph_source,
+                                "graph_topk": topk,
+                                "graph_loss_type": loss_type,
+                                "graph_loss_weight": loss_weight,
+                                "prompt_kl_weight": prompt_kl_weight,
+                                "opts": [
+                                    "MODEL.PROMPT.DISTRIBUTOR.SOURCE", source,
+                                    "MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE", graph_source,
+                                    "MODEL.SEMANTIC_GRAPH.TOPK", str(topk),
+                                    "MODEL.SEMANTIC_GRAPH.LOSS_TYPE", loss_type,
+                                    "MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT", str(loss_weight),
+                                ],
+                            }
+                        )
 
     search_space = {
         "config_file": args.config_file,
@@ -527,36 +390,44 @@ def main() -> None:
         "out_root": out_root,
         "total_trials": len(trials),
         "sweep": [
-            "base_setting",
-            "SOLVER.LOSS_ATTR_WEIGHT",
+            "MODEL.PROMPT.DISTRIBUTOR.SOURCE",
+            "MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE",
+            "MODEL.SEMANTIC_GRAPH.TOPK",
+            "MODEL.SEMANTIC_GRAPH.LOSS_TYPE",
+            "MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT",
         ],
-        "attr_weights": attr_weights,
-        "base_settings": base_settings,
-        "route_settings": {
-            name: {
-                "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA": spec["prompt_lambda"],
-                "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA": spec["semantic_lambda"],
-                "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT": spec["route_ts_prompt_weight"],
-                "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT": spec["route_ts_semantic_weight"],
-            }
-            for name, spec in route_setting_specs.items()
-        },
+        "sources": sources,
+        "graph_sources": graph_sources,
+        "topks": topks,
+        "loss_types": loss_types,
+        "loss_weights": loss_weights,
         "fixed_setting": {
             "MODEL.PROMPT.BACKEND": "dynamic",
-            "MODEL.AFFINITY_EVOLUTION.ENABLE": affinity_evolution_enable,
+            "MODEL.PROMPT.INIT_SOURCE": "distributor_mean",
+            "MODEL.PROMPT.NUM_TOKENS": 32,
+            "MODEL.PROMPT.DISTRIBUTOR.ENABLE": True,
+            "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": 8,
+            "MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS": 16,
+            "MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS": 16,
+            "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": "mean",
+            "MODEL.SEMANTIC_GRAPH.ENABLE": True,
+            "SOLVER.LOSS_PROMPT_KL_WEIGHT": prompt_kl_weight,
             "MODEL.SEMANTIC_TOKENS.ENABLE": True,
             "MODEL.SEMANTIC_TOKENS.TRAIN_SOURCE": "class_mean",
             "MODEL.SEMANTIC_TOKENS.EVAL_SOURCE": "class_mean",
+            "MODEL.SEMANTIC_TOKENS.TOKENIZER": "orthogonal",
+            "MODEL.SEMANTIC_TOKENS.NUM_TOKENS": 8,
+            "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE": "manual_cub8",
+            "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE": "null_residual",
+            "MODEL.AFFINITY_EVOLUTION.ENABLE": True,
+            "MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA": 0.0,
+            "MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA": 0.0,
+            "SOLVER.LOSS_ATTR_WEIGHT": 0.001,
             "SOLVER.ATTR.METRIC": "mse",
-        },
-        "semantic_mode_specs": {
-            name: {
-                "semantic_tokenizer": spec["semantic_tokenizer"],
-                "semantic_group_mode": spec["semantic_group_mode"],
-                "semantic_text_mode": spec["semantic_text_mode"],
-                "semantic_num_tokens": spec["semantic_num_tokens"],
-            }
-            for name, spec in semantic_mode_specs.items()
+            "SOLVER.LOSS_SEM_MED_WEIGHT": 0.0,
+            "SOLVER.LOSS_SPV_WEIGHT": 0.0,
+            "SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT": 0.0,
+            "SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT": 0.0,
         },
         "visualization_setting": {
             "SOLVER.VIS.SAVE_RAW": vis_save_raw,
@@ -591,21 +462,19 @@ def main() -> None:
         row: Dict[str, object] = {
             "trial_name": trial_name,
             "group": trial["group"],
-            "base_setting": trial["base_setting"],
-            "semantic_mode": trial["semantic_mode"],
-            "semantic_tokenizer": trial["semantic_tokenizer"],
-            "semantic_group_mode": trial["semantic_group_mode"],
-            "semantic_text_mode": trial["semantic_text_mode"],
-            "semantic_num_tokens": trial["semantic_num_tokens"],
             "prompt_backend": trial["prompt_backend"],
             "prompt_init_source": trial["prompt_init_source"],
             "prompt_distributor_enable": trial["prompt_distributor_enable"],
-            "route_setting": trial["route_setting"],
-            "prompt_lambda": trial["prompt_lambda"],
-            "semantic_lambda": trial["semantic_lambda"],
-            "route_ts_prompt_weight": trial["route_ts_prompt_weight"],
-            "route_ts_semantic_weight": trial["route_ts_semantic_weight"],
-            "attr_weight": trial["attr_weight"],
+            "distributor_source": trial["distributor_source"],
+            "stats_hidden_dim": trial["stats_hidden_dim"],
+            "instance_tokens": trial["instance_tokens"],
+            "domain_tokens": trial["domain_tokens"],
+            "semantic_graph_enable": trial["semantic_graph_enable"],
+            "graph_source": trial["graph_source"],
+            "graph_topk": trial["graph_topk"],
+            "graph_loss_type": trial["graph_loss_type"],
+            "graph_loss_weight": trial["graph_loss_weight"],
+            "prompt_kl_weight": trial["prompt_kl_weight"],
             "exit_code": -1,
             "run_dir": "",
         }
