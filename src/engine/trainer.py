@@ -105,14 +105,18 @@ class Trainer():
 
         # solver related
         # ================== optimizer / scheduler / loss ==================
-        self.optimizer = make_optimizer([self.model], cfg.SOLVER)
+        # loss 内部可能包含可训练辅助投影（例如 semantic graph 的 learned_proj bank）。
+        # 因此 optimizer 需要同时接收 model 和 cls_criterion；否则 learned_proj 会定义出来但不会更新。
+        self.optimizer = make_optimizer([self.model, self.cls_criterion], cfg.SOLVER)
         self.scheduler = make_scheduler(self.optimizer, cfg.SOLVER)
 
         # ================== Checkpointer ==================
         self.checkpointer = Checkpointer(
             self.model,
             save_dir=cfg.OUTPUT_DIR,
-            save_to_disk=True
+            save_to_disk=True,
+            # 同步保存 loss 内部可训练参数，主要服务 SEMANTIC_BANK_SOURCE="learned_proj"。
+            cls_criterion=self.cls_criterion,
         )
 
         # Optional pretrained checkpoint load.
@@ -1898,9 +1902,17 @@ class Trainer():
 
             # ================== 3. compute loss ==================
             model_ref = self._model_ref(self.model)
+            dataset_class_attributes = None
+            if dataset is not None and hasattr(dataset, "class_attributes"):
+                # XLSA/CUB 下这里通常是 [200,312] 的全局类别属性矩阵。
+                # semantic graph loss 优先使用它，避免每个 batch 从磁盘重复读取 CLASS_ATTR_PATH。
+                dataset_class_attributes = dataset.class_attributes
             loss_kwargs = {
                 "model": model_ref,
                 "raw_targets": targets,
+                # semantic graph 使用全局类别 id；不能使用 local-output remap 后的 loss_targets。
+                "targets_global": effective_targets.detach(),
+                "class_attributes": dataset_class_attributes,
                 "epoch": int(self._trace_epoch + 1),
                 # 属性重建辅助损失使用 batch 真实类别属性 a_y 作为监督目标。
                 # attributes 来自 xlsa_dataset.__getitem__ 返回的 class_attributes[label]。

@@ -1036,7 +1036,12 @@ class PromptedTransformer(Transformer):
         return 0
 
     def _build_vit_cls_prepass(self, x_base: torch.Tensor) -> torch.Tensor:
-        """Run frozen ViT once without prompt/semantic tokens to get CLS."""
+        """
+        为 SOURCE="vit_cls_prepass" 额外跑一次无 prompt / 无 semantic 的 ViT。
+
+        得到的 CLS 只作为 prompt distributor 的视觉统计输入；
+        全程 no_grad，不让这次 prepass 参与主训练反传。
+        """
         was_training = self.encoder.training
         self.encoder.eval()
         with torch.no_grad():
@@ -1052,7 +1057,12 @@ class PromptedTransformer(Transformer):
         return encoded[:, 0, :].detach()
 
     def _call_prompt_init_provider(self, raw_image: torch.Tensor, patch_tokens: torch.Tensor, x_base: torch.Tensor):
-        """Call the prompt distributor through the unified visual-source API."""
+        """
+        通过统一接口调用 prompt distributor。
+
+        这里同时传入 raw image、未加位置的 patch token、加位置后的 image token，
+        以及可选 vit_cls。具体使用哪个由 DISTRIBUTOR.SOURCE 决定。
+        """
         if self.prompt_init_provider is None:
             raise ValueError("prompt_init_provider is required for INIT_SOURCE='distributor_mean'.")
         vit_image_tokens = x_base[:, 1:, :]
@@ -1085,14 +1095,18 @@ class PromptedTransformer(Transformer):
         - 后续层 prompt 如何承接，由 dynamic/vpt_deep 两条后端各自负责
         """
 
+        # 当前主序列构造顺序为 [CLS | prompt_tokens | visual_tokens | semantic_tokens]。
+        # 本函数只负责输入层拼接和 distributor stats 缓存；层间演化逻辑不在这里实现。
         B = x.shape[0]
         self._last_semantic_token_state = None
         self._last_prompt_distribution_stats = None
 
         # 提取 patch token，但此时还没有 CLS / pos / prompt
+        # 先提取原始 ViT patch token；此时还没有 CLS、position embedding 和 prompt。
         patch_tokens = self.embeddings.forward_patches(x)  # (B, n_patches, hidden_dim)
 
         # 先形成不含 prompt 的基础主序列
+        # x_base 是无 prompt 的基础序列：[CLS | PATCH+POS]。
         x_base = self.embeddings.add_cls_and_pos(patch_tokens)  # (B, 1 + n_patches, hidden_dim)
         if self.prompt_enable:
             if self.prompt_backend == "dynamic":
@@ -1102,6 +1116,7 @@ class PromptedTransformer(Transformer):
                     prompt_tokens = self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)
                 elif self.prompt_init_source == "distributor_mean":
                     # distributor_mean：输入 prompt 由实例条件均值 mu 生成
+                    # distributor_mean：prompt 来自图像条件分布采样，并缓存 mu/logvar 供 KL/语义图 loss 使用。
                     prompt_tokens, provider_stats = self._call_prompt_init_provider(x, patch_tokens, x_base)
                     self._last_prompt_distribution_stats = provider_stats
                     expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
@@ -1117,6 +1132,7 @@ class PromptedTransformer(Transformer):
                     prompt_tokens = self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)
                 elif self.prompt_init_source == "distributor_mean":
                     # vpt_deep 下也允许只替换输入 prompt 来源，而不改后续 deep prompt 承接方式
+                    # vpt_deep 下也只替换输入 prompt 来源，不改变后续 deep prompt 承接方式。
                     prompt_tokens, provider_stats = self._call_prompt_init_provider(x, patch_tokens, x_base)
                     self._last_prompt_distribution_stats = provider_stats
                     expected_shape = (B, self.num_tokens, self.vit_config.hidden_size)
@@ -1139,6 +1155,7 @@ class PromptedTransformer(Transformer):
             prompt_tokens = x_base[:, :0, :]
             x = x_base
 
+        # semantic tokens 始终拼在序列最后，保持 affinity monitor/evolution 的切片协议不变。
         semantic_tokens = x[:, :0, :]
         if self.semantic_tokens_enable and torch.is_tensor(semantics):
             semantic_tokens, semantic_state = self._init_semantic_tokens(semantics)
@@ -1158,6 +1175,7 @@ class PromptedTransformer(Transformer):
             )
             self._shape_debug_incorporate_logged = True
 
+        # 记录本次 prompt/semantic 路径，便于 trainer trace 和实验日志确认配置是否真正生效。
         self._last_prompt_path_info = {
             "prompt_enable": bool(self.prompt_enable),
             "prompt_backend": self.prompt_backend,

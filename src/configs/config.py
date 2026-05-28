@@ -37,25 +37,26 @@ _C.MODEL.PROMPT.EVOLVE_INIT_MODE = "identity"
 _C.MODEL.LOG_TRAINABLE = True
 
 _C.MODEL.PROMPT.DISTRIBUTOR = CfgNode()
-_C.MODEL.PROMPT.DISTRIBUTOR.ENABLE = True
-_C.MODEL.PROMPT.DISTRIBUTOR.DISABLE_SAMPLING = False
-_C.MODEL.PROMPT.DISTRIBUTOR.LATENT_DIM = 256
-_C.MODEL.PROMPT.DISTRIBUTOR.HIDDEN_DIM = 512
-_C.MODEL.PROMPT.DISTRIBUTOR.POOL = "gap"
-_C.MODEL.PROMPT.DISTRIBUTOR.SOURCE = "token_mlp"       # vit_cls_prepass / cnn_torchvision / clip_frozen / dinov2_small / token_mlp
-_C.MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM = 64
-_C.MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS = 25
-_C.MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS = 25
-_C.MODEL.PROMPT.DISTRIBUTOR.LOGVAR_MIN = -10.0
-_C.MODEL.PROMPT.DISTRIBUTOR.LOGVAR_MAX = 5.0
-_C.MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE = "mean"  # mean / fixed_eps
-_C.MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED = False
-_C.MODEL.PROMPT.DISTRIBUTOR.CNN_NAME = "efficientnet_b0"  # efficientnet_b0 / mobilenet_v3_small
-_C.MODEL.PROMPT.DISTRIBUTOR.CLIP_NAME = "mobileclip_s0"   # mobileclip_s0 / tinyclip_vit8m
-_C.MODEL.PROMPT.DISTRIBUTOR.CLIP_LOCAL_DIR = ""
-_C.MODEL.PROMPT.DISTRIBUTOR.DINO_LOCAL_DIR = ""
-_C.MODEL.PROMPT.DISTRIBUTOR.EXTERNAL_ALLOW_DOWNLOAD = False
-_C.MODEL.PROMPT.DISTRIBUTOR.DEBUG_PREPROCESS_SHAPES = False
+_C.MODEL.PROMPT.DISTRIBUTOR.ENABLE = True                  # 是否启用 prompt_init_provider；通常配合 INIT_SOURCE="distributor_mean" 使用
+_C.MODEL.PROMPT.DISTRIBUTOR.DISABLE_SAMPLING = False       # 旧键：已废弃；新逻辑用 EVAL_SAMPLE_MODE 控制评测采样
+_C.MODEL.PROMPT.DISTRIBUTOR.LATENT_DIM = 256               # 旧键：旧 PromptGenerator latent 维度；ViaPT-style 新分支不再使用
+_C.MODEL.PROMPT.DISTRIBUTOR.HIDDEN_DIM = 512               # 旧键：旧 PromptGenerator hidden 维度；ViaPT-style 新分支不再使用
+_C.MODEL.PROMPT.DISTRIBUTOR.POOL = "gap"                   # 旧键：旧视觉池化方式；新分支按 SOURCE 各自处理
+_C.MODEL.PROMPT.DISTRIBUTOR.SOURCE = "token_mlp"           # 视觉统计来源：token_mlp / vit_cls_prepass / cnn_torchvision / clip_frozen / dinov2_small
+_C.MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM = 64          # stats head 中间维度 H：视觉输入先降到 H，再输出 mu/logvar
+_C.MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS = 25           # 图像条件 instance prompt 数量；与 DOMAIN_TOKENS 之和必须等于 NUM_TOKENS
+_C.MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS = 25             # 任务/数据集级 learnable domain prompt 数量
+_C.MODEL.PROMPT.DISTRIBUTOR.OUTPUT_PARAM = "logvar"        # 分布参数输出形式；当前只支持 logvar，即 stats_out=[mu, logvar]
+_C.MODEL.PROMPT.DISTRIBUTOR.LOGVAR_MIN = -10.0             # logvar clamp 下界，防止 std 过小导致数值异常
+_C.MODEL.PROMPT.DISTRIBUTOR.LOGVAR_MAX = 5.0               # logvar clamp 上界，防止 std 爆炸
+_C.MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE = "mean"      # 评测采样：mean 使用 eps=0；fixed_eps 使用固定噪声 buffer
+_C.MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED = False         # 是否给每个 instance prompt 加可学习槽位编码
+_C.MODEL.PROMPT.DISTRIBUTOR.CNN_NAME = "efficientnet_b0"   # cnn_torchvision 候选：efficientnet_b0 / mobilenet_v3_small
+_C.MODEL.PROMPT.DISTRIBUTOR.CLIP_NAME = "mobileclip_s0"    # clip_frozen 候选：mobileclip_s0 / tinyclip_vit8m；需本地权重
+_C.MODEL.PROMPT.DISTRIBUTOR.CLIP_LOCAL_DIR = ""            # clip_frozen 本地权重目录，期望存在 {CLIP_NAME}.pt
+_C.MODEL.PROMPT.DISTRIBUTOR.DINO_LOCAL_DIR = ""            # dinov2_small 本地权重目录，期望存在 dinov2_small.pt
+_C.MODEL.PROMPT.DISTRIBUTOR.EXTERNAL_ALLOW_DOWNLOAD = False # 是否允许 torchvision 自动下载 CNN 权重；默认禁止
+_C.MODEL.PROMPT.DISTRIBUTOR.DEBUG_DISTRIBUTOR_SHAPES = False # 打印一次 distributor 输入、mu/logvar、prompt 形状
 
 _C.MODEL.R_SIMILARITY = CfgNode()
 _C.MODEL.R_SIMILARITY.ENABLE = True
@@ -100,6 +101,33 @@ _C.MODEL.CONSISTENCY.ENABLE = False
 _C.MODEL.CONSISTENCY.PROJ = "linear"
 _C.MODEL.CONSISTENCY.DIST = "cosine"
 
+_C.MODEL.SEMANTIC_GRAPH = CfgNode()
+_C.MODEL.SEMANTIC_GRAPH.ENABLE = False                  # 是否启用 prompt distribution 语义图辅助约束
+_C.MODEL.SEMANTIC_GRAPH.CLASS_ATTR_PATH = ""            # 类别属性矩阵备用路径；dataset.class_attributes 可用时优先用 dataset
+_C.MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH = ""       # 属性名文本 embedding 路径，期望 [312,768] 或 dict["embeddings"]
+_C.MODEL.SEMANTIC_GRAPH.NUM_CLASSES = 200               # CUB 全局类别数；语义图 G 的尺寸为 [NUM_CLASSES, NUM_CLASSES]
+_C.MODEL.SEMANTIC_GRAPH.ATTR_DIM = 312                  # CUB 属性维度
+_C.MODEL.SEMANTIC_GRAPH.TEXT_DIM = 768                  # 属性名文本 embedding 维度，也对应 prompt mu 维度
+_C.MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE = "fuse"           # 语义图来源：acc=属性置信图；acssc=属性文本语义图；fuse=rho 融合
+_C.MODEL.SEMANTIC_GRAPH.RHO = 0.5                       # fuse 时 Acc 权重；G=rho*Acc+(1-rho)*Acssc
+_C.MODEL.SEMANTIC_GRAPH.RHO_SWEEP = []                  # 预留搜索位置；当前代码不自动展开 sweep
+_C.MODEL.SEMANTIC_GRAPH.TOPK = 20                       # 从 G[y] 中保留的语义相近类别数
+_C.MODEL.SEMANTIC_GRAPH.TAU_ACC = 0.07                  # 构造语义 target T_y 时的 softmax 温度
+_C.MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA = 0.1          # target=(1-alpha)*onehot+alpha*semantic_target
+_C.MODEL.SEMANTIC_GRAPH.LOSS_TYPE = "none"              # 候选：none / acc_hidden / rel_kl / rel_all / ot / gw / fgw
+_C.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT = 0.0               # 语义图辅助损失总权重；0 表示不参与训练
+_C.MODEL.SEMANTIC_GRAPH.TAU_PROMPT = 0.07               # prompt 关系分布 softmax 温度
+_C.MODEL.SEMANTIC_GRAPH.TAU_SEM = 0.07                  # semantic 关系分布 softmax 温度
+_C.MODEL.SEMANTIC_GRAPH.SEMANTIC_BANK_SOURCE = "asem"   # 语义 bank 来源：asem=A_conf@E_attr；learned_proj=可训练 312->768
+_C.MODEL.SEMANTIC_GRAPH.OT_EPS = 0.05                   # Sinkhorn 熵正则强度；越大 plan 越平滑
+_C.MODEL.SEMANTIC_GRAPH.OT_ITERS = 20                   # Sinkhorn 迭代次数
+_C.MODEL.SEMANTIC_GRAPH.OT_PRIOR_ETA = 1.0              # FGW 中语义先验 -eta*log(T) 的强度
+_C.MODEL.SEMANTIC_GRAPH.OT_ALPHA = 0.5                  # FGW 节点项与结构项平衡：alpha 越大越重视 GW 结构
+_C.MODEL.SEMANTIC_GRAPH.OT_DELTA = 1e-8                 # 概率 clamp 下界，避免 log(0) 和除 0
+_C.MODEL.SEMANTIC_GRAPH.OT_BALANCED_MODE = "batch_semantic_mean" # OT 目标边界构造；当前只支持 batch_semantic_mean
+_C.MODEL.SEMANTIC_GRAPH.OT_DETACH_PLAN = True           # 是否 detach Sinkhorn plan；True 时主要让 cost 对 mu 反传
+_C.MODEL.SEMANTIC_GRAPH.DEBUG = False                   # 打印一次 A_conf/E_attr/G/T/OT plan 等调试形状
+
 _C.MODEL.AFFINITY = CfgNode()
 _C.MODEL.AFFINITY.ENABLE = False
 _C.MODEL.AFFINITY.DETACH = True
@@ -132,7 +160,7 @@ _C.SOLVER.LOSS_SPV_WEIGHT = 0.0
 _C.SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT = 0.0
 _C.SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT = 0.0
 _C.SOLVER.LOSS_ATTR_WEIGHT = 0.0
-_C.SOLVER.LOSS_PROMPT_KL_WEIGHT = 0.0
+_C.SOLVER.LOSS_PROMPT_KL_WEIGHT = 0.0              # prompt distribution KL 权重；只约束 instance prompt 的 mu/logvar
 
 _C.SOLVER.SEM_MED = CfgNode()
 _C.SOLVER.SEM_MED.TARGET = "KpKv"                 # QpKv / QpQv / KpKv

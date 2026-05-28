@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from typing import Any, Dict, Optional
 
 from ..models.prompting.prompt_distribution import prompt_kl_loss
+from .semantic_graph_losses import SemanticGraphLossComputer
 
 
 def _extract_logits_and_aux(pred_logits: Any, kwargs: Optional[Dict[str, Any]]):
@@ -943,7 +944,16 @@ class AttributeReconstructionAuxLoss(nn.Module):
 
 
 def _compute_prompt_kl_aux_loss(kwargs: Optional[Dict[str, Any]]) -> torch.Tensor:
-    """Read prompt distribution stats from model runtime cache and compute KL."""
+    """
+    从模型 runtime cache 读取 prompt distribution stats 并计算 KL。
+
+    数据路径:
+        PromptedTransformer._last_prompt_distribution_stats
+        -> ViT.get_runtime_prompt_distribution_stats()
+        -> CompositeLoss / PromptKLAuxLoss
+
+    这里不读取 label，只约束 q(z|x)=N(mu,std^2) 不要偏离 N(0,I) 太远。
+    """
     if not isinstance(kwargs, Dict):
         raise RuntimeError("Prompt KL loss requires loss kwargs.")
     if "model" not in kwargs:
@@ -960,7 +970,11 @@ def _compute_prompt_kl_aux_loss(kwargs: Optional[Dict[str, Any]]) -> torch.Tenso
 
 
 class PromptKLAuxLoss(nn.Module):
-    """KL regularizer for the Gaussian prompt distribution q(z|x)."""
+    """
+    Gaussian prompt distribution 的 KL 辅助损失。
+
+    权重由 SOLVER.LOSS_PROMPT_KL_WEIGHT 控制；权重为 0 时不会加入 CompositeLoss。
+    """
 
     def __init__(self, cfg=None):
         super().__init__()
@@ -974,6 +988,53 @@ class PromptKLAuxLoss(nn.Module):
 
     def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
         return _compute_prompt_kl_aux_loss(kwargs)
+
+
+class SemanticGraphAuxLoss(nn.Module):
+    """
+    prompt distribution center mu 的语义图辅助损失。
+
+    该损失不依赖 affinity aux，而是读取:
+    - model runtime stats 中的 mu；
+    - trainer 传入的 targets_global；
+    - dataset.class_attributes 或 CLASS_ATTR_PATH；
+    - ATTR_NAME_EMBED_PATH 中的属性名文本 embedding。
+    """
+
+    def __init__(self, cfg=None):
+        super().__init__()
+        self.name = "semantic_graph_loss"
+        self.requires_affinity_aux = False
+        self.graph_weight = float(cfg.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT)
+        self.computer = SemanticGraphLossComputer(cfg)
+
+    @property
+    def weight(self) -> float:
+        return self.graph_weight
+
+    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        if not isinstance(kwargs, Dict):
+            raise RuntimeError("Semantic graph loss requires loss kwargs.")
+        if "model" not in kwargs:
+            raise RuntimeError("Semantic graph loss requires kwargs['model'].")
+        if "targets_global" not in kwargs:
+            raise RuntimeError("Semantic graph loss requires kwargs['targets_global'].")
+
+        model = kwargs["model"]
+        if not hasattr(model, "get_runtime_prompt_distribution_stats"):
+            raise RuntimeError("Semantic graph loss requires model.get_runtime_prompt_distribution_stats().")
+        stats = model.get_runtime_prompt_distribution_stats()
+        if not isinstance(stats, Dict) or "mu" not in stats:
+            raise RuntimeError("Semantic graph loss requires runtime prompt distribution stats['mu'].")
+
+        # class_attributes 优先由 trainer 从 dataset.class_attributes 传入；
+        # attr_name_embeddings 通常由 SemanticGraphLossComputer 按配置路径读取。
+        return self.computer(
+            mu=stats["mu"],
+            targets_global=kwargs["targets_global"],
+            class_attributes=kwargs.get("class_attributes", None),
+            attr_name_embeddings=kwargs.get("attr_name_embeddings", None),
+        )
 
 
 class CompositeLoss(nn.Module):
@@ -1163,6 +1224,15 @@ def _prompt_kl_enabled(cfg) -> bool:
     return float(cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT) > 0
 
 
+def _semantic_graph_enabled(cfg) -> bool:
+    """判断 prompt distribution 语义图辅助损失是否启用。"""
+    return (
+        bool(cfg.MODEL.SEMANTIC_GRAPH.ENABLE)
+        and float(cfg.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT) > 0
+        and str(cfg.MODEL.SEMANTIC_GRAPH.LOSS_TYPE).lower() != "none"
+    )
+
+
 def _build_aux_losses(cfg):
     """
     根据各辅助损失权重构建辅助损失列表。
@@ -1183,6 +1253,8 @@ def _build_aux_losses(cfg):
         aux_losses.append(AttributeReconstructionAuxLoss(cfg))
     if _prompt_kl_enabled(cfg):
         aux_losses.append(PromptKLAuxLoss(cfg))
+    if _semantic_graph_enabled(cfg):
+        aux_losses.append(SemanticGraphAuxLoss(cfg))
     return aux_losses
 
 

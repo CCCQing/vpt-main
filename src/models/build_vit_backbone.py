@@ -71,6 +71,9 @@ def build_vit_sup_models(
             use_distributor
             and prompt_provider is None
         ):
+            # ViaPT-style prompt distributor 的唯一构建入口。
+            # 这里仅把 config 转成模块参数；具体 SOURCE 如何取视觉特征、
+            # instance/domain prompt 如何拼接，都封装在 PreViTPromptDistributor 内部。
             prompt_provider = PreViTPromptDistributor(
                 dim=m2featdim[model_type],
                 prompt_len=prompt_cfg.NUM_TOKENS,
@@ -87,7 +90,8 @@ def build_vit_sup_models(
                 clip_local_dir=dist_cfg.CLIP_LOCAL_DIR,
                 dino_local_dir=dist_cfg.DINO_LOCAL_DIR,
                 external_allow_download=dist_cfg.EXTERNAL_ALLOW_DOWNLOAD,
-                debug_preprocess_shapes=dist_cfg.DEBUG_PREPROCESS_SHAPES,
+                output_param=dist_cfg.OUTPUT_PARAM,
+                debug_distributor_shapes=dist_cfg.DEBUG_DISTRIBUTOR_SHAPES,
             )
         if prompt_provider is not None:
             if bool(dist_cfg.DISABLE_SAMPLING):

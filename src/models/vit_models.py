@@ -72,7 +72,12 @@ class ViT(nn.Module):
         return self._runtime_token_sequence
 
     def get_runtime_prompt_distribution_stats(self):
-        """返回最近一次 forward 产生的 prompt distribution 统计量。"""
+        """
+        返回最近一次 forward 产生的 prompt distribution 统计量。
+
+        典型内容包括 mu/logvar/std/prompt_tokens。KL loss 和 semantic graph loss
+        都从这里读取 mu/logvar，避免把 label 传进 distributor.forward。
+        """
         return self._runtime_prompt_distribution_stats
 
     def build_backbone(self, prompt_cfg, cfg, adapter_cfg, load_pretrain, vis):
@@ -194,6 +199,7 @@ class ViT(nn.Module):
 
         transformer = self.enc.transformer
         self._runtime_semantic_state = transformer._last_semantic_token_state
+        # 缓存 prompt distributor stats，供 loss 侧读取；分类头仍只接收最终 CLS feature。
         self._runtime_prompt_distribution_stats = transformer._last_prompt_distribution_stats
         x = self.r_similarity_head(
             x,
@@ -259,6 +265,7 @@ class ViT(nn.Module):
         self._runtime_token_sequence = feats.detach() if torch.is_tensor(feats) else None
         self._runtime_affinities = affinities
         self._runtime_semantic_state = transformer._last_semantic_token_state
+        # forward_with_affinity 路径同样缓存 stats，保证启用 affinity aux 时 KL/graph loss 仍可用。
         self._runtime_prompt_distribution_stats = transformer._last_prompt_distribution_stats
 
         # 涓?forward 瀵归綈锛歟nc 杈撳嚭鍙兘鏄?[B, 1+N, D] 鎴?[B, D]锛屽彇 CLS 鍚庢帴澶撮儴
