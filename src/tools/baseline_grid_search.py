@@ -224,6 +224,13 @@ def _score_key(metrics: Dict[str, float]) -> Tuple[str, float]:
     return "score", float("-inf")
 
 
+def _has_valid_score(score: object) -> bool:
+    try:
+        return float(score) != float("-inf")
+    except (TypeError, ValueError):
+        return False
+
+
 def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
     keys = [
         "trial_name",
@@ -283,8 +290,8 @@ def main() -> None:
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
     ap.add_argument("--out-root", default="output/grid_prompt_distribution_semantic_graph")
     ap.add_argument("--sources", default="token_mlp,vit_cls_prepass")
-    ap.add_argument("--graph-sources", default="acc,acssc,fuse")
-    ap.add_argument("--topks", default="5,10")
+    ap.add_argument("--graph-sources", default="acc,acssc")
+    ap.add_argument("--topks", default="5")
     ap.add_argument("--loss-types", default="acc_hidden,rel_kl,rel_all,ot,fgw")
     ap.add_argument("--loss-weights", default="1e-4,1e-3")
     ap.add_argument("--prompt-kl-weight", default="0.0")
@@ -315,6 +322,7 @@ def main() -> None:
         "MODEL.PROMPT.INIT_SOURCE", "distributor_mean",
         "MODEL.PROMPT.NUM_TOKENS", "32",
         "MODEL.PROMPT.DISTRIBUTOR.ENABLE", "True",
+        "MODEL.PROMPT.DISTRIBUTOR.DISABLE_SAMPLING", "False",
         "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM", "8",
         "MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS", "16",
         "MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS", "16",
@@ -406,6 +414,7 @@ def main() -> None:
             "MODEL.PROMPT.INIT_SOURCE": "distributor_mean",
             "MODEL.PROMPT.NUM_TOKENS": 32,
             "MODEL.PROMPT.DISTRIBUTOR.ENABLE": True,
+            "MODEL.PROMPT.DISTRIBUTOR.DISABLE_SAMPLING": False,
             "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": 8,
             "MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS": 16,
             "MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS": 16,
@@ -484,22 +493,24 @@ def main() -> None:
             log_path = os.path.join(run_dir, "logs.txt")
             metrics = _parse_metrics(log_path)
             score_key, score = _score_key(metrics)
-            row.update(metrics)
-            row["score_key"] = score_key
-            row["score"] = score
-            row["run_dir"] = run_dir
-            row["exit_code"] = 0
-            rows.append(row)
-            elapsed = time.time() - trial_start
-            total_elapsed = time.time() - grid_start
-            avg_elapsed = total_elapsed / float(idx)
-            eta = avg_elapsed * float(total_trials - idx)
-            print(
-                f"[grid] skip existing {idx}/{total_trials}: {trial_name} "
-                f"trial_time={_format_duration(elapsed)} total_time={_format_duration(total_elapsed)} eta={_format_duration(eta)}",
-                flush=True,
-            )
-            continue
+            if _has_valid_score(score):
+                row.update(metrics)
+                row["score_key"] = score_key
+                row["score"] = score
+                row["run_dir"] = run_dir
+                row["exit_code"] = 0
+                rows.append(row)
+                elapsed = time.time() - trial_start
+                total_elapsed = time.time() - grid_start
+                avg_elapsed = total_elapsed / float(idx)
+                eta = avg_elapsed * float(total_trials - idx)
+                print(
+                    f"[grid] skip existing {idx}/{total_trials}: {trial_name} "
+                    f"trial_time={_format_duration(elapsed)} total_time={_format_duration(total_elapsed)} eta={_format_duration(eta)}",
+                    flush=True,
+                )
+                continue
+            print(f"[grid] rerun incomplete existing trial {idx}/{total_trials}: {trial_name}", flush=True)
 
         if args.dry_run:
             row["score_key"] = "dry_run"
