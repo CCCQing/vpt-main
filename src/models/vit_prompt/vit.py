@@ -494,11 +494,13 @@ class OrthogonalSemanticTokenizer(nn.Module):
             codebook = self.codebooks[group_id, :length, :]
             # text_group: 当前 semantic slot 覆盖的属性名文本向量，形状 [group_attr_count, hidden]。
             text_group = self.text_embeddings.index_select(0, indices)
-            # text_null: 把文本向量投到 W_i 的正交补。
-            # 这样输入 token 回投到属性行空间时，文本部分理论上不改变 numeric_token_i @ W_i^T。
-            text_null = self._null_project(text_group, codebook)
-            # null_residual 使用该组文本整体的 null-space 残差；不再用属性置信度对文本向量加权。
-            text_nulls.append(text_null.mean(dim=0).contiguous())
+            # 正交投影是线性算子：
+            # mean(null_project(text_group)) == null_project(mean(text_group))。
+            # 因此这里先求组内文本均值再投到 W_i 正交补，避免每个 trial 启动时重复做更大的矩阵乘法。
+            text_mean = text_group.mean(dim=0, keepdim=True)
+            # null_residual 使用该组文本整体的 null-space 残差；不与属性置信度相乘。
+            text_null = self._null_project(text_mean, codebook)
+            text_nulls.append(text_null.squeeze(0).contiguous())
         self.register_buffer("text_nulls", torch.stack(text_nulls, dim=0))
 
     def init_state(self, semantics: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
