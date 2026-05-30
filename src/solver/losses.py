@@ -616,8 +616,6 @@ class SoftmaxCMLoss(nn.Module):
         self.lambda_cm = cfg.SOLVER.LOSS_CM_WEIGHT
         self.agr_res_weight = cfg.SOLVER.LOSS_AGR_RES_WEIGHT
         self.cons_weight = cfg.SOLVER.LOSS_CONS_WEIGHT
-        self.anchor_cons_weight = cfg.SOLVER.LOSS_ANCHOR_CONS_WEIGHT
-        self.free_kd_weight = cfg.SOLVER.LOSS_FREE_KD_WEIGHT
         self.consistency_dist = cfg.MODEL.CONSISTENCY.DIST.lower()
         self.diag_strict = cfg.SOLVER.DIAG.STRICT_CHECKS
         self.diag_print_wiring = cfg.SOLVER.DIAG.PRINT_LOSS_WIRING
@@ -652,7 +650,7 @@ class SoftmaxCMLoss(nn.Module):
         1. 统一抽取 logits / aux
         2. 计算交叉熵 CE
         3. 从分类头缓存里取 visual_repr / semantic_repr，计算 CM
-        4. 叠加 role / consistency / AGR / free-KD 等附加项
+        4. 叠加 consistency / AGR 等附加项
         5. 把本次 batch 的关键损失值记录到 `_last_loss_stats`
 
         这里不再做 AM：
@@ -698,32 +696,6 @@ class SoftmaxCMLoss(nn.Module):
             if cons is not None:
                 total = total + self.cons_weight * cons
                 self._last_loss_stats["consistency_loss"] = float(cons.detach().item())
-
-        # Optional ablation 1: anchor-token consistency to class anchor h_y.
-        if self.anchor_cons_weight > 0 and model is not None:
-            sem_state = model.get_runtime_semantic_state()
-            if isinstance(sem_state, dict):
-                sem_vec = sem_state.get("sem_state")
-                semantic_input = sem_state.get("semantic_input")
-                if torch.is_tensor(sem_vec) and torch.is_tensor(semantic_input) and sem_vec.dim() == 2 and semantic_input.dim() == 2 and sem_vec.shape == semantic_input.shape:
-                    h = F.normalize(semantic_input, dim=-1)
-                    a = F.normalize(sem_vec, dim=-1)
-                    anchor_cons = (1.0 - (a * h).sum(dim=-1)).mean()
-                    total = total + self.anchor_cons_weight * anchor_cons
-                    self._last_loss_stats["anchor_cons_loss"] = float(anchor_cons.detach().item())
-
-        # Optional ablation 2: free-token KD to semantic increment direction.
-        if self.free_kd_weight > 0 and model is not None:
-            sem_state = model.get_runtime_semantic_state()
-            if isinstance(sem_state, dict):
-                sem_vec = sem_state.get("sem_state")
-                delta_sem = sem_state.get("semantic_delta")
-                if torch.is_tensor(sem_vec) and torch.is_tensor(delta_sem) and sem_vec.dim() == 2 and delta_sem.dim() == 2 and sem_vec.shape == delta_sem.shape:
-                    t = F.normalize(delta_sem.detach(), dim=-1)
-                    f = F.normalize(sem_vec, dim=-1)
-                    free_kd = (1.0 - (f * t).sum(dim=-1)).mean()
-                    total = total + self.free_kd_weight * free_kd
-                    self._last_loss_stats["free_kd_loss"] = float(free_kd.detach().item())
 
         if self.diag_print_wiring and (not self._diag_printed):
             print(

@@ -19,16 +19,6 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-_FIXED_GRAPH_RHO = 0.5
-_FIXED_TARGET_MIX_ALPHA = 0.1
-_FIXED_OT_EPS = 0.05
-_FIXED_OT_ITERS = 20
-_FIXED_OT_PRIOR_ETA = 1.0
-_FIXED_OT_ALPHA = 0.5
-_FIXED_OT_DELTA = 1e-8
-_PROMPT_TAU_INIT = 0.07
-
-
 def _row_normalize(x: torch.Tensor) -> torch.Tensor:
     """行向量 L2 归一化，用于余弦相似度图构造。"""
     return F.normalize(x, p=2, dim=-1)
@@ -64,9 +54,14 @@ class SemanticGraphLossComputer(torch.nn.Module):
         self.attr_dim = int(graph_cfg.ATTR_DIM)
         self.text_dim = int(graph_cfg.TEXT_DIM)
         self.loss_type = str(graph_cfg.LOSS_TYPE).lower()
-        # 用一个可学习 scale 取代手动搜索 TAU_PROMPT。
-        # 初始值等价于原来的 /0.07，即 scale=1/0.07。
-        self.prompt_logit_scale = torch.nn.Parameter(torch.tensor(math.log(1.0 / _PROMPT_TAU_INIT)))
+        prompt_tau = float(graph_cfg.TAU_PROMPT)
+        if prompt_tau <= 0.0:
+            raise ValueError("MODEL.SEMANTIC_GRAPH.TAU_PROMPT must be positive.")
+        prompt_logit_scale = torch.tensor(math.log(1.0 / prompt_tau))
+        if bool(graph_cfg.PROMPT_SCALE_LEARNABLE):
+            self.prompt_logit_scale = torch.nn.Parameter(prompt_logit_scale)
+        else:
+            self.register_buffer("prompt_logit_scale", prompt_logit_scale)
         self._debug_logged = False
 
     def _prepare_class_attributes(
@@ -120,7 +115,9 @@ class SemanticGraphLossComputer(torch.nn.Module):
         elif graph_source == "acssc":
             graph = acssc
         elif graph_source == "fuse":
-            rho = _FIXED_GRAPH_RHO
+            rho = float(graph_cfg.RHO)
+            if rho < 0.0 or rho > 1.0:
+                raise ValueError("MODEL.SEMANTIC_GRAPH.RHO must be in [0, 1].")
             graph = rho * acc + (1.0 - rho) * acssc
         else:
             raise ValueError("MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE must be acc / acssc / fuse.")
@@ -156,7 +153,7 @@ class SemanticGraphLossComputer(torch.nn.Module):
         4. 与 one-hot(y) 按 TARGET_MIX_ALPHA 混合。
         """
         graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
-        eps = _FIXED_OT_DELTA
+        eps = float(graph_cfg.OT_DELTA)
         # 取每个样本所属类别在图里的那一行 targets_global 告诉你 batch 里每个样本的真类 y
         rows = graph.index_select(0, targets_global)
         topk = int(graph_cfg.TOPK)
@@ -168,7 +165,9 @@ class SemanticGraphLossComputer(torch.nn.Module):
         masked.scatter_(1, indices, values)
         target_sem = F.softmax(masked / float(graph_cfg.TAU_ACC), dim=-1)
 
-        alpha = _FIXED_TARGET_MIX_ALPHA
+        alpha = float(graph_cfg.TARGET_MIX_ALPHA)
+        if alpha < 0.0 or alpha > 1.0:
+            raise ValueError("MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA must be in [0, 1].")
         #  和 one-hot 真类分布混合 alpha=0：纯 one-ho alpha=1：纯语义分布
         onehot = F.one_hot(targets_global, num_classes=self.num_classes).to(dtype=target_sem.dtype)
         target = (1.0 - alpha) * onehot + alpha * target_sem
@@ -182,15 +181,24 @@ class SemanticGraphLossComputer(torch.nn.Module):
         - 源边界 a 是 batch 内均匀分布；
         - 目标边界 b 是当前 batch 的语义 target 均值。
         """
-        eps = _FIXED_OT_EPS
-        delta = _FIXED_OT_DELTA
+        graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
+        balanced_mode = str(graph_cfg.OT_BALANCED_MODE).lower()
+        if balanced_mode != "batch_semantic_mean":
+            raise ValueError("MODEL.SEMANTIC_GRAPH.OT_BALANCED_MODE currently supports only batch_semantic_mean.")
+        eps = float(graph_cfg.OT_EPS)
+        delta = float(graph_cfg.OT_DELTA)
+        if eps <= 0.0:
+            raise ValueError("MODEL.SEMANTIC_GRAPH.OT_EPS must be positive.")
+        iters = int(graph_cfg.OT_ITERS)
+        if iters <= 0:
+            raise ValueError("MODEL.SEMANTIC_GRAPH.OT_ITERS must be positive.")
         batch_size = int(cost.shape[0])
         a = torch.full((batch_size,), 1.0 / float(batch_size), device=cost.device, dtype=cost.dtype)
         b = _normalize_prob(target.mean(dim=0), delta)
         kernel = torch.exp(-cost / eps).clamp_min(delta)
         u = torch.ones_like(a)
         v = torch.ones_like(b)
-        for _ in range(_FIXED_OT_ITERS):
+        for _ in range(iters):
             u = a / kernel.matmul(v).clamp_min(delta)
             v = b / kernel.t().matmul(u).clamp_min(delta)
         plan = u[:, None] * kernel * v[None, :]
@@ -212,7 +220,7 @@ class SemanticGraphLossComputer(torch.nn.Module):
 
         使用矩阵化公式，避免四重 Python 循环。
         """
-        delta = _FIXED_OT_DELTA
+        delta = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
         rp = _row_normalize(mu).matmul(_row_normalize(mu).t())
         a = _normalize_prob(plan.sum(dim=1), delta)
         b = _normalize_prob(plan.sum(dim=0), delta)
@@ -278,7 +286,7 @@ class SemanticGraphLossComputer(torch.nn.Module):
             raise RuntimeError(f"Semantic graph loss expects mu [B,{self.text_dim}], got {tuple(mu.shape)}.")
 
         graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
-        eps = _FIXED_OT_DELTA
+        eps = float(graph_cfg.OT_DELTA)
         # 输入校验与标准化
         targets_global = self._validate_targets(targets_global, mu.device)
         class_attributes = self._prepare_class_attributes(class_attributes, mu.device, mu.dtype)
@@ -312,7 +320,7 @@ class SemanticGraphLossComputer(torch.nn.Module):
             rp = _row_normalize(mu).matmul(_row_normalize(mu).t())
             rs = graph.index_select(0, targets_global).index_select(1, targets_global)
             pred = F.softmax(rp * prompt_scale, dim=-1)
-            sem = F.softmax(rs / float(graph_cfg.TAU_ACC), dim=-1)
+            sem = F.softmax(rs / float(graph_cfg.TAU_SEM), dim=-1)
             loss = _kl_target_pred(sem.detach(), pred, eps)
         elif self.loss_type == "rel_all":
             # 方案 C：先经 batch 内 prompt 关系传播，再对齐到全类语义 target。
@@ -324,25 +332,30 @@ class SemanticGraphLossComputer(torch.nn.Module):
             # 方案 D：用 OT 学习 batch prompt 到全类语义节点的软匹配。
             cost = self._node_cost(mu, bank)
             plan = self._sinkhorn(cost, target)
-            plan = plan.detach()
+            if bool(graph_cfg.OT_DETACH_PLAN):
+                plan = plan.detach()
             loss = (plan * cost).sum()
             extra = "M={} Pi={}".format(tuple(cost.shape), tuple(plan.shape))
         elif self.loss_type == "gw":
             # 方案 E：在 OT plan 下对齐 prompt 图结构与语义类图结构。
             cost = self._node_cost(mu, bank)
             plan = self._sinkhorn(cost, target)
-            plan = plan.detach()
+            if bool(graph_cfg.OT_DETACH_PLAN):
+                plan = plan.detach()
             loss = self._gw_term(mu, graph, plan)
             extra = "M={} Pi={} Rp={}".format(tuple(cost.shape), tuple(plan.shape), (mu.shape[0], mu.shape[0]))
         elif self.loss_type == "fgw":
             # 方案 F：节点 cost + 语义先验 cost + GW 结构项的融合版本。
             cost = self._node_cost(mu, bank)
-            prior_cost = cost - _FIXED_OT_PRIOR_ETA * torch.log(target + eps)
+            prior_cost = cost - float(graph_cfg.OT_PRIOR_ETA) * torch.log(target + eps)
             plan = self._sinkhorn(prior_cost, target)
-            plan = plan.detach()
+            if bool(graph_cfg.OT_DETACH_PLAN):
+                plan = plan.detach()
             node_loss = (plan * prior_cost).sum()
             gw_loss = self._gw_term(mu, graph, plan)
-            alpha = _FIXED_OT_ALPHA
+            alpha = float(graph_cfg.OT_ALPHA)
+            if alpha < 0.0 or alpha > 1.0:
+                raise ValueError("MODEL.SEMANTIC_GRAPH.OT_ALPHA must be in [0, 1].")
             loss = (1.0 - alpha) * node_loss + alpha * gw_loss
             extra = "M={} Pi={} node={} gw={}".format(
                 tuple(prior_cost.shape),

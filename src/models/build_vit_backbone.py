@@ -93,10 +93,6 @@ def build_vit_sup_models(
                 output_param=dist_cfg.OUTPUT_PARAM,
                 debug_distributor_shapes=dist_cfg.DEBUG_DISTRIBUTOR_SHAPES,
             )
-        if prompt_provider is not None:
-            if bool(dist_cfg.DISABLE_SAMPLING):
-                raise ValueError("DISTRIBUTOR.DISABLE_SAMPLING is deprecated by EVAL_SAMPLE_MODE and cannot be enabled.")
-
     if prompt_cfg is not None:
         model = PromptedVisionTransformer(
             prompt_cfg,

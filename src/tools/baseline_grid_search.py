@@ -107,7 +107,7 @@ def _trial_tag(prefix: str, params: Dict[str, object]) -> str:
     return "_".join(parts)
 
 
-def _run_cmd(cmd: List[str], cwd: str, stdout_path: str) -> int:
+def _run_cmd(cmd: List[str], cwd: str, stdout_path: str, env: Optional[Dict[str, str]] = None) -> int:
     with open(stdout_path, "w", encoding="utf-8", errors="ignore") as f:
         p = subprocess.run(
             cmd,
@@ -117,6 +117,7 @@ def _run_cmd(cmd: List[str], cwd: str, stdout_path: str) -> int:
             text=True,
             encoding="utf-8",
             errors="ignore",
+            env=env,
         )
     return p.returncode
 
@@ -244,10 +245,17 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
         "domain_tokens",
         "semantic_graph_enable",
         "graph_source",
+        "graph_rho",
         "graph_topk",
         "graph_loss_type",
         "graph_loss_weight",
+        "target_mix_alpha",
+        "tau_acc",
+        "tau_sem",
+        "tau_prompt",
+        "prompt_scale_learnable",
         "prompt_kl_weight",
+        "gpu",
         "exit_code",
         "score_key",
         "score",
@@ -290,12 +298,21 @@ def main() -> None:
     ap.add_argument("--config-file", default="configs/prompt/cub.yaml")
     ap.add_argument("--out-root", default="output/grid_prompt_distribution_semantic_graph")
     ap.add_argument("--sources", default="token_mlp,vit_cls_prepass")
-    ap.add_argument("--graph-sources", default="acc,acssc")
-    ap.add_argument("--topks", default="5")
+    ap.add_argument("--graph-sources", default="fuse")
+    ap.add_argument("--topks", default="16")
     ap.add_argument("--loss-types", default="acc_hidden,rel_kl,rel_all,ot,fgw")
-    ap.add_argument("--loss-weights", default="1e-4,1e-3")
-    ap.add_argument("--prompt-kl-weight", default="0.0")
-    ap.add_argument("--vis-save-raw", default="true", choices=["true", "false"])
+    ap.add_argument("--loss-weights", default="1e-2,1e-3")
+    ap.add_argument("--rhos", default="0,1,0.5")
+    ap.add_argument("--stats-hidden-dims", default="4")
+    ap.add_argument("--target-mix-alphas", default="0.1,0.5")
+    ap.add_argument("--prompt-kl-weight", default="0.1")
+    ap.add_argument("--tau-acc", default="1.0")
+    ap.add_argument("--tau-sem", default="1.0")
+    ap.add_argument("--tau-prompt", default="1.0")
+    ap.add_argument("--prompt-scale-learnable", default="true", choices=["true", "false"])
+    ap.add_argument("--gpus", default="", help="Comma-separated GPU ids for parallel server runs, e.g. 0,1.")
+    ap.add_argument("--max-workers", type=int, default=1, help="Number of concurrent trials. Use 2 with --gpus 0,1 for dual-card runs.")
+    ap.add_argument("--vis-save-raw", default="false", choices=["true", "false"])
     ap.add_argument("--vis-save-images", default="false", choices=["true", "false"])
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("opts", nargs=argparse.REMAINDER)
@@ -310,7 +327,19 @@ def main() -> None:
     topks = _parse_int_list(args.topks)
     loss_types = _parse_str_list(args.loss_types)
     loss_weights = _parse_float_list(args.loss_weights)
+    rhos = _parse_float_list(args.rhos)
+    stats_hidden_dims = _parse_int_list(args.stats_hidden_dims)
+    target_mix_alphas = _parse_float_list(args.target_mix_alphas)
     prompt_kl_weight = float(args.prompt_kl_weight)
+    tau_acc = float(args.tau_acc)
+    tau_sem = float(args.tau_sem)
+    tau_prompt = float(args.tau_prompt)
+    prompt_scale_learnable = _parse_bool(args.prompt_scale_learnable)
+    gpu_ids = _parse_str_list(args.gpus) if args.gpus.strip() else []
+    if args.max_workers <= 0:
+        raise ValueError("--max-workers must be positive.")
+    if gpu_ids and args.max_workers > len(gpu_ids):
+        raise ValueError("--max-workers must not exceed the number of --gpus.")
     vis_save_raw = _parse_bool(args.vis_save_raw)
     vis_save_images = _parse_bool(args.vis_save_images)
     _validate_choices("MODEL.PROMPT.DISTRIBUTOR.SOURCE", sources, ["token_mlp", "vit_cls_prepass"])
@@ -322,13 +351,21 @@ def main() -> None:
         "MODEL.PROMPT.INIT_SOURCE", "distributor_mean",
         "MODEL.PROMPT.NUM_TOKENS", "32",
         "MODEL.PROMPT.DISTRIBUTOR.ENABLE", "True",
-        "MODEL.PROMPT.DISTRIBUTOR.DISABLE_SAMPLING", "False",
-        "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM", "8",
         "MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS", "16",
         "MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS", "16",
         "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE", "mean",
         "MODEL.SEMANTIC_GRAPH.ENABLE", "True",
         "SOLVER.LOSS_PROMPT_KL_WEIGHT", str(prompt_kl_weight),
+        "MODEL.SEMANTIC_GRAPH.OT_EPS", "0.05",
+        "MODEL.SEMANTIC_GRAPH.OT_ITERS", "20",
+        "MODEL.SEMANTIC_GRAPH.OT_ALPHA", "0.5",
+        "MODEL.SEMANTIC_GRAPH.OT_DELTA", "1e-8",
+        "MODEL.SEMANTIC_GRAPH.OT_PRIOR_ETA", "1.0",
+        "MODEL.SEMANTIC_GRAPH.OT_DETACH_PLAN", "True",
+        "MODEL.SEMANTIC_GRAPH.TAU_ACC", str(tau_acc),
+        "MODEL.SEMANTIC_GRAPH.TAU_SEM", str(tau_sem),
+        "MODEL.SEMANTIC_GRAPH.TAU_PROMPT", str(tau_prompt),
+        "MODEL.SEMANTIC_GRAPH.PROMPT_SCALE_LEARNABLE", str(prompt_scale_learnable),
         "MODEL.SEMANTIC_TOKENS.ENABLE", "True",
         "MODEL.SEMANTIC_TOKENS.TRAIN_SOURCE", "class_mean",
         "MODEL.SEMANTIC_TOKENS.EVAL_SOURCE", "class_mean",
@@ -354,43 +391,59 @@ def main() -> None:
 
     trials: List[Dict[str, object]] = []
     for source in sources:
-        for graph_source in graph_sources:
-            for topk in topks:
-                for loss_type in loss_types:
-                    for loss_weight in loss_weights:
-                        params = {
-                            "src": source,
-                            "graph": graph_source,
-                            "topk": topk,
-                            "loss": loss_type,
-                            "w": loss_weight,
-                        }
-                        trials.append(
-                            {
-                                "group": "prompt_distribution_semantic_graph",
-                                "tag": _trial_tag("semgraph", params),
-                                "prompt_backend": "dynamic",
-                                "prompt_init_source": "distributor_mean",
-                                "prompt_distributor_enable": True,
-                                "distributor_source": source,
-                                "stats_hidden_dim": 8,
-                                "instance_tokens": 16,
-                                "domain_tokens": 16,
-                                "semantic_graph_enable": True,
-                                "graph_source": graph_source,
-                                "graph_topk": topk,
-                                "graph_loss_type": loss_type,
-                                "graph_loss_weight": loss_weight,
-                                "prompt_kl_weight": prompt_kl_weight,
-                                "opts": [
-                                    "MODEL.PROMPT.DISTRIBUTOR.SOURCE", source,
-                                    "MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE", graph_source,
-                                    "MODEL.SEMANTIC_GRAPH.TOPK", str(topk),
-                                    "MODEL.SEMANTIC_GRAPH.LOSS_TYPE", loss_type,
-                                    "MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT", str(loss_weight),
-                                ],
-                            }
-                        )
+        for loss_type in loss_types:
+            for loss_weight in loss_weights:
+                for rho in rhos:
+                    for topk in topks:
+                        for stats_hidden_dim in stats_hidden_dims:
+                            for target_mix_alpha in target_mix_alphas:
+                                for graph_source in graph_sources:
+                                    params = {
+                                        "src": source,
+                                        "loss": loss_type,
+                                        "w": loss_weight,
+                                        "rho": rho,
+                                        "topk": topk,
+                                        "h": stats_hidden_dim,
+                                        "mix": target_mix_alpha,
+                                        "tau": tau_prompt,
+                                        "scale": prompt_scale_learnable,
+                                    }
+                                    trials.append(
+                                        {
+                                            "group": "prompt_distribution_semantic_graph",
+                                            "tag": _trial_tag("semgraph", params),
+                                            "prompt_backend": "dynamic",
+                                            "prompt_init_source": "distributor_mean",
+                                            "prompt_distributor_enable": True,
+                                            "distributor_source": source,
+                                            "stats_hidden_dim": stats_hidden_dim,
+                                            "instance_tokens": 16,
+                                            "domain_tokens": 16,
+                                            "semantic_graph_enable": True,
+                                            "graph_source": graph_source,
+                                            "graph_rho": rho,
+                                            "graph_topk": topk,
+                                            "graph_loss_type": loss_type,
+                                            "graph_loss_weight": loss_weight,
+                                            "target_mix_alpha": target_mix_alpha,
+                                            "tau_acc": tau_acc,
+                                            "tau_sem": tau_sem,
+                                            "tau_prompt": tau_prompt,
+                                            "prompt_scale_learnable": prompt_scale_learnable,
+                                            "prompt_kl_weight": prompt_kl_weight,
+                                            "opts": [
+                                                "MODEL.PROMPT.DISTRIBUTOR.SOURCE", source,
+                                                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM", str(stats_hidden_dim),
+                                                "MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE", graph_source,
+                                                "MODEL.SEMANTIC_GRAPH.RHO", str(rho),
+                                                "MODEL.SEMANTIC_GRAPH.TOPK", str(topk),
+                                                "MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA", str(target_mix_alpha),
+                                                "MODEL.SEMANTIC_GRAPH.LOSS_TYPE", loss_type,
+                                                "MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT", str(loss_weight),
+                                            ],
+                                        }
+                                    )
 
     search_space = {
         "config_file": args.config_file,
@@ -399,8 +452,11 @@ def main() -> None:
         "total_trials": len(trials),
         "sweep": [
             "MODEL.PROMPT.DISTRIBUTOR.SOURCE",
+            "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM",
             "MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE",
+            "MODEL.SEMANTIC_GRAPH.RHO",
             "MODEL.SEMANTIC_GRAPH.TOPK",
+            "MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA",
             "MODEL.SEMANTIC_GRAPH.LOSS_TYPE",
             "MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT",
         ],
@@ -409,18 +465,39 @@ def main() -> None:
         "topks": topks,
         "loss_types": loss_types,
         "loss_weights": loss_weights,
+        "rhos": rhos,
+        "stats_hidden_dims": stats_hidden_dims,
+        "target_mix_alphas": target_mix_alphas,
+        "temperature_setting": {
+            "MODEL.SEMANTIC_GRAPH.TAU_ACC": tau_acc,
+            "MODEL.SEMANTIC_GRAPH.TAU_SEM": tau_sem,
+            "MODEL.SEMANTIC_GRAPH.TAU_PROMPT": tau_prompt,
+            "MODEL.SEMANTIC_GRAPH.PROMPT_SCALE_LEARNABLE": prompt_scale_learnable,
+        },
+        "server_parallel": {
+            "gpus": gpu_ids,
+            "max_workers": args.max_workers,
+        },
         "fixed_setting": {
             "MODEL.PROMPT.BACKEND": "dynamic",
             "MODEL.PROMPT.INIT_SOURCE": "distributor_mean",
             "MODEL.PROMPT.NUM_TOKENS": 32,
             "MODEL.PROMPT.DISTRIBUTOR.ENABLE": True,
-            "MODEL.PROMPT.DISTRIBUTOR.DISABLE_SAMPLING": False,
-            "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": 8,
             "MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS": 16,
             "MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS": 16,
             "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": "mean",
             "MODEL.SEMANTIC_GRAPH.ENABLE": True,
             "SOLVER.LOSS_PROMPT_KL_WEIGHT": prompt_kl_weight,
+            "MODEL.SEMANTIC_GRAPH.OT_EPS": 0.05,
+            "MODEL.SEMANTIC_GRAPH.OT_ITERS": 20,
+            "MODEL.SEMANTIC_GRAPH.OT_ALPHA": 0.5,
+            "MODEL.SEMANTIC_GRAPH.OT_DELTA": 1e-8,
+            "MODEL.SEMANTIC_GRAPH.OT_PRIOR_ETA": 1.0,
+            "MODEL.SEMANTIC_GRAPH.OT_DETACH_PLAN": True,
+            "MODEL.SEMANTIC_GRAPH.TAU_ACC": tau_acc,
+            "MODEL.SEMANTIC_GRAPH.TAU_SEM": tau_sem,
+            "MODEL.SEMANTIC_GRAPH.TAU_PROMPT": tau_prompt,
+            "MODEL.SEMANTIC_GRAPH.PROMPT_SCALE_LEARNABLE": prompt_scale_learnable,
             "MODEL.SEMANTIC_TOKENS.ENABLE": True,
             "MODEL.SEMANTIC_TOKENS.TRAIN_SOURCE": "class_mean",
             "MODEL.SEMANTIC_TOKENS.EVAL_SOURCE": "class_mean",
@@ -451,14 +528,12 @@ def main() -> None:
     rows: List[Dict[str, object]] = []
     grid_start = time.time()
     total_trials = len(trials)
-    for idx, trial in enumerate(trials, start=1):
+
+    def _build_trial(idx: int, trial: Dict[str, object], gpu_id: str = ""):
         trial_name = _trial_name(idx, str(trial["tag"]))
         trial_root = os.path.join(out_root, trial_name)
         os.makedirs(trial_root, exist_ok=True)
         stdout_path = os.path.join(trial_root, "launcher_stdout.txt")
-        trial_start = time.time()
-        print(f"[grid] start {idx}/{total_trials}: {trial_name}", flush=True)
-
         cmd = [
             args.python_bin,
             "train.py",
@@ -467,7 +542,6 @@ def main() -> None:
             "OUTPUT_DIR",
             trial_root,
         ] + base_opts + list(trial["opts"])
-
         row: Dict[str, object] = {
             "trial_name": trial_name,
             "group": trial["group"],
@@ -480,55 +554,32 @@ def main() -> None:
             "domain_tokens": trial["domain_tokens"],
             "semantic_graph_enable": trial["semantic_graph_enable"],
             "graph_source": trial["graph_source"],
+            "graph_rho": trial["graph_rho"],
             "graph_topk": trial["graph_topk"],
             "graph_loss_type": trial["graph_loss_type"],
             "graph_loss_weight": trial["graph_loss_weight"],
+            "target_mix_alpha": trial["target_mix_alpha"],
+            "tau_acc": trial["tau_acc"],
+            "tau_sem": trial["tau_sem"],
+            "tau_prompt": trial["tau_prompt"],
+            "prompt_scale_learnable": trial["prompt_scale_learnable"],
             "prompt_kl_weight": trial["prompt_kl_weight"],
+            "gpu": gpu_id,
             "exit_code": -1,
             "run_dir": "",
         }
+        return trial_name, trial_root, stdout_path, cmd, row
 
-        run_dir = _find_run_dir(trial_root)
-        if run_dir is not None:
-            log_path = os.path.join(run_dir, "logs.txt")
-            metrics = _parse_metrics(log_path)
-            score_key, score = _score_key(metrics)
-            if _has_valid_score(score):
-                row.update(metrics)
-                row["score_key"] = score_key
-                row["score"] = score
-                row["run_dir"] = run_dir
-                row["exit_code"] = 0
-                rows.append(row)
-                elapsed = time.time() - trial_start
-                total_elapsed = time.time() - grid_start
-                avg_elapsed = total_elapsed / float(idx)
-                eta = avg_elapsed * float(total_trials - idx)
-                print(
-                    f"[grid] skip existing {idx}/{total_trials}: {trial_name} "
-                    f"trial_time={_format_duration(elapsed)} total_time={_format_duration(total_elapsed)} eta={_format_duration(eta)}",
-                    flush=True,
-                )
-                continue
-            print(f"[grid] rerun incomplete existing trial {idx}/{total_trials}: {trial_name}", flush=True)
-
-        if args.dry_run:
-            row["score_key"] = "dry_run"
-            row["score"] = ""
-            rows.append(row)
-            print(" ".join(cmd))
-            elapsed = time.time() - trial_start
-            total_elapsed = time.time() - grid_start
-            avg_elapsed = total_elapsed / float(idx)
-            eta = avg_elapsed * float(total_trials - idx)
-            print(
-                f"[grid] dry-run done {idx}/{total_trials}: {trial_name} "
-                f"trial_time={_format_duration(elapsed)} total_time={_format_duration(total_elapsed)} eta={_format_duration(eta)}",
-                flush=True,
-            )
-            continue
-
-        code = _run_cmd(cmd, cwd=repo_root, stdout_path=stdout_path)
+    def _finish_trial(
+        idx: int,
+        trial_name: str,
+        trial_root: str,
+        stdout_path: str,
+        row: Dict[str, object],
+        code: int,
+        trial_start: float,
+        completed: int,
+    ) -> None:
         row["exit_code"] = code
         if code != 0:
             print(f"[grid] failure stdout tail for {trial_name}:", flush=True)
@@ -550,17 +601,167 @@ def main() -> None:
         rows.append(row)
         elapsed = time.time() - trial_start
         total_elapsed = time.time() - grid_start
-        avg_elapsed = total_elapsed / float(idx)
-        eta = avg_elapsed * float(total_trials - idx)
+        avg_elapsed = total_elapsed / float(max(1, completed))
+        eta = avg_elapsed * float(total_trials - completed)
         print(
-            f"[grid] done {idx}/{total_trials}: {trial_name} exit_code={code} "
+            f"[grid] done {completed}/{total_trials}: {trial_name} exit_code={code} "
             f"trial_time={_format_duration(elapsed)} total_time={_format_duration(total_elapsed)} eta={_format_duration(eta)}",
             flush=True,
         )
-
         _write_summary_csv(os.path.join(out_root, "summary.csv"), rows)
         with open(os.path.join(out_root, "summary.json"), "w", encoding="utf-8") as f:
             json.dump(rows, f, ensure_ascii=False, indent=2)
+
+    if args.max_workers == 1:
+        for idx, trial in enumerate(trials, start=1):
+            gpu_id = gpu_ids[(idx - 1) % len(gpu_ids)] if gpu_ids else ""
+            trial_name, trial_root, stdout_path, cmd, row = _build_trial(idx, trial, gpu_id)
+            trial_start = time.time()
+            print(f"[grid] start {idx}/{total_trials}: {trial_name} gpu={gpu_id or 'default'}", flush=True)
+
+            env = os.environ.copy()
+            if gpu_id:
+                env["CUDA_VISIBLE_DEVICES"] = gpu_id
+
+            run_dir = _find_run_dir(trial_root)
+            if run_dir is not None:
+                log_path = os.path.join(run_dir, "logs.txt")
+                metrics = _parse_metrics(log_path)
+                score_key, score = _score_key(metrics)
+                if _has_valid_score(score):
+                    row.update(metrics)
+                    row["score_key"] = score_key
+                    row["score"] = score
+                    row["run_dir"] = run_dir
+                    row["exit_code"] = 0
+                    rows.append(row)
+                    elapsed = time.time() - trial_start
+                    total_elapsed = time.time() - grid_start
+                    avg_elapsed = total_elapsed / float(idx)
+                    eta = avg_elapsed * float(total_trials - idx)
+                    print(
+                        f"[grid] skip existing {idx}/{total_trials}: {trial_name} "
+                        f"trial_time={_format_duration(elapsed)} total_time={_format_duration(total_elapsed)} eta={_format_duration(eta)}",
+                        flush=True,
+                    )
+                    continue
+                print(f"[grid] rerun incomplete existing trial {idx}/{total_trials}: {trial_name}", flush=True)
+
+            if args.dry_run:
+                row["score_key"] = "dry_run"
+                row["score"] = ""
+                rows.append(row)
+                prefix = f"CUDA_VISIBLE_DEVICES={gpu_id} " if gpu_id else ""
+                print(prefix + " ".join(cmd))
+                elapsed = time.time() - trial_start
+                total_elapsed = time.time() - grid_start
+                avg_elapsed = total_elapsed / float(idx)
+                eta = avg_elapsed * float(total_trials - idx)
+                print(
+                    f"[grid] dry-run done {idx}/{total_trials}: {trial_name} "
+                    f"trial_time={_format_duration(elapsed)} total_time={_format_duration(total_elapsed)} eta={_format_duration(eta)}",
+                    flush=True,
+                )
+                continue
+
+            code = _run_cmd(cmd, cwd=repo_root, stdout_path=stdout_path, env=env)
+            _finish_trial(idx, trial_name, trial_root, stdout_path, row, code, trial_start, idx)
+    else:
+        pending = list(enumerate(trials, start=1))
+        active: List[Dict[str, object]] = []
+        completed = 0
+        while pending or active:
+            while pending and len(active) < args.max_workers:
+                idx, trial = pending.pop(0)
+                gpu_id = ""
+                if gpu_ids:
+                    if args.dry_run:
+                        gpu_id = gpu_ids[(idx - 1) % len(gpu_ids)]
+                    else:
+                        used_gpus = {str(item["gpu"]) for item in active}
+                        free_gpus = [gpu for gpu in gpu_ids if gpu not in used_gpus]
+                        if not free_gpus:
+                            break
+                        gpu_id = free_gpus[0]
+                trial_name, trial_root, stdout_path, cmd, row = _build_trial(idx, trial, gpu_id)
+                trial_start = time.time()
+
+                run_dir = _find_run_dir(trial_root)
+                if run_dir is not None:
+                    log_path = os.path.join(run_dir, "logs.txt")
+                    metrics = _parse_metrics(log_path)
+                    score_key, score = _score_key(metrics)
+                    if _has_valid_score(score):
+                        row.update(metrics)
+                        row["score_key"] = score_key
+                        row["score"] = score
+                        row["run_dir"] = run_dir
+                        row["exit_code"] = 0
+                        rows.append(row)
+                        completed += 1
+                        print(f"[grid] skip existing {completed}/{total_trials}: {trial_name}", flush=True)
+                        continue
+                    print(f"[grid] rerun incomplete existing trial {idx}/{total_trials}: {trial_name}", flush=True)
+
+                if args.dry_run:
+                    row["score_key"] = "dry_run"
+                    row["score"] = ""
+                    rows.append(row)
+                    completed += 1
+                    prefix = f"CUDA_VISIBLE_DEVICES={gpu_id} " if gpu_id else ""
+                    print(prefix + " ".join(cmd))
+                    continue
+
+                env = os.environ.copy()
+                if gpu_id:
+                    env["CUDA_VISIBLE_DEVICES"] = gpu_id
+                stdout_file = open(stdout_path, "w", encoding="utf-8", errors="ignore")
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=repo_root,
+                    stdout=stdout_file,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                )
+                active.append(
+                    {
+                        "idx": idx,
+                        "trial_name": trial_name,
+                        "trial_root": trial_root,
+                        "stdout_path": stdout_path,
+                        "row": row,
+                        "process": process,
+                        "stdout_file": stdout_file,
+                        "trial_start": trial_start,
+                        "gpu": gpu_id,
+                    }
+                )
+                print(
+                    f"[grid] start {idx}/{total_trials}: {trial_name} gpu={gpu_id or 'default'}",
+                    flush=True,
+                )
+
+            time.sleep(5)
+            still_active: List[Dict[str, object]] = []
+            for item in active:
+                process = item["process"]
+                code = process.poll()
+                if code is None:
+                    still_active.append(item)
+                    continue
+                item["stdout_file"].close()
+                completed += 1
+                _finish_trial(
+                    int(item["idx"]),
+                    str(item["trial_name"]),
+                    str(item["trial_root"]),
+                    str(item["stdout_path"]),
+                    item["row"],
+                    int(code),
+                    float(item["trial_start"]),
+                    completed,
+                )
+            active = still_active
 
     rows_sorted = sorted(
         rows,

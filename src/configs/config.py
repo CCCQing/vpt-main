@@ -38,10 +38,6 @@ _C.MODEL.LOG_TRAINABLE = True
 
 _C.MODEL.PROMPT.DISTRIBUTOR = CfgNode()
 _C.MODEL.PROMPT.DISTRIBUTOR.ENABLE = True                  # 是否启用 prompt_init_provider；通常配合 INIT_SOURCE="distributor_mean" 使用
-_C.MODEL.PROMPT.DISTRIBUTOR.DISABLE_SAMPLING = False       # 旧键：已废弃；新逻辑用 EVAL_SAMPLE_MODE 控制评测采样
-_C.MODEL.PROMPT.DISTRIBUTOR.LATENT_DIM = 256               # 旧键：旧 PromptGenerator latent 维度；ViaPT-style 新分支不再使用
-_C.MODEL.PROMPT.DISTRIBUTOR.HIDDEN_DIM = 512               # 旧键：旧 PromptGenerator hidden 维度；ViaPT-style 新分支不再使用
-_C.MODEL.PROMPT.DISTRIBUTOR.POOL = "gap"                   # 旧键：旧视觉池化方式；新分支按 SOURCE 各自处理
 _C.MODEL.PROMPT.DISTRIBUTOR.SOURCE = "token_mlp"           # 视觉统计来源：token_mlp / vit_cls_prepass / cnn_torchvision / clip_frozen / dinov2_small
 _C.MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM = 64          # stats head 中间维度 H：视觉输入先降到 H，再输出 mu/logvar
 _C.MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS = 25           # 图像条件 instance prompt 数量；与 DOMAIN_TOKENS 之和必须等于 NUM_TOKENS
@@ -107,11 +103,23 @@ _C.MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH = "datasets/xlsa17/xlsa17/data/CUB/
 _C.MODEL.SEMANTIC_GRAPH.NUM_CLASSES = 200               # CUB 全局类别数；语义图 G 的尺寸为 [NUM_CLASSES, NUM_CLASSES]
 _C.MODEL.SEMANTIC_GRAPH.ATTR_DIM = 312                  # CUB 属性维度
 _C.MODEL.SEMANTIC_GRAPH.TEXT_DIM = 768                  # 属性名文本 embedding 维度，也对应 prompt mu 维度
-_C.MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE = "fuse"           # 语义图来源：acc=属性置信图；acssc=属性文本语义图；fuse=rho 融合
+_C.MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE = "fuse"           # 语义图来源：acc=属性置信图；acssc=属性文本语义图；fuse=rho 融合 acc / acssc / fuse
+_C.MODEL.SEMANTIC_GRAPH.RHO = 0.5                       # fuse 图中 Acc 的融合权重；G=rho*Acc+(1-rho)*Acssc
 _C.MODEL.SEMANTIC_GRAPH.TOPK = 20                       # 从 G[y] 中保留的语义相近类别数
 _C.MODEL.SEMANTIC_GRAPH.TAU_ACC = 0.07                  # 构造语义 target T_y 时的 softmax 温度
+_C.MODEL.SEMANTIC_GRAPH.TAU_SEM = 0.07                  # rel_kl 中 batch 语义关系 R_s 的 softmax 温度
+_C.MODEL.SEMANTIC_GRAPH.TAU_PROMPT = 0.07               # prompt 关系/原型 logits 的初始温度；若 PROMPT_SCALE_LEARNABLE=True，仅作为初始化
+_C.MODEL.SEMANTIC_GRAPH.PROMPT_SCALE_LEARNABLE = True   # 是否学习 prompt_logit_scale；True 时 scale 初始为 1/TAU_PROMPT
+_C.MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA = 0.1          # semantic target 与 one-hot 的混合比例；0=纯 one-hot，1=纯语义近邻分布
 _C.MODEL.SEMANTIC_GRAPH.LOSS_TYPE = "none"              # 候选：none / acc_hidden / rel_kl / rel_all / ot / gw / fgw
 _C.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT = 0.0               # 语义图辅助损失总权重；0 表示不参与训练
+_C.MODEL.SEMANTIC_GRAPH.OT_EPS = 0.05                   # Sinkhorn 熵正则系数；越大运输计划越平滑
+_C.MODEL.SEMANTIC_GRAPH.OT_ITERS = 20                   # Sinkhorn 迭代次数
+_C.MODEL.SEMANTIC_GRAPH.OT_PRIOR_ETA = 1.0              # FGW 中语义先验强度；作用于 prior_cost=M-eta*log(T+delta)
+_C.MODEL.SEMANTIC_GRAPH.OT_ALPHA = 0.5                  # FGW 中结构项权重；loss=(1-alpha)*node+alpha*gw
+_C.MODEL.SEMANTIC_GRAPH.OT_DELTA = 1e-8                 # OT/KL 概率归一化与 log 的数值稳定下界
+_C.MODEL.SEMANTIC_GRAPH.OT_BALANCED_MODE = "batch_semantic_mean" # OT 目标边界 b 的构造方式；当前支持 batch_semantic_mean
+_C.MODEL.SEMANTIC_GRAPH.OT_DETACH_PLAN = True           # 是否停止 Sinkhorn plan 的梯度；True 时只让 cost/GW 项回传到 mu
 _C.MODEL.SEMANTIC_GRAPH.DEBUG = False                   # 打印一次 A_conf/E_attr/G/T/OT plan 等调试形状
 
 _C.MODEL.AFFINITY = CfgNode()
@@ -177,8 +185,6 @@ _C.SOLVER.RSIM_V2.ALIGN_MODE = "ar"                  # ar / cm
 _C.SOLVER.RSIM_V2.ALIGN_WEIGHT = 0.02
 _C.SOLVER.LOSS_AGR_RES_WEIGHT = 0.0
 _C.SOLVER.LOSS_CONS_WEIGHT = 0.0
-_C.SOLVER.LOSS_ANCHOR_CONS_WEIGHT = 0.0
-_C.SOLVER.LOSS_FREE_KD_WEIGHT = 0.0
 
 _C.SOLVER.DIAG = CfgNode()
 _C.SOLVER.DIAG.SHUFFLE_RAW_TARGETS = False
@@ -188,10 +194,6 @@ _C.SOLVER.DIAG.PRINT_LOSS_WIRING = False
 _C.SOLVER.OPTIMIZER = "adamw"
 _C.SOLVER.MOMENTUM = 0.9
 _C.SOLVER.WEIGHT_DECAY = 0.0001
-_C.SOLVER.WEIGHT_DECAY_BIAS = 0
-_C.SOLVER.ADAM_BETA1 = 0.9
-_C.SOLVER.ADAM_BETA2 = 0.999
-_C.SOLVER.ADAM_EPS = 1e-8
 _C.SOLVER.PATIENCE = 300
 _C.SOLVER.SCHEDULER = "cosine"          # 学习率随 epoch 怎么变化
 _C.SOLVER.BASE_LR = 0.0005
@@ -227,7 +229,6 @@ _C.SOLVER.VIS.SEMANTIC_ABLATION.DELTA_REFERENCE_SOURCE = "class_mean"
 _C.SOLVER.DBG_TRAINABLE = False
 
 _C.DATA = CfgNode()
-_C.DATA_ROOT = ""
 _C.DATA.NAME = "CUB"
 _C.DATA.DATAPATH = "datasets/CUB/CUB_200_2011"
 _C.DATA.FEATURE = "sup_vitb16_224"
@@ -243,9 +244,7 @@ _C.DATA.XLSA.ENABLED = True
 _C.DATA.XLSA.RES101_PATH = "datasets/xlsa17/xlsa17/data/CUB/res101.mat"
 _C.DATA.XLSA.SPLIT_PATH = "datasets/xlsa17/xlsa17/data/CUB/att_splits.mat"
 _C.DATA.XLSA.PROTOCOL_MODE = "dev"     #dev / final_zsl / final_gzsl
-_C.DIST_BACKEND = "gloo"
 _C.DIST_INIT_PATH = "env://"
-_C.DIST_INIT_FILE = ""
 
 
 def get_cfg():
