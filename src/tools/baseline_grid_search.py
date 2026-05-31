@@ -301,7 +301,7 @@ def main() -> None:
     ap.add_argument("--graph-sources", default="fuse")
     ap.add_argument("--topks", default="16")
     ap.add_argument("--loss-types", default="acc_hidden,rel_kl,rel_all,ot,fgw")
-    ap.add_argument("--loss-weights", default="1e-2,1e-3")
+    ap.add_argument("--loss-weights", default="1e-2")
     ap.add_argument("--rhos", default="0,1,0.5")
     ap.add_argument("--stats-hidden-dims", default="4")
     ap.add_argument("--target-mix-alphas", default="0.1,0.5")
@@ -389,61 +389,136 @@ def main() -> None:
         _validate_extra_opts(args.opts)
         base_opts.extend(args.opts)
 
+    graph_loss_weight = loss_weights[0]
+    target_mix_alpha = 0.1
+    graph_source = "fuse"
+    topk = 16
+
     trials: List[Dict[str, object]] = []
-    for source in sources:
-        for loss_type in loss_types:
-            for loss_weight in loss_weights:
-                for rho in rhos:
-                    for topk in topks:
-                        for stats_hidden_dim in stats_hidden_dims:
-                            for target_mix_alpha in target_mix_alphas:
-                                for graph_source in graph_sources:
-                                    params = {
-                                        "src": source,
-                                        "loss": loss_type,
-                                        "w": loss_weight,
-                                        "rho": rho,
-                                        "topk": topk,
-                                        "h": stats_hidden_dim,
-                                        "mix": target_mix_alpha,
-                                        "tau": tau_prompt,
-                                        "scale": prompt_scale_learnable,
-                                    }
-                                    trials.append(
-                                        {
-                                            "group": "prompt_distribution_semantic_graph",
-                                            "tag": _trial_tag("semgraph", params),
-                                            "prompt_backend": "dynamic",
-                                            "prompt_init_source": "distributor_mean",
-                                            "prompt_distributor_enable": True,
-                                            "distributor_source": source,
-                                            "stats_hidden_dim": stats_hidden_dim,
-                                            "instance_tokens": 16,
-                                            "domain_tokens": 16,
-                                            "semantic_graph_enable": True,
-                                            "graph_source": graph_source,
-                                            "graph_rho": rho,
-                                            "graph_topk": topk,
-                                            "graph_loss_type": loss_type,
-                                            "graph_loss_weight": loss_weight,
-                                            "target_mix_alpha": target_mix_alpha,
-                                            "tau_acc": tau_acc,
-                                            "tau_sem": tau_sem,
-                                            "tau_prompt": tau_prompt,
-                                            "prompt_scale_learnable": prompt_scale_learnable,
-                                            "prompt_kl_weight": prompt_kl_weight,
-                                            "opts": [
-                                                "MODEL.PROMPT.DISTRIBUTOR.SOURCE", source,
-                                                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM", str(stats_hidden_dim),
-                                                "MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE", graph_source,
-                                                "MODEL.SEMANTIC_GRAPH.RHO", str(rho),
-                                                "MODEL.SEMANTIC_GRAPH.TOPK", str(topk),
-                                                "MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA", str(target_mix_alpha),
-                                                "MODEL.SEMANTIC_GRAPH.LOSS_TYPE", loss_type,
-                                                "MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT", str(loss_weight),
-                                            ],
-                                        }
-                                    )
+
+    def _add_trial(
+        *,
+        group: str,
+        source: str,
+        stats_hidden_dim: int,
+        prompt_kl: float,
+        eval_sample_mode: str,
+        use_slot_embed: bool,
+        graph_enable: bool,
+        rho: float,
+        loss_type: str,
+        loss_weight: float,
+    ) -> None:
+        params = {
+            "graph": graph_enable,
+            "src": source,
+            "h": stats_hidden_dim,
+            "kl": prompt_kl,
+            "eval": eval_sample_mode,
+            "slot": use_slot_embed,
+            "rho": rho,
+            "loss": loss_type,
+        }
+        opts = [
+            "MODEL.PROMPT.DISTRIBUTOR.SOURCE", source,
+            "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM", str(stats_hidden_dim),
+            "SOLVER.LOSS_PROMPT_KL_WEIGHT", str(prompt_kl),
+            "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE", eval_sample_mode,
+            "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED", str(use_slot_embed),
+            "MODEL.SEMANTIC_GRAPH.ENABLE", str(graph_enable),
+            "MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE", graph_source,
+            "MODEL.SEMANTIC_GRAPH.RHO", str(rho),
+            "MODEL.SEMANTIC_GRAPH.TOPK", str(topk),
+            "MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA", str(target_mix_alpha),
+            "MODEL.SEMANTIC_GRAPH.LOSS_TYPE", loss_type,
+            "MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT", str(loss_weight),
+        ]
+        trials.append(
+            {
+                "group": group,
+                "tag": _trial_tag("pdgraph", params),
+                "prompt_backend": "dynamic",
+                "prompt_init_source": "distributor_mean",
+                "prompt_distributor_enable": True,
+                "distributor_source": source,
+                "stats_hidden_dim": stats_hidden_dim,
+                "instance_tokens": 16,
+                "domain_tokens": 16,
+                "eval_sample_mode": eval_sample_mode,
+                "use_slot_embed": use_slot_embed,
+                "semantic_graph_enable": graph_enable,
+                "graph_source": graph_source,
+                "graph_rho": rho,
+                "graph_topk": topk,
+                "graph_loss_type": loss_type,
+                "graph_loss_weight": loss_weight,
+                "target_mix_alpha": target_mix_alpha,
+                "tau_acc": tau_acc,
+                "tau_sem": tau_sem,
+                "tau_prompt": tau_prompt,
+                "prompt_scale_learnable": prompt_scale_learnable,
+                "prompt_kl_weight": prompt_kl,
+                "opts": opts,
+            }
+        )
+
+    for stats_hidden_dim in [4, 16, 64]:
+        for prompt_kl in [0.0, 0.02, 0.005]:
+            for eval_sample_mode in ["mean", "fixed_eps"]:
+                for use_slot_embed in [True, False]:
+                    _add_trial(
+                        group="graph_off_token_mlp",
+                        source="token_mlp",
+                        stats_hidden_dim=stats_hidden_dim,
+                        prompt_kl=prompt_kl,
+                        eval_sample_mode=eval_sample_mode,
+                        use_slot_embed=use_slot_embed,
+                        graph_enable=False,
+                        rho=0.0,
+                        loss_type="none",
+                        loss_weight=0.0,
+                    )
+
+    _add_trial(
+        group="graph_off_vit_cls_prepass",
+        source="vit_cls_prepass",
+        stats_hidden_dim=16,
+        prompt_kl=0.02,
+        eval_sample_mode="mean",
+        use_slot_embed=False,
+        graph_enable=False,
+        rho=0.0,
+        loss_type="none",
+        loss_weight=0.0,
+    )
+
+    for rho in [1.0, 0.0, 0.5]:
+        for loss_type in ["acc_hidden", "rel_kl", "rel_all", "ot", "fgw"]:
+            _add_trial(
+                group="graph_on_token_mlp",
+                source="token_mlp",
+                stats_hidden_dim=16,
+                prompt_kl=0.02,
+                eval_sample_mode="mean",
+                use_slot_embed=False,
+                graph_enable=True,
+                rho=rho,
+                loss_type=loss_type,
+                loss_weight=graph_loss_weight,
+            )
+
+    _add_trial(
+        group="graph_on_vit_cls_prepass",
+        source="vit_cls_prepass",
+        stats_hidden_dim=16,
+        prompt_kl=0.02,
+        eval_sample_mode="mean",
+        use_slot_embed=False,
+        graph_enable=True,
+        rho=0.0,
+        loss_type="rel_kl",
+        loss_weight=graph_loss_weight,
+    )
 
     search_space = {
         "config_file": args.config_file,
@@ -453,21 +528,61 @@ def main() -> None:
         "sweep": [
             "MODEL.PROMPT.DISTRIBUTOR.SOURCE",
             "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM",
-            "MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE",
+            "SOLVER.LOSS_PROMPT_KL_WEIGHT",
+            "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE",
+            "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED",
+            "MODEL.SEMANTIC_GRAPH.ENABLE",
             "MODEL.SEMANTIC_GRAPH.RHO",
-            "MODEL.SEMANTIC_GRAPH.TOPK",
-            "MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA",
             "MODEL.SEMANTIC_GRAPH.LOSS_TYPE",
-            "MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT",
         ],
-        "sources": sources,
-        "graph_sources": graph_sources,
-        "topks": topks,
-        "loss_types": loss_types,
-        "loss_weights": loss_weights,
-        "rhos": rhos,
-        "stats_hidden_dims": stats_hidden_dims,
-        "target_mix_alphas": target_mix_alphas,
+        "groups": {
+            "graph_off_token_mlp": {
+                "count": 36,
+                "MODEL.SEMANTIC_GRAPH.ENABLE": False,
+                "MODEL.PROMPT.DISTRIBUTOR.SOURCE": ["token_mlp"],
+                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [4, 16, 64],
+                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.0, 0.02, 0.005],
+                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["mean", "fixed_eps"],
+                "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [True, False],
+            },
+            "graph_off_vit_cls_prepass": {
+                "count": 1,
+                "MODEL.SEMANTIC_GRAPH.ENABLE": False,
+                "MODEL.PROMPT.DISTRIBUTOR.SOURCE": ["vit_cls_prepass"],
+                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [16],
+                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.02],
+                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["mean"],
+                "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [False],
+            },
+            "graph_on_token_mlp": {
+                "count": 15,
+                "MODEL.SEMANTIC_GRAPH.ENABLE": True,
+                "MODEL.PROMPT.DISTRIBUTOR.SOURCE": ["token_mlp"],
+                "MODEL.SEMANTIC_GRAPH.RHO": [1.0, 0.0, 0.5],
+                "MODEL.SEMANTIC_GRAPH.LOSS_TYPE": ["acc_hidden", "rel_kl", "rel_all", "ot", "fgw"],
+                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [16],
+                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.02],
+                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["mean"],
+                "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [False],
+            },
+            "graph_on_vit_cls_prepass": {
+                "count": 1,
+                "MODEL.SEMANTIC_GRAPH.ENABLE": True,
+                "MODEL.PROMPT.DISTRIBUTOR.SOURCE": ["vit_cls_prepass"],
+                "MODEL.SEMANTIC_GRAPH.RHO": [0.0],
+                "MODEL.SEMANTIC_GRAPH.LOSS_TYPE": ["rel_kl"],
+                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [16],
+                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.02],
+                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["mean"],
+                "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [False],
+            },
+        },
+        "fixed_graph_setting": {
+            "MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE": graph_source,
+            "MODEL.SEMANTIC_GRAPH.TOPK": topk,
+            "MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA": target_mix_alpha,
+            "MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT": graph_loss_weight,
+        },
         "temperature_setting": {
             "MODEL.SEMANTIC_GRAPH.TAU_ACC": tau_acc,
             "MODEL.SEMANTIC_GRAPH.TAU_SEM": tau_sem,
@@ -485,9 +600,10 @@ def main() -> None:
             "MODEL.PROMPT.DISTRIBUTOR.ENABLE": True,
             "MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS": 16,
             "MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS": 16,
-            "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": "mean",
-            "MODEL.SEMANTIC_GRAPH.ENABLE": True,
-            "SOLVER.LOSS_PROMPT_KL_WEIGHT": prompt_kl_weight,
+            "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": "trial_specific",
+            "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": "trial_specific",
+            "MODEL.SEMANTIC_GRAPH.ENABLE": "trial_specific",
+            "SOLVER.LOSS_PROMPT_KL_WEIGHT": "trial_specific",
             "MODEL.SEMANTIC_GRAPH.OT_EPS": 0.05,
             "MODEL.SEMANTIC_GRAPH.OT_ITERS": 20,
             "MODEL.SEMANTIC_GRAPH.OT_ALPHA": 0.5,
@@ -552,6 +668,8 @@ def main() -> None:
             "stats_hidden_dim": trial["stats_hidden_dim"],
             "instance_tokens": trial["instance_tokens"],
             "domain_tokens": trial["domain_tokens"],
+            "eval_sample_mode": trial["eval_sample_mode"],
+            "use_slot_embed": trial["use_slot_embed"],
             "semantic_graph_enable": trial["semantic_graph_enable"],
             "graph_source": trial["graph_source"],
             "graph_rho": trial["graph_rho"],
