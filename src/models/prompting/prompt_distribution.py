@@ -267,6 +267,7 @@ class PreViTPromptDistributor(nn.Module):
         dino_local_dir: str = "",
         external_allow_download: bool = False,
         output_param: str = "logvar",
+        fixed_eps_seed: int = 0,
         debug_distributor_shapes: bool = False,
     ) -> None:
         super().__init__()
@@ -281,6 +282,7 @@ class PreViTPromptDistributor(nn.Module):
         self.eval_sample_mode = str(eval_sample_mode)
         self.use_slot_embed = bool(use_slot_embed)
         self.output_param = str(output_param)
+        self.fixed_eps_seed = int(fixed_eps_seed)
         self.debug_distributor_shapes = bool(debug_distributor_shapes)
         self._debug_shapes_logged = False
 
@@ -339,8 +341,14 @@ class PreViTPromptDistributor(nn.Module):
         if self.use_slot_embed:
             self.slot_embed = nn.Parameter(torch.zeros(1, self.instance_tokens, self.dim))
             nn.init.normal_(self.slot_embed, mean=0.0, std=0.02)
-        # fixed_eps 只在 eval 且 EVAL_SAMPLE_MODE="fixed_eps" 时使用，用于固定采样噪声。
-        self.register_buffer("fixed_eps", torch.randn(1, self.instance_tokens, self.dim))
+        # fixed_eps 只在 eval 且 EVAL_SAMPLE_MODE="fixed_eps" 时使用。
+        # 使用独立 Generator，避免初始化该 buffer 消耗或扰动全局 torch 随机序列。
+        fixed_eps_generator = torch.Generator()
+        fixed_eps_generator.manual_seed(self.fixed_eps_seed)
+        self.register_buffer(
+            "fixed_eps",
+            torch.randn(1, self.instance_tokens, self.dim, generator=fixed_eps_generator),
+        )
         self._freeze_external_encoder()
 
     def _freeze_external_encoder(self) -> None:

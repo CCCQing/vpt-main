@@ -46,6 +46,7 @@ _C.MODEL.PROMPT.DISTRIBUTOR.OUTPUT_PARAM = "logvar"        # 分布参数输出�
 _C.MODEL.PROMPT.DISTRIBUTOR.LOGVAR_MIN = -10.0             # logvar clamp 下界，防止 std 过小导致数值异常
 _C.MODEL.PROMPT.DISTRIBUTOR.LOGVAR_MAX = 5.0               # logvar clamp 上界，防止 std 爆炸
 _C.MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE = "mean"      # 评测采样：mean 使用 eps=0；fixed_eps 使用固定噪声 buffer
+_C.MODEL.PROMPT.DISTRIBUTOR.FIXED_EPS_SEED = 0             # fixed_eps buffer 的独立随机种子；不影响全局 torch 随机状态
 _C.MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED = False         # 是否给每个 instance prompt 加可学习槽位编码
 _C.MODEL.PROMPT.DISTRIBUTOR.CNN_NAME = "efficientnet_b0"   # cnn_torchvision 候选：efficientnet_b0 / mobilenet_v3_small
 _C.MODEL.PROMPT.DISTRIBUTOR.CLIP_NAME = "mobileclip_s0"    # clip_frozen 候选：mobileclip_s0 / tinyclip_vit8m；需本地权重
