@@ -404,6 +404,7 @@ def main() -> None:
         prompt_kl: float,
         eval_sample_mode: str,
         use_slot_embed: bool,
+        prompt_stat_source: str,
         graph_enable: bool,
         rho: float,
         loss_type: str,
@@ -416,6 +417,7 @@ def main() -> None:
             "kl": prompt_kl,
             "eval": eval_sample_mode,
             "slot": use_slot_embed,
+            "stat": prompt_stat_source,
             "rho": rho,
             "loss": loss_type,
         }
@@ -425,6 +427,7 @@ def main() -> None:
             "SOLVER.LOSS_PROMPT_KL_WEIGHT", str(prompt_kl),
             "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE", eval_sample_mode,
             "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED", str(use_slot_embed),
+            "MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE", prompt_stat_source,
             "MODEL.SEMANTIC_GRAPH.ENABLE", str(graph_enable),
             "MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE", graph_source,
             "MODEL.SEMANTIC_GRAPH.RHO", str(rho),
@@ -446,6 +449,7 @@ def main() -> None:
                 "domain_tokens": 16,
                 "eval_sample_mode": eval_sample_mode,
                 "use_slot_embed": use_slot_embed,
+                "prompt_stat_source": prompt_stat_source,
                 "semantic_graph_enable": graph_enable,
                 "graph_source": graph_source,
                 "graph_rho": rho,
@@ -462,63 +466,70 @@ def main() -> None:
             }
         )
 
-    for stats_hidden_dim in [4, 16, 64]:
-        for prompt_kl in [0.0, 0.02, 0.005]:
-            for eval_sample_mode in ["mean", "fixed_eps"]:
+    for stats_hidden_dim in [32, 64, 128]:
+        for prompt_kl in [0.0, 0.001]:
+            for prompt_stat_source in ["mu", "instance_mean"]:
                 for use_slot_embed in [True, False]:
                     _add_trial(
                         group="graph_off_token_mlp",
                         source="token_mlp",
                         stats_hidden_dim=stats_hidden_dim,
                         prompt_kl=prompt_kl,
-                        eval_sample_mode=eval_sample_mode,
+                        eval_sample_mode="fixed_eps",
                         use_slot_embed=use_slot_embed,
+                        prompt_stat_source=prompt_stat_source,
                         graph_enable=False,
                         rho=0.0,
                         loss_type="none",
                         loss_weight=0.0,
                     )
 
-    _add_trial(
-        group="graph_off_vit_cls_prepass",
-        source="vit_cls_prepass",
-        stats_hidden_dim=16,
-        prompt_kl=0.02,
-        eval_sample_mode="mean",
-        use_slot_embed=False,
-        graph_enable=False,
-        rho=0.0,
-        loss_type="none",
-        loss_weight=0.0,
-    )
+    for stats_hidden_dim in [32, 64, 128]:
+        _add_trial(
+            group="graph_off_vit_cls_prepass",
+            source="vit_cls_prepass",
+            stats_hidden_dim=stats_hidden_dim,
+            prompt_kl=0.0,
+            eval_sample_mode="fixed_eps",
+            use_slot_embed=True,
+            prompt_stat_source="mu",
+            graph_enable=False,
+            rho=0.0,
+            loss_type="none",
+            loss_weight=0.0,
+        )
 
-    for rho in [1.0, 0.0, 0.5]:
+    for rho in [1.0, 0.0]:
         for loss_type in ["acc_hidden", "rel_kl", "rel_all", "ot", "fgw"]:
             _add_trial(
                 group="graph_on_token_mlp",
                 source="token_mlp",
-                stats_hidden_dim=16,
-                prompt_kl=0.02,
-                eval_sample_mode="mean",
-                use_slot_embed=False,
+                stats_hidden_dim=64,
+                prompt_kl=0.0,
+                eval_sample_mode="fixed_eps",
+                use_slot_embed=True,
+                prompt_stat_source="mu",
                 graph_enable=True,
                 rho=rho,
                 loss_type=loss_type,
                 loss_weight=graph_loss_weight,
             )
 
-    _add_trial(
-        group="graph_on_vit_cls_prepass",
-        source="vit_cls_prepass",
-        stats_hidden_dim=16,
-        prompt_kl=0.02,
-        eval_sample_mode="mean",
-        use_slot_embed=False,
-        graph_enable=True,
-        rho=0.0,
-        loss_type="rel_kl",
-        loss_weight=graph_loss_weight,
-    )
+    for rho in [1.0, 0.0]:
+        for loss_type in ["acc_hidden", "rel_kl", "rel_all", "ot", "fgw"]:
+            _add_trial(
+                group="graph_on_vit_cls_prepass",
+                source="vit_cls_prepass",
+                stats_hidden_dim=64,
+                prompt_kl=0.0,
+                eval_sample_mode="fixed_eps",
+                use_slot_embed=True,
+                prompt_stat_source="mu",
+                graph_enable=True,
+                rho=rho,
+                loss_type=loss_type,
+                loss_weight=graph_loss_weight,
+            )
 
     search_space = {
         "config_file": args.config_file,
@@ -531,50 +542,55 @@ def main() -> None:
             "SOLVER.LOSS_PROMPT_KL_WEIGHT",
             "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE",
             "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED",
+            "MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE",
             "MODEL.SEMANTIC_GRAPH.ENABLE",
             "MODEL.SEMANTIC_GRAPH.RHO",
             "MODEL.SEMANTIC_GRAPH.LOSS_TYPE",
         ],
         "groups": {
             "graph_off_token_mlp": {
-                "count": 36,
+                "count": 24,
                 "MODEL.SEMANTIC_GRAPH.ENABLE": False,
                 "MODEL.PROMPT.DISTRIBUTOR.SOURCE": ["token_mlp"],
-                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [4, 16, 64],
-                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.0, 0.02, 0.005],
-                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["mean", "fixed_eps"],
+                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [32, 64, 128],
+                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.0, 0.001],
+                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["fixed_eps"],
                 "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [True, False],
+                "MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE": ["mu", "instance_mean"],
             },
             "graph_off_vit_cls_prepass": {
-                "count": 1,
+                "count": 3,
                 "MODEL.SEMANTIC_GRAPH.ENABLE": False,
                 "MODEL.PROMPT.DISTRIBUTOR.SOURCE": ["vit_cls_prepass"],
-                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [16],
-                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.02],
-                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["mean"],
-                "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [False],
+                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [32, 64, 128],
+                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.0],
+                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["fixed_eps"],
+                "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [True],
+                "MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE": ["mu"],
             },
             "graph_on_token_mlp": {
-                "count": 15,
+                "count": 10,
                 "MODEL.SEMANTIC_GRAPH.ENABLE": True,
                 "MODEL.PROMPT.DISTRIBUTOR.SOURCE": ["token_mlp"],
-                "MODEL.SEMANTIC_GRAPH.RHO": [1.0, 0.0, 0.5],
+                "MODEL.SEMANTIC_GRAPH.RHO": [1.0, 0.0],
                 "MODEL.SEMANTIC_GRAPH.LOSS_TYPE": ["acc_hidden", "rel_kl", "rel_all", "ot", "fgw"],
-                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [16],
-                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.02],
-                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["mean"],
-                "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [False],
+                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [64],
+                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.0],
+                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["fixed_eps"],
+                "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [True],
+                "MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE": ["mu"],
             },
             "graph_on_vit_cls_prepass": {
-                "count": 1,
+                "count": 10,
                 "MODEL.SEMANTIC_GRAPH.ENABLE": True,
                 "MODEL.PROMPT.DISTRIBUTOR.SOURCE": ["vit_cls_prepass"],
-                "MODEL.SEMANTIC_GRAPH.RHO": [0.0],
-                "MODEL.SEMANTIC_GRAPH.LOSS_TYPE": ["rel_kl"],
-                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [16],
-                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.02],
-                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["mean"],
-                "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [False],
+                "MODEL.SEMANTIC_GRAPH.RHO": [1.0, 0.0],
+                "MODEL.SEMANTIC_GRAPH.LOSS_TYPE": ["acc_hidden", "rel_kl", "rel_all", "ot", "fgw"],
+                "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": [64],
+                "SOLVER.LOSS_PROMPT_KL_WEIGHT": [0.0],
+                "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": ["fixed_eps"],
+                "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": [True],
+                "MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE": ["mu"],
             },
         },
         "fixed_graph_setting": {
@@ -602,6 +618,7 @@ def main() -> None:
             "MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS": 16,
             "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": "trial_specific",
             "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": "trial_specific",
+            "MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE": "trial_specific",
             "MODEL.SEMANTIC_GRAPH.ENABLE": "trial_specific",
             "SOLVER.LOSS_PROMPT_KL_WEIGHT": "trial_specific",
             "MODEL.SEMANTIC_GRAPH.OT_EPS": 0.05,
@@ -670,6 +687,7 @@ def main() -> None:
             "domain_tokens": trial["domain_tokens"],
             "eval_sample_mode": trial["eval_sample_mode"],
             "use_slot_embed": trial["use_slot_embed"],
+            "prompt_stat_source": trial["prompt_stat_source"],
             "semantic_graph_enable": trial["semantic_graph_enable"],
             "graph_source": trial["graph_source"],
             "graph_rho": trial["graph_rho"],
