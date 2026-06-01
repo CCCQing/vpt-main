@@ -110,6 +110,7 @@ _C.MODEL.SEMANTIC_GRAPH.TAU_ACC = 0.07                  # 构造语义 target T_
 _C.MODEL.SEMANTIC_GRAPH.TAU_SEM = 0.07                  # rel_kl 中 batch 语义关系 R_s 的 softmax 温度
 _C.MODEL.SEMANTIC_GRAPH.TAU_PROMPT = 0.07               # prompt 关系/原型 logits 的初始温度；若 PROMPT_SCALE_LEARNABLE=True，仅作为初始化
 _C.MODEL.SEMANTIC_GRAPH.PROMPT_SCALE_LEARNABLE = True   # 是否学习 prompt_logit_scale；True 时 scale 初始为 1/TAU_PROMPT
+_C.MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE = "mu"        # semantic graph 约束使用的 prompt 统计量：mu / instance_mean
 _C.MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA = 0.1          # semantic target 与 one-hot 的混合比例；0=纯 one-hot，1=纯语义近邻分布
 _C.MODEL.SEMANTIC_GRAPH.LOSS_TYPE = "none"              # 候选：none / acc_hidden / rel_kl / rel_all / ot / gw / fgw
 _C.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT = 0.0               # 语义图辅助损失总权重；0 表示不参与训练

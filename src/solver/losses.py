@@ -964,10 +964,10 @@ class PromptKLAuxLoss(nn.Module):
 
 class SemanticGraphAuxLoss(nn.Module):
     """
-    prompt distribution center mu 的语义图辅助损失。
+    prompt distribution 统计量的语义图辅助损失。
 
     该损失不依赖 affinity aux，而是读取:
-    - model runtime stats 中的 mu；
+    - model runtime stats 中由 MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE 指定的 prompt 表示；
     - trainer 传入的 targets_global；
     - dataset.class_attributes；
     - trainer 或 dataset 显式传入的 attr_name_embeddings。
@@ -978,6 +978,9 @@ class SemanticGraphAuxLoss(nn.Module):
         self.name = "semantic_graph_loss"
         self.requires_affinity_aux = False
         self.graph_weight = float(cfg.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT)
+        self.prompt_stat_source = str(cfg.MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE)
+        if self.prompt_stat_source not in ("mu", "instance_mean"):
+            raise ValueError("MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE must be mu / instance_mean.")
         self.computer = SemanticGraphLossComputer(cfg)
 
     @property
@@ -996,13 +999,27 @@ class SemanticGraphAuxLoss(nn.Module):
         if not hasattr(model, "get_runtime_prompt_distribution_stats"):
             raise RuntimeError("Semantic graph loss requires model.get_runtime_prompt_distribution_stats().")
         stats = model.get_runtime_prompt_distribution_stats()
-        if not isinstance(stats, Dict) or "mu" not in stats:
-            raise RuntimeError("Semantic graph loss requires runtime prompt distribution stats['mu'].")
+        if not isinstance(stats, Dict):
+            raise RuntimeError("Semantic graph loss requires runtime prompt distribution stats dict.")
+        if self.prompt_stat_source == "mu":
+            if "mu" not in stats:
+                raise RuntimeError("Semantic graph loss with PROMPT_STAT_SOURCE=mu requires stats['mu'].")
+            prompt_stat = stats["mu"]
+        else:
+            if "instance_prompt" not in stats:
+                raise RuntimeError(
+                    "Semantic graph loss with PROMPT_STAT_SOURCE=instance_mean requires stats['instance_prompt']."
+                )
+            instance_prompt = stats["instance_prompt"]
+            if instance_prompt.dim() != 3:
+                raise RuntimeError("stats['instance_prompt'] must be [B, instance_tokens, D].")
+            # instance_mean 让 semantic graph 直接约束实际采样后的 instance prompts 均值。
+            prompt_stat = instance_prompt.mean(dim=1)
 
         # class_attributes 必须由 trainer 从 dataset.class_attributes 传入；
         # attr_name_embeddings 必须由 trainer 或 dataset 显式传入，loss 内部不读路径。
         return self.computer(
-            mu=stats["mu"],
+            mu=prompt_stat,
             targets_global=kwargs["targets_global"],
             class_attributes=kwargs.get("class_attributes", None),
             attr_name_embeddings=kwargs.get("attr_name_embeddings", None),
