@@ -170,7 +170,7 @@ _C.SOLVER.SPV.COMPOSE = "prob"                    # prob (softmax(QsKp) @ softma
 _C.SOLVER.SPV.TARGET = "QpKv"                     # QpKv / QpQv / KpKv
 _C.SOLVER.SPV.METRIC = "kl"                       # mse / kl / cosine
 _C.SOLVER.SPV.NORM = "softmax"                    # "none"raw affinity 直接相乘
-_C.SOLVER.SPV.DETACH = "none"                     # via_prompt / direct / none
+_C.SOLVER.SPV.DETACH = "none"                     # mediated / direct / none
 _C.SOLVER.SPV.LAYERS = []                         # empty means all shared layers
 
 _C.SOLVER.ROUTE_TS = CfgNode()

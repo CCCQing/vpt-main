@@ -83,7 +83,7 @@ SOLVER:
     TARGET: "QpKv"           # QpKv / QpQv / KpKv
     METRIC: "kl"             # mse / kl / cosine
     NORM: "softmax"
-    DETACH: "none"           # via_prompt / direct / none
+    DETACH: "none"           # mediated / direct / none
     LAYERS: []
   ROUTE_TS:
     PROMPT_ENABLE: True

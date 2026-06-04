@@ -312,8 +312,8 @@ def _compute_semantic_prompt_visual_cycle_loss(aux: Optional[Dict[str, Any]], cf
     detach_mode = str(cfg.SOLVER.SPV.DETACH).lower()
     if compose_mode not in {"prob", "raw_then_norm"}:
         raise ValueError(f"Unsupported SOLVER.SPV.COMPOSE='{compose_mode}'. Expected prob / raw_then_norm.")
-    if detach_mode not in {"via_prompt", "direct", "none"}:
-        raise ValueError(f"Unsupported SOLVER.SPV.DETACH='{detach_mode}'. Expected via_prompt / direct / none.")
+    if detach_mode not in {"mediated", "direct", "none"}:
+        raise ValueError(f"Unsupported SOLVER.SPV.DETACH='{detach_mode}'. Expected mediated / direct / none.")
 
     layer_losses = []
     for layer_idx in shared_layers:
@@ -352,7 +352,7 @@ def _compute_semantic_prompt_visual_cycle_loss(aux: Optional[Dict[str, Any]], cf
             via_prompt = _normalize_affinity_for_aux_loss(via_prompt_raw, norm_type, "SOLVER.SPV")
         direct_norm = _normalize_affinity_for_aux_loss(qskv, norm_type, "SOLVER.SPV")
 
-        if detach_mode == "via_prompt":
+        if detach_mode == "mediated":
             loss_i = _semantic_mediated_distance(direct_norm, via_prompt.detach(), metric, "SOLVER.SPV.METRIC")
         elif detach_mode == "direct":
             loss_i = _semantic_mediated_distance(via_prompt, direct_norm.detach(), metric, "SOLVER.SPV.METRIC")

@@ -320,7 +320,7 @@ def main() -> None:
     ap.add_argument("--out-root", default="output/grid_prompt_distribution_47_batch_lr")
     ap.add_argument(
         "--pairs",
-        default="48:0.0009,48:0.001",
+        default="64:0.0012,64:0.0011,64:0.001,64:0.0013,56:0.00105,56:0.001,56:0.0009,56:0.0011",
         help="Comma-separated paired search points in batch_size:lr format.",
     )
     ap.add_argument("--batch-sizes", default="", help="Fallback Cartesian batch sizes when --pairs is empty.")
