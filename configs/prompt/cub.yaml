@@ -55,6 +55,8 @@ MODEL:
     # 新的 block 内 mediated attention correction 分支。
     # 开启时必须关闭 AFFINITY_EVOLUTION，避免层间 evolution 和层内 correction 混在一起。
     # 当前只支持 attention_parallel + visual_block + row_preserve。
+    # 当前代码支持 attention_parallel/block_parallel、visual_block/full_row、row_preserve/block_redistribute。
+    # block_parallel 需要 MLP_POLICY=enter_mlp；full_row 不能配合 block_redistribute。
     ENABLE: False
     SOURCE: "probs"                 # probs / scores
     EXECUTION_MODE: "attention_parallel"

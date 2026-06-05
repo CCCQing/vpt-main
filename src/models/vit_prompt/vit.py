@@ -861,18 +861,20 @@ class PromptedTransformer(Transformer):
         # 未实现的 block_parallel/full_row/block_redistribute 显式报错，不做隐藏兜底。
         if str(self.attention_mediation_cfg.SOURCE) not in {"scores", "probs"}:
             raise ValueError("ATTENTION_MEDIATION.SOURCE must be scores or probs.")
-        if str(self.attention_mediation_cfg.EXECUTION_MODE) != "attention_parallel":
-            raise ValueError("First ATTENTION_MEDIATION implementation supports only EXECUTION_MODE='attention_parallel'.")
+        if str(self.attention_mediation_cfg.EXECUTION_MODE) not in {"attention_parallel", "block_parallel"}:
+            raise ValueError("ATTENTION_MEDIATION.EXECUTION_MODE must be attention_parallel or block_parallel.")
         if str(self.attention_mediation_cfg.MLP_POLICY) not in {"enter_mlp", "skip_mlp"}:
             raise ValueError("ATTENTION_MEDIATION.MLP_POLICY must be enter_mlp or skip_mlp.")
-        if str(self.attention_mediation_cfg.ROUTE_SCOPE) != "visual_block":
-            raise ValueError("First ATTENTION_MEDIATION implementation supports only ROUTE_SCOPE='visual_block'.")
+        if str(self.attention_mediation_cfg.EXECUTION_MODE) == "block_parallel" and str(self.attention_mediation_cfg.MLP_POLICY) != "enter_mlp":
+            raise ValueError("ATTENTION_MEDIATION block_parallel requires MLP_POLICY='enter_mlp'.")
+        if str(self.attention_mediation_cfg.ROUTE_SCOPE) not in {"visual_block", "full_row"}:
+            raise ValueError("ATTENTION_MEDIATION.ROUTE_SCOPE must be visual_block or full_row.")
         if str(self.attention_mediation_cfg.PROMPT_ROUTE) not in {"S_to_P_and_V", "P_to_S_to_V"}:
             raise ValueError("ATTENTION_MEDIATION.PROMPT_ROUTE must be S_to_P_and_V or P_to_S_to_V.")
         if str(self.attention_mediation_cfg.SEMANTIC_ROUTE) not in {"S_to_P_to_V", "P_to_S_and_V"}:
             raise ValueError("ATTENTION_MEDIATION.SEMANTIC_ROUTE must be S_to_P_to_V or P_to_S_and_V.")
-        if str(self.attention_mediation_cfg.MASS_MODE) != "row_preserve":
-            raise ValueError("First ATTENTION_MEDIATION implementation supports only MASS_MODE='row_preserve'.")
+        if str(self.attention_mediation_cfg.MASS_MODE) not in {"row_preserve", "block_redistribute"}:
+            raise ValueError("ATTENTION_MEDIATION.MASS_MODE must be row_preserve or block_redistribute.")
         if str(self.attention_mediation_cfg.PROMPT_DETACH) not in {"mediated", "direct", "none"}:
             raise ValueError("ATTENTION_MEDIATION.PROMPT_DETACH must be mediated / direct / none.")
         if str(self.attention_mediation_cfg.SEMANTIC_DETACH) not in {"via_prompt", "direct", "none"}:
@@ -881,8 +883,8 @@ class PromptedTransformer(Transformer):
             raise ValueError("ATTENTION_MEDIATION.BETA_PROMPT_MASS must be in [0, 1].")
         if not 0.0 <= float(self.attention_mediation_cfg.BETA_SEMANTIC_MASS) <= 1.0:
             raise ValueError("ATTENTION_MEDIATION.BETA_SEMANTIC_MASS must be in [0, 1].")
-        if float(self.attention_mediation_cfg.BETA_PROMPT_MASS) != 0.0 or float(self.attention_mediation_cfg.BETA_SEMANTIC_MASS) != 0.0:
-            raise ValueError("BETA_*_MASS is reserved for block_redistribute; first implementation requires both beta values to be 0.")
+        if str(self.attention_mediation_cfg.ROUTE_SCOPE) == "full_row" and str(self.attention_mediation_cfg.MASS_MODE) == "block_redistribute":
+            raise ValueError("ATTENTION_MEDIATION full_row already builds a full probability row; use MASS_MODE='row_preserve'.")
 
     def _make_attention_mediation_config(self):
         """
@@ -904,6 +906,8 @@ class PromptedTransformer(Transformer):
             "mass_mode": str(self.attention_mediation_cfg.MASS_MODE),
             "prompt_detach": str(self.attention_mediation_cfg.PROMPT_DETACH),
             "semantic_detach": str(self.attention_mediation_cfg.SEMANTIC_DETACH),
+            "beta_prompt_mass": float(self.attention_mediation_cfg.BETA_PROMPT_MASS),
+            "beta_semantic_mass": float(self.attention_mediation_cfg.BETA_SEMANTIC_MASS),
             "prompt_gamma": self.attention_mediation_prompt_gamma,
             "semantic_gamma": self.attention_mediation_semantic_gamma,
         }

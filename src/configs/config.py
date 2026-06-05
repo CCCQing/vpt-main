@@ -175,6 +175,13 @@ _C.MODEL.ATTENTION_MEDIATION.PROMPT_GAMMA_INIT = 0.0
 _C.MODEL.ATTENTION_MEDIATION.SEMANTIC_GAMMA_INIT = 0.0
 _C.MODEL.ATTENTION_MEDIATION.PROMPT_DETACH = "none"       # mediated / direct / none
 _C.MODEL.ATTENTION_MEDIATION.SEMANTIC_DETACH = "none"     # via_prompt / direct / none
+# 当前代码已支持：
+#   EXECUTION_MODE: attention_parallel / block_parallel
+#   ROUTE_SCOPE: visual_block / full_row
+#   MASS_MODE: row_preserve / block_redistribute
+# 约束：
+#   block_parallel 必须配合 MLP_POLICY="enter_mlp"。
+#   full_row 已经构造完整 attention row，因此不能配合 block_redistribute。
 
 _C.MODEL.ADAPTER = CfgNode()
 _C.MODEL.ADAPTER.REDUCATION_FACTOR = 8
