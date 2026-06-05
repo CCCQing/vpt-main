@@ -51,12 +51,23 @@ def _parse_pair_list(raw: str) -> List[Dict[str, object]]:
         s = item.strip()
         if not s:
             continue
-        if ":" not in s:
-            raise ValueError("Pair values must use batch_size:lr format, e.g. 64:0.0006.")
-        batch_raw, lr_raw = s.split(":", 1)
-        vals.append({"batch_size": int(batch_raw.strip()), "base_lr": float(lr_raw.strip())})
+        parts = [part.strip() for part in s.split(":")]
+        if len(parts) != 4:
+            raise ValueError(
+                "Pair values must use batch_size:lr:total_epoch:warmup_epoch format, "
+                "e.g. 64:0.0012:40:3."
+            )
+        batch_raw, lr_raw, total_raw, warmup_raw = parts
+        vals.append(
+            {
+                "batch_size": int(batch_raw),
+                "base_lr": float(lr_raw),
+                "total_epoch": int(total_raw),
+                "warmup_epoch": int(warmup_raw),
+            }
+        )
     if not vals:
-        raise ValueError("Empty batch/lr pair list.")
+        raise ValueError("Empty batch/lr/epoch/warmup pair list.")
     return vals
 
 
@@ -76,19 +87,22 @@ def _format_float_tag(x: float) -> str:
     return s.replace("-", "m").replace(".", "p")
 
 
-def _trial_name(idx: int, batch_size: int, lr: float) -> str:
-    return f"exp{idx:03d}_best47_bs_{batch_size}_lr_{_format_float_tag(lr)}"
+def _trial_name(idx: int, batch_size: int, lr: float, total_epoch: int, warmup_epoch: int) -> str:
+    return (
+        f"exp{idx:03d}_best47_bs_{batch_size}_lr_{_format_float_tag(lr)}"
+        f"_ep_{total_epoch}_warm_{warmup_epoch}"
+    )
 
 
 def _validate_extra_opts(opts: List[str]) -> None:
     if len(opts) % 2 != 0:
         raise ValueError("Extra config overrides must be KEY VALUE pairs.")
-    owned = {"OUTPUT_DIR", "DATA.BATCH_SIZE", "SOLVER.BASE_LR"}
+    owned = {"OUTPUT_DIR", "DATA.BATCH_SIZE", "SOLVER.BASE_LR", "SOLVER.TOTAL_EPOCH", "SOLVER.WARMUP_EPOCH"}
     bad = [item for item in opts if item.strip().upper() in owned]
     if bad:
         raise ValueError(
-            "Do not pass OUTPUT_DIR, DATA.BATCH_SIZE, or SOLVER.BASE_LR through extra opts; "
-            "use --out-root, --batch-sizes, and --lrs."
+            "Do not pass OUTPUT_DIR, DATA.BATCH_SIZE, SOLVER.BASE_LR, SOLVER.TOTAL_EPOCH, "
+            "or SOLVER.WARMUP_EPOCH through extra opts; use the dedicated grid arguments."
         )
 
 
@@ -222,6 +236,8 @@ def _write_summary_csv(path: str, rows: List[Dict[str, object]]) -> None:
         "trial_name",
         "batch_size",
         "base_lr",
+        "total_epoch",
+        "warmup_epoch",
         "source_best_trial",
         "gpu",
         "exit_code",
@@ -320,11 +336,13 @@ def main() -> None:
     ap.add_argument("--out-root", default="output/grid_prompt_distribution_47_batch_lr")
     ap.add_argument(
         "--pairs",
-        default="64:0.0012,64:0.0011,64:0.001,64:0.0013,56:0.00105,56:0.001,56:0.0009,56:0.0011",
-        help="Comma-separated paired search points in batch_size:lr format.",
+        default="",
+        help="Comma-separated paired search points in batch_size:lr:total_epoch:warmup_epoch format.",
     )
-    ap.add_argument("--batch-sizes", default="", help="Fallback Cartesian batch sizes when --pairs is empty.")
-    ap.add_argument("--lrs", default="", help="Fallback Cartesian learning rates when --pairs is empty.")
+    ap.add_argument("--batch-sizes", default="64", help="Fallback Cartesian batch sizes when --pairs is empty.")
+    ap.add_argument("--lrs", default="0.0012,0.00125,0.00115", help="Fallback Cartesian learning rates when --pairs is empty.")
+    ap.add_argument("--total-epochs", default="40,35,45", help="Fallback Cartesian total epochs when --pairs is empty.")
+    ap.add_argument("--warmup-epochs", default="3,5,6", help="Fallback Cartesian warmup epochs when --pairs is empty.")
     ap.add_argument("--gpus", default="", help="Comma-separated GPU ids for parallel server runs, e.g. 0,1.")
     ap.add_argument("--max-workers", type=int, default=1)
     ap.add_argument("--vis-save-raw", default="false", choices=["true", "false"])
@@ -339,15 +357,28 @@ def main() -> None:
 
     if args.pairs.strip():
         trials = _parse_pair_list(args.pairs)
-        batch_sizes = [int(item["batch_size"]) for item in trials]
-        lrs = [float(item["base_lr"]) for item in trials]
+        batch_sizes = list(dict.fromkeys(int(item["batch_size"]) for item in trials))
+        lrs = list(dict.fromkeys(float(item["base_lr"]) for item in trials))
+        total_epochs = list(dict.fromkeys(int(item["total_epoch"]) for item in trials))
+        warmup_epochs = list(dict.fromkeys(int(item["warmup_epoch"]) for item in trials))
     else:
         batch_sizes = _parse_int_list(args.batch_sizes)
         lrs = _parse_float_list(args.lrs)
+        total_epochs = _parse_int_list(args.total_epochs)
+        warmup_epochs = _parse_int_list(args.warmup_epochs)
         trials = []
         for batch_size in batch_sizes:
             for lr in lrs:
-                trials.append({"batch_size": batch_size, "base_lr": lr})
+                for total_epoch in total_epochs:
+                    for warmup_epoch in warmup_epochs:
+                        trials.append(
+                            {
+                                "batch_size": batch_size,
+                                "base_lr": lr,
+                                "total_epoch": total_epoch,
+                                "warmup_epoch": warmup_epoch,
+                            }
+                        )
     gpu_ids = _parse_str_list(args.gpus) if args.gpus.strip() else []
     if args.max_workers <= 0:
         raise ValueError("--max-workers must be positive.")
@@ -368,10 +399,12 @@ def main() -> None:
         "source_best_trial": "exp047_pdgraph_graph_True_src_vit_cls_prepass_h_64_kl_0_eval_fixed_eps_slot_True_stat_mu_rho_0_loss_fgw",
         "source_best_score": {"score_key": "gzsl_h_best", "score": 48.29},
         "total_trials": len(trials),
-        "sweep": ["DATA.BATCH_SIZE", "SOLVER.BASE_LR"],
+        "sweep": ["DATA.BATCH_SIZE", "SOLVER.BASE_LR", "SOLVER.TOTAL_EPOCH", "SOLVER.WARMUP_EPOCH"],
         "pairs": trials,
         "batch_sizes": batch_sizes,
         "lrs": lrs,
+        "total_epochs": total_epochs,
+        "warmup_epochs": warmup_epochs,
         "fixed_setting": {
             "MODEL.PROMPT.BACKEND": "dynamic",
             "MODEL.PROMPT.INIT_SOURCE": "distributor_mean",
@@ -420,7 +453,13 @@ def main() -> None:
     total_trials = len(trials)
 
     def _build_trial(idx: int, trial: Dict[str, object], gpu_id: str = ""):
-        trial_name = _trial_name(idx, int(trial["batch_size"]), float(trial["base_lr"]))
+        trial_name = _trial_name(
+            idx,
+            int(trial["batch_size"]),
+            float(trial["base_lr"]),
+            int(trial["total_epoch"]),
+            int(trial["warmup_epoch"]),
+        )
         trial_root = os.path.join(out_root, trial_name)
         os.makedirs(trial_root, exist_ok=True)
         stdout_path = os.path.join(trial_root, "launcher_stdout.txt")
@@ -436,11 +475,17 @@ def main() -> None:
             str(trial["batch_size"]),
             "SOLVER.BASE_LR",
             str(trial["base_lr"]),
+            "SOLVER.TOTAL_EPOCH",
+            str(trial["total_epoch"]),
+            "SOLVER.WARMUP_EPOCH",
+            str(trial["warmup_epoch"]),
         ]
         row: Dict[str, object] = {
             "trial_name": trial_name,
             "batch_size": trial["batch_size"],
             "base_lr": trial["base_lr"],
+            "total_epoch": trial["total_epoch"],
+            "warmup_epoch": trial["warmup_epoch"],
             "source_best_trial": search_space["source_best_trial"],
             "gpu": gpu_id,
             "exit_code": -1,

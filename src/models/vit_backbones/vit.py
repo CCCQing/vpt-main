@@ -131,7 +131,304 @@ class Attention(nn.Module):
 
         return query_layer, key_layer, value_layer
 
-    def _scaled_attention(self, query_layer, key_layer, value_layer, semantic_length: int = 0, block_s_to_cls: bool = False):
+    def _merge_heads(self, context_layer: torch.Tensor) -> torch.Tensor:
+        """
+        将多头上下文从 [B, H, N, Dh] 合并回 [B, N, D]。
+
+        attention mediation 会额外构造一份 delta_context，它和标准 MHSA
+        的 context_layer 具有同样的多头形状，因此复用这一段合并逻辑。
+        """
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+        return context_layer.view(*new_context_layer_shape)
+
+    def _context_to_attention_output(self, context_layer: torch.Tensor, *, include_bias: bool = True) -> torch.Tensor:
+        """
+        把 [B, H, N, Dh] 的 attention context 变成标准 attention 输出 [B, N, D]。
+
+        include_bias=True:
+            标准 MHSA 主路径，完整经过 self.out 的 weight+bias。
+        include_bias=False:
+            mediated 分支只表示“修正量 delta”，不能额外叠加一次 out bias，
+            否则即使 delta_context 很小也会引入固定偏置，破坏“只修正注意力分布”的语义。
+        """
+        context_layer = self._merge_heads(context_layer)
+        if include_bias:
+            attention_output = self.out(context_layer)
+        else:
+            attention_output = torch.nn.functional.linear(context_layer, self.out.weight, None)
+        return self.proj_dropout(attention_output)
+
+    @staticmethod
+    def _row_normalize(x: torch.Tensor, dim: int, eps: float = 1e-8) -> torch.Tensor:
+        """
+        对局部 attention 子块做行归一化。
+
+        这里不使用 softmax，因为 SOURCE="probs" 时输入已经是 full softmax
+        后的概率子块；此时只需要在局部区域内转成条件分布。
+        """
+        return x / x.sum(dim=dim, keepdim=True).clamp_min(eps)
+
+    @staticmethod
+    def _route_detach(direct: torch.Tensor, mediated: torch.Tensor, detach_mode: str) -> torch.Tensor:
+        """
+        根据 teacher/student 设定选择最终写回 visual block 的条件路由。
+
+        mediated / via_prompt:
+            使用 mediated route 的前向值，但 detach 掉 mediated 分支梯度。
+            适合把 mediated route 当 teacher，只让后续 gamma / token 状态承受影响。
+        direct:
+            保持 direct route，不进行 mediated 前向替换。
+            这一版不制造“前向为 mediated、梯度走 direct”的隐式技巧，避免语义不清。
+        none:
+            直接使用 mediated route，并允许梯度沿 mediated route 回传。
+        """
+        if detach_mode in {"mediated", "via_prompt"}:
+            return mediated.detach()
+        if detach_mode == "direct":
+            return direct
+        if detach_mode == "none":
+            return mediated
+        raise ValueError(f"Unsupported attention mediation detach mode='{detach_mode}'.")
+
+    def _conditional_normalize(self, x: torch.Tensor, dim: int, source: str) -> torch.Tensor:
+        """
+        将局部子块转成条件分布。
+
+        SOURCE="scores":
+            子块来自 softmax 前 logits，因此用 softmax 得到局部条件分布。
+        SOURCE="probs":
+            子块来自 full attention softmax 后的真实概率，因此只做局部行归一化。
+        """
+        if source == "scores":
+            return torch.softmax(x, dim=dim)
+        if source == "probs":
+            return self._row_normalize(x, dim=dim)
+        raise ValueError(f"Unsupported ATTENTION_MEDIATION.SOURCE='{source}'. Expected scores / probs.")
+
+    def _attention_mediation_slices(self, seq_len: int, prompt_length: int, semantic_length: int) -> Dict[str, slice]:
+        """
+        根据当前主序列布局切分 token 区间。
+
+        当前项目固定布局为:
+            [CLS | prompt_tokens | visual_tokens | semantic_tokens]
+        mediated attention 只在 prompt/semantic 到 visual 的子块上做修正，
+        因此这里必须明确得到 P/V/S 三段 slice。
+        """
+        prompt_length = int(prompt_length)
+        semantic_length = int(semantic_length)
+        if prompt_length <= 0:
+            raise ValueError("ATTENTION_MEDIATION requires prompt_length > 0.")
+        if semantic_length <= 0:
+            raise ValueError("ATTENTION_MEDIATION requires semantic_length > 0.")
+        if seq_len <= 1 + prompt_length + semantic_length:
+            raise ValueError(
+                f"ATTENTION_MEDIATION requires visual tokens, got seq_len={seq_len}, "
+                f"prompt_length={prompt_length}, semantic_length={semantic_length}."
+            )
+        prompt_start = 1
+        prompt_end = prompt_start + prompt_length
+        visual_start = prompt_end
+        visual_end = seq_len - semantic_length
+        return {
+            "prompt": slice(prompt_start, prompt_end),
+            "visual": slice(visual_start, visual_end),
+            "semantic": slice(visual_end, seq_len),
+        }
+
+    def _build_prompt_mediated_visual(
+        self,
+        route_base: torch.Tensor,
+        attention_probs: torch.Tensor,
+        prompt_slice: slice,
+        visual_slice: slice,
+        semantic_slice: slice,
+        source: str,
+        route: str,
+        detach_mode: str,
+    ) -> torch.Tensor:
+        """
+        构造 prompt -> visual 的 mediated visual 子块。
+
+        输出形状:
+            [B, H, P, V]
+
+        支持两种 prompt route:
+            S_to_P_and_V:
+                P <- S -> V。先看 semantic 如何解释 prompt，再看 semantic 如何看 visual。
+            P_to_S_to_V:
+                P -> S -> V。prompt 先路由到 semantic，再由 semantic 路由到 visual。
+
+        row_preserve 策略:
+            只改变每个 prompt 在 visual patch 内部的分配位置；
+            每个 prompt 原本分给 visual 区域的总 attention mass 保持不变。
+        """
+        a_sp = route_base[:, :, semantic_slice, prompt_slice]
+        a_ps = route_base[:, :, prompt_slice, semantic_slice]
+        a_sv = route_base[:, :, semantic_slice, visual_slice]
+        # semantic -> visual 的条件分布，是两种 prompt mediated route 的共同尾段。
+        sv_cond = self._conditional_normalize(a_sv, dim=-1, source=source)
+        if route == "S_to_P_and_V":
+            # A_SP: [B,H,S,P]。在 S 维归一化后转置，得到每个 prompt 被哪些 semantic slot 解释。
+            sp_cond = self._conditional_normalize(a_sp, dim=-2, source=source)
+            mediated_base = torch.matmul(sp_cond.transpose(-1, -2), sv_cond)
+        elif route == "P_to_S_to_V":
+            # A_PS: [B,H,P,S]。prompt 先选择 semantic slot，再通过 semantic -> visual 到达 patch。
+            ps_cond = self._conditional_normalize(a_ps, dim=-1, source=source)
+            mediated_base = torch.matmul(ps_cond, sv_cond)
+        else:
+            raise ValueError(
+                f"Unsupported ATTENTION_MEDIATION.PROMPT_ROUTE='{route}'. "
+                "Expected S_to_P_and_V / P_to_S_to_V."
+            )
+        # direct_pv_probs 来自 full softmax 后的真实 P->V 概率子块，用它提供原始 visual mass。
+        direct_pv_probs = attention_probs[:, :, prompt_slice, visual_slice]
+        direct_pv_mass = direct_pv_probs.sum(dim=-1, keepdim=True)
+        direct_pv_cond = self._row_normalize(direct_pv_probs, dim=-1)
+        mediated_pv_cond = self._row_normalize(mediated_base, dim=-1)
+        # detach_mode 只决定使用 direct 还是 mediated 条件分布，以及 mediated 是否截断梯度。
+        prompt_route = self._route_detach(direct_pv_cond, mediated_pv_cond, detach_mode)
+        return prompt_route * direct_pv_mass
+
+    def _build_semantic_mediated_visual(
+        self,
+        route_base: torch.Tensor,
+        attention_probs: torch.Tensor,
+        prompt_slice: slice,
+        visual_slice: slice,
+        semantic_slice: slice,
+        source: str,
+        route: str,
+        detach_mode: str,
+    ) -> torch.Tensor:
+        """
+        构造 semantic -> visual 的 mediated visual 子块。
+
+        输出形状:
+            [B, H, S, V]
+
+        支持两种 semantic route:
+            S_to_P_to_V:
+                S -> P -> V。semantic 先路由到 prompt，再由 prompt 路由到 visual。
+            P_to_S_and_V:
+                S <- P -> V。反向解释 P->S，让 semantic 借 prompt 的 visual evidence。
+
+        与 prompt route 一样，这里第一版只做 row_preserve：
+            保持每个 semantic token 原本分给 visual 区域的总 mass 不变。
+        """
+        a_sp = route_base[:, :, semantic_slice, prompt_slice]
+        a_ps = route_base[:, :, prompt_slice, semantic_slice]
+        a_pv = route_base[:, :, prompt_slice, visual_slice]
+        # prompt -> visual 的条件分布，是 semantic mediated route 的 visual evidence 来源。
+        pv_cond = self._conditional_normalize(a_pv, dim=-1, source=source)
+        if route == "S_to_P_to_V":
+            # semantic 先选择 prompt，再沿 prompt -> visual 到达 patch。
+            sp_cond = self._conditional_normalize(a_sp, dim=-1, source=source)
+            mediated_base = torch.matmul(sp_cond, pv_cond)
+        elif route == "P_to_S_and_V":
+            # A_PS: [B,H,P,S]。在 P 维归一化后转置，得到每个 semantic 可由哪些 prompt 支持。
+            ps_cond = self._conditional_normalize(a_ps, dim=-2, source=source)
+            mediated_base = torch.matmul(ps_cond.transpose(-1, -2), pv_cond)
+        else:
+            raise ValueError(
+                f"Unsupported ATTENTION_MEDIATION.SEMANTIC_ROUTE='{route}'. "
+                "Expected S_to_P_to_V / P_to_S_and_V."
+            )
+        # direct_sv_probs 提供原始 S->V 的 visual mass；mediated route 只改 visual 内部位置。
+        direct_sv_probs = attention_probs[:, :, semantic_slice, visual_slice]
+        direct_sv_mass = direct_sv_probs.sum(dim=-1, keepdim=True)
+        direct_sv_cond = self._row_normalize(direct_sv_probs, dim=-1)
+        mediated_sv_cond = self._row_normalize(mediated_base, dim=-1)
+        semantic_route = self._route_detach(direct_sv_cond, mediated_sv_cond, detach_mode)
+        return semantic_route * direct_sv_mass
+
+    def _compute_attention_mediation(
+        self,
+        attention_scores: torch.Tensor,
+        attention_probs: torch.Tensor,
+        value_layer: torch.Tensor,
+        prompt_length: int,
+        semantic_length: int,
+        mediation_config: Dict[str, Any],
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        """
+        在当前层 MHSA 内部构造 mediated attention correction。
+
+        输入:
+            attention_scores: full QK logits，softmax 前。
+            attention_probs:  full attention 概率，softmax 后、dropout 前。
+            value_layer:      当前层真实 V 投影。
+
+        第一版实现范围:
+            - attention_parallel: 只复制 attention 级别的计算，不复制完整 block。
+            - visual_block:      只替换 P->V 与 S->V 两个 visual 子块。
+            - row_preserve:      每个 P/S token 分给 visual 的总 mass 保持不变。
+
+        输出:
+            delta_attention_output: [B,N,D]，表示 mediated_probs 与原始 probs 的差异经过 V 和 out projection 后的修正量。
+            prompt_slice/semantic_slice: 供 Block 只把 gamma 作用到 P/S token。
+        """
+        if not mediation_config or not mediation_config.get("enable", False):
+            return None
+        if mediation_config.get("execution_mode") != "attention_parallel":
+            raise ValueError("ATTENTION_MEDIATION first implementation supports only EXECUTION_MODE='attention_parallel'.")
+        if mediation_config.get("route_scope") != "visual_block":
+            raise ValueError("ATTENTION_MEDIATION first implementation supports only ROUTE_SCOPE='visual_block'.")
+        if mediation_config.get("mass_mode") != "row_preserve":
+            raise ValueError("ATTENTION_MEDIATION first implementation supports only MASS_MODE='row_preserve'.")
+
+        source = str(mediation_config.get("source"))
+        slices = self._attention_mediation_slices(attention_probs.size(-1), prompt_length, semantic_length)
+        prompt_slice = slices["prompt"]
+        visual_slice = slices["visual"]
+        semantic_slice = slices["semantic"]
+        route_base = attention_scores if source == "scores" else attention_probs
+
+        # 从原始 full attention 概率复制一份，只替换 prompt/semantic 到 visual 的局部子块。
+        # 非 visual 区域保持原始分布，因此 row_preserve 下完整 row 的概率和仍为 1。
+        modified_probs = attention_probs.clone()
+        modified_probs[:, :, prompt_slice, visual_slice] = self._build_prompt_mediated_visual(
+            route_base,
+            attention_probs,
+            prompt_slice,
+            visual_slice,
+            semantic_slice,
+            source,
+            str(mediation_config.get("prompt_route")),
+            str(mediation_config.get("prompt_detach")),
+        )
+        modified_probs[:, :, semantic_slice, visual_slice] = self._build_semantic_mediated_visual(
+            route_base,
+            attention_probs,
+            prompt_slice,
+            visual_slice,
+            semantic_slice,
+            source,
+            str(mediation_config.get("semantic_route")),
+            str(mediation_config.get("semantic_detach")),
+        )
+
+        # delta_probs 只表示 mediated route 对原始 attention 概率的改变量。
+        # 后续乘当前层真实 value_layer，使修正量和标准 MHSA 处于同一特征空间。
+        delta_probs = modified_probs - attention_probs
+        delta_context = torch.matmul(delta_probs, value_layer)
+        delta_attention_output = self._context_to_attention_output(delta_context, include_bias=False)
+        return {
+            "delta_attention_output": delta_attention_output,
+            "prompt_slice": prompt_slice,
+            "semantic_slice": semantic_slice,
+        }
+
+    def _scaled_attention(
+        self,
+        query_layer,
+        key_layer,
+        value_layer,
+        semantic_length: int = 0,
+        block_s_to_cls: bool = False,
+        mediation_config: Optional[Dict[str, Any]] = None,
+        prompt_length: int = 0,
+    ):
         """
         缩放点积注意力的核心计算部分。
 
@@ -156,6 +453,7 @@ class Attention(nn.Module):
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         semantic_length = int(semantic_length)
         if block_s_to_cls and semantic_length > 0:
+            # semantic token 作为 query 时禁止读取 CLS；只改 logits，随后仍由 full softmax 统一归一化。
             if attention_scores.size(-1) <= semantic_length:
                 raise ValueError(
                     f"Cannot apply S->CLS attention mask with semantic_length={semantic_length} "
@@ -166,17 +464,22 @@ class Attention(nn.Module):
 
         attention_probs = self.softmax(attention_scores) # B, num_head, num_patches(query), num_patches(key) # 行归一化
         weights = attention_probs if self.vis else None     # 用于可视化
+        # ATTENTION_MEDIATION 的介入点在 softmax 之后、attention dropout 之前。
+        # 这样既能拿到 score/prob 两种来源，也能保证 correction 使用未 dropout 的完整注意力分布。
+        mediation = self._compute_attention_mediation(
+            attention_scores,
+            attention_probs,
+            value_layer,
+            prompt_length,
+            semantic_length,
+            mediation_config,
+        )
         attention_probs = self.attn_dropout(attention_probs)
 
+        # 标准 MHSA 主路径不被替换；mediated correction 作为额外 delta 在 Block.forward 中合并。
         context_layer = torch.matmul(attention_probs, value_layer)
-        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()  # [B, N, h, d_k]
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,) # [B, N, D]
-        context_layer = context_layer.view(*new_context_layer_shape)
-
-        # 输出线性映射 + dropout
-        attention_output = self.out(context_layer)  # [B, N, D]
-        attention_output = self.proj_dropout(attention_output)
-        return attention_output, weights
+        attention_output = self._context_to_attention_output(context_layer, include_bias=True)
+        return attention_output, weights, mediation
 
     @staticmethod
     def _minmax_normalize_lastdim(x: torch.Tensor) -> torch.Tensor:
@@ -185,28 +488,52 @@ class Attention(nn.Module):
         x_max = x.amax(dim=-1, keepdim=True)
         denom = (x_max - x_min).clamp_min(1e-12)
         return (x - x_min) / denom
-    def forward(self, hidden_states, semantic_length: int = 0, block_s_to_cls: bool = False):
+    def forward(
+        self,
+        hidden_states,
+        semantic_length: int = 0,
+        block_s_to_cls: bool = False,
+        mediation_config: Optional[Dict[str, Any]] = None,
+        prompt_length: int = 0,
+    ):
         """
         对整段序列执行标准 self-attention 前向。
 
         返回 attention 输出及（可选）注意力权重，兼容原有调用路径。
         """
         query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
-        return self._scaled_attention(query_layer, key_layer, value_layer, semantic_length, block_s_to_cls)
+        return self._scaled_attention(
+            query_layer,
+            key_layer,
+            value_layer,
+            semantic_length,
+            block_s_to_cls,
+            mediation_config,
+            prompt_length,
+        )
 
-    def forward_with_projections(self, hidden_states, semantic_length: int = 0, block_s_to_cls: bool = False):
+    def forward_with_projections(
+        self,
+        hidden_states,
+        semantic_length: int = 0,
+        block_s_to_cls: bool = False,
+        mediation_config: Optional[Dict[str, Any]] = None,
+        prompt_length: int = 0,
+    ):
         """
         在返回 self-attention 输出的同时，额外暴露多头形式的 q/k。
 
         供亲和矩阵等附加分支复用，避免重复线性映射计算。
         """
         query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
-        attention_output, weights = self._scaled_attention(
+        attention_output, weights, mediation = self._scaled_attention(
             query_layer,
             key_layer,
             value_layer,
             semantic_length,
             block_s_to_cls,
+            mediation_config,
+            prompt_length,
         )
         if self.debug_shapes and (not self._shape_debug_forward_proj_logged):
             print(
@@ -217,7 +544,7 @@ class Attention(nn.Module):
                 )
             )
             self._shape_debug_forward_proj_logged = True
-        return attention_output, weights, query_layer, key_layer
+        return attention_output, weights, query_layer, key_layer, mediation
 
     def compute_prompt_visual_monitors(self, query_layer, key_layer, prompt_length, semantic_length=0, *, detach=True):
         """
@@ -386,6 +713,51 @@ class Block(nn.Module):
         self.ffn = Mlp(config)                  # 段2的两层 MLP（D→H→D，通常 H≈4D），完成通道内的非线性变换
         self.attn = Attention(config, vis)      # 段1的多头自注意力
         self.debug_shapes = False
+
+    @staticmethod
+    def _attention_mediation_gamma(config: Dict[str, Any], name: str, layer_idx: int, ref: torch.Tensor) -> torch.Tensor:
+        """
+        取当前层的 gamma gate，并整理成可广播到 [B,N,D] 的形状。
+
+        attention mediation 是“当前层内”的修正，因此 gamma 长度等于 ViT block 数；
+        这和旧 affinity_evolution 的“层间”更新不同，旧分支通常只有 num_layers-1 个 gamma。
+        """
+        if name not in config:
+            raise ValueError(f"ATTENTION_MEDIATION missing gamma field: {name}.")
+        gamma = config[name]
+        if torch.is_tensor(gamma):
+            if gamma.dim() == 0:
+                return gamma.to(device=ref.device, dtype=ref.dtype).view(1, 1, 1)
+            return gamma[int(layer_idx)].to(device=ref.device, dtype=ref.dtype).view(1, 1, 1)
+        return torch.tensor(float(gamma), device=ref.device, dtype=ref.dtype).view(1, 1, 1)
+
+    def _scale_attention_mediation_delta(
+        self,
+        delta: torch.Tensor,
+        mediation: Optional[Dict[str, Any]],
+        config: Optional[Dict[str, Any]],
+        layer_idx: int,
+    ) -> Optional[torch.Tensor]:
+        """
+        只把 mediated attention correction 写到 prompt / semantic token。
+
+        delta_attention_output 本身是 [B,N,D]，但新分支的目的不是改 CLS 或 visual patch
+        主路径，而是让 P/S token 获得 mediated route 修正。因此这里创建全零张量，
+        只在 prompt_slice 和 semantic_slice 上乘各自 gamma 后写入。
+        """
+        if mediation is None:
+            return None
+        if not config or not config.get("enable", False):
+            return None
+        prompt_slice = mediation["prompt_slice"]
+        semantic_slice = mediation["semantic_slice"]
+        gamma_prompt = self._attention_mediation_gamma(config, "prompt_gamma", layer_idx, delta)
+        gamma_semantic = self._attention_mediation_gamma(config, "semantic_gamma", layer_idx, delta)
+        scaled = torch.zeros_like(delta)
+        scaled[:, prompt_slice, :] = gamma_prompt * delta[:, prompt_slice, :]
+        scaled[:, semantic_slice, :] = gamma_semantic * delta[:, semantic_slice, :]
+        return scaled
+
     def forward(
         self,
         x,
@@ -393,11 +765,32 @@ class Block(nn.Module):
         num_prompt_tokens: int = 0,
         semantic_length: int = 0,
         block_s_to_cls: bool = False,
+        attention_mediation_config: Optional[Dict[str, Any]] = None,
+        layer_idx: int = 0,
     ):
         # 段1：注意力 + 残差
         h = x  # 残差分支
         x = self.attention_norm(x)  # LN
-        x, weights = self.attn(x, semantic_length, block_s_to_cls)   # MHSA（输出同形状）; weights 仅在 vis=True 时非 None
+        # Attention 内部会先计算原始 MHSA；如果开启 ATTENTION_MEDIATION，
+        # 会额外返回一份基于 mediated route 的 delta_attention_output。
+        x, weights, mediation = self.attn(
+            x,
+            semantic_length,
+            block_s_to_cls,
+            attention_mediation_config,
+            num_prompt_tokens,
+        )   # MHSA（输出同形状）; weights 仅在 vis=True 时非 None
+        scaled_delta = self._scale_attention_mediation_delta(
+            mediation["delta_attention_output"] if mediation is not None else None,
+            mediation,
+            attention_mediation_config,
+            layer_idx,
+        )
+        mlp_policy = attention_mediation_config.get("mlp_policy") if attention_mediation_config else None
+        if scaled_delta is not None and mlp_policy == "enter_mlp":
+            # enter_mlp：在 attention output 阶段合并 mediated correction，
+            # 后续 FFN 会看到修正后的 P/S token，属于更强的 block 内介入。
+            x = x + scaled_delta
         x = x + h                   # 残差相加
 
         # 段2：FFN + 残差
@@ -405,10 +798,22 @@ class Block(nn.Module):
         x = self.ffn_norm(x)        # LN
         x = self.ffn(x)             # MLP: D→H→D
         x = x + h                   # 残差相加
+        if scaled_delta is not None and mlp_policy == "skip_mlp":
+            # skip_mlp：原始 block 完整结束后再写回 P/S residual。
+            # 当前层 FFN 不处理 mediated 修改，更接近旧层间 residual controller。
+            x = x + scaled_delta
 
         return x, weights, semantics
 
-    def forward_with_affinity(self, x, affinity_config, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
+    def forward_with_affinity(
+        self,
+        x,
+        affinity_config,
+        semantics: torch.Tensor = None,
+        num_prompt_tokens: int = 0,
+        attention_mediation_config: Optional[Dict[str, Any]] = None,
+        layer_idx: int = 0,
+    ):
         """
         带亲和矩阵输出的前向：
 
@@ -441,11 +846,23 @@ class Block(nn.Module):
         h = x
         x_norm = self.attention_norm(x)
         # 同时拿到 MHSA 输出 + 多头形式的 q_proj / k_proj
-        x, weights, q_proj, k_proj = self.attn.forward_with_projections(
+        x, weights, q_proj, k_proj, mediation = self.attn.forward_with_projections(
             x_norm,
             affinity_config.get("semantic_length", 0),
             affinity_config.get("block_s_to_cls", False),
+            attention_mediation_config,
+            num_prompt_tokens,
         )
+        scaled_delta = self._scale_attention_mediation_delta(
+            mediation["delta_attention_output"] if mediation is not None else None,
+            mediation,
+            attention_mediation_config,
+            layer_idx,
+        )
+        mlp_policy = attention_mediation_config.get("mlp_policy") if attention_mediation_config else None
+        if scaled_delta is not None and mlp_policy == "enter_mlp":
+            # 与标准 forward 保持同一插入点：attention output 合并后再进入残差和 FFN。
+            x = x + scaled_delta
         x = x + h
 
         # --- FFN 分支 + 残差 ---
@@ -453,6 +870,9 @@ class Block(nn.Module):
         x = self.ffn_norm(x)
         x = self.ffn(x)
         x = x + h
+        if scaled_delta is not None and mlp_policy == "skip_mlp":
+            # affinity monitor 路径也保留同样的 skip_mlp 语义，避免训练/可视化前向不一致。
+            x = x + scaled_delta
 
         # --- 基于 Q/K 计算 prompt/patch 亲和 ---
         attn_aff = self.attn.compute_prompt_visual_monitors(
@@ -526,18 +946,28 @@ class Encoder(nn.Module):
         num_prompt_tokens: int = 0,
         semantic_length: int = 0,
         block_s_to_cls: bool = False,
+        attention_mediation_config: Optional[Dict[str, Any]] = None,
     ):
         """常规前向：返回编码结果与（可选）各层注意力权重。"""
         attn_weights = []
-        for layer_block in self.layer:
+        for layer_idx, layer_block in enumerate(self.layer):
+            # attention_mediation_config 在所有层共享，layer_idx 用于取当前层独立的 gamma gate。
             hidden_states, weights, semantics = layer_block(hidden_states, semantics,
-                    num_prompt_tokens, semantic_length, block_s_to_cls)  # hidden_states为(B, 1+N, D)D 为 hidden_size
+                    num_prompt_tokens, semantic_length, block_s_to_cls,
+                    attention_mediation_config, layer_idx)  # hidden_states为(B, 1+N, D)D 为 hidden_size
             if self.vis:
                 attn_weights.append(weights)    # 把每层的 weights 保存到列表里否则返回空列表
         encoded = self.encoder_norm(hidden_states)  # 对最后一层输出再做一次 LayerNorm，得到 encoded
         return encoded, attn_weights
 
-    def forward_with_affinity(self, hidden_states, affinity_config, semantics: torch.Tensor = None, num_prompt_tokens: int = 0):
+    def forward_with_affinity(
+        self,
+        hidden_states,
+        affinity_config,
+        semantics: torch.Tensor = None,
+        num_prompt_tokens: int = 0,
+        attention_mediation_config: Optional[Dict[str, Any]] = None,
+    ):
         """
         与标准 Encoder.forward 类似，但在遍历每一层 Block 时，
         额外收集该层的 prompt/patch 亲和矩阵。
@@ -562,8 +992,16 @@ class Encoder(nn.Module):
         """
         attn_weights = []
         affinities = []
-        for layer_block in self.layer:
-            hidden_states, weights, affinity, semantics = layer_block.forward_with_affinity(hidden_states, affinity_config, semantics, num_prompt_tokens)
+        for layer_idx, layer_block in enumerate(self.layer):
+            # forward_with_affinity 同时服务训练损失/可视化，因此 mediation 的插入点必须和常规 forward 一致。
+            hidden_states, weights, affinity, semantics = layer_block.forward_with_affinity(
+                hidden_states,
+                affinity_config,
+                semantics,
+                num_prompt_tokens,
+                attention_mediation_config,
+                layer_idx,
+            )
             if self.vis:
                 attn_weights.append(weights)
             affinities.append(affinity)

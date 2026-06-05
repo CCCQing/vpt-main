@@ -51,6 +51,25 @@ MODEL:
     SEMANTIC_DETACH: "direct"
     SEMANTIC_COMPOSE: "prob"
 
+  ATTENTION_MEDIATION:
+    # 新的 block 内 mediated attention correction 分支。
+    # 开启时必须关闭 AFFINITY_EVOLUTION，避免层间 evolution 和层内 correction 混在一起。
+    # 第一版只支持 attention_parallel + visual_block + row_preserve。
+    ENABLE: False
+    SOURCE: "probs"                 # probs / scores
+    EXECUTION_MODE: "attention_parallel"
+    MLP_POLICY: "enter_mlp"         # enter_mlp / skip_mlp
+    ROUTE_SCOPE: "visual_block"
+    PROMPT_ROUTE: "S_to_P_and_V"    # S_to_P_and_V / P_to_S_to_V
+    SEMANTIC_ROUTE: "S_to_P_to_V"   # S_to_P_to_V / P_to_S_and_V
+    MASS_MODE: "row_preserve"
+    BETA_PROMPT_MASS: 0.0
+    BETA_SEMANTIC_MASS: 0.0
+    PROMPT_GAMMA_INIT: 0.0
+    SEMANTIC_GAMMA_INIT: 0.0
+    PROMPT_DETACH: "none"           # mediated / direct / none
+    SEMANTIC_DETACH: "none"         # via_prompt / direct / none
+
   R_SIMILARITY:
     ENABLE: True
     USE_COSINE: True

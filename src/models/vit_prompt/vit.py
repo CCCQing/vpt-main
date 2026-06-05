@@ -611,6 +611,8 @@ class PromptedTransformer(Transformer):
         self.block_s_to_cls = bool(self.semantic_tokens_cfg.BLOCK_S_TO_CLS)
         self.affinity_evolution_cfg = prompt_config.AFFINITY_EVOLUTION
         self.affinity_evolution_enable = bool(self.affinity_evolution_cfg.ENABLE)
+        self.attention_mediation_cfg = prompt_config.ATTENTION_MEDIATION
+        self.attention_mediation_enable = bool(self.attention_mediation_cfg.ENABLE)
         self.prompt_enable = bool(prompt_config.ENABLE)
         self.prompt_backend = prompt_config.BACKEND.lower()
         if self.prompt_backend not in {"dynamic", "vpt_deep"}:
@@ -666,6 +668,10 @@ class PromptedTransformer(Transformer):
         self.affinity_evolution_prompt_gamma = None
         self.affinity_evolution_semantic_gamma = None
         self._affinity_evolution_scale_logged = False
+        # 新增的 ATTENTION_MEDIATION 分支不在这里构造 route。
+        # PromptedTransformer 只保存每层的可学习 gamma gate，并把配置传给 ViT block 内部执行。
+        self.attention_mediation_prompt_gamma = None
+        self.attention_mediation_semantic_gamma = None
 
         # 运行期 debug 配置
         self.debug_shapes = bool(self.prompt_config.DEBUG_SHAPES)
@@ -691,6 +697,7 @@ class PromptedTransformer(Transformer):
 
         # 把 shape debug 开关同步到语义分支与编码器各层
         self._validate_affinity_evolution_config()
+        self._validate_attention_mediation_config()
 
         if self.semantic_token_projector is not None:
             # orthogonal tokenizer 允许单独打开语义 token 形状调试。
@@ -767,6 +774,33 @@ class PromptedTransformer(Transformer):
                 self.deep_prompt_embeddings = nn.Parameter(torch.zeros(total_d_layer, num_tokens, prompt_dim))
                 nn.init.uniform_(self.deep_prompt_embeddings.data, -val, val)
 
+        if self.attention_mediation_enable:
+            # attention mediation 是“当前 block 内”的注意力修正，因此每一层 ViT block 都有独立 gamma。
+            # gamma 初始化为 0 时，mediated correction 初始不影响前向，训练中再逐步学习是否打开。
+            self.attention_mediation_prompt_gamma = nn.Parameter(
+                torch.full((num_layers,), float(self.attention_mediation_cfg.PROMPT_GAMMA_INIT))
+            )
+            self.attention_mediation_semantic_gamma = nn.Parameter(
+                torch.full((num_layers,), float(self.attention_mediation_cfg.SEMANTIC_GAMMA_INIT))
+            )
+            # 这条日志用于从训练 stdout 中区分新分支 ATTENTION_MEDIATION 与旧层间 AFFINITY_EVOLUTION。
+            logger.info(
+                "[attention-mediation] enable=True source=%s execution=%s mlp_policy=%s route_scope=%s "
+                "prompt_route=%s semantic_route=%s mass_mode=%s prompt_gamma_init=%.6g semantic_gamma_init=%.6g "
+                "prompt_detach=%s semantic_detach=%s",
+                str(self.attention_mediation_cfg.SOURCE),
+                str(self.attention_mediation_cfg.EXECUTION_MODE),
+                str(self.attention_mediation_cfg.MLP_POLICY),
+                str(self.attention_mediation_cfg.ROUTE_SCOPE),
+                str(self.attention_mediation_cfg.PROMPT_ROUTE),
+                str(self.attention_mediation_cfg.SEMANTIC_ROUTE),
+                str(self.attention_mediation_cfg.MASS_MODE),
+                float(self.attention_mediation_cfg.PROMPT_GAMMA_INIT),
+                float(self.attention_mediation_cfg.SEMANTIC_GAMMA_INIT),
+                str(self.attention_mediation_cfg.PROMPT_DETACH),
+                str(self.attention_mediation_cfg.SEMANTIC_DETACH),
+            )
+
     def _validate_affinity_evolution_config(self):
         if not self.affinity_evolution_enable:
             return
@@ -798,6 +832,81 @@ class PromptedTransformer(Transformer):
             raise ValueError("AFFINITY_EVOLUTION.PROMPT_LAMBDA must be in [0, 1].")
         if not 0.0 <= float(self.affinity_evolution_cfg.SEMANTIC_LAMBDA) <= 1.0:
             raise ValueError("AFFINITY_EVOLUTION.SEMANTIC_LAMBDA must be in [0, 1].")
+
+    def _validate_attention_mediation_config(self):
+        """
+        校验 block 内 mediated attention correction 的实验边界。
+
+        这条新分支和旧 AFFINITY_EVOLUTION 的作用位置不同：
+            - AFFINITY_EVOLUTION 使用上一层 affinity，在层间更新 prompt/semantic token；
+            - ATTENTION_MEDIATION 使用当前层真实 attention score/prob，在 block 内生成修正量。
+        两者第一版强制互斥，避免同一实验同时改变“层间状态”和“层内注意力”两个因素。
+        """
+        if not self.attention_mediation_enable:
+            return
+        if self.affinity_evolution_enable:
+            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE and MODEL.AFFINITY_EVOLUTION.ENABLE must not be enabled together.")
+        if not self.prompt_enable:
+            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE requires MODEL.PROMPT.ENABLE=True.")
+        if not bool(self.prompt_config.DEEP):
+            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE requires MODEL.PROMPT.DEEP=True.")
+        if not self.semantic_tokens_enable:
+            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE requires MODEL.SEMANTIC_TOKENS.ENABLE=True.")
+        if int(self.semantic_tokens_cfg.NUM_TOKENS) <= 0:
+            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE requires semantic token length > 0.")
+        if int(self.prompt_config.NUM_TOKENS) <= 0:
+            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE requires prompt token length > 0.")
+
+        # 第一版只实现最小闭环：attention_parallel + visual_block + row_preserve。
+        # 未实现的 block_parallel/full_row/block_redistribute 显式报错，不做隐藏兜底。
+        if str(self.attention_mediation_cfg.SOURCE) not in {"scores", "probs"}:
+            raise ValueError("ATTENTION_MEDIATION.SOURCE must be scores or probs.")
+        if str(self.attention_mediation_cfg.EXECUTION_MODE) != "attention_parallel":
+            raise ValueError("First ATTENTION_MEDIATION implementation supports only EXECUTION_MODE='attention_parallel'.")
+        if str(self.attention_mediation_cfg.MLP_POLICY) not in {"enter_mlp", "skip_mlp"}:
+            raise ValueError("ATTENTION_MEDIATION.MLP_POLICY must be enter_mlp or skip_mlp.")
+        if str(self.attention_mediation_cfg.ROUTE_SCOPE) != "visual_block":
+            raise ValueError("First ATTENTION_MEDIATION implementation supports only ROUTE_SCOPE='visual_block'.")
+        if str(self.attention_mediation_cfg.PROMPT_ROUTE) not in {"S_to_P_and_V", "P_to_S_to_V"}:
+            raise ValueError("ATTENTION_MEDIATION.PROMPT_ROUTE must be S_to_P_and_V or P_to_S_to_V.")
+        if str(self.attention_mediation_cfg.SEMANTIC_ROUTE) not in {"S_to_P_to_V", "P_to_S_and_V"}:
+            raise ValueError("ATTENTION_MEDIATION.SEMANTIC_ROUTE must be S_to_P_to_V or P_to_S_and_V.")
+        if str(self.attention_mediation_cfg.MASS_MODE) != "row_preserve":
+            raise ValueError("First ATTENTION_MEDIATION implementation supports only MASS_MODE='row_preserve'.")
+        if str(self.attention_mediation_cfg.PROMPT_DETACH) not in {"mediated", "direct", "none"}:
+            raise ValueError("ATTENTION_MEDIATION.PROMPT_DETACH must be mediated / direct / none.")
+        if str(self.attention_mediation_cfg.SEMANTIC_DETACH) not in {"via_prompt", "direct", "none"}:
+            raise ValueError("ATTENTION_MEDIATION.SEMANTIC_DETACH must be via_prompt / direct / none.")
+        if not 0.0 <= float(self.attention_mediation_cfg.BETA_PROMPT_MASS) <= 1.0:
+            raise ValueError("ATTENTION_MEDIATION.BETA_PROMPT_MASS must be in [0, 1].")
+        if not 0.0 <= float(self.attention_mediation_cfg.BETA_SEMANTIC_MASS) <= 1.0:
+            raise ValueError("ATTENTION_MEDIATION.BETA_SEMANTIC_MASS must be in [0, 1].")
+        if float(self.attention_mediation_cfg.BETA_PROMPT_MASS) != 0.0 or float(self.attention_mediation_cfg.BETA_SEMANTIC_MASS) != 0.0:
+            raise ValueError("BETA_*_MASS is reserved for block_redistribute; first implementation requires both beta values to be 0.")
+
+    def _make_attention_mediation_config(self):
+        """
+        将配置节点转成传给 Encoder/Block/Attention 的运行时 dict。
+
+        这里同时携带 prompt_gamma 和 semantic_gamma 两个 Parameter；
+        Block 会按照 layer_idx 取当前层 gamma，只把 delta 写回 P/S token。
+        """
+        if not self.attention_mediation_enable:
+            return None
+        return {
+            "enable": True,
+            "source": str(self.attention_mediation_cfg.SOURCE),
+            "execution_mode": str(self.attention_mediation_cfg.EXECUTION_MODE),
+            "mlp_policy": str(self.attention_mediation_cfg.MLP_POLICY),
+            "route_scope": str(self.attention_mediation_cfg.ROUTE_SCOPE),
+            "prompt_route": str(self.attention_mediation_cfg.PROMPT_ROUTE),
+            "semantic_route": str(self.attention_mediation_cfg.SEMANTIC_ROUTE),
+            "mass_mode": str(self.attention_mediation_cfg.MASS_MODE),
+            "prompt_detach": str(self.attention_mediation_cfg.PROMPT_DETACH),
+            "semantic_detach": str(self.attention_mediation_cfg.SEMANTIC_DETACH),
+            "prompt_gamma": self.attention_mediation_prompt_gamma,
+            "semantic_gamma": self.attention_mediation_semantic_gamma,
+        }
 
     def _make_affinity_evolution_config(self, affinity_config=None):
         if affinity_config is None:
@@ -1289,6 +1398,11 @@ class PromptedTransformer(Transformer):
         num_layers = self.vit_config.transformer["num_layers"]
         sem_state, semantic_input = None, None
         semantic_length = self._active_semantic_length(semantics)
+        if self.attention_mediation_enable and semantic_length <= 0:
+            raise ValueError("Attention mediation requires semantic tensor input for every forward pass.")
+        attention_mediation_config = self._make_attention_mediation_config()
+        # 深层 prompt 前向逐层调用 encoder.layer[i]，因此 mediation 配置在这里逐层传入。
+        # 每层 Block 会用 layer index 选择自己的 gamma，只在当前层 attention 内修正 P/S。
         for i in range(num_layers):
             if i == 0:
                 hidden_states, weights, _ = self.encoder.layer[i](
@@ -1297,6 +1411,8 @@ class PromptedTransformer(Transformer):
                     self.num_tokens,
                     semantic_length,
                     self.block_s_to_cls,
+                    attention_mediation_config,
+                    i,
                 )
                 if torch.is_tensor(hidden_states):
                     row_hidden_ok = torch.isfinite(hidden_states).flatten(1).all(dim=1)
@@ -1337,6 +1453,8 @@ class PromptedTransformer(Transformer):
                     self.num_tokens,
                     semantic_length,
                     self.block_s_to_cls,
+                    attention_mediation_config,
+                    i,
                 )
                 if torch.is_tensor(hidden_states):
                     row_hidden_ok = torch.isfinite(hidden_states).flatten(1).all(dim=1)
@@ -1364,6 +1482,12 @@ class PromptedTransformer(Transformer):
         sem_state, semantic_input = None, None
         if self.affinity_evolution_enable and self._active_semantic_length(semantics) <= 0:
             raise ValueError("Affinity evolution requires semantic tensor input for every forward pass.")
+        semantic_length = self._active_semantic_length(semantics)
+        if self.attention_mediation_enable and semantic_length <= 0:
+            raise ValueError("Attention mediation requires semantic tensor input for every forward pass.")
+        attention_mediation_config = self._make_attention_mediation_config()
+        # 带 affinity 输出的 deep prompt 路径也必须传入同一 mediation 配置，
+        # 否则训练前向和可视化/监测前向会走不同的 attention 计算图。
         effective_affinity_config = (
             self._make_affinity_evolution_config(affinity_config)
             if self.affinity_evolution_enable
@@ -1375,7 +1499,12 @@ class PromptedTransformer(Transformer):
                 # 第 0 层没有“上一层 affinity”，因此直接跑 ViT block 并导出本层 affinity。
                 # 这份 affinity 会在进入第 1 层前作为 evolution 路由来源。
                 hidden_states, weights, affinity, _ = self.encoder.layer[i].forward_with_affinity(
-                    hidden_states, effective_affinity_config, None, self.num_tokens
+                    hidden_states,
+                    effective_affinity_config,
+                    None,
+                    self.num_tokens,
+                    attention_mediation_config,
+                    i,
                 )
             else:
                 if self.prompt_backend == "dynamic" and self.affinity_evolution_enable:
@@ -1401,7 +1530,12 @@ class PromptedTransformer(Transformer):
                     hidden_states = self._replace_prompt_tokens(hidden_states, next_prompt)
 
                 hidden_states, weights, affinity, _ = self.encoder.layer[i].forward_with_affinity(
-                    hidden_states, effective_affinity_config, None, self.num_tokens
+                    hidden_states,
+                    effective_affinity_config,
+                    None,
+                    self.num_tokens,
+                    attention_mediation_config,
+                    i,
                 )
             if self.encoder.vis:
                 attn_weights.append(weights)
@@ -1421,6 +1555,11 @@ class PromptedTransformer(Transformer):
         embedding_output, semantics = self.incorporate_prompt(x, semantics)
 
         effective_prompt_tokens = self.num_tokens
+        semantic_length = self._active_semantic_length(semantics)
+        if self.attention_mediation_enable and semantic_length <= 0:
+            raise ValueError("Attention mediation requires semantic tensor input for every forward pass.")
+        attention_mediation_config = self._make_attention_mediation_config()
+        # 非 deep 路径直接进入 Encoder；配置会在 Encoder 内逐层下发给每个 Block。
         if self.prompt_enable and self.prompt_config.DEEP:
             encoded, attn_weights = self.forward_deep_prompt(
                 embedding_output, semantics)
@@ -1429,8 +1568,9 @@ class PromptedTransformer(Transformer):
                 embedding_output,
                 None,
                 effective_prompt_tokens,
-                self._active_semantic_length(semantics),
+                semantic_length,
                 self.block_s_to_cls,
+                attention_mediation_config,
             )
 
         self._finalize_semantic_token_state(encoded)
@@ -1449,6 +1589,11 @@ class PromptedTransformer(Transformer):
 
         effective_prompt_tokens = self.num_tokens
         effective_affinity_config = affinity_config
+        semantic_length = self._active_semantic_length(semantics)
+        if self.attention_mediation_enable and semantic_length <= 0:
+            raise ValueError("Attention mediation requires semantic tensor input for every forward pass.")
+        attention_mediation_config = self._make_attention_mediation_config()
+        # monitor/affinity 前向复用同一 mediation 配置，保证导出的亲和矩阵对应当前真实前向。
 
         if self.prompt_enable and self.prompt_config.DEEP:
             encoded, attn_weights, affinities = self.forward_deep_prompt_with_affinity(
@@ -1456,7 +1601,11 @@ class PromptedTransformer(Transformer):
             )
         else:
             encoded, attn_weights, affinities = self.encoder.forward_with_affinity(
-                embedding_output, effective_affinity_config, None, effective_prompt_tokens
+                embedding_output,
+                effective_affinity_config,
+                None,
+                effective_prompt_tokens,
+                attention_mediation_config,
             )
 
         self._finalize_semantic_token_state(encoded)

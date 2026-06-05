@@ -143,6 +143,39 @@ _C.MODEL.AFFINITY_EVOLUTION.PROMPT_DETACH = "none"       # mediated / direct / n
 _C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_DETACH = "none"     # via_prompt / direct / none；非 none 时表示 teacher 选择
 _C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_COMPOSE = "prob"    # prob / raw_then_norm
 
+_C.MODEL.ATTENTION_MEDIATION = CfgNode()
+# ATTENTION_MEDIATION 是新增的 block 内 mediated attention correction 分支。
+# 默认关闭；开启时会在每层 ViT self-attention 内部额外构造 mediated route，
+# 只对 prompt/semantic token 产生 correction，不替换原始 ViT attention 主路径。
+# SOURCE:
+#   probs  - 从 full softmax 后的真实 attention 概率子块构造 route。
+#   scores - 从 softmax 前 QK logits 子块构造局部条件 route。
+# EXECUTION_MODE:
+#   attention_parallel 表示只复制 attention 级别计算，不复制完整 Transformer block。
+# MLP_POLICY:
+#   enter_mlp 表示 correction 在当前层 MLP 前合并；skip_mlp 表示 block 后只写回 P/S residual。
+# ROUTE_SCOPE/MASS_MODE:
+#   第一版只支持 visual_block + row_preserve，即只改 P->V/S->V 的 visual 内部分配，
+#   并保持每个 P/S token 原本分给 visual 区域的总 attention mass 不变。
+# PROMPT_ROUTE/SEMANTIC_ROUTE:
+#   分别控制 prompt-mediated 和 semantic-mediated 路径的方向。
+# *_GAMMA_INIT:
+#   每层可学习 gate 的初始值；0 表示初始等价于不开启 correction。
+_C.MODEL.ATTENTION_MEDIATION.ENABLE = False
+_C.MODEL.ATTENTION_MEDIATION.SOURCE = "probs"             # probs / scores；从 full attention 概率或 logits 构造 mediated route
+_C.MODEL.ATTENTION_MEDIATION.EXECUTION_MODE = "attention_parallel"  # 第一版实现 attention_parallel；block_parallel 暂不启用
+_C.MODEL.ATTENTION_MEDIATION.MLP_POLICY = "enter_mlp"     # enter_mlp / skip_mlp
+_C.MODEL.ATTENTION_MEDIATION.ROUTE_SCOPE = "visual_block" # 第一版只改 P->V / S->V visual 子块；full_row 暂不启用
+_C.MODEL.ATTENTION_MEDIATION.PROMPT_ROUTE = "S_to_P_and_V"    # S_to_P_and_V / P_to_S_to_V
+_C.MODEL.ATTENTION_MEDIATION.SEMANTIC_ROUTE = "S_to_P_to_V"   # S_to_P_to_V / P_to_S_and_V
+_C.MODEL.ATTENTION_MEDIATION.MASS_MODE = "row_preserve"   # 第一版实现 row_preserve；block_redistribute 暂不启用
+_C.MODEL.ATTENTION_MEDIATION.BETA_PROMPT_MASS = 0.0
+_C.MODEL.ATTENTION_MEDIATION.BETA_SEMANTIC_MASS = 0.0
+_C.MODEL.ATTENTION_MEDIATION.PROMPT_GAMMA_INIT = 0.0
+_C.MODEL.ATTENTION_MEDIATION.SEMANTIC_GAMMA_INIT = 0.0
+_C.MODEL.ATTENTION_MEDIATION.PROMPT_DETACH = "none"       # mediated / direct / none
+_C.MODEL.ATTENTION_MEDIATION.SEMANTIC_DETACH = "none"     # via_prompt / direct / none
+
 _C.MODEL.ADAPTER = CfgNode()
 _C.MODEL.ADAPTER.REDUCATION_FACTOR = 8
 _C.MODEL.ADAPTER.STYLE = "Pfeiffer"

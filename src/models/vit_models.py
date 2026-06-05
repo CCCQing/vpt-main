@@ -37,6 +37,7 @@ class ViT(nn.Module):
             prompt_cfg.SEMANTIC_TOKENS = cfg.MODEL.SEMANTIC_TOKENS.clone()
             prompt_cfg.AFFINITY = cfg.MODEL.AFFINITY.clone()
             prompt_cfg.AFFINITY_EVOLUTION = cfg.MODEL.AFFINITY_EVOLUTION.clone()
+            prompt_cfg.ATTENTION_MEDIATION = cfg.MODEL.ATTENTION_MEDIATION.clone()
             prompt_cfg.freeze()
 
         adapter_cfg = None
@@ -95,6 +96,7 @@ class ViT(nn.Module):
         if cfg.MODEL.PROMPT.ENABLE:
             prompt_backend = cfg.MODEL.PROMPT.BACKEND.lower()
             affinity_evolution_enable = bool(cfg.MODEL.AFFINITY_EVOLUTION.ENABLE)
+            attention_mediation_enable = bool(cfg.MODEL.ATTENTION_MEDIATION.ENABLE)
             if prompt_backend == "dynamic":
                 prompt_init_source = cfg.MODEL.PROMPT.INIT_SOURCE.lower()
                 if prompt_init_source == "learned":
@@ -109,6 +111,10 @@ class ViT(nn.Module):
                     trainable_keys.append("affinity_evolution")
                 else:
                     trainable_keys.append("prompt_update_layers")
+                if attention_mediation_enable:
+                    # ATTENTION_MEDIATION 的新增可训练量只有每层 P/S gamma gate。
+                    # ViT block 的 Q/K/V/out/MLP 仍被冻结，不把主干 attention 参数加入 optimizer。
+                    trainable_keys.append("attention_mediation")
             elif prompt_backend == "vpt_deep":
                 prompt_init_source = cfg.MODEL.PROMPT.INIT_SOURCE.lower()
                 if prompt_init_source == "learned":
@@ -127,6 +133,10 @@ class ViT(nn.Module):
                     raise ValueError(
                         f"Unsupported MODEL.PROMPT.INIT_SOURCE='{cfg.MODEL.PROMPT.INIT_SOURCE}'"
                     )
+                if attention_mediation_enable:
+                    # vpt_deep 下也允许 block 内 attention correction；
+                    # 这里同样只解冻 attention_mediation_*gamma，不解冻 ViT 主干。
+                    trainable_keys.append("attention_mediation")
             else:
                 raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{cfg.MODEL.PROMPT.BACKEND}'")
         if cfg.MODEL.SEMANTIC_TOKENS.ENABLE:
