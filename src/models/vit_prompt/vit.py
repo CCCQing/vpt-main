@@ -1203,7 +1203,7 @@ class PromptedTransformer(Transformer):
 
         注意：
         - 这里只决定“输入 prompt 从哪里来”
-        - 后续层 prompt 如何承接，由 dynamic/vpt_deep 两条后端各自负责
+        - 后续层 prompt 如何承接，由 dynamic/vpt_deep 两条后端各自负责。
         """
 
         # 当前主序列构造顺序为 [CLS | prompt_tokens | visual_tokens | semantic_tokens]。

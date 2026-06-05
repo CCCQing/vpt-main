@@ -155,7 +155,7 @@ _C.MODEL.ATTENTION_MEDIATION = CfgNode()
 # MLP_POLICY:
 #   enter_mlp 表示 correction 在当前层 MLP 前合并；skip_mlp 表示 block 后只写回 P/S residual。
 # ROUTE_SCOPE/MASS_MODE:
-#   第一版只支持 visual_block + row_preserve，即只改 P->V/S->V 的 visual 内部分配，
+#   当前只支持 visual_block + row_preserve，即只改 P->V/S->V 的 visual 内部分配，
 #   并保持每个 P/S token 原本分给 visual 区域的总 attention mass 不变。
 # PROMPT_ROUTE/SEMANTIC_ROUTE:
 #   分别控制 prompt-mediated 和 semantic-mediated 路径的方向。

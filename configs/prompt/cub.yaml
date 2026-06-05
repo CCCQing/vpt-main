@@ -54,7 +54,7 @@ MODEL:
   ATTENTION_MEDIATION:
     # 新的 block 内 mediated attention correction 分支。
     # 开启时必须关闭 AFFINITY_EVOLUTION，避免层间 evolution 和层内 correction 混在一起。
-    # 第一版只支持 attention_parallel + visual_block + row_preserve。
+    # 当前只支持 attention_parallel + visual_block + row_preserve。
     ENABLE: False
     SOURCE: "probs"                 # probs / scores
     EXECUTION_MODE: "attention_parallel"

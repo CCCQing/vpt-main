@@ -334,7 +334,7 @@ class Attention(nn.Module):
                 f"Unsupported ATTENTION_MEDIATION.SEMANTIC_ROUTE='{route}'. "
                 "Expected S_to_P_to_V / P_to_S_and_V."
             )
-        # direct_sv_probs 提供原始 S->V 的 visual mass；mediated route 只改 visual 内部位置。
+        # direct_sv_probs 提供原始 S->V 的 visual mass；mediated route 只改 visual 内部位置
         direct_sv_probs = attention_probs[:, :, semantic_slice, visual_slice]
         direct_sv_mass = direct_sv_probs.sum(dim=-1, keepdim=True)
         direct_sv_cond = self._row_normalize(direct_sv_probs, dim=-1)
