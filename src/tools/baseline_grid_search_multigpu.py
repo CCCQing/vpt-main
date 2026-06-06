@@ -48,6 +48,10 @@ def _ddp_train_main(argv: List[str]) -> None:
     if not train_argv:
         raise ValueError("Missing train.py arguments after DDP launcher options.")
 
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     import torch.multiprocessing as mp
 
     from launch import default_argument_parser
