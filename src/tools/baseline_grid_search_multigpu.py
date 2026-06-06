@@ -56,7 +56,7 @@ def _ddp_train_main(argv: List[str]) -> None:
 
     from launch import default_argument_parser
     from src.utils import distributed as du
-    from train import setup, train
+    from train import setup
 
     train_args = default_argument_parser().parse_args(train_argv)
     cfg = setup(train_args)
@@ -74,7 +74,7 @@ def _ddp_train_main(argv: List[str]) -> None:
         nprocs=known.nproc_per_node,
         args=(
             known.nproc_per_node,
-            train,
+            _train_with_ddp_attr_forward,
             init_method,
             0,
             1,
@@ -84,6 +84,30 @@ def _ddp_train_main(argv: List[str]) -> None:
         ),
         join=True,
     )
+
+
+def _train_with_ddp_attr_forward(cfg, args) -> None:
+    import torch
+
+    ddp_cls = torch.nn.parallel.DistributedDataParallel
+    if not getattr(ddp_cls, "_vpt_forward_missing_attrs", False):
+        original_getattr = ddp_cls.__getattr__
+
+        def forwarded_getattr(self, name):
+            try:
+                return original_getattr(self, name)
+            except AttributeError as exc:
+                module = original_getattr(self, "module")
+                if hasattr(module, name):
+                    return getattr(module, name)
+                raise exc
+
+        ddp_cls.__getattr__ = forwarded_getattr
+        ddp_cls._vpt_forward_missing_attrs = True
+
+    from train import train
+
+    train(cfg, args)
 
 
 def _parse_gpu_groups(raw_groups: str, raw_gpus: str) -> List[str]:
