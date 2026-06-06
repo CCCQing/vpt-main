@@ -697,7 +697,6 @@ class PromptedTransformer(Transformer):
 
         # 把 shape debug 开关同步到语义分支与编码器各层
         self._validate_affinity_evolution_config()
-        self._validate_attention_mediation_config()
 
         if self.semantic_token_projector is not None:
             # orthogonal tokenizer 允许单独打开语义 token 形状调试。
@@ -775,6 +774,8 @@ class PromptedTransformer(Transformer):
                 nn.init.uniform_(self.deep_prompt_embeddings.data, -val, val)
 
         if self.attention_mediation_enable:
+            if self.affinity_evolution_enable:
+                raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE and MODEL.AFFINITY_EVOLUTION.ENABLE must not be enabled together.")
             # attention mediation 是“当前 block 内”的注意力修正，因此每一层 ViT block 都有独立 gamma。
             # gamma 初始化为 0 时，mediated correction 初始不影响前向，训练中再逐步学习是否打开。
             self.attention_mediation_prompt_gamma = nn.Parameter(
@@ -786,8 +787,7 @@ class PromptedTransformer(Transformer):
             # 这条日志用于从训练 stdout 中区分新分支 ATTENTION_MEDIATION 与旧层间 AFFINITY_EVOLUTION。
             logger.info(
                 "[attention-mediation] enable=True source=%s execution=%s mlp_policy=%s route_scope=%s "
-                "prompt_route=%s semantic_route=%s mass_mode=%s prompt_gamma_init=%.6g semantic_gamma_init=%.6g "
-                "prompt_detach=%s semantic_detach=%s",
+                "prompt_route=%s semantic_route=%s mass_mode=%s prompt_gamma_init=%.6g semantic_gamma_init=%.6g",
                 str(self.attention_mediation_cfg.SOURCE),
                 str(self.attention_mediation_cfg.EXECUTION_MODE),
                 str(self.attention_mediation_cfg.MLP_POLICY),
@@ -797,8 +797,6 @@ class PromptedTransformer(Transformer):
                 str(self.attention_mediation_cfg.MASS_MODE),
                 float(self.attention_mediation_cfg.PROMPT_GAMMA_INIT),
                 float(self.attention_mediation_cfg.SEMANTIC_GAMMA_INIT),
-                str(self.attention_mediation_cfg.PROMPT_DETACH),
-                str(self.attention_mediation_cfg.SEMANTIC_DETACH),
             )
 
     def _validate_affinity_evolution_config(self):
@@ -833,62 +831,9 @@ class PromptedTransformer(Transformer):
         if not 0.0 <= float(self.affinity_evolution_cfg.SEMANTIC_LAMBDA) <= 1.0:
             raise ValueError("AFFINITY_EVOLUTION.SEMANTIC_LAMBDA must be in [0, 1].")
 
-    def _validate_attention_mediation_config(self):
-        """
-        校验 block 内 mediated attention correction 的实验边界。
-
-        这条新分支和旧 AFFINITY_EVOLUTION 的作用位置不同：
-            - AFFINITY_EVOLUTION 使用上一层 affinity，在层间更新 prompt/semantic token；
-            - ATTENTION_MEDIATION 使用当前层真实 attention score/prob，在 block 内生成修正量。
-        两者第一版强制互斥，避免同一实验同时改变“层间状态”和“层内注意力”两个因素。
-        """
-        if not self.attention_mediation_enable:
-            return
-        if self.affinity_evolution_enable:
-            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE and MODEL.AFFINITY_EVOLUTION.ENABLE must not be enabled together.")
-        if not self.prompt_enable:
-            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE requires MODEL.PROMPT.ENABLE=True.")
-        if not bool(self.prompt_config.DEEP):
-            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE requires MODEL.PROMPT.DEEP=True.")
-        if not self.semantic_tokens_enable:
-            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE requires MODEL.SEMANTIC_TOKENS.ENABLE=True.")
-        if int(self.semantic_tokens_cfg.NUM_TOKENS) <= 0:
-            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE requires semantic token length > 0.")
-        if int(self.prompt_config.NUM_TOKENS) <= 0:
-            raise ValueError("MODEL.ATTENTION_MEDIATION.ENABLE requires prompt token length > 0.")
-
-        # 第一版只实现最小闭环：attention_parallel + visual_block + row_preserve。
-        # 未实现的 block_parallel/full_row/block_redistribute 显式报错，不做隐藏兜底。
-        if str(self.attention_mediation_cfg.SOURCE) not in {"scores", "probs"}:
-            raise ValueError("ATTENTION_MEDIATION.SOURCE must be scores or probs.")
-        if str(self.attention_mediation_cfg.EXECUTION_MODE) not in {"attention_parallel", "block_parallel"}:
-            raise ValueError("ATTENTION_MEDIATION.EXECUTION_MODE must be attention_parallel or block_parallel.")
-        if str(self.attention_mediation_cfg.MLP_POLICY) not in {"enter_mlp", "skip_mlp"}:
-            raise ValueError("ATTENTION_MEDIATION.MLP_POLICY must be enter_mlp or skip_mlp.")
-        if str(self.attention_mediation_cfg.EXECUTION_MODE) == "block_parallel" and str(self.attention_mediation_cfg.MLP_POLICY) != "enter_mlp":
-            raise ValueError("ATTENTION_MEDIATION block_parallel requires MLP_POLICY='enter_mlp'.")
-        if str(self.attention_mediation_cfg.ROUTE_SCOPE) not in {"visual_block", "full_row"}:
-            raise ValueError("ATTENTION_MEDIATION.ROUTE_SCOPE must be visual_block or full_row.")
-        if str(self.attention_mediation_cfg.PROMPT_ROUTE) not in {"S_to_P_and_V", "P_to_S_to_V"}:
-            raise ValueError("ATTENTION_MEDIATION.PROMPT_ROUTE must be S_to_P_and_V or P_to_S_to_V.")
-        if str(self.attention_mediation_cfg.SEMANTIC_ROUTE) not in {"S_to_P_to_V", "P_to_S_and_V"}:
-            raise ValueError("ATTENTION_MEDIATION.SEMANTIC_ROUTE must be S_to_P_to_V or P_to_S_and_V.")
-        if str(self.attention_mediation_cfg.MASS_MODE) not in {"row_preserve", "block_redistribute"}:
-            raise ValueError("ATTENTION_MEDIATION.MASS_MODE must be row_preserve or block_redistribute.")
-        if str(self.attention_mediation_cfg.PROMPT_DETACH) not in {"mediated", "direct", "none"}:
-            raise ValueError("ATTENTION_MEDIATION.PROMPT_DETACH must be mediated / direct / none.")
-        if str(self.attention_mediation_cfg.SEMANTIC_DETACH) not in {"via_prompt", "direct", "none"}:
-            raise ValueError("ATTENTION_MEDIATION.SEMANTIC_DETACH must be via_prompt / direct / none.")
-        if not 0.0 <= float(self.attention_mediation_cfg.BETA_PROMPT_MASS) <= 1.0:
-            raise ValueError("ATTENTION_MEDIATION.BETA_PROMPT_MASS must be in [0, 1].")
-        if not 0.0 <= float(self.attention_mediation_cfg.BETA_SEMANTIC_MASS) <= 1.0:
-            raise ValueError("ATTENTION_MEDIATION.BETA_SEMANTIC_MASS must be in [0, 1].")
-        if str(self.attention_mediation_cfg.ROUTE_SCOPE) == "full_row" and str(self.attention_mediation_cfg.MASS_MODE) == "block_redistribute":
-            raise ValueError("ATTENTION_MEDIATION full_row already builds a full probability row; use MASS_MODE='row_preserve'.")
-
     def _make_attention_mediation_config(self):
         """
-        将配置节点转成传给 Encoder/Block/Attention 的运行时 dict。
+        将配置节点转成传给 Encoder/Block/Attention 的运行时 dict。“配置 + gamma 参数”的运行时包
 
         这里同时携带 prompt_gamma 和 semantic_gamma 两个 Parameter；
         Block 会按照 layer_idx 取当前层 gamma，只把 delta 写回 P/S token。
@@ -904,8 +849,6 @@ class PromptedTransformer(Transformer):
             "prompt_route": str(self.attention_mediation_cfg.PROMPT_ROUTE),
             "semantic_route": str(self.attention_mediation_cfg.SEMANTIC_ROUTE),
             "mass_mode": str(self.attention_mediation_cfg.MASS_MODE),
-            "prompt_detach": str(self.attention_mediation_cfg.PROMPT_DETACH),
-            "semantic_detach": str(self.attention_mediation_cfg.SEMANTIC_DETACH),
             "beta_prompt_mass": float(self.attention_mediation_cfg.BETA_PROMPT_MASS),
             "beta_semantic_mass": float(self.attention_mediation_cfg.BETA_SEMANTIC_MASS),
             "prompt_gamma": self.attention_mediation_prompt_gamma,

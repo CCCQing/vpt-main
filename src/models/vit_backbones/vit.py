@@ -169,28 +169,6 @@ class Attention(nn.Module):
         """
         return x / x.sum(dim=dim, keepdim=True).clamp_min(eps)
 
-    @staticmethod
-    def _route_detach(direct: torch.Tensor, mediated: torch.Tensor, detach_mode: str) -> torch.Tensor:
-        """
-        根据 teacher/student 设定选择最终写回 visual block 的条件路由。
-
-        mediated / via_prompt:
-            使用 mediated route 的前向值，但 detach 掉 mediated 分支梯度。
-            适合把 mediated route 当 teacher，只让后续 gamma / token 状态承受影响。
-        direct:
-            保持 direct route，不进行 mediated 前向替换。
-            这一版不制造“前向为 mediated、梯度走 direct”的隐式技巧，避免语义不清。
-        none:
-            直接使用 mediated route，并允许梯度沿 mediated route 回传。
-        """
-        if detach_mode in {"mediated", "via_prompt"}:
-            return mediated.detach()
-        if detach_mode == "direct":
-            return direct
-        if detach_mode == "none":
-            return mediated
-        raise ValueError(f"Unsupported attention mediation detach mode='{detach_mode}'.")
-
     def _conditional_normalize(self, x: torch.Tensor, dim: int, source: str) -> torch.Tensor:
         """
         将局部子块转成条件分布。
@@ -212,15 +190,11 @@ class Attention(nn.Module):
 
         当前项目固定布局为:
             [CLS | prompt_tokens | visual_tokens | semantic_tokens]
-        mediated attention 只在 prompt/semantic 到 visual 的子块上做修正，
-        因此这里必须明确得到 P/V/S 三段 slice。
+        mediated attention 需要基于 P/V/S 三段切出局部路径；
+        visual_block 模式只改 P->V/S->V，full_row 模式会构造 P/S 的完整 attention row。
         """
         prompt_length = int(prompt_length)
         semantic_length = int(semantic_length)
-        if prompt_length <= 0:
-            raise ValueError("ATTENTION_MEDIATION requires prompt_length > 0.")
-        if semantic_length <= 0:
-            raise ValueError("ATTENTION_MEDIATION requires semantic_length > 0.")
         if seq_len <= 1 + prompt_length + semantic_length:
             raise ValueError(
                 f"ATTENTION_MEDIATION requires visual tokens, got seq_len={seq_len}, "
@@ -241,7 +215,6 @@ class Attention(nn.Module):
         direct_full_row: torch.Tensor,
         visual_slice: slice,
         mediated_visual_cond: torch.Tensor,
-        detach_mode: str,
         mass_mode: str,
         beta_mass: float,
         mediated_mass_score: Optional[torch.Tensor],
@@ -257,26 +230,50 @@ class Attention(nn.Module):
         """
         direct_visual_probs = direct_full_row[:, :, :, visual_slice]
         direct_visual_mass = direct_visual_probs.sum(dim=-1, keepdim=True)
-        direct_visual_cond = self._row_normalize(direct_visual_probs, dim=-1)
-        selected_visual_cond = self._route_detach(direct_visual_cond, mediated_visual_cond, detach_mode)
 
         if mass_mode == "row_preserve":
             new_visual_mass = direct_visual_mass
         elif mass_mode == "block_redistribute":
+            # block_redistribute 允许同一组 query token 之间重新分配 visual mass。
+            # beta_mass 控制“保留原始 visual mass 分布”和“采用 mediated visual mass 分布”的混合比例：
+            #   beta_mass=0 时完全使用原始 attention 的 mass 分布；
+            #   beta_mass=1 时完全使用 mediation 计算出的 mass 分布；
+            #   中间值则做线性插值，以避免 mass 路由变化过猛。
+            if not 0.0 <= float(beta_mass) <= 1.0:
+                raise ValueError("ATTENTION_MEDIATION beta mass must be in [0, 1] when MASS_MODE='block_redistribute'.")
             if mediated_mass_score is None:
                 raise ValueError("block_redistribute requires mediated_mass_score.")
+
+            # direct_visual_mass 的形状为 [B, H, Q, 1]，表示每个 query row 原本分配给 visual block 的总概率质量。
+            # 去掉最后一维后得到 [B, H, Q]，方便在 query维度上做归一化和重分配。
             direct_mass_per_query = direct_visual_mass.squeeze(-1)
+
+            # direct_total_mass 是同一组 query 在 visual block 上的总 mass。
+            # block_redistribute 只改变这些 mass 在 query 之间的分布，不凭空增加或减少
+            # 这一组 query 合计投向 visual block 的概率质量。
             direct_total_mass = direct_mass_per_query.sum(dim=-1, keepdim=True)
+
+            # 将原始 visual mass 归一化成 query 维度上的分布：
+            # 每个位置表示该 query 占整组 visual mass 的比例，而不是完整 attention row
+            # 中的概率值。
             direct_mass_dist = self._row_normalize(direct_mass_per_query, dim=-1)
+
+            # mediated_mass_score 是 mediation 路径给出的 query 级 visual mass 打分。
+            # squeeze 后同样归一化为分布，保证后续混合的是两个可比较的 query 分布。
             mediated_mass_dist = self._row_normalize(mediated_mass_score.squeeze(-1), dim=-1)
-            selected_mass_dist = self._route_detach(direct_mass_dist, mediated_mass_dist, detach_mode)
-            mixed_mass_dist = (1.0 - float(beta_mass)) * direct_mass_dist + float(beta_mass) * selected_mass_dist
+
+            # 对原始 query mass 分布和 mediated query mass 分布做线性插值。
+            # 这里混合的是“分布形状”，总 mass 仍由 direct_total_mass 保持。
+            mixed_mass_dist = (1.0 - float(beta_mass)) * direct_mass_dist + float(beta_mass) * mediated_mass_dist
+
+            # 把混合后的 query 分布重新乘回整组 visual 总 mass，得到每个 query 新的
+            # visual mass，并恢复到 [B, H, Q, 1]，以便和 mediated_visual_cond 相乘。
             new_visual_mass = (direct_total_mass * mixed_mass_dist).unsqueeze(-1)
         else:
             raise ValueError(f"Unsupported ATTENTION_MEDIATION.MASS_MODE='{mass_mode}'.")
 
         modified_row = direct_full_row.clone()
-        modified_row[:, :, :, visual_slice] = selected_visual_cond * new_visual_mass
+        modified_row[:, :, :, visual_slice] = mediated_visual_cond * new_visual_mass
 
         # visual mass 改变后，非 visual 区域不能保持原值；否则整行概率和会偏离 1。
         direct_nonvisual_mass = 1.0 - direct_visual_mass
@@ -297,7 +294,6 @@ class Attention(nn.Module):
         semantic_slice: slice,
         source: str,
         route: str,
-        detach_mode: str,
         route_scope: str,
         mass_mode: str,
         beta_mass: float,
@@ -339,14 +335,13 @@ class Attention(nn.Module):
 
         if route_scope == "full_row":
             mediated_full = self._row_normalize(mediated_full, dim=-1)
-            return self._route_detach(direct_prompt_row, mediated_full, detach_mode)
+            return mediated_full
         if route_scope == "visual_block":
             mediated_visual_cond = self._row_normalize(mediated_visual_base, dim=-1)
             return self._compose_visual_block_row(
                 direct_prompt_row,
                 visual_slice,
                 mediated_visual_cond,
-                detach_mode,
                 mass_mode,
                 beta_mass,
                 mediated_mass_score,
@@ -362,7 +357,6 @@ class Attention(nn.Module):
         semantic_slice: slice,
         source: str,
         route: str,
-        detach_mode: str,
         route_scope: str,
         mass_mode: str,
         beta_mass: float,
@@ -404,14 +398,13 @@ class Attention(nn.Module):
 
         if route_scope == "full_row":
             mediated_full = self._row_normalize(mediated_full, dim=-1)
-            return self._route_detach(direct_semantic_row, mediated_full, detach_mode)
+            return mediated_full
         if route_scope == "visual_block":
             mediated_visual_cond = self._row_normalize(mediated_visual_base, dim=-1)
             return self._compose_visual_block_row(
                 direct_semantic_row,
                 visual_slice,
                 mediated_visual_cond,
-                detach_mode,
                 mass_mode,
                 beta_mass,
                 mediated_mass_score,
@@ -434,19 +427,50 @@ class Attention(nn.Module):
         log(target_probs)-log(original_probs) 形成 score bias，并重新对完整 row 做 softmax。
         这样 score 分支最终仍由 full softmax 产生合法 attention 概率。
         """
+        # 未开启 ATTENTION_MEDIATION 时直接返回 None，让调用方继续走标准 MHSA 路径。
+        # 这里放在最前面，避免在普通训练/推理中做任何额外配置解析和张量拷贝。
         if not mediation_config or not mediation_config.get("enable", False):
             return None
 
+        # 读取本层 mediation 的核心路由配置：
+        # source 决定用 score logits 还是 softmax 后的 probs 作为构造 mediated row 的基础；
+        # route_scope 决定只改 visual block，还是直接构造完整 attention row；
+        # mass_mode 决定 visual block 的总 mass 是逐 row 保持，还是在 query 之间重分配。
         source = str(mediation_config.get("source"))
         route_scope = str(mediation_config.get("route_scope"))
         mass_mode = str(mediation_config.get("mass_mode"))
+
+        # 这里尽早做配置合法性检查，避免后续构造 target_probs 时产生难定位的 shape
+        # 或概率归一化错误。full_row 已经直接产出完整 row，因此不再支持额外的
+        # block_redistribute mass 重分配。
+        if source not in {"scores", "probs"}:
+            raise ValueError("ATTENTION_MEDIATION.SOURCE must be scores or probs.")
+        if mass_mode not in {"row_preserve", "block_redistribute"}:
+            raise ValueError("ATTENTION_MEDIATION.MASS_MODE must be row_preserve or block_redistribute.")
+        if route_scope == "full_row" and mass_mode == "block_redistribute":
+            raise ValueError("ATTENTION_MEDIATION full_row already builds a full probability row; use MASS_MODE='row_preserve'.")
+
+        # 根据当前序列布局 [CLS | prompt_tokens | visual_tokens | semantic_tokens]
+        # 切出 P/V/S 三段。mediation 只重写 prompt query 和 semantic query 的 attention row，
+        # visual query 与 CLS query 保持原始 attention_probs。
         slices = self._attention_mediation_slices(attention_probs.size(-1), prompt_length, semantic_length)
         prompt_slice = slices["prompt"]
         visual_slice = slices["visual"]
         semantic_slice = slices["semantic"]
+
+        # route_base 是下游构造 mediated row 时读取的“原始注意力基准”。
+        # SOURCE=scores 时使用未 softmax 的 logits，适合在 score 空间做路由后再回到 full softmax；
+        # SOURCE=probs 时直接使用 softmax 概率，构造出的 target_probs 会作为最终 modified_probs。
         route_base = attention_scores if source == "scores" else attention_probs
 
+        # 先复制完整 attention 概率矩阵作为 target_probs。
+        # 后面只覆盖 prompt rows 和 semantic rows；其它 query rows 仍沿用原始 attention_probs，
+        # 从而把 mediation 的影响范围限制在 P->* 与 S->*。
         target_probs = attention_probs.clone()
+
+        # 构造 prompt token 作为 query 时的 mediated attention row。
+        # prompt_route 控制 prompt 侧如何借助 semantic/visual 路径生成目标分布；
+        # beta_prompt_mass 只在 block_redistribute 下影响 prompt query 之间的 visual mass 重分配强度。
         target_probs[:, :, prompt_slice, :] = self._build_prompt_mediated_row(
             route_base,
             attention_probs,
@@ -455,11 +479,14 @@ class Attention(nn.Module):
             semantic_slice,
             source,
             str(mediation_config.get("prompt_route")),
-            str(mediation_config.get("prompt_detach")),
             route_scope,
             mass_mode,
             float(mediation_config.get("beta_prompt_mass", 0.0)),
         )
+
+        # 构造 semantic token 作为 query 时的 mediated attention row。
+        # semantic_route 与 prompt 侧含义对应，但方向变为 semantic 侧读取
+        # prompt/visual 信息；beta_semantic_mass 控制 semantic query 之间的 visual mass 重分配强度。
         target_probs[:, :, semantic_slice, :] = self._build_semantic_mediated_row(
             route_base,
             attention_probs,
@@ -468,7 +495,6 @@ class Attention(nn.Module):
             semantic_slice,
             source,
             str(mediation_config.get("semantic_route")),
-            str(mediation_config.get("semantic_detach")),
             route_scope,
             mass_mode,
             float(mediation_config.get("beta_semantic_mass", 0.0)),
@@ -477,18 +503,34 @@ class Attention(nn.Module):
         if source == "scores":
             # score 空间不能直接比较普通数值和。这里使用 log-ratio bias：
             # score' = score + log(target_prob) - log(original_prob)，再由 full softmax 重新归一化。
+            # 这样做的好处是仍然让完整 attention row 经过一次统一 softmax，
+            # 保证 score 分支输出的 modified_probs 是合法概率分布，并保留 logits 级调制的语义。
             score_bias = torch.log(target_probs.clamp_min(1e-8)) - torch.log(attention_probs.clamp_min(1e-8))
             modified_probs = torch.softmax(attention_scores + score_bias, dim=-1)
         elif source == "probs":
+            # probs 分支已经直接构造出完整概率矩阵，因此不再回到 logits 空间。
+            # _build_*_mediated_row 内部已经保证被替换的 rows 完成归一化。
             modified_probs = target_probs
         else:
             raise ValueError(f"Unsupported ATTENTION_MEDIATION.SOURCE='{source}'.")
 
+        # delta_probs 描述 mediation 相对原始 attention_probs 的概率变化。
+        # 用同一份 value_layer 计算 delta_context，得到“额外修正量”，供 attention_parallel
+        # 或 block_parallel 在 Block.forward 中按策略合并。
         delta_probs = modified_probs - attention_probs
         delta_context = torch.matmul(delta_probs, value_layer)
+
+        # mediated_context 是完全采用 modified_probs 时的注意力上下文，
+        # 主要用于 block_parallel 等需要完整 mediated attention 输出的路径。
         mediated_context = torch.matmul(modified_probs, value_layer)
+
+        # delta_attention_output 只表示增量，所以不加输出投影 bias；
+        # mediated_attention_output 表示完整注意力输出，需要与标准 attention 输出保持同一投影形式，因此包含 bias。
         delta_attention_output = self._context_to_attention_output(delta_context, include_bias=False)
         mediated_attention_output = self._context_to_attention_output(mediated_context, include_bias=True)
+
+        # 返回 slice 是为了让上层在需要时知道 correction 覆盖了哪些 token 段；
+        # 两种输出张量则分别服务于“增量合并”和“完整 mediated 分支替换/并行”的执行模式。
         return {
             "delta_attention_output": delta_attention_output,
             "mediated_attention_output": mediated_attention_output,
@@ -896,6 +938,10 @@ class Block(nn.Module):
         )   # MHSA（输出同形状）; weights 仅在 vis=True 时非 None
         execution_mode = attention_mediation_config.get("execution_mode") if attention_mediation_config else None
         mlp_policy = attention_mediation_config.get("mlp_policy") if attention_mediation_config else None
+        if mediation is not None and execution_mode not in {"attention_parallel", "block_parallel"}:
+            raise ValueError("ATTENTION_MEDIATION.EXECUTION_MODE must be attention_parallel or block_parallel.")
+        if mediation is not None and mlp_policy not in {"enter_mlp", "skip_mlp"}:
+            raise ValueError("ATTENTION_MEDIATION.MLP_POLICY must be enter_mlp or skip_mlp.")
         if mediation is not None and execution_mode == "block_parallel":
             if mlp_policy != "enter_mlp":
                 raise ValueError("ATTENTION_MEDIATION block_parallel requires MLP_POLICY='enter_mlp'.")
@@ -986,6 +1032,10 @@ class Block(nn.Module):
         )
         execution_mode = attention_mediation_config.get("execution_mode") if attention_mediation_config else None
         mlp_policy = attention_mediation_config.get("mlp_policy") if attention_mediation_config else None
+        if mediation is not None and execution_mode not in {"attention_parallel", "block_parallel"}:
+            raise ValueError("ATTENTION_MEDIATION.EXECUTION_MODE must be attention_parallel or block_parallel.")
+        if mediation is not None and mlp_policy not in {"enter_mlp", "skip_mlp"}:
+            raise ValueError("ATTENTION_MEDIATION.MLP_POLICY must be enter_mlp or skip_mlp.")
         if mediation is not None and execution_mode == "block_parallel":
             if mlp_policy != "enter_mlp":
                 raise ValueError("ATTENTION_MEDIATION block_parallel requires MLP_POLICY='enter_mlp'.")
