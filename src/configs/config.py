@@ -45,9 +45,15 @@ _C.MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS = 25             # 任务/数据集级
 _C.MODEL.PROMPT.DISTRIBUTOR.OUTPUT_PARAM = "logvar"        # 分布参数输出形式；当前只支持 logvar，即 stats_out=[mu, logvar]
 _C.MODEL.PROMPT.DISTRIBUTOR.LOGVAR_MIN = -10.0             # logvar clamp 下界，防止 std 过小导致数值异常
 _C.MODEL.PROMPT.DISTRIBUTOR.LOGVAR_MAX = 5.0               # logvar clamp 上界，防止 std 爆炸
-_C.MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE = "mean"      # 评测采样：mean 使用 eps=0；fixed_eps 使用固定噪声 buffer
+_C.MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE = "fixed_eps"      # 评测采样：mean 使用 eps=0；fixed_eps 使用固定噪声 buffer
 _C.MODEL.PROMPT.DISTRIBUTOR.FIXED_EPS_SEED = 0             # fixed_eps buffer 的独立随机种子；不影响全局 torch 随机状态
-_C.MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED = False         # 是否给每个 instance prompt 加可学习槽位编码
+_C.MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED = True         # 是否给每个 instance prompt 加可学习槽位编码
+
+_C.MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE = False      # 是否启用 split-latent prompt：把 posterior 切成 semantic/variation 两个因子
+_C.MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_SEMANTIC_DIM = 384  # semantic factor 维度；第一版默认 384
+_C.MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_VARIATION_DIM = 384 # variation factor 维度；第一版默认 384，二者之和必须等于 768
+_C.MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_VARIATION_GATE_INIT = 0.0 # variation prompt 注入强度初值；0 表示初始先不让 variation 强扰动 prompt
+
 _C.MODEL.PROMPT.DISTRIBUTOR.CNN_NAME = "efficientnet_b0"   # cnn_torchvision 候选：efficientnet_b0 / mobilenet_v3_small
 _C.MODEL.PROMPT.DISTRIBUTOR.CLIP_NAME = "mobileclip_s0"    # clip_frozen 候选：mobileclip_s0 / tinyclip_vit8m；需本地权重
 _C.MODEL.PROMPT.DISTRIBUTOR.CLIP_LOCAL_DIR = ""            # clip_frozen 本地权重目录，期望存在 {CLIP_NAME}.pt
@@ -89,7 +95,7 @@ _C.MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE = "none"          # none / null_residua
 _C.MODEL.SEMANTIC_TOKENS.ORTHO.ATTRIBUTES_PATH = "datasets/CUB/attributes.txt"
 _C.MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_EMBED_PATH = "datasets/xlsa17/xlsa17/data/CUB/cub_attributes_sbert_all_mpnet_base_v2.pt"
 _C.MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_GATE_INIT = 0.0
-_C.MODEL.SEMANTIC_TOKENS.ORTHO.CODEBOOK_TRAINABLE = False
+_C.MODEL.SEMANTIC_TOKENS.ORTHO.CODEBOOK_TRAINABLE = False   # 让 semantic token 更像确定的属性编码，而不是又变成一组自由可学习 prompt
 _C.MODEL.SEMANTIC_TOKENS.ORTHO.CODEBOOK_SEED = 0
 _C.MODEL.SEMANTIC_TOKENS.ORTHO.DEBUG = False
 
@@ -105,12 +111,17 @@ _C.MODEL.SEMANTIC_GRAPH.NUM_CLASSES = 200               # CUB 全局类别数；
 _C.MODEL.SEMANTIC_GRAPH.ATTR_DIM = 312                  # CUB 属性维度
 _C.MODEL.SEMANTIC_GRAPH.TEXT_DIM = 768                  # 属性名文本 embedding 维度，也对应 prompt mu 维度
 _C.MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE = "fuse"           # 语义图来源：acc=属性置信图；acssc=属性文本语义图；fuse=rho 融合 acc / acssc / fuse
-_C.MODEL.SEMANTIC_GRAPH.RHO = 0.5                       # fuse 图中 Acc 的融合权重；G=rho*Acc+(1-rho)*Acssc
-_C.MODEL.SEMANTIC_GRAPH.TOPK = 20                       # 从 G[y] 中保留的语义相近类别数
+_C.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_PATH = ""        # GRAPH_SOURCE=external 时读取的 [C,C] 语义关系矩阵文件；支持 .npz/.npy/.pt/.pth
+_C.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_KEY = "graph"    # .npz 或 dict 文件中的矩阵 key
+_C.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_SYMMETRIZE = True # 是否强制 external graph 对称化
+_C.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_CLAMP = True     # 是否把 external graph 截断到 [0,1]
+_C.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_DIAG_VALUE = 1.0 # external graph 对角线值；负数表示不改对角线
+_C.MODEL.SEMANTIC_GRAPH.RHO = 0.0                       # fuse 图中 Acc 的融合权重；G=rho*Acc+(1-rho)*Acssc
+_C.MODEL.SEMANTIC_GRAPH.TOPK = 16                       # 从 G[y] 中保留的语义相近类别数
 _C.MODEL.SEMANTIC_GRAPH.TAU_ACC = 0.07                  # 构造语义 target T_y 时的 softmax 温度
 _C.MODEL.SEMANTIC_GRAPH.TAU_SEM = 0.07                  # rel_kl 中 batch 语义关系 R_s 的 softmax 温度
 _C.MODEL.SEMANTIC_GRAPH.TAU_PROMPT = 0.07               # prompt 关系/原型 logits 的初始温度；若 PROMPT_SCALE_LEARNABLE=True，仅作为初始化
-_C.MODEL.SEMANTIC_GRAPH.PROMPT_SCALE_LEARNABLE = True   # 是否学习 prompt_logit_scale；True 时 scale 初始为 1/TAU_PROMPT
+_C.MODEL.SEMANTIC_GRAPH.PROMPT_SCALE_LEARNABLE = True   # 控制 prompt 关系相似度温度/尺度是否可学习 的开关；True 时 scale 初始为 1/TAU_PROMPT
 _C.MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE = "mu"        # semantic graph 约束使用的 prompt 统计量：mu / instance_mean
 _C.MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA = 0.1          # semantic target 与 one-hot 的混合比例；0=纯 one-hot，1=纯语义近邻分布
 _C.MODEL.SEMANTIC_GRAPH.LOSS_TYPE = "none"              # 候选：none / acc_hidden / rel_kl / rel_all / ot / gw / fgw
@@ -123,6 +134,25 @@ _C.MODEL.SEMANTIC_GRAPH.OT_DELTA = 1e-8                 # OT/KL 概率归一化�
 _C.MODEL.SEMANTIC_GRAPH.OT_BALANCED_MODE = "batch_semantic_mean" # OT 目标边界 b 的构造方式；当前支持 batch_semantic_mean
 _C.MODEL.SEMANTIC_GRAPH.OT_DETACH_PLAN = True           # 是否停止 Sinkhorn plan 的梯度；True 时只让 cost/GW 项回传到 mu
 _C.MODEL.SEMANTIC_GRAPH.DEBUG = False                   # 打印一次 A_conf/E_attr/G/T/OT plan 等调试形状
+
+_C.MODEL.GRAPH_PROB_PRIOR = CfgNode()
+_C.MODEL.GRAPH_PROB_PRIOR.ENABLE = True                # 是否启用 GraphProbPrior；默认关闭，不影响标准 Prompt KL 和旧 semantic graph loss
+_C.MODEL.GRAPH_PROB_PRIOR.MODE = "graph_conditioned_semantic_prior" # 候选：true_class_kl / graph_conditioned_semantic_prior / class_aggregate_moment / class_aggregate_mmd / factorized_latent
+_C.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT = 0.001             # GraphProbPrior 辅助损失权重；用于替代标准 N(0,I) KL 时单独开启
+_C.MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH = 0.07              # 用 G[c] 聚合语义邻居 bank 时的 softmax 温度
+_C.MODEL.GRAPH_PROB_PRIOR.TAU_LATENT = 1.0              # softmax(-KL(q||p_c)/tau) 的温度，控制 latent matching 分布尖锐程度
+_C.MODEL.GRAPH_PROB_PRIOR.REL_WEIGHT = 0.0              # class_aggregate_* 专用全类 prior 关系正则权重；0 表示关闭
+_C.MODEL.GRAPH_PROB_PRIOR.TAU_PRIOR = 0.07              # prior Gaussian symKL 关系分布 softmax 温度，仅 REL_WEIGHT>0 时生效
+_C.MODEL.GRAPH_PROB_PRIOR.MOMENT_VAR_WEIGHT = 1.0       # class_aggregate_moment 中 log-variance matching 项权重
+_C.MODEL.GRAPH_PROB_PRIOR.MMD_SAMPLES = 1               # class_aggregate_mmd 中每个 posterior/prior 高斯采样次数
+_C.MODEL.GRAPH_PROB_PRIOR.MMD_SIGMA = 1.0               # class_aggregate_mmd 的 RBF kernel sigma
+_C.MODEL.GRAPH_PROB_PRIOR.FACTORIZED_VARIATION_WEIGHT = 0.0 # factorized_latent 中 variation aggregate matching 权重；第一版默认关闭
+_C.MODEL.GRAPH_PROB_PRIOR.FACTORIZED_DECOUPLE_WEIGHT = 0.0  # factorized_latent 中 semantic/variation 去相关权重；0 表示不启用
+_C.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE = False        # 是否记录 GraphProbPrior 温度/距离尺度监测量；默认关闭避免日常日志过长
+_C.MODEL.GRAPH_PROB_PRIOR.MONITOR_INACTIVE = False      # 是否额外计算当前 MODE 未使用的温度位置；默认关闭以避免额外开销
+_C.MODEL.GRAPH_PROB_PRIOR.MONITOR_TOPK = 5              # 监测 top-k mass 时使用的 k
+_C.MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N = 37           # 每多少次 GraphProbPrior forward 记录一次监测量；1 表示每次都记录
+_C.MODEL.GRAPH_PROB_PRIOR.DEBUG = False                 # 打印一次 GraphProbPrior 的关键 shape 和 loss 标量
 
 _C.MODEL.AFFINITY = CfgNode()
 _C.MODEL.AFFINITY.ENABLE = False
@@ -236,7 +266,7 @@ _C.SOLVER.BASE_LR = 0.0005
 _C.SOLVER.BIAS_MULTIPLIER = 1.
 _C.SOLVER.WARMUP_EPOCH = 5
 _C.SOLVER.TOTAL_EPOCH = 30
-_C.SOLVER.LOG_EVERY_N = 1000
+_C.SOLVER.LOG_EVERY_N = 111
 _C.SOLVER.DEBUG_GRAD_NORM = False
 _C.SOLVER.DEBUG_TRACE_ONCE = False
 _C.SOLVER.DEBUG_SHAPES = False

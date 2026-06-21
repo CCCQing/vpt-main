@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from typing import Any, Dict, Optional
 
 from ..models.prompting.prompt_distribution import prompt_kl_loss
-from .semantic_graph_losses import SemanticGraphLossComputer
+from .semantic_graph_losses import GraphProbPriorLossComputer, SemanticGraphLossComputer
 
 
 def _extract_logits_and_aux(pred_logits: Any, kwargs: Optional[Dict[str, Any]]):
@@ -1026,6 +1026,150 @@ class SemanticGraphAuxLoss(nn.Module):
         )
 
 
+class GraphProbPriorAuxLoss(nn.Module):
+    """
+    GraphProbPrior 辅助损失。
+
+    该分支不替换 PromptKLAuxLoss 的代码，而是作为独立 aux loss 接入：
+    - posterior: prompt distributor runtime stats 中的 mu/logvar；
+    - prior: 由 semantic graph 的 A_conf/E_attr/G 生成 all-class Gaussian prior；
+    - true_class_kl: 每个样本只对齐自己的真类 graph-conditioned prior；
+    - graph_conditioned_semantic_prior: 用 T_i 监督逐样本 latent matching；
+    - class_aggregate_moment / class_aggregate_mmd: 对 batch 内同类 posterior 聚合后做分布匹配。
+    - factorized_latent: 只让 semantic factor 接受 semantic graph prior matching，
+      variation factor 默认不做逐样本 KL。
+
+    因此它可以单独开启，用来替代标准 N(0,I) KL；也可以和标准 KL 同时开启，
+    但同时开启时训练目标会变成“双 prior 约束”。
+    """
+
+    def __init__(self, cfg=None):
+        super().__init__()
+        # CompositeLoss 会用 name 作为 stats 里的键：
+        # stats["graph_prob_prior_loss"] = 当前 batch 未乘权重的 aux loss 标量。
+        self.name = "graph_prob_prior_loss"
+
+        # GraphProbPrior 不需要 trainer 额外导出 attention affinity aux；
+        # 它只依赖 prompt distributor runtime stats 和 trainer 传入的语义图资源。
+        self.requires_affinity_aux = False
+
+        # 这是 CompositeLoss 外层乘的辅助损失权重。
+        # forward() 返回的是未乘 LOSS_WEIGHT 的原始 GraphProbPrior loss。
+        self.graph_prob_prior_weight = float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT)
+
+        # 标准 Prompt KL 约束的是 q(z|x) 接近 N(0,I)；
+        # GraphProbPrior 约束的是 q(z|x) 接近由语义图生成的 class prior。
+        # 两者同时打开不是错误，但语义上是“双 prior”共同约束同一个 posterior。
+        if self.graph_prob_prior_weight > 0.0 and float(cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT) > 0.0:
+            print(
+                "[graph-prob-prior] SOLVER.LOSS_PROMPT_KL_WEIGHT and "
+                "MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT are both > 0; "
+                "training will use both N(0,I) KL and graph-conditioned prior KL."
+            )
+
+        # 具体的图构造、class prior 生成、KL/moment/MMD/factorized loss 计算
+        # 都放在 GraphProbPriorLossComputer 中；这个 AuxLoss 只负责和 CompositeLoss/trainer 对接。
+        self.computer = GraphProbPriorLossComputer(cfg)
+
+        # mode 决定后面从 runtime stats 读取完整 posterior，还是读取 factorized posterior。
+        self.mode = str(cfg.MODEL.GRAPH_PROB_PRIOR.MODE).lower()
+
+        # 保存最近一次 forward 的细粒度诊断项，CompositeLoss 会把它们合并到总 stats。
+        self._last_loss_stats: Dict[str, float] = {}
+
+    @property
+    def weight(self) -> float:
+        # CompositeLoss 统一通过 aux_loss.weight 判断是否启用并决定外层加权。
+        return self.graph_prob_prior_weight
+
+    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
+        # pred_logits / targets / per_cls_weights 是 CompositeLoss 的统一接口参数。
+        # GraphProbPrior 自己不直接使用分类 logits，也不使用 remap 后的 local targets；
+        # 它需要的是 kwargs 中的模型运行时状态和全局类别语义资源。
+        if not isinstance(kwargs, dict):
+            raise RuntimeError("GraphProbPrior loss requires loss kwargs.")
+
+        # trainer 在 forward_one_batch 中构造 loss_kwargs：
+        #   model:              当前 ViT 模型引用，用于读取 runtime prompt stats；
+        #   targets_global:     全局类别 id，不能用 local-output remap 后的 targets；
+        #   class_attributes:   全类属性矩阵 A_conf；
+        #   attr_name_embeddings: 属性名文本 embedding E_attr。
+        if "model" not in kwargs:
+            raise RuntimeError("GraphProbPrior loss requires kwargs['model'].")
+        if "targets_global" not in kwargs:
+            raise RuntimeError("GraphProbPrior loss requires kwargs['targets_global'].")
+        if "class_attributes" not in kwargs:
+            raise RuntimeError("GraphProbPrior loss requires kwargs['class_attributes'].")
+        if "attr_name_embeddings" not in kwargs:
+            raise RuntimeError("GraphProbPrior loss requires kwargs['attr_name_embeddings'].")
+
+        model = kwargs["model"]
+        # PromptedTransformer 在前向时会缓存 distributor 返回的 stats；
+        # ViT model 通过 get_runtime_prompt_distribution_stats() 暴露给 loss 侧。
+        if not hasattr(model, "get_runtime_prompt_distribution_stats"):
+            raise RuntimeError("GraphProbPrior loss requires model.get_runtime_prompt_distribution_stats().")
+        stats = model.get_runtime_prompt_distribution_stats()
+        if not isinstance(stats, dict):
+            raise RuntimeError("GraphProbPrior loss requires runtime prompt distribution stats dict.")
+
+        # 所有 GraphProbPrior mode 至少要求普通 posterior 参数存在：
+        #   stats["mu"], stats["logvar"] 形状通常是 [B,768]。
+        # factorized_latent 虽然后面主要用 semantic_mu/logvar，
+        # 但这里仍先确认 distributor 的基础 stats 是完整的。
+        if "mu" not in stats or "logvar" not in stats:
+            raise RuntimeError("GraphProbPrior loss requires stats['mu'] and stats['logvar'].")
+
+        if self.mode == "factorized_latent":
+            # factorized_latent 不使用完整 768 维 posterior 做 graph prior matching；
+            # 它要求 distributor 已经把 posterior 切成：
+            #   semantic_mu/logvar  -> 接受 semantic graph prior matching；
+            #   variation_mu/logvar -> 可选 aggregate matching / decouple 接口。
+            required_keys = (
+                "factorized_enable",
+                "semantic_mu",
+                "semantic_logvar",
+                "variation_mu",
+                "variation_logvar",
+            )
+            for key in required_keys:
+                if key not in stats:
+                    raise RuntimeError(f"GraphProbPrior factorized_latent requires stats['{key}'].")
+            if not bool(stats["factorized_enable"]):
+                raise RuntimeError(
+                    "GraphProbPrior factorized_latent requires MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE=True."
+                )
+
+            # 传给 computer 的 posterior_mu/logvar 是 semantic factor，
+            # variation factor 作为额外参数传入，只在 factorized_latent 内部按配置使用。
+            loss = self.computer(
+                posterior_mu=stats["semantic_mu"],
+                posterior_logvar=stats["semantic_logvar"],
+                targets_global=kwargs["targets_global"],
+                class_attributes=kwargs["class_attributes"],
+                attr_name_embeddings=kwargs["attr_name_embeddings"],
+                variation_mu=stats["variation_mu"],
+                variation_logvar=stats["variation_logvar"],
+            )
+        else:
+            # 非 factorized mode 使用完整 posterior：
+            #   true_class_kl: 逐样本 q(z|x) 只和对应真类 prior 做 KL；
+            #   graph_conditioned_semantic_prior: 逐样本 q(z|x) 到 all-class prior 的 KL matching；
+            #   class_aggregate_moment: batch 内同类 posterior 聚合后做 moment matching；
+            #   class_aggregate_mmd: batch 内同类 posterior 聚合后做 RBF-MMD matching。
+            loss = self.computer(
+                posterior_mu=stats["mu"],
+                posterior_logvar=stats["logvar"],
+                targets_global=kwargs["targets_global"],
+                class_attributes=kwargs["class_attributes"],
+                attr_name_embeddings=kwargs["attr_name_embeddings"],
+            )
+
+        # GraphProbPriorLossComputer 内部会记录细粒度指标，例如 match_loss、entropy、
+        # posterior/prior 方差均值、factorized 子项等；这里复制出来给 CompositeLoss 合并。
+        self._last_loss_stats = dict(self.computer._last_loss_stats)
+        return loss
+
+
 class CompositeLoss(nn.Module):
     """
     组合式 loss：main_loss 负责分类主线，aux_losses 只负责各自的辅助约束。
@@ -1061,6 +1205,8 @@ class CompositeLoss(nn.Module):
             aux_value = aux_loss(pred_logits, targets, per_cls_weights, kwargs=kwargs)
             total = total + weight * aux_value
             stats[aux_loss.name] = float(aux_value.detach().item())
+            if isinstance(aux_loss, GraphProbPriorAuxLoss):
+                stats.update(aux_loss._last_loss_stats)
         self._last_loss_stats = stats
         return total
 
@@ -1222,6 +1368,14 @@ def _semantic_graph_enabled(cfg) -> bool:
     )
 
 
+def _graph_prob_prior_enabled(cfg) -> bool:
+    """判断 GraphProbPrior 辅助损失是否启用。"""
+    return (
+        bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE)
+        and float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT) > 0
+    )
+
+
 def _build_aux_losses(cfg):
     """
     根据各辅助损失权重构建辅助损失列表。
@@ -1244,6 +1398,8 @@ def _build_aux_losses(cfg):
         aux_losses.append(PromptKLAuxLoss(cfg))
     if _semantic_graph_enabled(cfg):
         aux_losses.append(SemanticGraphAuxLoss(cfg))
+    if _graph_prob_prior_enabled(cfg):
+        aux_losses.append(GraphProbPriorAuxLoss(cfg))
     return aux_losses
 
 

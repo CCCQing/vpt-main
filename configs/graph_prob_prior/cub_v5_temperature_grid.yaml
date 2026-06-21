@@ -1,0 +1,65 @@
+BASE_CONFIG_FILE: "configs/prompt/cub.yaml"
+DIAGNOSE_SCRIPT: "src/tools/diagnose_graph_prob_prior_temperatures.py"
+PYTHON_BIN: ""
+OUTPUT_DIR: "output/gpp_v5_temperature_grid"
+MAX_BATCHES: 111
+NO_TRAIN_STEP: false
+
+EXTERNAL_GRAPH:
+  PATH: "output/cub_attribute_localization/hparam_search_v5_seven_methods_nocap_gate/seven_method_matrices.npz"
+  METHODS:
+    - "method1_diff"
+    - "method2_diff"
+    - "method3_diff"
+    - "llm_gate"
+    - "method1_diff_llm_gate"
+    - "method2_diff_llm_gate"
+    - "method3_diff_llm_gate"
+
+FIXED_OPTS:
+  MODEL.SEMANTIC_GRAPH.ENABLE: false
+  MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE: "external"
+  MODEL.SEMANTIC_GRAPH.LOSS_TYPE: "none"
+  MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT: 0.0
+  MODEL.SEMANTIC_GRAPH.TOPK: 16
+  MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA: 0.1
+  MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_SYMMETRIZE: true
+  MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_CLAMP: true
+  MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_DIAG_VALUE: 1.0
+  MODEL.GRAPH_PROB_PRIOR.ENABLE: true
+  MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT: 0.001
+  MODEL.GRAPH_PROB_PRIOR.REL_WEIGHT: 0.0
+  MODEL.GRAPH_PROB_PRIOR.TAU_PRIOR: 0.07
+  SOLVER.LOSS_PROMPT_KL_WEIGHT: 0.0
+  SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT: 0.0
+  SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT: 0.0
+  SOLVER.VIS.ENABLE: false
+
+MODE_SEARCH_SPACE:
+  true_class_kl:
+    GRID:
+      MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH: [0.05, 0.10, 0.20]
+
+  graph_conditioned_semantic_prior:
+    GRID:
+      MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH: [0.05, 0.10, 0.20]
+      MODEL.GRAPH_PROB_PRIOR.TAU_LATENT: [0.05, 0.10]
+      MODEL.SEMANTIC_GRAPH.TAU_ACC: [0.05, 0.10]
+
+  class_aggregate_moment:
+    GRID:
+      MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH: [0.05, 0.10, 0.20]
+      MODEL.GRAPH_PROB_PRIOR.MOMENT_VAR_WEIGHT: [0.5, 1.0]
+
+  class_aggregate_mmd:
+    GRID:
+      MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH: [0.05, 0.10, 0.20]
+      MODEL.GRAPH_PROB_PRIOR.MMD_SIGMA: [16.0, 32.0, 64.0]
+
+  factorized_latent:
+    FIXED_OPTS:
+      MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE: true
+    GRID:
+      MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH: [0.05, 0.10, 0.20]
+      MODEL.GRAPH_PROB_PRIOR.TAU_LATENT: [0.05, 0.10]
+      MODEL.SEMANTIC_GRAPH.TAU_ACC: [0.05, 0.10]

@@ -8,7 +8,7 @@ https://github.com/jeonsworld/ViT-pytorch/blob/main/models/modeling.py
 import copy
 import logging
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 # 8.21改动
 # 原有 Win 下 os.path.join 会产生反斜杠 "\"，会影响从权重字典中取键（键名一般用 "/"）
 # 因此改为从 posixpath 导入 join，确保键名分隔符始终为 "/"
@@ -159,6 +159,26 @@ class Attention(nn.Module):
             attention_output = torch.nn.functional.linear(context_layer, self.out.weight, None)
         return self.proj_dropout(attention_output)
 
+    def _apply_shared_attention_dropout(
+        self,
+        attention_probs: torch.Tensor,
+        modified_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        [ATTN-MED-DROPOUT-SYNC]
+        让原始 attention row 和 mediated attention row 使用同一份 attention dropout 掩码。
+
+        训练时 nn.Dropout 会把被保留的位置除以 keep_prob。这里手动生成同样语义的
+        mask，并同时乘到 original/modified 两份概率上，避免主路径使用 dropout 后概率、
+        mediated delta 却使用 dropout 前概率。
+        """
+        dropout_p = float(self.attn_dropout.p)
+        if (not self.training) or dropout_p <= 0.0:
+            return attention_probs, modified_probs
+        keep_prob = 1.0 - dropout_p
+        shared_mask = torch.empty_like(attention_probs).bernoulli_(keep_prob).div_(keep_prob)
+        return attention_probs * shared_mask, modified_probs * shared_mask
+
     @staticmethod
     def _row_normalize(x: torch.Tensor, dim: int, eps: float = 1e-8) -> torch.Tensor:
         """
@@ -249,13 +269,11 @@ class Attention(nn.Module):
             direct_mass_per_query = direct_visual_mass.squeeze(-1)
 
             # direct_total_mass 是同一组 query 在 visual block 上的总 mass。
-            # block_redistribute 只改变这些 mass 在 query 之间的分布，不凭空增加或减少
-            # 这一组 query 合计投向 visual block 的概率质量。
+            # block_redistribute 只改变这些 mass 在 query 之间的分布，不凭空增加或减少这一组 query 合计投向 visual block 的概率质量。
             direct_total_mass = direct_mass_per_query.sum(dim=-1, keepdim=True)
 
             # 将原始 visual mass 归一化成 query 维度上的分布：
-            # 每个位置表示该 query 占整组 visual mass 的比例，而不是完整 attention row
-            # 中的概率值。
+            # 每个位置表示该 query 占整组 visual mass 的比例，而不是完整 attention row中的概率值。
             direct_mass_dist = self._row_normalize(direct_mass_per_query, dim=-1)
 
             # mediated_mass_score 是 mediation 路径给出的 query 级 visual mass 打分。
@@ -301,30 +319,72 @@ class Attention(nn.Module):
         """
         构造 prompt query 的完整 modified attention row。
 
-        visual_block 只改 P->V 子块；full_row 直接构造 P->[CLS|P|V|S] 完整行。
+        输入的 attention row 按 [CLS | P(prompt) | V(visual) | S(semantic)] 排列。
+        本函数只负责 prompt token 作为 query 时的 P->* 行：
+        - visual_block 只改 P->V 子块，再把它拼回原始 P->[CLS|P|V|S] 完整行；
+        - full_row 直接通过中介路径构造 P->[CLS|P|V|S] 完整行。
         """
+        # 取出 mediation 需要的三块原始注意力：
+        # a_sp: semantic query 到 prompt key，形状 [B, H, S, P]；
+        # a_ps: prompt query 到 semantic key，形状 [B, H, P, S]；
+        # a_sv: semantic query 到 visual key，形状 [B, H, S, V]。
+        # route_base 可能是 attention_scores，也可能是 attention_probs；
+        # _conditional_normalize 会根据 source 选择 softmax 或普通归一化。
         a_sp = route_base[:, :, semantic_slice, prompt_slice]
         a_ps = route_base[:, :, prompt_slice, semantic_slice]
         a_sv = route_base[:, :, semantic_slice, visual_slice]
+
+        # 把 S->V 归一化成“给定某个 semantic query 时，它如何分配 visual key”的条件分布。
+        # 后续两种 prompt route 都会把 prompt 与 semantic 的关系投影到这组 S->V 分布上，
+        # 从而得到间接的 P->V 分布。
         sv_cond = self._conditional_normalize(a_sv, dim=-1, source=source)
+
+        # prompt query 的原始完整 attention row，形状 [B, H, P, all_tokens]。
+        # visual_block 模式会在这个完整行上只替换 visual_slice 对应的 P->V 子块；
+        # full_row 模式则不会用它拼接，而是直接返回 mediated_full。
         direct_prompt_row = attention_probs[:, :, prompt_slice, :]
 
         if route == "S_to_P_and_V":
+            # 路径含义：用 semantic token 作为中介，同时参考 S->P 与 S->V。
+            # a_sp 原始形状是 [B, H, S, P]，这里沿 S 维归一化，得到“对每个 prompt，
+            # 哪些 semantic 更相关”的条件分布。之后转置成 [B, H, P, S]，才能从 prompt
+            # query 聚合 semantic 侧的信息。
             sp_cond = self._conditional_normalize(a_sp, dim=-2, source=source)
             if route_scope == "full_row":
+                # full_row 模式：不是只构造 P->V，而是先得到每个 semantic query 的完整
+                # S->[CLS|P|V|S] 条件分布，再按 P<-S 的权重聚合，得到完整的
+                # P->[CLS|P|V|S] mediated row。
                 s_full_cond = self._conditional_normalize(route_base[:, :, semantic_slice, :], dim=-1, source=source)
                 mediated_full = torch.matmul(sp_cond.transpose(-1, -2), s_full_cond)
             else:
+                # visual_block 模式：只用 P<-S 的权重聚合 S->V 条件分布，得到 mediated P->V。
+                # mediated_visual_base 形状 [B, H, P, V]，表示 prompt query 经 semantic
+                # 中介后应当关注哪些 visual token。
                 mediated_visual_base = torch.matmul(sp_cond.transpose(-1, -2), sv_cond)
+
+                # 额外计算 semantic query 原本分配给 visual block 的总 mass，形状 [B, H, S, 1]。
+                # block_redistribute 模式会通过 P<-S 权重把这些 mass 投影到 prompt query 上，
+                # 用来决定每个 prompt row 的新 visual 总质量；row_preserve 模式下也会传入，
+                # 但 _compose_visual_block_row 不会使用它来改变总 mass。
                 semantic_visual_mass = attention_probs[:, :, semantic_slice, visual_slice].sum(dim=-1, keepdim=True)
                 mediated_mass_score = torch.matmul(sp_cond.transpose(-1, -2), semantic_visual_mass)
         elif route == "P_to_S_to_V":
+            # 路径含义：先看 prompt query 直接关注哪些 semantic key，再沿这些 semantic
+            # token 的 S->V 分布继续走到 visual token，即 P->S->V。
+            # ps_cond 形状 [B, H, P, S]，每个 prompt row 内对 semantic key 归一化。
             ps_cond = self._conditional_normalize(a_ps, dim=-1, source=source)
             if route_scope == "full_row":
+                # full_row 模式：用 P->S 权重聚合 semantic query 的完整 attention row，
+                # 得到完整 P->[CLS|P|V|S] mediated row。
                 s_full_cond = self._conditional_normalize(route_base[:, :, semantic_slice, :], dim=-1, source=source)
                 mediated_full = torch.matmul(ps_cond, s_full_cond)
             else:
+                # visual_block 模式：用 P->S 权重聚合 S->V 条件分布，得到 mediated P->V。
                 mediated_visual_base = torch.matmul(ps_cond, sv_cond)
+
+                # 与上一个分支一样，估计经 P->S 路径传递到每个 prompt query 的 visual mass。
+                # 这个值只决定 visual block 的总质量如何分配；P->V 内部具体落在哪些 visual token
+                # 由 mediated_visual_base / mediated_visual_cond 决定。
                 semantic_visual_mass = attention_probs[:, :, semantic_slice, visual_slice].sum(dim=-1, keepdim=True)
                 mediated_mass_score = torch.matmul(ps_cond, semantic_visual_mass)
         else:
@@ -334,10 +394,20 @@ class Attention(nn.Module):
             )
 
         if route_scope == "full_row":
+            # full_row 已经生成完整 P->[CLS|P|V|S] 行。这里再做一次 row normalize，
+            # 防止 score/prob source 的数值路径或矩阵乘法带来微小归一化误差。
             mediated_full = self._row_normalize(mediated_full, dim=-1)
             return mediated_full
         if route_scope == "visual_block":
+            # visual_block 只替换 P->V 子块：先把 mediated_visual_base 归一化成
+            # 每个 prompt query 在 visual tokens 内部的条件分布，再交给
+            # _compose_visual_block_row 拼回完整 row。
             mediated_visual_cond = self._row_normalize(mediated_visual_base, dim=-1)
+
+            # _compose_visual_block_row 会根据 mass_mode 决定 P->V 的总质量：
+            # - row_preserve: 每个 prompt row 保持原来的 visual mass，只改 visual 内部分布；
+            # - block_redistribute: 在 prompt queries 之间重分配 visual mass，强度由 beta_mass 控制。
+            # 非 visual 区域会按剩余 mass 等比例缩放，保证最终完整 row 仍然和为 1。
             return self._compose_visual_block_row(
                 direct_prompt_row,
                 visual_slice,
@@ -415,7 +485,6 @@ class Attention(nn.Module):
         self,
         attention_scores: torch.Tensor,
         attention_probs: torch.Tensor,
-        value_layer: torch.Tensor,
         prompt_length: int,
         semantic_length: int,
         mediation_config: Dict[str, Any],
@@ -423,12 +492,14 @@ class Attention(nn.Module):
         """
         在当前层 MHSA 内部构造 mediated attention correction。
 
-        这里先构造目标概率分布 target_probs。若 SOURCE=scores，再用
+        [ATTN-MED-DROPOUT-SYNC]
+        这里只构造 dropout 前的目标概率分布 target_probs / modified_probs。若 SOURCE=scores，再用
         log(target_probs)-log(original_probs) 形成 score bias，并重新对完整 row 做 softmax。
         这样 score 分支最终仍由 full softmax 产生合法 attention 概率。
+
+        注意：delta_context 不在这里计算，而是在 _scaled_attention() 中和主路径共享
+        attention dropout 之后再计算，保证训练时两条路径的随机性一致。
         """
-        # 未开启 ATTENTION_MEDIATION 时直接返回 None，让调用方继续走标准 MHSA 路径。
-        # 这里放在最前面，避免在普通训练/推理中做任何额外配置解析和张量拷贝。
         if not mediation_config or not mediation_config.get("enable", False):
             return None
 
@@ -441,8 +512,7 @@ class Attention(nn.Module):
         mass_mode = str(mediation_config.get("mass_mode"))
 
         # 这里尽早做配置合法性检查，避免后续构造 target_probs 时产生难定位的 shape
-        # 或概率归一化错误。full_row 已经直接产出完整 row，因此不再支持额外的
-        # block_redistribute mass 重分配。
+        # 或概率归一化错误。full_row 已经直接产出完整 row，因此不再支持额外的block_redistribute mass 重分配。
         if source not in {"scores", "probs"}:
             raise ValueError("ATTENTION_MEDIATION.SOURCE must be scores or probs.")
         if mass_mode not in {"row_preserve", "block_redistribute"}:
@@ -514,26 +584,12 @@ class Attention(nn.Module):
         else:
             raise ValueError(f"Unsupported ATTENTION_MEDIATION.SOURCE='{source}'.")
 
-        # delta_probs 描述 mediation 相对原始 attention_probs 的概率变化。
-        # 用同一份 value_layer 计算 delta_context，得到“额外修正量”，供 attention_parallel
-        # 或 block_parallel 在 Block.forward 中按策略合并。
-        delta_probs = modified_probs - attention_probs
-        delta_context = torch.matmul(delta_probs, value_layer)
-
-        # mediated_context 是完全采用 modified_probs 时的注意力上下文，
-        # 主要用于 block_parallel 等需要完整 mediated attention 输出的路径。
-        mediated_context = torch.matmul(modified_probs, value_layer)
-
-        # delta_attention_output 只表示增量，所以不加输出投影 bias；
-        # mediated_attention_output 表示完整注意力输出，需要与标准 attention 输出保持同一投影形式，因此包含 bias。
-        delta_attention_output = self._context_to_attention_output(delta_context, include_bias=False)
-        mediated_attention_output = self._context_to_attention_output(mediated_context, include_bias=True)
-
-        # 返回 slice 是为了让上层在需要时知道 correction 覆盖了哪些 token 段；
-        # 两种输出张量则分别服务于“增量合并”和“完整 mediated 分支替换/并行”的执行模式。
+        # [ATTN-MED-DROPOUT-SYNC]
+        # 返回 modified_probs，而不是在这里直接计算 delta_context。
+        # _scaled_attention() 会先把 original/modified 两份 probs 乘同一份 attention dropout mask，
+        # 再计算 delta_attention_output 和 mediated_attention_output。
         return {
-            "delta_attention_output": delta_attention_output,
-            "mediated_attention_output": mediated_attention_output,
+            "modified_probs": modified_probs,
             "prompt_slice": prompt_slice,
             "semantic_slice": semantic_slice,
         }
@@ -588,12 +644,25 @@ class Attention(nn.Module):
         mediation = self._compute_attention_mediation(
             attention_scores,
             attention_probs,
-            value_layer,
             prompt_length,
             semantic_length,
             mediation_config,
         )
-        attention_probs = self.attn_dropout(attention_probs)
+
+        if mediation is not None:
+            # [ATTN-MED-DROPOUT-SYNC]
+            # mediation 先构造 dropout 前的 modified_probs；这里让原始主路径和 mediated 分支
+            # 共享同一份 attention dropout mask，然后再分别计算主路径 context 与 mediated delta。
+            modified_probs = mediation.pop("modified_probs")
+            attention_probs, modified_probs = self._apply_shared_attention_dropout(attention_probs, modified_probs)
+
+            delta_probs = modified_probs - attention_probs
+            delta_context = torch.matmul(delta_probs, value_layer)
+            mediated_context = torch.matmul(modified_probs, value_layer)
+            mediation["delta_attention_output"] = self._context_to_attention_output(delta_context, include_bias=False)
+            mediation["mediated_attention_output"] = self._context_to_attention_output(mediated_context, include_bias=True)
+        else:
+            attention_probs = self.attn_dropout(attention_probs)
 
         # 标准 MHSA 主路径不被替换；mediated correction 作为额外 delta 在 Block.forward 中合并。
         context_layer = torch.matmul(attention_probs, value_layer)

@@ -268,6 +268,10 @@ class PreViTPromptDistributor(nn.Module):
         external_allow_download: bool = False,
         output_param: str = "logvar",
         fixed_eps_seed: int = 0,
+        factorized_enable: bool = False,
+        factorized_semantic_dim: int = 384,
+        factorized_variation_dim: int = 384,
+        factorized_variation_gate_init: float = 0.0,
         debug_distributor_shapes: bool = False,
     ) -> None:
         super().__init__()
@@ -283,6 +287,10 @@ class PreViTPromptDistributor(nn.Module):
         self.use_slot_embed = bool(use_slot_embed)
         self.output_param = str(output_param)
         self.fixed_eps_seed = int(fixed_eps_seed)
+        self.factorized_enable = bool(factorized_enable)
+        self.factorized_semantic_dim = int(factorized_semantic_dim)
+        self.factorized_variation_dim = int(factorized_variation_dim)
+        self.factorized_variation_gate_init = float(factorized_variation_gate_init)
         self.debug_distributor_shapes = bool(debug_distributor_shapes)
         self._debug_shapes_logged = False
 
@@ -302,6 +310,15 @@ class PreViTPromptDistributor(nn.Module):
             raise ValueError("DISTRIBUTOR.OUTPUT_PARAM currently supports only 'logvar'.")
         if self.logvar_min > self.logvar_max:
             raise ValueError("DISTRIBUTOR.LOGVAR_MIN must be <= LOGVAR_MAX.")
+        if self.factorized_enable:
+            if self.factorized_semantic_dim <= 0:
+                raise ValueError("DISTRIBUTOR.FACTORIZED_SEMANTIC_DIM must be positive.")
+            if self.factorized_variation_dim <= 0:
+                raise ValueError("DISTRIBUTOR.FACTORIZED_VARIATION_DIM must be positive.")
+            if self.factorized_semantic_dim + self.factorized_variation_dim != self.dim:
+                raise ValueError(
+                    "DISTRIBUTOR.FACTORIZED_SEMANTIC_DIM + FACTORIZED_VARIATION_DIM must equal hidden dim."
+                )
 
         # 根据 SOURCE 选择视觉统计量来源。所有来源最终只负责输出 stats_out=[B,1536]，
         # 后续 mu/logvar 切分、采样、拼接 domain prompt 都走同一条逻辑。
@@ -341,6 +358,15 @@ class PreViTPromptDistributor(nn.Module):
         if self.use_slot_embed:
             self.slot_embed = nn.Parameter(torch.zeros(1, self.instance_tokens, self.dim))
             nn.init.normal_(self.slot_embed, mean=0.0, std=0.02)
+        if self.factorized_enable:
+            # factorized 第一版采用 split-latent：
+            # stats_head 仍输出原来的 [mu, logvar]，再按通道切成 semantic / variation 两段。
+            # 这样关闭 FACTORIZED_ENABLE 时旧路径完全不变，后续若要改成双 head 也只需要替换这里。
+            self.factorized_semantic_proj = nn.Linear(self.factorized_semantic_dim, self.dim)
+            self.factorized_variation_proj = nn.Linear(self.factorized_variation_dim, self.dim)
+            self.factorized_variation_gate = nn.Parameter(
+                torch.tensor(self.factorized_variation_gate_init, dtype=torch.float32)
+            )
         # fixed_eps 只在 eval 且 EVAL_SAMPLE_MODE="fixed_eps" 时使用。
         # 使用独立 Generator，避免初始化该 buffer 消耗或扰动全局 torch 随机序列。
         fixed_eps_generator = torch.Generator()
@@ -442,6 +468,120 @@ class PreViTPromptDistributor(nn.Module):
             instance_prompt = instance_prompt + self.slot_embed.to(device=mu.device, dtype=mu.dtype)
         return instance_prompt
 
+    def _sample_factor_latent(
+        self,
+        mu: torch.Tensor,
+        std: torch.Tensor,
+        eps_start: int,
+        eps_end: int,
+    ) -> torch.Tensor:
+        """
+        为 split-latent 的某一个因子采样。
+
+        semantic factor 和 variation factor 都沿用 distributor 的采样协议：
+        - train: 每个 instance prompt 重新采样 eps；
+        - eval mean: eps=0；
+        - eval fixed_eps: 使用同一个 fixed_eps buffer 的对应通道切片。
+
+        这样 factorized 分支不会额外引入一套评测随机性。
+        """
+        latent_dim = int(eps_end - eps_start)
+        if self.training:
+            eps = torch.randn(
+                mu.shape[0],
+                self.instance_tokens,
+                latent_dim,
+                device=mu.device,
+                dtype=mu.dtype,
+            )
+        elif self.eval_sample_mode == "mean":
+            eps = torch.zeros(
+                mu.shape[0],
+                self.instance_tokens,
+                latent_dim,
+                device=mu.device,
+                dtype=mu.dtype,
+            )
+        elif self.eval_sample_mode == "fixed_eps":
+            eps = self.fixed_eps[..., eps_start:eps_end].to(device=mu.device, dtype=mu.dtype)
+            eps = eps.expand(mu.shape[0], -1, -1)
+        else:
+            raise ValueError(f"Unsupported EVAL_SAMPLE_MODE='{self.eval_sample_mode}'")
+        return mu[:, None, :] + std[:, None, :] * eps
+
+    def _sample_factorized_instance_prompt(
+        self,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        std: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        split-latent prompt 生成路径。
+        当前 posterior 仍是原始 q(z|x)=N(mu,diag(v))，但把 768 维通道切成：
+        - semantic factor: 负责类别语义和 semantic graph prior matching；
+        - variation factor: 负责姿态、背景、局部外观等类内变化。
+
+        prompt 由两段 latent 分别投影后相加：
+            prompt = P_s(z_s) + gate * P_v(z_v)
+        gate 是可学习标量，默认初始化为 0，表示新分支初始时不让
+        variation latent 强烈扰动 prompt。
+        """
+        # 外部 forward 已经把 stats_out=[B,1536] 切成 mu=[B,768] 和 logvar=[B,768]，
+        # 这里再把每个 768 维 posterior 参数按通道切成两段。
+        # 默认配置下：semantic_end = 384 variation_end = 768
+        semantic_end = self.factorized_semantic_dim
+        variation_end = semantic_end + self.factorized_variation_dim
+
+        # semantic factor 的后验参数：q_s(z_s|x) = N(semantic_mu, diag(exp(semantic_logvar)))
+        semantic_mu = mu[:, :semantic_end]
+        semantic_logvar = logvar[:, :semantic_end]
+        semantic_std = std[:, :semantic_end]
+        # variation factor 的后验参数：q_v(z_v|x) = N(variation_mu, diag(exp(variation_logvar)))
+        variation_mu = mu[:, semantic_end:variation_end]
+        variation_logvar = logvar[:, semantic_end:variation_end]
+        variation_std = std[:, semantic_end:variation_end]
+
+        # 两个 factor 沿用普通 prompt distribution 的采样规则，统一控制键：
+        # train: 随机 eps；eval + mean: eps=0；eval + fixed_eps: 使用 fixed_eps 对应通道切片。
+        semantic_latent = self._sample_factor_latent(semantic_mu, semantic_std, 0, semantic_end)
+        variation_latent = self._sample_factor_latent(variation_mu, variation_std, semantic_end, variation_end)
+
+        # 每个 latent factor 采样后形状 [B, instance_tokens, factor_dim]。投影回 prompt [B, instance_tokens, 768]
+        semantic_prompt = self.factorized_semantic_proj(semantic_latent)
+        variation_prompt = self.factorized_variation_proj(variation_latent)
+
+        # variation_gate 是一个可学习标量，而不是每个样本/每个 token 一套 gate。
+        # 初始化为 FACTORIZED_VARIATION_GATE_INIT，默认 0.0。
+        # 因此刚启用 factorized 时，prompt 主要由 semantic_prompt 决定；
+        # 训练如果发现 variation_prompt 有用，会通过梯度把 gate 调大或调成其他合适值。
+        variation_gate = self.factorized_variation_gate.to(device=mu.device, dtype=mu.dtype)
+        instance_prompt = semantic_prompt + variation_gate * variation_prompt
+
+        # slot_embed 如果启用，仍然作为“第几个 instance prompt 槽位”的编码加入最终 prompt。
+        # 它不区分 semantic/variation，只作用在融合后的 instance_prompt 上。
+        if self.use_slot_embed:
+            instance_prompt = instance_prompt + self.slot_embed.to(device=mu.device, dtype=mu.dtype)
+
+        # 这些 stats 会随 prompt_tokens 一起被 PromptedTransformer 缓存，
+        # 后续 loss 侧通过 model.get_runtime_prompt_distribution_stats() 读取。
+        # 其中 semantic_mu/logvar 和 variation_mu/logvar 是 factorized_latent loss 的关键输入；
+        # semantic_prompt / variation_prompt / variation_gate 主要用于调试、监控和后续可视化。
+        factor_stats = {
+            "factorized_enable": True,
+            "semantic_mu": semantic_mu,
+            "semantic_logvar": semantic_logvar,
+            "semantic_std": semantic_std,
+            "semantic_latent": semantic_latent,
+            "variation_mu": variation_mu,
+            "variation_logvar": variation_logvar,
+            "variation_std": variation_std,
+            "variation_latent": variation_latent,
+            "semantic_prompt": semantic_prompt,
+            "variation_prompt": variation_prompt,
+            "variation_gate": variation_gate,
+        }
+        return instance_prompt, factor_stats
+
     def _debug_shapes(
         self,
         raw_image: Optional[torch.Tensor],
@@ -493,21 +633,56 @@ class PreViTPromptDistributor(nn.Module):
         不接收 label，不计算 loss，只负责生成 prompt 和缓存 stats。
         KL / semantic graph 等约束在 trainer/loss 侧读取 stats 后计算。
         """
+        # 1. 先根据 DISTRIBUTOR.SOURCE 选择视觉统计输入，并通过 stats_head 得到分布参数。
+        #   - vit_cls_prepass: 使用 ViT prepass 得到的 CLS 表征；
+        #   - token_mlp: 使用 ViT image tokens；
+        #   - cnn_torchvision / clip_frozen / dinov2_small: 使用 raw_image 经过冻结外部编码器。
+        # _encode_visual 会把这些来源统一成：
+        #   visual_input: stats_head 的真实输入，形状由 source 决定；
+        #   stats_out:    [B, 2*768]，前 768 维是 mu，后 768 维是 logvar。
         visual_input, stats_out = self._encode_visual(raw_image, vit_patch_tokens, vit_image_tokens, vit_cls)
+
+        # stats_out 是后续所有 prompt 分布逻辑的唯一参数来源。
+        # 这里强校验它必须是 [B,1536]，避免 source/head 改动后悄悄产生错位。
         if tuple(stats_out.shape) != (visual_input.shape[0], self.dim * 2):
             raise ValueError(f"stats_out must be [B,{self.dim * 2}], got {tuple(stats_out.shape)}")
 
-        # stats head 只输出 mu/logvar；std 由 logvar 显式转换，便于 KL 使用同一组参数。
+        # 2. 把 stats_head 输出切成 Gaussian posterior 的均值和 log 方差。
+        #   q(z|x) = N(mu, diag(exp(logvar)))
         mu, logvar = stats_out.chunk(2, dim=-1)
+
+        # 对 logvar 做数值裁剪，防止 std 过小或过大导致 KL、采样和梯度不稳定。
+        # clamp 后再计算 std = exp(0.5 * logvar)。
         logvar = logvar.clamp(min=self.logvar_min, max=self.logvar_max)
         std = torch.exp(0.5 * logvar)
-        instance_prompt = self._sample_instance_prompt(mu, std)
+
+        # 3. 生成图像条件 instance prompt。
+        # 普通路径：使用完整 768 维 q(z|x) 采样，直接得到 [B, instance_tokens, 768]。
+        # factorized 路径：先把 mu/logvar/std 切成 semantic 与 variation 两段；分别采样、投影回 768 维，再用 gate 融合。
+        # 两条路径最终都必须返回同形状的 instance_prompt，
+        # 这样后面的 domain_prompt 拼接和 ViT 主干不需要知道当前走的是哪条路径。
+        if self.factorized_enable:
+            instance_prompt, factor_stats = self._sample_factorized_instance_prompt(mu, logvar, std)
+        else:
+            instance_prompt = self._sample_instance_prompt(mu, std)
+            factor_stats = {"factorized_enable": False}
+
+        # 4. 构造 domain prompt。
+        # domain_prompt 是任务/数据集级可学习参数，不依赖单张图像。
+        # 参数本体形状是 [1, domain_tokens, 768]；这里 expand 到 batch 维，得到 [B, domain_tokens, 768]。
         domain_prompt = self.domain_prompt.to(device=mu.device, dtype=mu.dtype).expand(mu.shape[0], -1, -1)
+
         # token 顺序固定为 [instance prompt | domain prompt]，总长度必须等于 MODEL.PROMPT.NUM_TOKENS。
+        # instance prompt 放前面，domain prompt 放后面；这个顺序会影响后续 ViT 中 prompt token 的位置。
         prompt_tokens = torch.cat((instance_prompt, domain_prompt), dim=1)
+
+        # 最终 prompt_tokens 是真正送回 PromptedTransformer、插入 ViT 的提示 token。
+        # 形状必须是 [B, NUM_TOKENS, 768]。
         if tuple(prompt_tokens.shape) != (mu.shape[0], self.prompt_len, self.dim):
             raise ValueError(f"prompt_tokens must be [B,{self.prompt_len},{self.dim}], got {tuple(prompt_tokens.shape)}")
 
+        # 5. 如果开启 DEBUG_DISTRIBUTOR_SHAPES，只打印一次关键 shape。
+        # 这不参与训练，只用于排查 source、stats_head、prompt 拼接是否对齐。
         self._debug_shapes(
             raw_image,
             vit_patch_tokens,
@@ -522,7 +697,15 @@ class PreViTPromptDistributor(nn.Module):
             domain_prompt,
             prompt_tokens,
         )
+
         # stats 会被 PromptedTransformer 缓存，再由 trainer/loss 读取。
+        #
+        # 这里返回的 stats 有两个用途：
+        #   1. PromptKLAuxLoss / SemanticGraphAuxLoss / GraphProbPriorAuxLoss 读取 mu/logvar；
+        #   2. debug、可视化或监控读取 visual_input、prompt_tokens、factorized stats。
+        #
+        # 注意：forward 本身不接收 targets，也不在这里计算任何 loss。
+        # label 相关信息由 trainer 在 loss_kwargs 中单独传给 loss。
         stats = {
             "visual_source": self.source,
             "visual_input": visual_input,
@@ -535,6 +718,17 @@ class PreViTPromptDistributor(nn.Module):
             "domain_prompt": domain_prompt,
             "prompt_tokens": prompt_tokens,
         }
+
+        # factorized_enable=True 时，factor_stats 会额外加入 semantic_mu/logvar、
+        # variation_mu/logvar、semantic_prompt、variation_prompt 和 variation_gate。
+        # factorized_enable=False 时，只记录 {"factorized_enable": False}，
+        # 方便 loss 侧明确判断当前 batch 是否真的走了 factorized 路径。
+        stats.update(factor_stats)
+
+        # 返回值一：
+        #   prompt_tokens: 立即送回 ViT 主干使用。
+        # 返回值二：
+        #   stats: 缓存在 transformer/model 上，供 trainer/loss 在本次 forward 后读取。
         return prompt_tokens, stats
 
 

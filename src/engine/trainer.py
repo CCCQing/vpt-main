@@ -106,11 +106,16 @@ def _load_semantic_graph_attr_name_embeddings(cfg: CfgNode) -> torch.Tensor:
 
 def _semantic_graph_loss_enabled(cfg: CfgNode) -> bool:
     """Trainer 侧判断是否需要预加载属性名文本 embedding。"""
-    return (
+    semantic_graph_enabled = (
         bool(cfg.MODEL.SEMANTIC_GRAPH.ENABLE)
         and float(cfg.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT) > 0
         and str(cfg.MODEL.SEMANTIC_GRAPH.LOSS_TYPE).lower() != "none"
     )
+    graph_prob_prior_enabled = (
+        bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE)
+        and float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT) > 0
+    )
+    return semantic_graph_enabled or graph_prob_prior_enabled
 
 
 class Trainer():
@@ -759,6 +764,49 @@ class Trainer():
                 a - b,
             )
         self._debug_step_logged = True
+
+    def _format_graph_prob_prior_monitor_log(self) -> str:
+        if not bool(self.cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE):
+            return ""
+        stats = getattr(self.cls_criterion, "_last_loss_stats", None)
+        if not isinstance(stats, dict):
+            return ""
+        keys = [
+            ("gEnt", "graph_prob_prior_monitor_tau_graph_neighbor_entropy_norm_mean"),
+            ("gTop1", "graph_prob_prior_monitor_tau_graph_neighbor_top1_mean"),
+            ("tEnt", "graph_prob_prior_monitor_tau_acc_target_entropy_norm_mean"),
+            ("tTrue", "graph_prob_prior_monitor_tau_acc_target_true_mean"),
+            ("lEnt", "graph_prob_prior_monitor_tau_latent_entropy_norm_mean"),
+            ("lTrue", "graph_prob_prior_monitor_tau_latent_true_mean"),
+            ("klQ50", "graph_prob_prior_monitor_tau_latent_distance_q50"),
+            ("pEnt", "graph_prob_prior_monitor_tau_prior_entropy_norm_mean"),
+            ("mmdK", "graph_prob_prior_monitor_mmd_kernel_mean"),
+        ]
+        parts = []
+        for label, key in keys:
+            value = stats.get(key)
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                parts.append(f"{label}={float(value):.4g}")
+        if not parts:
+            return ""
+        return "\n\t[graph-prob-prior-monitor] " + " ".join(parts)
+
+    def _log_train_loader_summary(self, protocol_name: str, train_loader, total_data: int, log_interval: int) -> None:
+        dataset = getattr(train_loader, "dataset", None)
+        try:
+            dataset_size = len(dataset) if dataset is not None else None
+        except TypeError:
+            dataset_size = None
+        loader_batch_size = getattr(train_loader, "batch_size", None)
+        logger.info(
+            "[train-loader] protocol=%s batches_per_epoch=%d dataset_size=%s cfg_batch_size=%s loader_batch_size=%s log_every_n=%d",
+            str(protocol_name),
+            int(total_data),
+            str(dataset_size) if dataset_size is not None else "unknown",
+            str(self.cfg.DATA.BATCH_SIZE),
+            str(loader_batch_size) if loader_batch_size is not None else "unknown",
+            int(log_interval),
+        )
 
     @staticmethod
     def _tensor_stats(t: torch.Tensor):
@@ -2118,6 +2166,7 @@ class Trainer():
                         str(eta),
                     )
                     + "max mem: {:.1f} GB ".format(gpu_mem_usage())
+                    + self._format_graph_prob_prior_monitor_log()
                 )
 
         logger.info(
@@ -2136,6 +2185,7 @@ class Trainer():
         total_epoch = self.cfg.SOLVER.TOTAL_EPOCH
         total_data = len(train_loader)
         log_interval = self.cfg.SOLVER.LOG_EVERY_N
+        self._log_train_loader_summary("dev", train_loader, total_data, log_interval)
 
         best_epoch = -1
         best_metric = float("-inf")
@@ -2217,6 +2267,7 @@ class Trainer():
         total_epoch = self.cfg.SOLVER.TOTAL_EPOCH
         total_data = len(train_loader)
         log_interval = self.cfg.SOLVER.LOG_EVERY_N
+        self._log_train_loader_summary("final", train_loader, total_data, log_interval)
 
         losses = AverageMeter('Loss', ':.4e')
         batch_time = AverageMeter('Time', ':6.3f')

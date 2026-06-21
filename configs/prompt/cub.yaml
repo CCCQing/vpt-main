@@ -17,10 +17,10 @@ MODEL:
     DISTRIBUTOR:
       ENABLE: True
       SOURCE: "token_mlp"
-      STATS_HIDDEN_DIM: 8
+      STATS_HIDDEN_DIM: 64
       INSTANCE_TOKENS: 16
       DOMAIN_TOKENS: 16
-      EVAL_SAMPLE_MODE: "mean"
+      EVAL_SAMPLE_MODE: "fixed_eps"
 
   SEMANTIC_TOKENS:
     ENABLE: True
@@ -38,7 +38,7 @@ MODEL:
     DETACH: False
 
   AFFINITY_EVOLUTION:
-    ENABLE: True
+    ENABLE: False
     PROMPT_ENABLE: True
     SEMANTIC_ENABLE: True
     PROMPT_TARGET: "QpQv"
@@ -56,14 +56,14 @@ MODEL:
     # 开启时必须关闭 AFFINITY_EVOLUTION，避免层间 evolution 和层内 correction 混在一起。
     # 当前代码支持 attention_parallel/block_parallel、visual_block/full_row、row_preserve/block_redistribute。
     # block_parallel 需要 MLP_POLICY=enter_mlp；full_row 不能配合 block_redistribute。
-    ENABLE: False
-    SOURCE: "probs"                 # probs / scores
+    ENABLE: True
+    SOURCE: "scores"                 # probs / scores
     EXECUTION_MODE: "attention_parallel"
-    MLP_POLICY: "enter_mlp"         # enter_mlp / skip_mlp
+    MLP_POLICY: "skip_mlp"         # enter_mlp / skip_mlp
     ROUTE_SCOPE: "visual_block"
-    PROMPT_ROUTE: "S_to_P_and_V"    # S_to_P_and_V / P_to_S_to_V
+    PROMPT_ROUTE: "P_to_S_to_V"    # S_to_P_and_V / P_to_S_to_V
     SEMANTIC_ROUTE: "S_to_P_to_V"   # S_to_P_to_V / P_to_S_and_V
-    MASS_MODE: "row_preserve"
+    MASS_MODE: "block_redistribute"
     BETA_PROMPT_MASS: 0.0
     BETA_SEMANTIC_MASS: 0.0
     PROMPT_GAMMA_INIT: 0.0
@@ -88,8 +88,8 @@ SOLVER:
   LOSS_VSPCN_AR_WEIGHT: 0.0005
   LOSS_SEM_MED_WEIGHT: 0.0
   LOSS_SPV_WEIGHT: 0.0
-  LOSS_ROUTE_TS_PROMPT_WEIGHT: 0.00005
-  LOSS_ROUTE_TS_SEMANTIC_WEIGHT: 0.00005
+  LOSS_ROUTE_TS_PROMPT_WEIGHT: 0.0
+  LOSS_ROUTE_TS_SEMANTIC_WEIGHT: 0.0
   SEM_MED:
     TARGET: "QpQv"           # QpKv / QpQv / KpKv
     METRIC: "kl"            # mse / kl / cosine
