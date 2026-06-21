@@ -413,16 +413,41 @@ def main() -> None:
             rows.append(_run_trial(trial, gpu_id=gpu))
     else:
         rows = []
-        with ThreadPoolExecutor(max_workers=int(args.max_workers)) as executor:
-            future_to_trial = {}
-            for idx, trial in enumerate(trials):
-                gpu = gpus[idx % len(gpus)] if gpus else ""
-                future = executor.submit(_run_trial, trial, gpu)
-                future_to_trial[future] = trial
-            for done_idx, future in enumerate(as_completed(future_to_trial), start=1):
-                trial = future_to_trial[future]
-                print(f"[{done_idx}/{len(trials)}] finished {trial['trial_name']}", flush=True)
-                rows.append(future.result())
+        worker_count = int(args.max_workers)
+        worker_gpus = gpus[:worker_count] if gpus else [""] * worker_count
+        worker_trials = [[] for _ in range(worker_count)]
+        for idx, trial in enumerate(trials):
+            worker_trials[idx % worker_count].append(trial)
+
+        def _run_worker(worker_idx: int, gpu: str, assigned_trials: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+            worker_rows = []
+            for local_idx, trial in enumerate(assigned_trials, start=1):
+                print(
+                    f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
+                    f"started {local_idx}/{len(assigned_trials)} {trial['trial_name']}",
+                    flush=True,
+                )
+                result = _run_trial(trial, gpu_id=gpu)
+                print(
+                    f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
+                    f"finished {local_idx}/{len(assigned_trials)} {trial['trial_name']} "
+                    f"returncode={result['returncode']}",
+                    flush=True,
+                )
+                worker_rows.append(result)
+            return worker_rows
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(_run_worker, worker_idx, worker_gpus[worker_idx], assigned_trials)
+                for worker_idx, assigned_trials in enumerate(worker_trials)
+            ]
+            finished = 0
+            for future in as_completed(futures):
+                worker_rows = future.result()
+                rows.extend(worker_rows)
+                finished += len(worker_rows)
+                print(f"[{finished}/{len(trials)}] collected worker results", flush=True)
         rows.sort(key=lambda row: int(row["trial_index"]))
 
     _write_csv(out_root / "summary.csv", rows)
