@@ -133,7 +133,7 @@ class Trainer():
         self.model = model
         self.device = device
 
-        self.cls_criterion = build_loss(self.cfg)
+        self.cls_criterion = build_loss(self.cfg).to(self.device)
         # loss 对象自己声明是否需要 affinity aux，trainer 不再硬编码具体辅助损失名。
         self.affinity_aux_needed = bool(self.cls_criterion.requires_affinity_aux)
         if self.affinity_aux_needed and bool(cfg.MODEL.AFFINITY.DETACH):
