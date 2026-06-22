@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import itertools
 import json
 import os
@@ -17,7 +18,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
 import numpy as np
 import yaml
@@ -31,7 +32,26 @@ GRAPH_PROB_PRIOR_MODES = [
     "class_aggregate_moment",
     "class_aggregate_mmd",
     "factorized_latent",
+    "dual_metric_semantic_distribution",
 ]
+GRAPH_METHOD_ALIASES = {
+    "method1_diff": "m1d",
+    "method2_diff": "m2d",
+    "method3_diff": "m3d",
+    "llm_gate": "llmg",
+    "method1_diff_llm_gate": "m1dlg",
+    "method2_diff_llm_gate": "m2dlg",
+    "method3_diff_llm_gate": "m3dlg",
+}
+MODE_ALIASES = {
+    "true_class_kl": "tckl",
+    "graph_conditioned_semantic_prior": "gcsp",
+    "class_aggregate_moment": "cam",
+    "class_aggregate_mmd": "mmd",
+    "factorized_latent": "fact",
+    "dual_metric_semantic_distribution": "dual",
+}
+SEARCH_STAGES = {"temperature", "other", "all"}
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
@@ -110,6 +130,24 @@ def _cartesian_grid(grid: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return combos
 
 
+def _stage_specs(spec: Mapping[str, Any], selected_stage: str) -> List[Dict[str, Any]]:
+    base_fixed = dict(spec.get("FIXED_OPTS", {}) or {})
+    stages: List[Dict[str, Any]] = []
+    if selected_stage in {"temperature", "all"}:
+        grid = spec.get("TEMPERATURE_GRID", spec.get("GRID", {}) or {}) or {}
+        fixed = dict(base_fixed)
+        fixed.update(dict(spec.get("TEMPERATURE_FIXED_OPTS", {}) or {}))
+        if grid or selected_stage == "temperature":
+            stages.append({"stage": "temperature", "fixed": fixed, "grid": grid})
+    if selected_stage in {"other", "all"}:
+        grid = spec.get("OTHER_GRID", {}) or {}
+        fixed = dict(base_fixed)
+        fixed.update(dict(spec.get("OTHER_FIXED_OPTS", {}) or {}))
+        if grid or selected_stage == "other":
+            stages.append({"stage": "other", "fixed": fixed, "grid": grid})
+    return stages
+
+
 def _load_graph_methods(grid_cfg: Mapping[str, Any], selected: str) -> List[str]:
     external = grid_cfg.get("EXTERNAL_GRAPH", {})
     methods = [str(item) for item in _as_list(external.get("METHODS"))]
@@ -162,12 +200,12 @@ def _validate_external_graph_file(repo_root: Path, grid_cfg: Mapping[str, Any], 
     return path
 
 
-def _trial_name(index: int, graph_method: str, mode: str, combo: Mapping[str, Any]) -> str:
-    parts = [f"t{index:04d}", _sanitize(graph_method), _sanitize(mode)]
-    for key, value in combo.items():
-        short_key = str(key).split(".")[-1].lower()
-        parts.append(f"{_sanitize(short_key)}{_sanitize(value)}")
-    return "_".join(parts)
+def _trial_name(index: int, stage: str, graph_method: str, mode: str, combo: Mapping[str, Any]) -> str:
+    combo_json = json.dumps(dict(combo), sort_keys=True, ensure_ascii=True)
+    combo_hash = hashlib.md5(combo_json.encode("utf-8")).hexdigest()[:8]
+    graph_alias = GRAPH_METHOD_ALIASES.get(str(graph_method), _sanitize(graph_method)[:12])
+    mode_alias = MODE_ALIASES.get(str(mode), _sanitize(mode)[:12])
+    return f"t{index:04d}_{stage[:4]}_{graph_alias}_{mode_alias}_{combo_hash}"
 
 
 def _build_trials(
@@ -182,6 +220,7 @@ def _build_trials(
     max_batches: int,
     no_train_step: bool,
     extra_opts: Sequence[str],
+    stage: str,
 ) -> List[Dict[str, Any]]:
     fixed_opts = dict(grid_cfg.get("FIXED_OPTS", {}) or {})
     mode_space = grid_cfg["MODE_SEARCH_SPACE"]
@@ -191,52 +230,55 @@ def _build_trials(
     for graph_method in graph_methods:
         for mode in modes:
             spec = mode_space[mode] or {}
-            mode_fixed = dict(spec.get("FIXED_OPTS", {}) or {})
-            combos = _cartesian_grid(spec.get("GRID", {}) or {})
-            for combo_index, combo in enumerate(combos):
-                overrides: Dict[str, Any] = {}
-                overrides.update(fixed_opts)
-                overrides.update(mode_fixed)
-                overrides.update(
-                    {
-                        "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_PATH": graph_path,
-                        "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_KEY": graph_method,
-                        "MODEL.GRAPH_PROB_PRIOR.MODE": mode,
-                    }
-                )
-                overrides.update(combo)
-                trial_name = _trial_name(index, graph_method, mode, combo)
-                output_dir = out_root / graph_method / mode / trial_name
-                cmd = [
-                    python_bin,
-                    diagnose_script,
-                    "--config-file",
-                    config_file,
-                    "--max-batches",
-                    str(max_batches),
-                    "--output-dir",
-                    str(output_dir),
-                ]
-                if no_train_step:
-                    cmd.append("--no-train-step")
-                cmd.extend(_mapping_to_opts(overrides))
-                cmd.extend(extra_opts)
-                trials.append(
-                    {
-                        "trial_index": index,
-                        "combo_index": combo_index,
-                        "trial_name": trial_name,
-                        "graph_method": graph_method,
-                        "mode": mode,
-                        "combo": dict(combo),
-                        "overrides": overrides,
-                        "output_dir": str(output_dir),
-                        "stdout_path": str(output_dir / "launcher_stdout.txt"),
-                        "cmd": cmd,
-                        "repo_root": str(repo_root),
-                    }
-                )
-                index += 1
+            for stage_spec in _stage_specs(spec, stage):
+                stage_name = str(stage_spec["stage"])
+                mode_fixed = dict(stage_spec["fixed"])
+                combos = _cartesian_grid(stage_spec.get("grid", {}) or {})
+                for combo_index, combo in enumerate(combos):
+                    overrides: Dict[str, Any] = {}
+                    overrides.update(fixed_opts)
+                    overrides.update(mode_fixed)
+                    overrides.update(
+                        {
+                            "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_PATH": graph_path,
+                            "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_KEY": graph_method,
+                            "MODEL.GRAPH_PROB_PRIOR.MODE": mode,
+                        }
+                    )
+                    overrides.update(combo)
+                    trial_name = _trial_name(index, stage_name, graph_method, mode, combo)
+                    output_dir = out_root / stage_name / graph_method / mode / trial_name
+                    cmd = [
+                        python_bin,
+                        diagnose_script,
+                        "--config-file",
+                        config_file,
+                        "--max-batches",
+                        str(max_batches),
+                        "--output-dir",
+                        str(output_dir),
+                    ]
+                    if no_train_step:
+                        cmd.append("--no-train-step")
+                    cmd.extend(_mapping_to_opts(overrides))
+                    cmd.extend(extra_opts)
+                    trials.append(
+                        {
+                            "trial_index": index,
+                            "stage": stage_name,
+                            "combo_index": combo_index,
+                            "trial_name": trial_name,
+                            "graph_method": graph_method,
+                            "mode": mode,
+                            "combo": dict(combo),
+                            "overrides": overrides,
+                            "output_dir": str(output_dir),
+                            "stdout_path": str(output_dir / "launcher_stdout.txt"),
+                            "cmd": cmd,
+                            "repo_root": str(repo_root),
+                        }
+                    )
+                    index += 1
     return trials
 
 
@@ -251,6 +293,7 @@ def _summary_payload(output_dir: Path) -> Dict[str, Any]:
 def _flatten_result(trial: Mapping[str, Any], returncode: int, gpu_id: str = "") -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "trial_index": trial["trial_index"],
+        "stage": trial.get("stage", ""),
         "trial_name": trial["trial_name"],
         "graph_method": trial["graph_method"],
         "mode": trial["mode"],
@@ -272,6 +315,117 @@ def _flatten_result(trial: Mapping[str, Any], returncode: int, gpu_id: str = "")
             if isinstance(value, (int, float)):
                 row[key] = value
     return row
+
+
+def _row_float(row: Mapping[str, Any], key: str) -> Optional[float]:
+    value = row.get(key, "")
+    if value in ("", None):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _target_penalty(row: Mapping[str, Any], key: str, target: float, tolerance: float, weight: float) -> float:
+    value = _row_float(row, key)
+    if value is None:
+        return 0.0
+    return float(weight) * abs(value - float(target)) / max(float(tolerance), 1e-12)
+
+
+def _upper_penalty(row: Mapping[str, Any], key: str, limit: float, weight: float) -> float:
+    value = _row_float(row, key)
+    if value is None:
+        return 0.0
+    return float(weight) * max(0.0, value - float(limit)) / max(abs(float(limit)), 1e-12)
+
+
+def _lower_is_better(row: Mapping[str, Any], key: str, scale: float, weight: float) -> float:
+    value = _row_float(row, key)
+    if value is None:
+        return 0.0
+    return float(weight) * max(0.0, value) / max(float(scale), 1e-12)
+
+
+def _higher_is_better(row: Mapping[str, Any], key: str, target: float, weight: float) -> float:
+    value = _row_float(row, key)
+    if value is None:
+        return 0.0
+    return float(weight) * max(0.0, float(target) - value) / max(abs(float(target)), 1e-12)
+
+
+def _with_monitor_scores(row: MutableMapping[str, Any]) -> Dict[str, Any]:
+    scored = dict(row)
+    if int(scored.get("returncode", 0)) != 0:
+        scored["monitor_score"] = 1.0e9
+        scored["selection_score"] = 1.0e9
+        return scored
+
+    score = 0.0
+    # TAU_GRAPH: old results show 0.05 was too sharp and 0.20 too flat; target a middle-entropy neighbor distribution.
+    score += _target_penalty(scored, "graph_prob_prior_monitor_tau_graph_neighbor_entropy_norm_mean", 0.55, 0.30, 1.2)
+    score += _target_penalty(scored, "graph_prob_prior_monitor_neighbor_entropy_norm_mean", 0.55, 0.30, 1.2)
+    score += _target_penalty(scored, "graph_prob_prior_monitor_tau_graph_neighbor_top1_mean", 0.35, 0.30, 0.8)
+    score += _target_penalty(scored, "graph_prob_prior_monitor_neighbor_top1_mean", 0.35, 0.30, 0.8)
+    score += _lower_is_better(scored, "graph_prob_prior_monitor_neighbor_hubness_gini", 1.0, 0.5)
+
+    # TAU_LATENT: avoid all-class latent probabilities being almost uniform, but also avoid one-hot collapse.
+    score += _target_penalty(scored, "graph_prob_prior_monitor_tau_latent_entropy_norm_mean", 0.75, 0.25, 1.0)
+    score += _target_penalty(scored, "graph_prob_prior_monitor_latent_prob_entropy_norm_mean", 0.75, 0.25, 1.0)
+    score += _higher_is_better(scored, "graph_prob_prior_monitor_posterior_true_rank_top1", 0.20, 1.0)
+    score += _higher_is_better(scored, "graph_prob_prior_monitor_posterior_kl_margin_positive_ratio", 0.50, 0.8)
+
+    # MMD_SIGMA: old MMD_SIGMA=16 underflowed; 64 was too close to all-ones; target an informative mid kernel.
+    score += _target_penalty(scored, "graph_prob_prior_monitor_mmd_kernel_mean", 0.50, 0.35, 1.2)
+    score += _lower_is_better(scored, "graph_prob_prior_monitor_mmd_kernel_saturation_low_ratio", 1.0, 1.0)
+    score += _lower_is_better(scored, "graph_prob_prior_monitor_mmd_kernel_saturation_high_ratio", 1.0, 1.0)
+
+    # Prior shape and graph-specific pathology monitors from graph_prob_prior_monitors.py.
+    score += _lower_is_better(scored, "graph_prob_prior_monitor_prior_overlap_risk_rate", 1.0, 1.0)
+    score += _lower_is_better(scored, "graph_prob_prior_monitor_false_high_prior_relation_still_gt_0_9_count", 20.0, 0.8)
+    score += _lower_is_better(scored, "graph_prob_prior_monitor_prior_gzsl_unseen_to_seen_bias_risk_mean", 1.0, 0.5)
+
+    # Dual mode: prefer P+/P- separation and fewer hard-negative violations.
+    score += _lower_is_better(scored, "graph_prob_prior_monitor_dual_sample_beta_hardneg_violation_rate", 1.0, 1.0)
+    score += _higher_is_better(scored, "graph_prob_prior_monitor_dual_pos_neg_js_divergence_mean", 0.20, 0.6)
+    score += _lower_is_better(scored, "graph_prob_prior_monitor_dual_alpha_beta_conflict_rate", 1.0, 0.8)
+
+    # Keep auxiliary loss from overpowering classification when the monitor is available.
+    score += _upper_penalty(scored, "graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio", 0.10, 1.0)
+
+    loss = _row_float(scored, "graph_prob_prior_match_loss")
+    loss_term = 0.0 if loss is None else 0.01 * np.log1p(max(loss, 0.0))
+    scored["monitor_score"] = float(score)
+    scored["selection_score"] = float(score + loss_term)
+    return scored
+
+
+def _rank_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    scored = [_with_monitor_scores(dict(row)) for row in rows]
+    return sorted(
+        scored,
+        key=lambda row: (
+            int(row.get("returncode", 0)) != 0,
+            float(row.get("selection_score", 1.0e9)),
+            str(row.get("stage", "")),
+            str(row.get("graph_method", "")),
+            str(row.get("mode", "")),
+            int(row.get("trial_index", 0)),
+        ),
+    )
+
+
+def _best_rows(rows: Sequence[Mapping[str, Any]], group_keys: Sequence[str]) -> List[Dict[str, Any]]:
+    best: Dict[tuple, Dict[str, Any]] = {}
+    for row in _rank_rows(rows):
+        if int(row.get("returncode", 0)) != 0:
+            continue
+        key = tuple(row.get(group_key, "") for group_key in group_keys)
+        if key not in best:
+            best[key] = dict(row)
+    return sorted(best.values(), key=lambda row: tuple(str(row.get(k, "")) for k in group_keys))
 
 
 def _run_trial(trial: Mapping[str, Any], gpu_id: str = "") -> Dict[str, Any]:
@@ -324,6 +478,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--graph-methods", default="all")
     parser.add_argument("--modes", default="all")
+    parser.add_argument("--stage", default="", choices=["", "temperature", "other", "all"])
     parser.add_argument("--gpus", default="", help="Comma-separated GPU ids for parallel trials.")
     parser.add_argument("--max-workers", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0, help="Run only the first N expanded trials; 0 means all.")
@@ -350,6 +505,9 @@ def main() -> None:
     max_batches = int(args.max_batches if args.max_batches is not None else int(grid_cfg.get("MAX_BATCHES", 111)))
     no_train_step = bool(grid_cfg.get("NO_TRAIN_STEP", False)) or bool(args.no_train_step)
     extra_opts = _validate_extra_opts(args.opts)
+    stage = str(args.stage or grid_cfg.get("STAGE", "temperature")).lower()
+    if stage not in SEARCH_STAGES:
+        raise ValueError(f"--stage must be one of {sorted(SEARCH_STAGES)}, got {stage}.")
 
     graph_methods = _load_graph_methods(grid_cfg, args.graph_methods)
     modes = _load_modes(grid_cfg, args.modes)
@@ -372,12 +530,14 @@ def main() -> None:
         max_batches=max_batches,
         no_train_step=no_train_step,
         extra_opts=extra_opts,
+        stage=stage,
     )
     if args.limit > 0:
         trials = trials[: int(args.limit)]
 
     out_root.mkdir(parents=True, exist_ok=True)
-    commands_path = out_root / "commands.txt"
+    stage_suffix = f"_{stage}"
+    commands_path = out_root / f"commands{stage_suffix}.txt"
     with commands_path.open("w", encoding="utf-8") as handle:
         for trial in trials:
             handle.write(subprocess.list2cmdline(list(trial["cmd"])) + "\n")
@@ -392,6 +552,7 @@ def main() -> None:
         "modes": modes,
         "max_batches": max_batches,
         "no_train_step": no_train_step,
+        "stage": stage,
         "total_trials": len(trials),
         "dry_run": bool(args.dry_run),
         "gpus": gpus,
@@ -400,6 +561,13 @@ def main() -> None:
         "mode_search_space": grid_cfg.get("MODE_SEARCH_SPACE", {}),
         "fixed_opts": grid_cfg.get("FIXED_OPTS", {}),
         "commands_path": str(commands_path),
+        "ranking": {
+            "selection_score": "monitor_score + 0.01*log1p(graph_prob_prior_match_loss)",
+            "notes": [
+                "lower selection_score is better",
+                "score prefers balanced graph-neighbor entropy/top1, informative latent probabilities, non-saturated MMD kernel, low prior overlap, low false-high residue, low dual beta violation, and reasonable weighted loss scale",
+            ],
+        },
     }
     _write_json(out_root / "search_space.json", search_space)
 
@@ -450,14 +618,36 @@ def main() -> None:
                 print(f"[{finished}/{len(trials)}] collected worker results", flush=True)
         rows.sort(key=lambda row: int(row["trial_index"]))
 
-    _write_csv(out_root / "summary.csv", rows)
-    _write_json(out_root / "summary.json", {"search_space": search_space, "rows": rows})
+    ranked_rows = _rank_rows(rows)
+    best_by_stage_graph_mode = _best_rows(ranked_rows, ["stage", "graph_method", "mode"])
+    best_by_stage_mode = _best_rows(ranked_rows, ["stage", "mode"])
+    _write_csv(out_root / "summary.csv", ranked_rows)
+    _write_json(out_root / "summary.json", {"search_space": search_space, "rows": ranked_rows})
+    _write_csv(out_root / "ranked_summary.csv", ranked_rows)
+    _write_json(out_root / "ranked_summary.json", {"search_space": search_space, "rows": ranked_rows})
+    _write_csv(out_root / "best_by_stage_graph_mode.csv", best_by_stage_graph_mode)
+    _write_json(out_root / "best_by_stage_graph_mode.json", {"rows": best_by_stage_graph_mode})
+    _write_csv(out_root / "best_by_stage_mode.csv", best_by_stage_mode)
+    _write_json(out_root / "best_by_stage_mode.json", {"rows": best_by_stage_mode})
+    _write_csv(out_root / f"summary{stage_suffix}.csv", ranked_rows)
+    _write_json(out_root / f"summary{stage_suffix}.json", {"search_space": search_space, "rows": ranked_rows})
+    _write_csv(out_root / f"ranked_summary{stage_suffix}.csv", ranked_rows)
+    _write_json(out_root / f"ranked_summary{stage_suffix}.json", {"search_space": search_space, "rows": ranked_rows})
+    _write_csv(out_root / f"best_by_stage_graph_mode{stage_suffix}.csv", best_by_stage_graph_mode)
+    _write_json(out_root / f"best_by_stage_graph_mode{stage_suffix}.json", {"rows": best_by_stage_graph_mode})
+    _write_csv(out_root / f"best_by_stage_mode{stage_suffix}.csv", best_by_stage_mode)
+    _write_json(out_root / f"best_by_stage_mode{stage_suffix}.json", {"rows": best_by_stage_mode})
     failures = [row for row in rows if int(row.get("returncode", 0)) not in {0, -1}]
     if failures:
         _write_json(out_root / "failures.json", {"failures": failures})
         raise SystemExit(f"{len(failures)} trials failed; see {out_root / 'failures.json'}")
     print(f"wrote {out_root / 'summary.csv'}")
     print(f"wrote {out_root / 'summary.json'}")
+    print(f"wrote {out_root / 'ranked_summary.csv'}")
+    print(f"wrote {out_root / 'best_by_stage_graph_mode.csv'}")
+    print(f"wrote {out_root / 'best_by_stage_mode.csv'}")
+    print(f"wrote {out_root / f'ranked_summary{stage_suffix}.csv'}")
+    print(f"wrote {out_root / f'best_by_stage_graph_mode{stage_suffix}.csv'}")
 
 
 if __name__ == "__main__":

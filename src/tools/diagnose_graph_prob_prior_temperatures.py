@@ -67,6 +67,7 @@ GRAPH_PROB_PRIOR_MODES = [
     "class_aggregate_moment",
     "class_aggregate_mmd",
     "factorized_latent",
+    "dual_metric_semantic_distribution",
 ]
 
 
@@ -132,7 +133,7 @@ def run_multiple_modes(args, modes: List[str]) -> None:
             "MODEL.GRAPH_PROB_PRIOR.MODE",
             mode,
         ]
-        if mode == "factorized_latent":
+        if mode in {"factorized_latent", "dual_metric_semantic_distribution"}:
             child_opts.extend([
                 "MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE",
                 "True",
@@ -395,6 +396,8 @@ def main():
             "TAU_LATENT": float(cfg.MODEL.GRAPH_PROB_PRIOR.TAU_LATENT),
             "TAU_PRIOR": float(cfg.MODEL.GRAPH_PROB_PRIOR.TAU_PRIOR),
             "MMD_SIGMA": float(cfg.MODEL.GRAPH_PROB_PRIOR.MMD_SIGMA),
+            "DUAL_TAU_NEG": float(cfg.MODEL.GRAPH_PROB_PRIOR.DUAL_TAU_NEG),
+            "DUAL_NEG_TOPK": int(cfg.MODEL.GRAPH_PROB_PRIOR.DUAL_NEG_TOPK),
             "TAU_ACC": float(cfg.MODEL.SEMANTIC_GRAPH.TAU_ACC),
             "TARGET_MIX_ALPHA": float(cfg.MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA),
         },

@@ -774,13 +774,28 @@ class Trainer():
         keys = [
             ("gEnt", "graph_prob_prior_monitor_tau_graph_neighbor_entropy_norm_mean"),
             ("gTop1", "graph_prob_prior_monitor_tau_graph_neighbor_top1_mean"),
+            ("gHub", "graph_prob_prior_monitor_neighbor_hubness_gini"),
+            ("gQ95", "graph_prob_prior_monitor_graph_offdiag_q95"),
             ("tEnt", "graph_prob_prior_monitor_tau_acc_target_entropy_norm_mean"),
             ("tTrue", "graph_prob_prior_monitor_tau_acc_target_true_mean"),
             ("lEnt", "graph_prob_prior_monitor_tau_latent_entropy_norm_mean"),
             ("lTrue", "graph_prob_prior_monitor_tau_latent_true_mean"),
             ("klQ50", "graph_prob_prior_monitor_tau_latent_distance_q50"),
+            ("rank1", "graph_prob_prior_monitor_posterior_true_rank_top1"),
+            ("klMargin", "graph_prob_prior_monitor_posterior_kl_margin_mean"),
+            ("pOv", "graph_prob_prior_monitor_prior_overlap_risk_rate"),
+            ("pRank", "graph_prob_prior_monitor_prior_effective_rank"),
             ("pEnt", "graph_prob_prior_monitor_tau_prior_entropy_norm_mean"),
             ("mmdK", "graph_prob_prior_monitor_mmd_kernel_mean"),
+            ("agg1", "graph_prob_prior_monitor_agg_single_sample_class_ratio"),
+            ("facCov", "graph_prob_prior_monitor_factorized_cross_cov_fro"),
+            ("betaV", "graph_prob_prior_monitor_dual_sample_beta_hardneg_violation_rate"),
+            ("abJS", "graph_prob_prior_monitor_dual_pos_neg_js_divergence_mean"),
+            ("gzsl", "graph_prob_prior_monitor_prior_gzsl_unseen_to_seen_bias_risk_mean"),
+            ("fhG", "graph_prob_prior_monitor_false_high_graph_relation_still_gt_0_9_count"),
+            ("fhP", "graph_prob_prior_monitor_false_high_prior_relation_still_gt_0_9_count"),
+            ("wRatio", "graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio"),
+            ("gPrior", "graph_prob_prior_monitor_grad_prior_head_norm"),
         ]
         parts = []
         for label, key in keys:
@@ -2013,6 +2028,8 @@ class Trainer():
                 if dataset_attr_name_embeddings is not None
                 else self.semantic_graph_attr_name_embeddings
             )
+            dataset_seen_classes = getattr(dataset, "seen_classes", None) if dataset is not None else None
+            dataset_unseen_classes = getattr(dataset, "unseen_classes", None) if dataset is not None else None
             loss_kwargs = {
                 "model": model_ref,
                 "raw_targets": targets,
@@ -2020,6 +2037,8 @@ class Trainer():
                 "targets_global": effective_targets.detach(),
                 "class_attributes": dataset_class_attributes,
                 "attr_name_embeddings": attr_name_embeddings,
+                "seen_class_ids": dataset_seen_classes,
+                "unseen_class_ids": dataset_unseen_classes,
                 "epoch": int(self._trace_epoch + 1),
                 # 属性重建辅助损失使用 batch 真实类别属性 a_y 作为监督目标。
                 # attributes 来自 xlsa_dataset.__getitem__ 返回的 class_attributes[label]。
@@ -2100,6 +2119,14 @@ class Trainer():
         if is_train:
             self.optimizer.zero_grad()
             loss.backward()
+            if bool(self.cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE):
+                monitor_every = max(1, int(self.cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N))
+                if int(self._trace_global_step) % monitor_every == 0:
+                    from ..solver.graph_prob_prior_monitors import graph_prob_prior_grad_monitor
+
+                    loss_stats = getattr(self.cls_criterion, "_last_loss_stats", None)
+                    if isinstance(loss_stats, dict):
+                        loss_stats.update(graph_prob_prior_grad_monitor(self.model.named_parameters()))
             refs = None
             before_norms = None
             if self.debug_grad_norm:

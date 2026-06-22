@@ -137,7 +137,7 @@ _C.MODEL.SEMANTIC_GRAPH.DEBUG = False                   # 打印一次 A_conf/E_
 
 _C.MODEL.GRAPH_PROB_PRIOR = CfgNode()
 _C.MODEL.GRAPH_PROB_PRIOR.ENABLE = True                # 是否启用 GraphProbPrior；默认关闭，不影响标准 Prompt KL 和旧 semantic graph loss
-_C.MODEL.GRAPH_PROB_PRIOR.MODE = "graph_conditioned_semantic_prior" # 候选：true_class_kl / graph_conditioned_semantic_prior / class_aggregate_moment / class_aggregate_mmd / factorized_latent
+_C.MODEL.GRAPH_PROB_PRIOR.MODE = "graph_conditioned_semantic_prior" # 候选：true_class_kl / graph_conditioned_semantic_prior / class_aggregate_moment / class_aggregate_mmd / factorized_latent / dual_metric_semantic_distribution
 _C.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT = 0.001             # GraphProbPrior 辅助损失权重；用于替代标准 N(0,I) KL 时单独开启
 _C.MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH = 0.07              # 用 G[c] 聚合语义邻居 bank 时的 softmax 温度
 _C.MODEL.GRAPH_PROB_PRIOR.TAU_LATENT = 1.0              # softmax(-KL(q||p_c)/tau) 的温度，控制 latent matching 分布尖锐程度
@@ -148,6 +148,16 @@ _C.MODEL.GRAPH_PROB_PRIOR.MMD_SAMPLES = 1               # class_aggregate_mmd �
 _C.MODEL.GRAPH_PROB_PRIOR.MMD_SIGMA = 1.0               # class_aggregate_mmd 的 RBF kernel sigma
 _C.MODEL.GRAPH_PROB_PRIOR.FACTORIZED_VARIATION_WEIGHT = 0.0 # factorized_latent 中 variation aggregate matching 权重；第一版默认关闭
 _C.MODEL.GRAPH_PROB_PRIOR.FACTORIZED_DECOUPLE_WEIGHT = 0.0  # factorized_latent 中 semantic/variation 去相关权重；0 表示不启用
+_C.MODEL.GRAPH_PROB_PRIOR.DUAL_NEG_TOPK = 16            # dual_metric 中每个类别选多少个 hard negative 类；不包含自身类
+_C.MODEL.GRAPH_PROB_PRIOR.DUAL_TAU_NEG = 0.10           # dual_metric 中 hard negative 图行 softmax 温度；越小越集中到高风险负类
+_C.MODEL.GRAPH_PROB_PRIOR.DUAL_ALPHA_WEIGHT = 1.0       # dual_metric 中 alpha/context 分布对齐项权重
+_C.MODEL.GRAPH_PROB_PRIOR.DUAL_BETA_LOWER_WEIGHT = 1.0  # dual_metric 中 beta hard-negative 下界间隔项权重
+_C.MODEL.GRAPH_PROB_PRIOR.DUAL_BETA_UPPER_WEIGHT = 0.0  # dual_metric 中 beta context 弱上界项权重；第一版默认关闭
+_C.MODEL.GRAPH_PROB_PRIOR.DUAL_MARGIN_BASE = 1.0        # dual_metric beta 下界基础间隔 m0
+_C.MODEL.GRAPH_PROB_PRIOR.DUAL_MARGIN_RISK_WEIGHT = 1.0 # dual_metric beta 下界风险加权 m1，margin=m0+m1*R_minus
+_C.MODEL.GRAPH_PROB_PRIOR.DUAL_UPPER_BASE = 2.0         # dual_metric beta context 弱上界基础值 u0
+_C.MODEL.GRAPH_PROB_PRIOR.DUAL_UPPER_CONTEXT_WEIGHT = 1.0 # dual_metric beta context 弱上界语义调制 u1
+_C.MODEL.GRAPH_PROB_PRIOR.DUAL_PRIOR_VAR_MODE = "unit"  # dual_metric 先验方差策略；当前只允许 unit，即 prior logvar 固定为 0
 _C.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE = False        # 是否记录 GraphProbPrior 温度/距离尺度监测量；默认关闭避免日常日志过长
 _C.MODEL.GRAPH_PROB_PRIOR.MONITOR_INACTIVE = False      # 是否额外计算当前 MODE 未使用的温度位置；默认关闭以避免额外开销
 _C.MODEL.GRAPH_PROB_PRIOR.MONITOR_TOPK = 5              # 监测 top-k mass 时使用的 k
