@@ -52,6 +52,7 @@ import numpy as np
 import torch
 
 import src.utils.logging as logging
+from src.utils import distributed as du
 from src.configs.config import get_cfg
 from src.data import loader as data_loader
 from src.engine.evaluator import Evaluator
@@ -377,6 +378,9 @@ def main():
 
     if not rows:
         raise RuntimeError("No diagnosis rows collected. Check the train loader and max-batches.")
+
+    if not du.is_master_process(cfg.NUM_GPUS):
+        return
 
     csv_path = output_dir / "graph_prob_prior_temperature_diagnosis.csv"
     json_path = output_dir / "graph_prob_prior_temperature_diagnosis.json"

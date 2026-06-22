@@ -14,6 +14,7 @@ import hashlib
 import itertools
 import json
 import os
+import socket
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -52,6 +53,101 @@ MODE_ALIASES = {
     "dual_metric_semantic_distribution": "dual",
 }
 SEARCH_STAGES = {"temperature", "other", "all"}
+
+
+def _default_dist_backend() -> str:
+    return "gloo" if os.name == "nt" else "nccl"
+
+
+def _pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _parse_gpu_groups(raw_groups: str, raw_gpus: str) -> List[str]:
+    if str(raw_groups).strip():
+        return [item.strip() for item in str(raw_groups).split(";") if item.strip()]
+    if str(raw_gpus).strip():
+        return _parse_csv(raw_gpus)
+    return [""]
+
+
+def _group_nproc(gpu_group: str, fallback_nproc: int) -> int:
+    if fallback_nproc > 0:
+        return int(fallback_nproc)
+    if not gpu_group:
+        return 1
+    return len([item for item in str(gpu_group).split(",") if item.strip()])
+
+
+def _patch_ddp_forward_missing_attrs() -> None:
+    import torch
+
+    ddp_cls = torch.nn.parallel.DistributedDataParallel
+    if getattr(ddp_cls, "_gpp_forward_missing_attrs", False):
+        return
+    original_getattr = ddp_cls.__getattr__
+
+    def forwarded_getattr(self, name):
+        try:
+            return original_getattr(self, name)
+        except AttributeError as exc:
+            module = original_getattr(self, "module")
+            if hasattr(module, name):
+                return getattr(module, name)
+            raise exc
+
+    ddp_cls.__getattr__ = forwarded_getattr
+    ddp_cls._gpp_forward_missing_attrs = True
+
+
+def _diagnose_with_ddp_attr_forward(argv: Sequence[str], _unused: Any = None) -> None:
+    _patch_ddp_forward_missing_attrs()
+    from src.tools import diagnose_graph_prob_prior_temperatures as diagnose
+
+    old_argv = sys.argv
+    try:
+        sys.argv = [str(Path(diagnose.__file__).resolve())] + list(argv)
+        diagnose.main()
+    finally:
+        sys.argv = old_argv
+
+
+def _ddp_diagnose_main(argv: Sequence[str]) -> None:
+    parser = argparse.ArgumentParser("grid_search_graph_prob_prior_v5_temperatures ddp diagnose")
+    parser.add_argument("--nproc-per-node", type=int, required=True)
+    parser.add_argument("--dist-backend", default=_default_dist_backend(), choices=["nccl", "gloo"])
+    parser.add_argument("--dist-url", default="")
+    known, diagnose_argv = parser.parse_known_args(list(argv))
+    if known.nproc_per_node <= 1:
+        raise ValueError("--nproc-per-node must be greater than 1 in DDP diagnose mode.")
+    if not diagnose_argv:
+        raise ValueError("Missing diagnose_graph_prob_prior_temperatures.py arguments after DDP launcher options.")
+
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+    import torch.multiprocessing as mp
+
+    from src.utils import distributed as du
+
+    init_method = known.dist_url or "tcp://127.0.0.1:{}".format(_pick_free_port())
+    mp.spawn(
+        du.run,
+        nprocs=int(known.nproc_per_node),
+        args=(
+            int(known.nproc_per_node),
+            _diagnose_with_ddp_attr_forward,
+            init_method,
+            0,
+            1,
+            str(known.dist_backend),
+            list(diagnose_argv),
+            None,
+        ),
+        join=True,
+    )
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
@@ -290,7 +386,14 @@ def _summary_payload(output_dir: Path) -> Dict[str, Any]:
         return json.load(handle)
 
 
-def _flatten_result(trial: Mapping[str, Any], returncode: int, gpu_id: str = "") -> Dict[str, Any]:
+def _flatten_result(
+    trial: Mapping[str, Any],
+    returncode: int,
+    gpu_id: str = "",
+    command: Optional[Sequence[str]] = None,
+    num_gpus: int = 1,
+) -> Dict[str, Any]:
+    command = list(command) if command is not None else list(trial["cmd"])
     row: Dict[str, Any] = {
         "trial_index": trial["trial_index"],
         "stage": trial.get("stage", ""),
@@ -300,9 +403,10 @@ def _flatten_result(trial: Mapping[str, Any], returncode: int, gpu_id: str = "")
         "combo_index": trial["combo_index"],
         "returncode": returncode,
         "gpu": gpu_id,
+        "num_gpus": int(num_gpus),
         "output_dir": trial["output_dir"],
         "stdout_path": trial["stdout_path"],
-        "command": subprocess.list2cmdline(list(trial["cmd"])),
+        "command": subprocess.list2cmdline(command),
     }
     for key, value in trial["combo"].items():
         row[key] = value
@@ -428,21 +532,66 @@ def _best_rows(rows: Sequence[Mapping[str, Any]], group_keys: Sequence[str]) -> 
     return sorted(best.values(), key=lambda row: tuple(str(row.get(k, "")) for k in group_keys))
 
 
-def _run_trial(trial: Mapping[str, Any], gpu_id: str = "") -> Dict[str, Any]:
+def _build_run_command(
+    trial: Mapping[str, Any],
+    python_bin: str,
+    gpu_group: str,
+    nproc_per_trial: int,
+    dist_backend: str,
+) -> tuple[List[str], int]:
+    nproc = _group_nproc(gpu_group, nproc_per_trial)
+    if nproc <= 1:
+        return list(trial["cmd"]), 1
+
+    diagnose_cmd = list(trial["cmd"])
+    diagnose_args = diagnose_cmd[2:]
+    return (
+        [
+            python_bin,
+            str(Path(__file__).resolve()),
+            "--ddp-diagnose",
+            "--nproc-per-node",
+            str(nproc),
+            "--dist-backend",
+            str(dist_backend),
+        ]
+        + diagnose_args
+        + [
+            "NUM_GPUS",
+            str(nproc),
+        ],
+        nproc,
+    )
+
+
+def _run_trial(
+    trial: Mapping[str, Any],
+    gpu_id: str = "",
+    python_bin: str = sys.executable,
+    nproc_per_trial: int = 0,
+    dist_backend: str = "",
+) -> Dict[str, Any]:
     output_dir = Path(str(trial["output_dir"]))
     output_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     if gpu_id:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    run_cmd, nproc = _build_run_command(
+        trial,
+        python_bin=python_bin,
+        gpu_group=gpu_id,
+        nproc_per_trial=int(nproc_per_trial),
+        dist_backend=dist_backend or _default_dist_backend(),
+    )
     with Path(str(trial["stdout_path"])).open("w", encoding="utf-8", errors="replace") as stdout:
         proc = subprocess.run(
-            list(trial["cmd"]),
+            run_cmd,
             cwd=str(trial["repo_root"]),
             env=env,
             stdout=stdout,
             stderr=subprocess.STDOUT,
         )
-    return _flatten_result(trial, int(proc.returncode), gpu_id=gpu_id)
+    return _flatten_result(trial, int(proc.returncode), gpu_id=gpu_id, command=run_cmd, num_gpus=nproc)
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -480,6 +629,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--modes", default="all")
     parser.add_argument("--stage", default="", choices=["", "temperature", "other", "all"])
     parser.add_argument("--gpus", default="", help="Comma-separated GPU ids for parallel trials.")
+    parser.add_argument(
+        "--gpu-groups",
+        default="",
+        help="Semicolon-separated GPU groups. Example: '0,5' runs one DDP trial on GPUs 0 and 5; '0,1;2,3' runs two DDP trials.",
+    )
+    parser.add_argument(
+        "--nproc-per-trial",
+        type=int,
+        default=0,
+        help="DDP process count for each trial. Default: GPU count in each --gpu-groups item; 0 keeps single-GPU behavior for --gpus.",
+    )
+    parser.add_argument("--dist-backend", default=_default_dist_backend(), choices=["nccl", "gloo"])
     parser.add_argument("--max-workers", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0, help="Run only the first N expanded trials; 0 means all.")
     parser.add_argument("--dry-run", action="store_true")
@@ -512,11 +673,16 @@ def main() -> None:
     graph_methods = _load_graph_methods(grid_cfg, args.graph_methods)
     modes = _load_modes(grid_cfg, args.modes)
     graph_npz = _validate_external_graph_file(repo_root, grid_cfg, graph_methods)
-    gpus = _parse_csv(args.gpus)
+    gpu_groups = _parse_gpu_groups(args.gpu_groups, args.gpus)
     if args.max_workers <= 0:
         raise ValueError("--max-workers must be positive.")
-    if gpus and args.max_workers > len(gpus):
-        raise ValueError("--max-workers must not exceed the number of --gpus.")
+    if args.max_workers > len(gpu_groups):
+        raise ValueError("--max-workers must not exceed the number of GPU groups.")
+    for gpu_group in gpu_groups:
+        nproc = _group_nproc(gpu_group, int(args.nproc_per_trial))
+        visible_gpu_count = len([item for item in str(gpu_group).split(",") if item.strip()])
+        if gpu_group and nproc > 1 and nproc != visible_gpu_count:
+            raise ValueError("--nproc-per-trial must match each --gpu-groups item size when CUDA_VISIBLE_DEVICES is set.")
 
     trials = _build_trials(
         repo_root=repo_root,
@@ -540,7 +706,14 @@ def main() -> None:
     commands_path = out_root / f"commands{stage_suffix}.txt"
     with commands_path.open("w", encoding="utf-8") as handle:
         for trial in trials:
-            handle.write(subprocess.list2cmdline(list(trial["cmd"])) + "\n")
+            run_cmd, _ = _build_run_command(
+                trial,
+                python_bin=python_bin,
+                gpu_group=gpu_groups[0] if gpu_groups else "",
+                nproc_per_trial=int(args.nproc_per_trial),
+                dist_backend=str(args.dist_backend),
+            )
+            handle.write(subprocess.list2cmdline(run_cmd) + "\n")
 
     search_space = {
         "grid_config": str(grid_config),
@@ -555,7 +728,9 @@ def main() -> None:
         "stage": stage,
         "total_trials": len(trials),
         "dry_run": bool(args.dry_run),
-        "gpus": gpus,
+        "gpu_groups": gpu_groups,
+        "nproc_per_trial": int(args.nproc_per_trial),
+        "dist_backend": str(args.dist_backend),
         "max_workers": int(args.max_workers),
         "extra_opts": extra_opts,
         "mode_search_space": grid_cfg.get("MODE_SEARCH_SPACE", {}),
@@ -572,17 +747,36 @@ def main() -> None:
     _write_json(out_root / "search_space.json", search_space)
 
     if args.dry_run:
-        rows = [_flatten_result(trial, returncode=-1, gpu_id="") for trial in trials]
+        rows = []
+        for idx, trial in enumerate(trials):
+            gpu = gpu_groups[idx % len(gpu_groups)] if gpu_groups else ""
+            run_cmd, nproc = _build_run_command(
+                trial,
+                python_bin=python_bin,
+                gpu_group=gpu,
+                nproc_per_trial=int(args.nproc_per_trial),
+                dist_backend=str(args.dist_backend),
+            )
+            rows.append(_flatten_result(trial, returncode=-1, gpu_id=gpu, command=run_cmd, num_gpus=nproc))
     elif args.max_workers == 1:
         rows = []
         for idx, trial in enumerate(trials):
-            gpu = gpus[idx % len(gpus)] if gpus else ""
-            print(f"[{idx + 1}/{len(trials)}] {trial['trial_name']} gpu={gpu}", flush=True)
-            rows.append(_run_trial(trial, gpu_id=gpu))
+            gpu = gpu_groups[idx % len(gpu_groups)] if gpu_groups else ""
+            nproc = _group_nproc(gpu, int(args.nproc_per_trial))
+            print(f"[{idx + 1}/{len(trials)}] {trial['trial_name']} gpu={gpu} nproc={nproc}", flush=True)
+            rows.append(
+                _run_trial(
+                    trial,
+                    gpu_id=gpu,
+                    python_bin=python_bin,
+                    nproc_per_trial=int(args.nproc_per_trial),
+                    dist_backend=str(args.dist_backend),
+                )
+            )
     else:
         rows = []
         worker_count = int(args.max_workers)
-        worker_gpus = gpus[:worker_count] if gpus else [""] * worker_count
+        worker_gpus = gpu_groups[:worker_count] if gpu_groups else [""] * worker_count
         worker_trials = [[] for _ in range(worker_count)]
         for idx, trial in enumerate(trials):
             worker_trials[idx % worker_count].append(trial)
@@ -595,7 +789,13 @@ def main() -> None:
                     f"started {local_idx}/{len(assigned_trials)} {trial['trial_name']}",
                     flush=True,
                 )
-                result = _run_trial(trial, gpu_id=gpu)
+                result = _run_trial(
+                    trial,
+                    gpu_id=gpu,
+                    python_bin=python_bin,
+                    nproc_per_trial=int(args.nproc_per_trial),
+                    dist_backend=str(args.dist_backend),
+                )
                 print(
                     f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
                     f"finished {local_idx}/{len(assigned_trials)} {trial['trial_name']} "
@@ -651,4 +851,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--ddp-diagnose":
+        _ddp_diagnose_main(sys.argv[2:])
+    else:
+        main()
