@@ -379,11 +379,67 @@ def _build_trials(
 
 
 def _summary_payload(output_dir: Path) -> Dict[str, Any]:
+    path = _diagnosis_json_path(output_dir)
+    if path is None:
+        return {}
+    with path.open("r", encoding="utf-8-sig") as handle:
+        return json.load(handle)
+
+
+def _diagnosis_json_path(output_dir: Path) -> Optional[Path]:
     path = output_dir / "graph_prob_prior_temperature_diagnosis.json"
     if not path.is_file():
-        return {}
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        if not output_dir.is_dir():
+            return None
+        matches = sorted(output_dir.rglob("graph_prob_prior_temperature_diagnosis.json"))
+        if not matches:
+            return None
+        return matches[0]
+    return path
+
+
+def _trial_has_complete_output(trial: Mapping[str, Any], expected_batches: int) -> bool:
+    payload = _summary_payload(Path(str(trial["output_dir"])))
+    if not payload:
+        return False
+    try:
+        num_batches = int(payload.get("num_batches", 0))
+    except (TypeError, ValueError):
+        return False
+    if num_batches <= 0:
+        return False
+    return isinstance(payload.get("summary"), dict)
+
+
+def _existing_trial_result(
+    trial: Mapping[str, Any],
+    gpu_id: str,
+    command: Sequence[str],
+    num_gpus: int,
+) -> Optional[Dict[str, Any]]:
+    if not _trial_has_complete_output(trial, expected_batches=0):
+        return None
+    return _flatten_result(
+        trial,
+        0,
+        gpu_id=gpu_id,
+        command=command,
+        num_gpus=num_gpus,
+        skipped_existing=True,
+    )
+
+
+def _resume_status(trial: Mapping[str, Any]) -> str:
+    output_dir = Path(str(trial["output_dir"]))
+    json_path = _diagnosis_json_path(output_dir)
+    if json_path is None:
+        return f"missing diagnosis json under {output_dir}"
+    payload = _summary_payload(output_dir)
+    if not payload:
+        return f"unreadable diagnosis json {json_path}"
+    if not isinstance(payload.get("summary"), dict):
+        return f"diagnosis json has no summary {json_path}"
+    return f"complete {json_path}"
 
 
 def _flatten_result(
@@ -392,6 +448,7 @@ def _flatten_result(
     gpu_id: str = "",
     command: Optional[Sequence[str]] = None,
     num_gpus: int = 1,
+    skipped_existing: bool = False,
 ) -> Dict[str, Any]:
     command = list(command) if command is not None else list(trial["cmd"])
     row: Dict[str, Any] = {
@@ -404,6 +461,7 @@ def _flatten_result(
         "returncode": returncode,
         "gpu": gpu_id,
         "num_gpus": int(num_gpus),
+        "skipped_existing": bool(skipped_existing),
         "output_dir": trial["output_dir"],
         "stdout_path": trial["stdout_path"],
         "command": subprocess.list2cmdline(command),
@@ -570,6 +628,8 @@ def _run_trial(
     python_bin: str = sys.executable,
     nproc_per_trial: int = 0,
     dist_backend: str = "",
+    expected_batches: int = 0,
+    resume: bool = True,
 ) -> Dict[str, Any]:
     output_dir = Path(str(trial["output_dir"]))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -583,6 +643,15 @@ def _run_trial(
         nproc_per_trial=int(nproc_per_trial),
         dist_backend=dist_backend or _default_dist_backend(),
     )
+    if resume and _trial_has_complete_output(trial, expected_batches=expected_batches):
+        return _flatten_result(
+            trial,
+            0,
+            gpu_id=gpu_id,
+            command=run_cmd,
+            num_gpus=nproc,
+            skipped_existing=True,
+        )
     with Path(str(trial["stdout_path"])).open("w", encoding="utf-8", errors="replace") as stdout:
         proc = subprocess.run(
             run_cmd,
@@ -644,6 +713,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-workers", type=int, default=1)
     parser.add_argument("--limit", type=int, default=0, help="Run only the first N expanded trials; 0 means all.")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-resume", action="store_true", help="Rerun trials even when their diagnosis JSON already exists.")
+    parser.add_argument("--resume-debug", action="store_true", help="Print why an existing trial was or was not skipped.")
     parser.add_argument("--no-train-step", action="store_true", help="Override YAML NO_TRAIN_STEP to true.")
     parser.add_argument("opts", nargs=argparse.REMAINDER, help="Extra KEY VALUE config overrides appended to every child run.")
     return parser.parse_args()
@@ -728,6 +799,7 @@ def main() -> None:
         "stage": stage,
         "total_trials": len(trials),
         "dry_run": bool(args.dry_run),
+        "resume": not bool(args.no_resume),
         "gpu_groups": gpu_groups,
         "nproc_per_trial": int(args.nproc_per_trial),
         "dist_backend": str(args.dist_backend),
@@ -763,6 +835,20 @@ def main() -> None:
         for idx, trial in enumerate(trials):
             gpu = gpu_groups[idx % len(gpu_groups)] if gpu_groups else ""
             nproc = _group_nproc(gpu, int(args.nproc_per_trial))
+            run_cmd, run_nproc = _build_run_command(
+                trial,
+                python_bin=python_bin,
+                gpu_group=gpu,
+                nproc_per_trial=int(args.nproc_per_trial),
+                dist_backend=str(args.dist_backend),
+            )
+            existing = None if bool(args.no_resume) else _existing_trial_result(trial, gpu, run_cmd, run_nproc)
+            if existing is not None:
+                print(f"[{idx + 1}/{len(trials)}] skip existing {trial['trial_name']} gpu={gpu} nproc={run_nproc}", flush=True)
+                rows.append(existing)
+                continue
+            if bool(args.resume_debug) and not bool(args.no_resume):
+                print(f"[{idx + 1}/{len(trials)}] resume miss {trial['trial_name']}: {_resume_status(trial)}", flush=True)
             print(f"[{idx + 1}/{len(trials)}] {trial['trial_name']} gpu={gpu} nproc={nproc}", flush=True)
             rows.append(
                 _run_trial(
@@ -771,6 +857,8 @@ def main() -> None:
                     python_bin=python_bin,
                     nproc_per_trial=int(args.nproc_per_trial),
                     dist_backend=str(args.dist_backend),
+                    expected_batches=max_batches,
+                    resume=not bool(args.no_resume),
                 )
             )
     else:
@@ -784,6 +872,28 @@ def main() -> None:
         def _run_worker(worker_idx: int, gpu: str, assigned_trials: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
             worker_rows = []
             for local_idx, trial in enumerate(assigned_trials, start=1):
+                run_cmd, run_nproc = _build_run_command(
+                    trial,
+                    python_bin=python_bin,
+                    gpu_group=gpu,
+                    nproc_per_trial=int(args.nproc_per_trial),
+                    dist_backend=str(args.dist_backend),
+                )
+                existing = None if bool(args.no_resume) else _existing_trial_result(trial, gpu, run_cmd, run_nproc)
+                if existing is not None:
+                    print(
+                        f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
+                        f"skip existing {local_idx}/{len(assigned_trials)} {trial['trial_name']} nproc={run_nproc}",
+                        flush=True,
+                    )
+                    worker_rows.append(existing)
+                    continue
+                if bool(args.resume_debug) and not bool(args.no_resume):
+                    print(
+                        f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
+                        f"resume miss {local_idx}/{len(assigned_trials)} {trial['trial_name']}: {_resume_status(trial)}",
+                        flush=True,
+                    )
                 print(
                     f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
                     f"started {local_idx}/{len(assigned_trials)} {trial['trial_name']}",
@@ -795,6 +905,8 @@ def main() -> None:
                     python_bin=python_bin,
                     nproc_per_trial=int(args.nproc_per_trial),
                     dist_backend=str(args.dist_backend),
+                    expected_batches=max_batches,
+                    resume=not bool(args.no_resume),
                 )
                 print(
                     f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
