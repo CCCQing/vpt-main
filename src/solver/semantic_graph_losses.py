@@ -27,6 +27,7 @@ from .graph_prob_prior_monitors import (
     dual_sample_beta_monitor,
     factorized_health_monitor,
     false_high_pair_monitor,
+    graph_prior_geometry_monitor,
     gzsl_prior_risk_monitor,
     graph_health_monitor,
     graph_neighbor_monitor,
@@ -35,6 +36,7 @@ from .graph_prob_prior_monitors import (
     posterior_prior_alignment_monitor,
     prior_health_monitor,
     relation_monitor,
+    residual_anchor_prior_monitor,
     semantic_target_monitor,
     seen_unseen_prior_monitor,
     true_class_kl_monitor,
@@ -549,11 +551,15 @@ class GraphProbPriorLossComputer(torch.nn.Module):
     GraphProbPrior 用 -KL(q(z|x), p(z|c)) 产生类别分布。
 
     函数摘要：
-    - __init__: 读取配置、校验温度/权重，并创建 prior head。
-    - _class_priors: 用 semantic bank 和语义图 G 生成每个类别的 Gaussian prior。
+    - __init__: 读取配置、校验温度/权重，并按 mode 创建 learned prior 或 residual-anchor prior head。
+    - _standardized_residual_attributes: 把 [C,312] 属性置信度转成相对“平均鸟”的标准化残差。
+    - _residual_anchor_class_priors: 用 residual_attr -> anchor -> graph top-k context -> delta 构造 prior_mu。
+    - _class_priors: 按 PRIOR_MEAN_MODE 分派 learned prior 或 residual-anchor prior。
     - _gaussian_kl_all_classes: 计算每个样本 posterior 到所有 class prior 的 KL 距离。
 
     - _relation_regularization: class-aggregate 模式专用，用全类 prior Gaussian symKL 对齐语义图关系。
+    - compute_prior_distribution_distance: 计算 prior 类别分布之间的标准化几何距离 D_cd。
+    - compute_graph_prior_geometry_loss: 可选几何正则入口，支持 uniform_topk / graph_supcon / soft_distribution_matching。
     - _true_class_kl_loss: 逐样本只对齐真类 prior 的最简 KL matching。
     - _samplewise_latent_matching_loss: 逐样本 all-class KL matching，服务 graph_conditioned_semantic_prior 和 factorized semantic loss。
 
@@ -570,11 +576,11 @@ class GraphProbPriorLossComputer(torch.nn.Module):
     def __init__(self, cfg) -> None:
         super().__init__()
         self.cfg = cfg
-        # dual_metric_semantic_distribution 新增函数摘要：
+        # dual_metric_semantic_distribution 函数摘要：
         # - _masked_topk_distribution: 从图的一行里取非自身 top-k，并转成 P+ / P- 概率分布。
-        # - _dual_class_priors: 用 bank 与 P+ / P- 聚合上下文生成 alpha/beta 两套 prior center。
+        # - _dual_class_priors: 用 312 维 residual anchor 与 P+ / P- 残差上下文生成 alpha/beta 两套 prior center。
         # - _dual_metric_semantic_distribution_loss: alpha 做语义上下文分布匹配，beta 做 hard-negative 间隔分离。
-        # - forward: dual 模式不调用旧 _class_priors，而是直接进入双分布 loss 分支。
+        # - forward: dual 模式不调用普通 _class_priors，而是直接进入双分布 loss 分支。
         # 复用 SemanticGraphBuilder，确保 GraphProbPrior 和旧 semantic graph loss 使用同一套 A/G/T。
         self.graph_builder = SemanticGraphBuilder(cfg)
         graph_cfg = cfg.MODEL.SEMANTIC_GRAPH
@@ -583,6 +589,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
 
         # 基础维度和 posterior/prior logvar 裁剪范围都和 prompt distributor 对齐。
         self.num_classes = int(graph_cfg.NUM_CLASSES)
+        self.attr_dim = int(graph_cfg.ATTR_DIM)
         self.text_dim = int(graph_cfg.TEXT_DIM)
         self.hidden_dim = int(dist_cfg.STATS_HIDDEN_DIM)
         self.logvar_min = float(dist_cfg.LOGVAR_MIN)
@@ -590,6 +597,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         self.factorized_semantic_dim = int(dist_cfg.FACTORIZED_SEMANTIC_DIM)
         self.factorized_variation_dim = int(dist_cfg.FACTORIZED_VARIATION_DIM)
         self.mode = str(prior_cfg.MODE).lower()
+        self.prior_mean_mode = str(prior_cfg.PRIOR_MEAN_MODE).lower()
+        self.prior_var_mode = str(prior_cfg.PRIOR_VAR_MODE).lower()
         self.supported_modes = {
             "true_class_kl",
             "graph_conditioned_semantic_prior",
@@ -604,6 +613,10 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                 "graph_conditioned_semantic_prior / class_aggregate_moment / "
                 "class_aggregate_mmd / factorized_latent / dual_metric_semantic_distribution."
             )
+        if self.prior_mean_mode not in {"learned", "residual_anchor"}:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_MEAN_MODE must be learned / residual_anchor.")
+        if self.prior_var_mode not in {"learned", "unit", "constant"}:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_VAR_MODE must be learned / unit / constant.")
 
         tau_graph = float(prior_cfg.TAU_GRAPH)
         tau_latent = float(prior_cfg.TAU_LATENT)
@@ -623,6 +636,49 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.MMD_SAMPLES must be positive.")
         if float(prior_cfg.MMD_SIGMA) <= 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.MMD_SIGMA must be positive.")
+        if float(prior_cfg.RESIDUAL_SIGMA_MIN) <= 0.0:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.RESIDUAL_SIGMA_MIN must be positive.")
+        if float(prior_cfg.RESIDUAL_CLIP) <= 0.0:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.RESIDUAL_CLIP must be positive.")
+        if int(prior_cfg.PRIOR_CONTEXT_TOPK) <= 0 or int(prior_cfg.PRIOR_CONTEXT_TOPK) > self.num_classes - 1:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_CONTEXT_TOPK must be in [1, NUM_CLASSES-1].")
+        if float(prior_cfg.PRIOR_DELTA_SCALE) < 0.0:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE must be non-negative.")
+        if float(prior_cfg.PRIOR_MU_SCALE) <= 0.0:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE must be positive.")
+        if float(prior_cfg.GEOM_LOSS_WEIGHT) < 0.0:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT must be non-negative.")
+        if str(prior_cfg.GEOM_LOSS_TYPE).lower() not in {
+            "uniform_topk",
+            "graph_supcon",
+            "soft_distribution_matching",
+        }:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE must be uniform_topk / graph_supcon / soft_distribution_matching.")
+        if int(prior_cfg.GEOM_TOPK) <= 0 or int(prior_cfg.GEOM_TOPK) > self.num_classes - 1:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_TOPK must be in [1, NUM_CLASSES-1].")
+        for key in (
+            "GEOM_TAU_UNI",
+            "GEOM_TAU_GRAPH_TOP",
+            "GEOM_MARGIN_GAMMA",
+            "GEOM_SIGMA_PRIOR",
+            "GEOM_TAU_CON",
+            "GEOM_TAU_GRAPH_POS",
+            "GEOM_TAU_BARRIER",
+            "GEOM_TAU_GRAPH_DIST",
+            "GEOM_TAU_DIST",
+        ):
+            if float(getattr(prior_cfg, key)) <= 0.0:
+                raise ValueError(f"MODEL.GRAPH_PROB_PRIOR.{key} must be positive.")
+        for key in (
+            "GEOM_UNI_WEIGHT",
+            "GEOM_TOP_WEIGHT",
+            "GEOM_MARGIN_MIN",
+            "GEOM_MARGIN_SCALE",
+            "GEOM_CLEAR_WEIGHT",
+            "GEOM_BOUND_WEIGHT",
+        ):
+            if float(getattr(prior_cfg, key)) < 0.0:
+                raise ValueError(f"MODEL.GRAPH_PROB_PRIOR.{key} must be non-negative.")
         if self.factorized_semantic_dim <= 0:
             raise ValueError("DISTRIBUTOR.FACTORIZED_SEMANTIC_DIM must be positive.")
         if self.factorized_variation_dim <= 0:
@@ -663,6 +719,10 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                 raise ValueError("MODEL.GRAPH_PROB_PRIOR.DUAL_UPPER_CONTEXT_WEIGHT must be non-negative.")
             if str(prior_cfg.DUAL_PRIOR_VAR_MODE).lower() != "unit":
                 raise ValueError("MODEL.GRAPH_PROB_PRIOR.DUAL_PRIOR_VAR_MODE currently supports only 'unit'.")
+            if float(prior_cfg.DUAL_ALPHA_DELTA_SCALE) < 0.0:
+                raise ValueError("MODEL.GRAPH_PROB_PRIOR.DUAL_ALPHA_DELTA_SCALE must be non-negative.")
+            if float(prior_cfg.DUAL_BETA_DELTA_SCALE) < 0.0:
+                raise ValueError("MODEL.GRAPH_PROB_PRIOR.DUAL_BETA_DELTA_SCALE must be non-negative.")
         self.monitor_enable = bool(prior_cfg.MONITOR_ENABLE)
         self.monitor_inactive = bool(prior_cfg.MONITOR_INACTIVE)
         self.monitor_topk = int(prior_cfg.MONITOR_TOPK)
@@ -672,80 +732,173 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         if self.monitor_every_n <= 0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N must be positive.")
 
-        # prior head 与 posterior stats_head 保持同样的“一层 hidden MLP”结构：
-        # stats_head: visual_input -> STATS_HIDDEN_DIM -> [mu, logvar]
-        # prior_head: concat(b_c, graph_neighbor_b_c) -> STATS_HIDDEN_DIM -> [prior_mu, prior_logvar]
-        if self.mode != "dual_metric_semantic_distribution":
-            self.prior_head = torch.nn.Sequential(
-                torch.nn.Linear(self.text_dim * 2, self.hidden_dim),
+        def make_mlp(input_dim: int, output_dim: int) -> torch.nn.Sequential:
+            return torch.nn.Sequential(
+                torch.nn.Linear(input_dim, self.hidden_dim),
                 torch.nn.GELU(),
-                torch.nn.Linear(self.hidden_dim, self.text_dim * 2),
+                torch.nn.Linear(self.hidden_dim, output_dim),
             )
-        if self.mode == "factorized_latent":
-            # factorized_latent 专用 prior head。
-            # 输入仍然是 768 维 semantic bank 与 graph-neighbor bank 的拼接，
-            # 输出只对应 semantic factor 的 Gaussian prior: [mu_s, logvar_s]。
-            # hidden 层宽度与 posterior stats_head 一致，避免新增另一套隐藏层设计。
-            self.factorized_semantic_prior_head = torch.nn.Sequential(
-                torch.nn.Linear(self.text_dim * 2, self.hidden_dim),
-                torch.nn.GELU(),
-                torch.nn.Linear(self.hidden_dim, self.factorized_semantic_dim * 2),
-            )
+
+        # learned 是旧路径：cat(bank, dense_neighbor_bank) 直接输出 [prior_mu, prior_logvar]。
+        # residual_anchor 是新路径：312 维标准化属性残差先生成 anchor，再用 graph top-k context 做小修正。
+        full_prior_mode = self.mode not in {"factorized_latent", "dual_metric_semantic_distribution"}
+        if full_prior_mode and self.prior_mean_mode == "learned":
+            self.prior_head = make_mlp(self.text_dim * 2, self.text_dim * 2)
+        if self.mode == "factorized_latent" and self.prior_mean_mode == "learned":
+            self.factorized_semantic_prior_head = make_mlp(self.text_dim * 2, self.factorized_semantic_dim * 2)
+
+        if full_prior_mode and self.prior_mean_mode == "residual_anchor":
+            # 普通 GraphProbPrior 的 anchor_head: 312 维 residual_attr -> 768 维 latent anchor。
+            # delta_head 只接收 [anchor, graph_topk_context, anchor-context]，
+            # 因而它只能做小修正，不能像旧 prior_head 那样自由生成整个 prior_mu。
+            self.residual_anchor_head = make_mlp(self.attr_dim, self.text_dim)
+            self.residual_delta_head = make_mlp(self.text_dim * 3, self.text_dim)
+            if self.prior_var_mode == "learned":
+                self.residual_logvar_head = make_mlp(self.text_dim * 3, self.text_dim)
+        if self.mode == "factorized_latent" and self.prior_mean_mode == "residual_anchor":
+            # factorized_latent 只让 semantic factor 接语义 prior，所以这里输出 semantic_dim。
+            self.factorized_residual_anchor_head = make_mlp(self.attr_dim, self.factorized_semantic_dim)
+            self.factorized_residual_delta_head = make_mlp(self.factorized_semantic_dim * 3, self.factorized_semantic_dim)
+            if self.prior_var_mode == "learned":
+                self.factorized_residual_logvar_head = make_mlp(self.factorized_semantic_dim * 3, self.factorized_semantic_dim)
+
         if self.mode == "dual_metric_semantic_distribution":
-            # dual_metric_semantic_distribution 不再输出 prior_logvar：
-            #   alpha prior center 由“本类 bank + 正语义上下文 C+”生成；
-            #   beta prior center 由“本类 bank + 难负类上下文 C-”生成。
-            # 先验方差固定为单位方差，避免语义图直接替实例 posterior 决定不确定性。
-            self.dual_alpha_mu_head = torch.nn.Sequential(
-                torch.nn.Linear(self.text_dim * 2, self.hidden_dim),
-                torch.nn.GELU(),
-                torch.nn.Linear(self.hidden_dim, self.factorized_semantic_dim),
-            )
-            self.dual_beta_mu_head = torch.nn.Sequential(
-                torch.nn.Linear(self.text_dim * 2, self.hidden_dim),
-                torch.nn.GELU(),
-                torch.nn.Linear(self.hidden_dim, self.factorized_variation_dim),
-            )
+            # dual 第一版按提示词改成 residual-anchor：
+            # alpha/beta 都先从 312 维属性残差生成自己的 anchor，再分别用正邻域/难负邻域 residual 做小修正。
+            self.dual_alpha_anchor_head = make_mlp(self.attr_dim, self.factorized_semantic_dim)
+            self.dual_alpha_delta_head = make_mlp(self.factorized_semantic_dim * 3, self.factorized_semantic_dim)
+            self.dual_beta_anchor_head = make_mlp(self.attr_dim, self.factorized_variation_dim)
+            self.dual_beta_delta_head = make_mlp(self.factorized_variation_dim * 3, self.factorized_variation_dim)
         self._last_loss_stats: Dict[str, float] = {}
         self._debug_logged = False
         self._monitor_step = 0
+        self._last_prior_debug: Dict[str, torch.Tensor] = {}
 
-    def _class_priors(self, bank: torch.Tensor, graph: torch.Tensor, factorized: bool = False):
+    def _standardized_residual_attributes(self, class_attributes: torch.Tensor) -> torch.Tensor:
         """
-        根据 semantic bank 和全类语义图生成所有类别的 Gaussian prior。
+        构造提示词中的 312 维标准化属性残差。
 
-        b_c 是类别自己的语义原型；
-        neighbor_c 是按 graph row 聚合的语义邻居原型；
-        二者拼接后送入 prior_head，输出 p(z|c) 的 mean/logvar。
+        原始 A_conf[c, i] 表示类别 c 对属性 i 的置信度。直接使用它会包含大量“所有鸟共有”的属性。
+        这里先减去全类平均鸟，再除以跨类标准差，得到“这个类相对平均鸟偏离多少个标准差”。
         """
         prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        mean = class_attributes.mean(dim=0, keepdim=True)
+        std = class_attributes.std(dim=0, unbiased=False, keepdim=True).clamp_min(float(prior_cfg.RESIDUAL_SIGMA_MIN))
+        residual = (class_attributes - mean) / std
+        return residual.clamp(min=-float(prior_cfg.RESIDUAL_CLIP), max=float(prior_cfg.RESIDUAL_CLIP))
 
-        # TAU_GRAPH 控制这行相似度转成邻居权重时的尖锐程度：tau 小 -> 只聚合最相近的少数邻居；tau 大 -> 更多邻居会以较平滑的权重参与。
+    def _fixed_or_learned_logvar(
+        self,
+        reference: torch.Tensor,
+        logvar_input: Optional[torch.Tensor] = None,
+        factorized: bool = False,
+    ) -> torch.Tensor:
+        """
+        根据 PRIOR_VAR_MODE 生成 prior_logvar。
+
+        learned 只在当前 residual-anchor 分支显式创建 logvar_head 时使用；
+        unit/constant 则完全固定方差，不让语义图无依据地预测类别不确定性。
+        """
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        if self.prior_var_mode == "unit":
+            return torch.zeros_like(reference)
+        if self.prior_var_mode == "constant":
+            return torch.full_like(reference, float(prior_cfg.PRIOR_LOGVAR_CONST))
+        if logvar_input is None:
+            raise RuntimeError("PRIOR_VAR_MODE=learned requires residual logvar input.")
+        head = self.factorized_residual_logvar_head if bool(factorized) else self.residual_logvar_head
+        return head(logvar_input).clamp(min=self.logvar_min, max=self.logvar_max)
+
+    def _residual_anchor_class_priors(
+        self,
+        class_attributes: torch.Tensor,
+        graph: torch.Tensor,
+        factorized: bool = False,
+    ):
+        """
+        新的 residual-anchor class prior。
+
+        数据流：
+        1. class_attributes [C,312] -> 标准化 residual_attr；
+        2. residual_attr -> anchor_head -> 类别自身语义锚点 anchor；
+        3. graph top-k -> P_plus，只聚合少数正邻域，不做 dense smoothing；
+        4. context = P_plus @ anchor；
+        5. delta_head(cat(anchor, context, anchor-context)) 给出小修正；
+        6. prior_mu = PRIOR_MU_SCALE * normalize(anchor + scale*tanh(delta))。
+        """
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
+        residual_attr = self._standardized_residual_attributes(class_attributes)
+
+        if bool(factorized):
+            anchor = self.factorized_residual_anchor_head(residual_attr)
+            delta_head = self.factorized_residual_delta_head
+        else:
+            anchor = self.residual_anchor_head(residual_attr)
+            delta_head = self.residual_delta_head
+
+        positive_weight = self._masked_topk_distribution(
+            graph,
+            topk=int(prior_cfg.PRIOR_CONTEXT_TOPK),
+            tau=float(prior_cfg.TAU_GRAPH),
+            exclude_self=True,
+        )
+        context = positive_weight.matmul(anchor)
+        delta_input = torch.cat((anchor, context, anchor - context), dim=-1)
+        delta = delta_head(delta_input)
+
+        # tanh(delta) 把修正方向限制在有界范围内；PRIOR_DELTA_SCALE 控制修正只能是 anchor 的小偏移。
+        raw_mu = anchor + float(prior_cfg.PRIOR_DELTA_SCALE) * torch.tanh(delta)
+        prior_mu = float(prior_cfg.PRIOR_MU_SCALE) * F.normalize(raw_mu, p=2, dim=-1, eps=eps)
+        prior_logvar = self._fixed_or_learned_logvar(prior_mu, logvar_input=delta_input, factorized=factorized)
+
+        # 仅缓存监测需要的中间张量。loss 仍从 prior_mu/prior_logvar 正常回传。
+        self._last_prior_debug = {
+            "residual_attr": residual_attr,
+            "anchor": anchor,
+            "context": context,
+            "delta": delta,
+            "positive_weight": positive_weight,
+        }
+        return prior_mu, prior_logvar
+
+    def _learned_class_priors(self, bank: torch.Tensor, graph: torch.Tensor, factorized: bool = False):
+        """
+        旧 learned prior 路径。
+
+        该路径保留给复现实验：dense softmax(graph/tau) 聚合 neighbor_bank，
+        再由 prior_head 直接输出 prior_mu/prior_logvar。
+        """
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
         neighbor_weight = F.softmax(graph / float(prior_cfg.TAU_GRAPH), dim=-1)
-
-        # bank 是全类语义原型 [C, 768]。
-        # neighbor_bank[c] = sum_d neighbor_weight[c,d] * bank[d]，
-        # 即类别 c 的“语义邻居聚合原型”，形状仍是 [C, 768]。
         neighbor_bank = neighbor_weight.matmul(bank)
-
-        # prior head 的输入同时包含：
-        #   bank[c]          -> 类别 c 自己的语义原型；
-        #   neighbor_bank[c] -> 类别 c 的语义邻居上下文。
-        # 拼接后形状为 [C, 1536]。
         prior_input = torch.cat((bank, neighbor_bank), dim=-1)
-
-        # 非 factorized: prior_head 输出 [C, 1536]，再切成 prior_mu/prior_logvar: [C,768]。
-        # factorized_latent: factorized_semantic_prior_head 输出 [C, 2*semantic_dim]，默认切成 prior_mu/prior_logvar: [C,384]。
         prior_head = self.factorized_semantic_prior_head if bool(factorized) else self.prior_head
         prior_stats = prior_head(prior_input)
-
-        # prior_mu / prior_logvar 共同定义每个类别的 diagonal Gaussian prior:
-        #   p_c(z) = N(prior_mu[c], diag(exp(prior_logvar[c])))
         prior_mu, prior_logvar = prior_stats.chunk(2, dim=-1)
-
-        # 限制 prior 方差范围，避免 exp(logvar) 过小导致 KL 爆炸，或过大导致 prior 对 posterior 几乎没有约束。
-        prior_logvar = prior_logvar.clamp(min=self.logvar_min, max=self.logvar_max)
+        self._last_prior_debug = {}
+        if self.prior_var_mode == "learned":
+            prior_logvar = prior_logvar.clamp(min=self.logvar_min, max=self.logvar_max)
+        else:
+            prior_logvar = self._fixed_or_learned_logvar(prior_mu)
         return prior_mu, prior_logvar
+
+    def _class_priors(
+        self,
+        bank: torch.Tensor,
+        graph: torch.Tensor,
+        class_attributes: torch.Tensor,
+        factorized: bool = False,
+    ):
+        """
+        生成普通五个 mode 使用的全类 Gaussian prior。
+
+        PRIOR_MEAN_MODE=learned 时走旧 prior_head；
+        PRIOR_MEAN_MODE=residual_anchor 时走提示词要求的 312 维属性残差锚点。
+        """
+        if self.prior_mean_mode == "learned":
+            return self._learned_class_priors(bank, graph, factorized=factorized)
+        return self._residual_anchor_class_priors(class_attributes, graph, factorized=factorized)
 
     def _masked_topk_distribution(
         self,
@@ -805,62 +958,80 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         prob = prob.masked_fill(~torch.isfinite(masked_logits), 0.0)
         return prob / prob.sum(dim=-1, keepdim=True).clamp_min(eps)
 
-    def _dual_class_priors(self, bank: torch.Tensor, graph: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def _dual_class_priors(self, class_attributes: torch.Tensor, graph: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        为 dual_metric_semantic_distribution 生成两套 class prior center。
+        为 dual_metric_semantic_distribution 生成两套 residual-anchor class prior center。
 
-        这一步对应提示词里的两套类别先验:
-        - alpha prior: p_c^alpha(z)=N(mu_c^alpha, I)
-          作用是表达“类别 c 应该从哪些正语义上下文类借信息”。
-        - beta prior: p_c^beta(z)=N(mu_c^beta, I)
-          作用是表达“类别 c 应该和哪些高风险负类拉开边界”。
-
-        注意这里 V1 固定先验方差为 I，也就是 logvar=0：
-        - 图结构只负责组织 prior center；
-        - 图结构不直接决定实例 posterior 的真实方差；
-        - posterior 方差仍由图像输入经过 prompt distributor 的 stats_head 决定。
+        alpha/beta 不再从 cat(bank, context) 直接自由生成，而是：
+        1. 从 312 维属性残差分别生成 alpha_anchor / beta_anchor；
+        2. alpha 用正邻域 context 做小修正；
+        3. beta 显式看到 b-C+ 与 b-C-，同时知道正邻域和难负类方向；
+        4. 两套 prior 方差固定为 I。
         """
-        graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
         prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
         if str(prior_cfg.DUAL_PRIOR_VAR_MODE).lower() != "unit":
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.DUAL_PRIOR_VAR_MODE currently supports only 'unit'.")
 
-        # P+ 是正语义上下文分布：每个类别只看 top-k 个非自身近邻。
-        # context_bank[c] = sum_d P_plus[c,d] * bank[d]，表示类别 c 的正上下文原型。
+        residual_attr = self._standardized_residual_attributes(class_attributes)
+        alpha_anchor = self.dual_alpha_anchor_head(residual_attr)
+        beta_anchor = self.dual_beta_anchor_head(residual_attr)
+
         positive_weight = self._masked_topk_distribution(
             graph,
-            topk=int(graph_cfg.TOPK),
+            topk=int(prior_cfg.PRIOR_CONTEXT_TOPK),
             tau=float(prior_cfg.TAU_GRAPH),
             exclude_self=True,
         )
-        context_bank = positive_weight.matmul(bank)
-
-        # P- 是 hard negative 分布：每个类别只看 top-k 个非自身高风险类。
-        # 当前风险值仍使用同一张 graph，因为 V5 外部图已经表达了类别相似/混淆风险；
-        # 如果后续要引入专门的 risk graph，应替换这里的 graph 来源，而不是在本函数里做兜底。
         negative_weight = self._masked_topk_distribution(
             graph,
             topk=int(prior_cfg.DUAL_NEG_TOPK),
             tau=float(prior_cfg.DUAL_TAU_NEG),
             exclude_self=True,
         )
-        hard_negative_bank = negative_weight.matmul(bank)
 
-        # 两个 head 都接收 [本类语义原型, 上下文语义原型] 的拼接。
-        # alpha_input 用正上下文 C+，beta_input 用难负上下文 C-，因此两套 center 学到的是不同用途的空间。
-        alpha_input = torch.cat((bank, context_bank), dim=-1)
-        beta_input = torch.cat((bank, hard_negative_bank), dim=-1)
-        alpha_mu = self.dual_alpha_mu_head(alpha_input)
-        beta_mu = self.dual_beta_mu_head(beta_input)
+        alpha_context = positive_weight.matmul(alpha_anchor)
+        beta_positive_context = positive_weight.matmul(beta_anchor)
+        beta_negative_context = negative_weight.matmul(beta_anchor)
 
-        # 固定单位方差：logvar=0 -> var=1。
+        alpha_input = torch.cat((alpha_anchor, alpha_context, alpha_anchor - alpha_context), dim=-1)
+        beta_input = torch.cat(
+            (
+                beta_anchor,
+                beta_anchor - beta_positive_context,
+                beta_anchor - beta_negative_context,
+            ),
+            dim=-1,
+        )
+        alpha_delta = self.dual_alpha_delta_head(alpha_input)
+        beta_delta = self.dual_beta_delta_head(beta_input)
+
+        eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
+        alpha_mu = float(prior_cfg.PRIOR_MU_SCALE) * F.normalize(
+            alpha_anchor + float(prior_cfg.DUAL_ALPHA_DELTA_SCALE) * torch.tanh(alpha_delta),
+            p=2,
+            dim=-1,
+            eps=eps,
+        )
+        beta_mu = float(prior_cfg.PRIOR_MU_SCALE) * F.normalize(
+            beta_anchor + float(prior_cfg.DUAL_BETA_DELTA_SCALE) * torch.tanh(beta_delta),
+            p=2,
+            dim=-1,
+            eps=eps,
+        )
+
         alpha_logvar = torch.zeros_like(alpha_mu)
         beta_logvar = torch.zeros_like(beta_mu)
         return {
             "positive_weight": positive_weight,
             "negative_weight": negative_weight,
-            "context_bank": context_bank,
-            "hard_negative_bank": hard_negative_bank,
+            "residual_attr": residual_attr,
+            "alpha_anchor": alpha_anchor,
+            "alpha_context": alpha_context,
+            "alpha_delta": alpha_delta,
+            "beta_anchor": beta_anchor,
+            "beta_positive_context": beta_positive_context,
+            "beta_negative_context": beta_negative_context,
+            "beta_delta": beta_delta,
             "alpha_input": alpha_input,
             "beta_input": beta_input,
             "alpha_mu": alpha_mu,
@@ -957,6 +1128,240 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         monitor_stats = relation_monitor(sym_kl, pred_rel, topk=self.monitor_topk) if monitor else {}
         return _kl_target_pred(target_rel, pred_rel, eps), monitor_stats
 
+    def _geometry_topk(self, graph: torch.Tensor, topk: int, tau: float):
+        """
+        geometry loss 专用 top-k 读取。
+
+        它和 _masked_topk_distribution 的核心一致，但这里还需要返回 top-k 下标和值，
+        因为三种 geometry loss 都要在 D_cd 或 similarity 矩阵里 gather 对应类别对。
+        """
+        class_count = int(graph.shape[0])
+        logits = graph.clone()
+        diag = torch.arange(class_count, device=graph.device)
+        logits[diag, diag] = float("-inf")
+        values, indices = torch.topk(logits, k=int(topk), dim=-1)
+        weights = F.softmax(values / float(tau), dim=-1)
+        return values, indices, weights
+
+    def compute_prior_distribution_distance(
+        self,
+        prior_mu: torch.Tensor,
+        prior_logvar: Optional[torch.Tensor] = None,
+    ):
+        """
+        计算提示词中的类别分布标准化距离 D_cd。
+
+        dist_mu(c,d) = ||mu_c - mu_d||_2 / sqrt(D)
+        D_cd = dist_mu(c,d) / (r_c + r_d + eps)
+
+        如果 prior 方差是 unit/constant，就使用 GEOM_SIGMA_PRIOR 作为半径；
+        如果 prior 方差是 learned，就从 exp(prior_logvar) 估计半径，并按配置决定是否 detach。
+        """
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
+        latent_dim = int(prior_mu.shape[1])
+        dist_mu = torch.cdist(prior_mu, prior_mu, p=2) / math.sqrt(float(latent_dim))
+
+        if self.prior_var_mode == "learned" and prior_logvar is not None:
+            radius = prior_logvar.exp().mean(dim=-1).clamp_min(eps).sqrt()
+        else:
+            radius = torch.full(
+                (int(prior_mu.shape[0]),),
+                float(prior_cfg.GEOM_SIGMA_PRIOR),
+                device=prior_mu.device,
+                dtype=prior_mu.dtype,
+            )
+        if bool(prior_cfg.GEOM_DETACH_RADIUS):
+            radius = radius.detach()
+        d_norm = dist_mu / (radius[:, None] + radius[None, :] + eps)
+        eye = torch.eye(int(prior_mu.shape[0]), dtype=torch.bool, device=prior_mu.device)
+        d_norm = d_norm.masked_fill(eye, 0.0)
+        return d_norm, dist_mu, radius
+
+    def _graph_prior_geometry_stats(
+        self,
+        prior_mu: torch.Tensor,
+        prior_logvar: torch.Tensor,
+        graph: torch.Tensor,
+    ) -> Dict[str, float]:
+        """只计算 geometry 监测量，不产生额外 loss。"""
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        d_norm, dist_mu, radius = self.compute_prior_distribution_distance(prior_mu, prior_logvar)
+        _, top_indices, _ = self._geometry_topk(
+            graph,
+            topk=int(prior_cfg.GEOM_TOPK),
+            tau=float(prior_cfg.GEOM_TAU_GRAPH_DIST),
+        )
+        return graph_prior_geometry_monitor(
+            d_norm,
+            dist_mu,
+            radius,
+            prior_mu,
+            graph=graph,
+            top_indices=top_indices,
+            margin_min=float(prior_cfg.GEOM_MARGIN_MIN),
+        )
+
+    def compute_graph_prior_geometry_loss(
+        self,
+        prior_mu: torch.Tensor,
+        prior_logvar: torch.Tensor,
+        graph: torch.Tensor,
+    ):
+        """
+        prior_mu 几何校准正则统一入口。
+
+        它不生成 prior_mu，只在 residual-anchor 已经得到 prior_mu 后追加轻量约束：
+        - uniform_topk: 全局 soft repulsion + graph top-k 距离校准；
+        - graph_supcon: graph top-k 作为 soft positives，其他类进入 contrastive denominator；
+        - soft_distribution_matching: 让 graph top-k 分布与 prior-distance 诱导分布一致。
+        """
+        if self.mode == "dual_metric_semantic_distribution":
+            raise RuntimeError("GEOM_LOSS_ENABLE=True is not connected to dual_metric_semantic_distribution in this version.")
+
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
+        method = str(prior_cfg.GEOM_LOSS_TYPE).lower()
+        class_count = int(prior_mu.shape[0])
+        row = torch.arange(class_count, device=prior_mu.device)[:, None]
+        eye = torch.eye(class_count, dtype=torch.bool, device=prior_mu.device)
+        d_norm, dist_mu, radius = self.compute_prior_distribution_distance(prior_mu, prior_logvar)
+
+        stats = graph_prior_geometry_monitor(
+            d_norm,
+            dist_mu,
+            radius,
+            prior_mu,
+            graph=graph,
+            margin_min=float(prior_cfg.GEOM_MARGIN_MIN),
+        )
+
+        if method == "uniform_topk":
+            off_d = d_norm[~eye]
+            uni_logits = -float(prior_cfg.GEOM_TAU_UNI) * off_d.pow(2)
+            uniform_loss = torch.logsumexp(uni_logits, dim=0) - math.log(float(max(int(off_d.numel()), 1)))
+
+            top_values, top_indices, top_weight = self._geometry_topk(
+                graph,
+                topk=int(prior_cfg.GEOM_TOPK),
+                tau=float(prior_cfg.GEOM_TAU_GRAPH_TOP),
+            )
+            top_d = d_norm[row, top_indices]
+            denom = (top_values[:, :1] - top_values[:, -1:]).clamp_min(eps)
+            local_rank_score = (top_values - top_values[:, -1:]) / denom
+            target_d = 1.0 + float(prior_cfg.GEOM_MARGIN_MIN) + float(prior_cfg.GEOM_MARGIN_SCALE) * (
+                1.0 - local_rank_score
+            ).pow(float(prior_cfg.GEOM_MARGIN_GAMMA))
+            top_loss = top_weight.mul(F.smooth_l1_loss(top_d, target_d.detach(), reduction="none")).sum(dim=-1).mean()
+            loss = float(prior_cfg.GEOM_UNI_WEIGHT) * uniform_loss + float(prior_cfg.GEOM_TOP_WEIGHT) * top_loss
+            stats.update(
+                {
+                    "graph_prob_prior_geom_uniform_loss": float(uniform_loss.detach().item()),
+                    "graph_prob_prior_geom_top_loss": float(top_loss.detach().item()),
+                    "graph_prob_prior_geom_loss": float(loss.detach().item()),
+                }
+            )
+            stats.update(
+                graph_prior_geometry_monitor(
+                    d_norm,
+                    dist_mu,
+                    radius,
+                    prior_mu,
+                    graph=graph,
+                    top_indices=top_indices,
+                    margin_min=float(prior_cfg.GEOM_MARGIN_MIN),
+                )
+            )
+            return loss, stats
+
+        if method == "graph_supcon":
+            top_values, top_indices, positive_weight = self._geometry_topk(
+                graph,
+                topk=int(prior_cfg.GEOM_TOPK),
+                tau=float(prior_cfg.GEOM_TAU_GRAPH_POS),
+            )
+            if bool(prior_cfg.GEOM_USE_DISTANCE_SIM):
+                similarity = -d_norm
+            else:
+                similarity = F.normalize(prior_mu, p=2, dim=-1, eps=eps).matmul(
+                    F.normalize(prior_mu, p=2, dim=-1, eps=eps).t()
+                )
+            logits = similarity / float(prior_cfg.GEOM_TAU_CON)
+            logits = logits.masked_fill(eye, float("-inf"))
+            log_den = torch.logsumexp(logits, dim=-1)
+            pos_logits = logits[row, top_indices]
+            gcon_loss = -positive_weight.mul(pos_logits - log_den[:, None]).sum(dim=-1).mean()
+
+            top_d = d_norm[row, top_indices]
+            clear_loss = F.softplus(
+                (1.0 + float(prior_cfg.GEOM_MARGIN_MIN) - top_d) / float(prior_cfg.GEOM_TAU_BARRIER)
+            ).mul(positive_weight).sum(dim=-1).mean()
+            loss = gcon_loss + float(prior_cfg.GEOM_CLEAR_WEIGHT) * clear_loss
+            stats.update(
+                {
+                    "graph_prob_prior_geom_gcon_loss": float(gcon_loss.detach().item()),
+                    "graph_prob_prior_geom_gcon_clear_loss": float(clear_loss.detach().item()),
+                    "graph_prob_prior_geom_loss": float(loss.detach().item()),
+                    "graph_prob_prior_geom_gcon_den_logsumexp_mean": float(log_den.detach().mean().item()),
+                    "graph_prob_prior_geom_gcon_pos_sim_mean": float(similarity[row, top_indices].detach().mean().item()),
+                }
+            )
+            stats.update(
+                graph_prior_geometry_monitor(
+                    d_norm,
+                    dist_mu,
+                    radius,
+                    prior_mu,
+                    graph=graph,
+                    top_indices=top_indices,
+                    margin_min=float(prior_cfg.GEOM_MARGIN_MIN),
+                )
+            )
+            return loss, stats
+
+        if method == "soft_distribution_matching":
+            top_values, top_indices, target_weight = self._geometry_topk(
+                graph,
+                topk=int(prior_cfg.GEOM_TOPK),
+                tau=float(prior_cfg.GEOM_TAU_GRAPH_DIST),
+            )
+            logits = (-d_norm / float(prior_cfg.GEOM_TAU_DIST)).masked_fill(eye, float("-inf"))
+            log_q = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
+            log_q_top = log_q[row, top_indices]
+            dist_match_kl = target_weight.mul(target_weight.clamp_min(eps).log() - log_q_top).sum(dim=-1).mean()
+
+            top_d = d_norm[row, top_indices]
+            bound_loss = F.softplus(
+                (1.0 + float(prior_cfg.GEOM_MARGIN_MIN) - top_d) / float(prior_cfg.GEOM_TAU_BARRIER)
+            ).mul(target_weight).sum(dim=-1).mean()
+            loss = dist_match_kl + float(prior_cfg.GEOM_BOUND_WEIGHT) * bound_loss
+            q_top = log_q_top.exp()
+            q_entropy = -(log_q.exp() * log_q).masked_fill(eye, 0.0).sum(dim=-1).mean()
+            stats.update(
+                {
+                    "graph_prob_prior_geom_dist_match_kl": float(dist_match_kl.detach().item()),
+                    "graph_prob_prior_geom_dist_match_bound_loss": float(bound_loss.detach().item()),
+                    "graph_prob_prior_geom_loss": float(loss.detach().item()),
+                    "graph_prob_prior_geom_dist_match_top_prob_mean": float(target_weight.detach().mean().item()),
+                    "graph_prob_prior_geom_dist_match_q_top_prob_mean": float(q_top.detach().mean().item()),
+                    "graph_prob_prior_geom_dist_match_q_entropy_mean": float(q_entropy.detach().item()),
+                }
+            )
+            stats.update(
+                graph_prior_geometry_monitor(
+                    d_norm,
+                    dist_mu,
+                    radius,
+                    prior_mu,
+                    graph=graph,
+                    top_indices=top_indices,
+                    margin_min=float(prior_cfg.GEOM_MARGIN_MIN),
+                )
+            )
+            return loss, stats
+
+        raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE must be uniform_topk / graph_supcon / soft_distribution_matching.")
+
     def _samplewise_latent_matching_loss(
         self,
         posterior_mu: torch.Tensor,
@@ -1026,8 +1431,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         """
         最简 GraphProbPrior 替换项：每个样本只和自己的真类 class prior 做 KL。
 
-        prior 仍然由 _class_priors() 根据 semantic bank + graph-neighbor bank 生成，
-        所以它仍是 graph-conditioned prior；区别是 loss 不再构造 all-class target，
+        prior 仍然由 _class_priors() 生成；当 PRIOR_MEAN_MODE=residual_anchor 时，
+        它来自 312 维属性残差锚点和 graph top-k context。区别是 loss 不再构造 all-class target，
         也不使用 softmax(-KL/TAU_LATENT)，只优化 KL(q_i || p_{y_i})。
         """
         selected_prior_mu = prior_mu.index_select(0, targets_global)
@@ -1125,6 +1530,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
 
         # 2. 从全类 prior 中取出当前 batch 出现类别对应的 prior。
         # prior_mu/logvar 是 _class_priors() 生成的全类 prior，形状 [C, D]。
+        # residual_anchor 模式下，prior_mu 主体来自 312 维属性残差 anchor，prior_logvar 可固定为 unit/constant。
         # 取出selected_prior_mu/logvar: [K, D]和 aggregate_mu/var 按类别一一对应。
         # 只取当前 batch 出现类别对应的 prior，与聚合 posterior Q_c 一一对齐。
         selected_prior_mu = prior_mu.index_select(0, class_ids)
@@ -1305,7 +1711,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         beta_mu: torch.Tensor,
         beta_logvar: torch.Tensor,
         targets_global: torch.Tensor,
-        bank: torch.Tensor,
+        class_attributes: torch.Tensor,
         graph: torch.Tensor,
         monitor: bool = False,
     ):
@@ -1331,7 +1737,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
         eps = float(graph_cfg.OT_DELTA)
 
-        dual_priors = self._dual_class_priors(bank, graph)
+        dual_priors = self._dual_class_priors(class_attributes, graph)
         positive_weight = dual_priors["positive_weight"]
         negative_weight = dual_priors["negative_weight"]
         alpha_prior_mu = dual_priors["alpha_mu"]
@@ -1463,9 +1869,20 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     t_alpha=positive_weight,
                     p_pos=positive_weight,
                     p_neg=negative_weight,
-                    bank=bank,
+                    bank=dual_priors["alpha_anchor"],
                     topk=self.monitor_topk,
                     margin=float(prior_cfg.DUAL_MARGIN_BASE),
+                )
+            )
+            stats.update(
+                residual_anchor_prior_monitor(
+                    dual_priors["residual_attr"],
+                    dual_priors["alpha_anchor"],
+                    alpha_prior_mu,
+                    delta=dual_priors["alpha_delta"],
+                    context=dual_priors["alpha_context"],
+                    graph=graph,
+                    positive_weight=positive_weight,
                 )
             )
 
@@ -1668,6 +2085,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             dtype=posterior_mu.dtype,
         )
         targets_global = graph_inputs["targets_global"]
+        class_attributes = graph_inputs["class_attributes"]
         acc = graph_inputs["acc"]
         graph = graph_inputs["graph"]
         bank = graph_inputs["bank"]
@@ -1675,13 +2093,18 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         monitor_stats: Dict[str, float] = {}
 
         # 根据当前 mode 生成完整 768 维 prior 或 factorized semantic 维 prior。
-        # 旧五种模式使用 _class_priors() 生成 class Gaussian prior。
-        # dual_metric_semantic_distribution 不调用旧 prior_head；它在自己的 loss 中生成 alpha/beta prior。
+        # 普通五个 mode 使用 _class_priors()，内部再按 PRIOR_MEAN_MODE 走 learned 或 residual_anchor。
+        # dual_metric_semantic_distribution 不调用普通 _class_priors；它在自己的 loss 中生成 alpha/beta prior。
         if self.mode == "dual_metric_semantic_distribution":
             prior_mu = posterior_mu.new_zeros((self.num_classes, self.factorized_semantic_dim))
             prior_logvar = posterior_mu.new_zeros((self.num_classes, self.factorized_semantic_dim))
         else:
-            prior_mu, prior_logvar = self._class_priors(bank, graph, factorized=(self.mode == "factorized_latent"))
+            prior_mu, prior_logvar = self._class_priors(
+                bank,
+                graph,
+                class_attributes,
+                factorized=(self.mode == "factorized_latent"),
+            )
         if monitor_active:
             graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
             monitor_stats.update(graph_neighbor_monitor(graph, float(prior_cfg.TAU_GRAPH), topk=self.monitor_topk))
@@ -1707,6 +2130,19 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                         num_classes=int(graph_cfg.NUM_CLASSES),
                         eps=float(graph_cfg.OT_DELTA),
                         topk=self.monitor_topk,
+                    )
+                )
+            if self.prior_mean_mode == "residual_anchor" and self.mode != "dual_metric_semantic_distribution":
+                prior_debug = self._last_prior_debug
+                monitor_stats.update(
+                    residual_anchor_prior_monitor(
+                        prior_debug["residual_attr"],
+                        prior_debug["anchor"],
+                        prior_mu,
+                        delta=prior_debug["delta"],
+                        context=prior_debug["context"],
+                        graph=graph,
+                        positive_weight=prior_debug["positive_weight"],
                     )
                 )
 
@@ -1763,14 +2199,14 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         elif self.mode == "dual_metric_semantic_distribution":
             # dual_metric 把 posterior_mu/logvar 当作 alpha/context posterior，
             # 把 variation_mu/logvar 当作 beta/separation posterior。
-            # 该分支内部生成 alpha/beta 两套 prior，不使用上面的旧 _class_priors() 输出。
+            # 该分支内部生成 alpha/beta 两套 residual-anchor prior，不使用上面的普通 _class_priors() 输出。
             match_loss, match_stats, debug_info, prior_mu, prior_logvar = self._dual_metric_semantic_distribution_loss(
                 posterior_mu,
                 posterior_logvar,
                 variation_mu,
                 variation_logvar,
                 targets_global,
-                bank,
+                class_attributes,
                 graph,
                 monitor=monitor_active,
             )
@@ -1803,6 +2239,16 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     monitor=True,
                 )
                 monitor_stats.update(rel_monitor_stats)
+
+        if bool(prior_cfg.GEOM_LOSS_ENABLE):
+            geometry_loss, geometry_stats = self.compute_graph_prior_geometry_loss(prior_mu, prior_logvar, graph)
+            monitor_stats.update(geometry_stats)
+            loss = loss + float(prior_cfg.GEOM_LOSS_WEIGHT) * geometry_loss
+        else:
+            geometry_loss = posterior_mu.new_tensor(0.0)
+            if monitor_active and self.mode != "dual_metric_semantic_distribution":
+                monitor_stats.update(self._graph_prior_geometry_stats(prior_mu, prior_logvar, graph))
+
         if monitor_active and self.monitor_inactive and self.mode not in {
             "graph_conditioned_semantic_prior",
             "factorized_latent",
@@ -1875,6 +2321,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             **monitor_stats,
             "graph_prob_prior_rel_loss": float(rel_loss.detach().item()),
             "graph_prob_prior_rel_enabled": float(rel_weight > 0.0 and class_aggregate_mode),
+            "graph_prob_prior_geom_loss": float(geometry_loss.detach().item()),
+            "graph_prob_prior_geom_enabled": float(bool(prior_cfg.GEOM_LOSS_ENABLE)),
             "graph_prob_prior_posterior_mu_norm": float(posterior_mu.detach().norm(dim=-1).mean().item()),
             "graph_prob_prior_prior_mu_norm": float(prior_mu.detach().norm(dim=-1).mean().item()),
             "graph_prob_prior_posterior_var_mean": float(posterior_var.detach().mean().item()),

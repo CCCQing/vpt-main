@@ -229,6 +229,103 @@ def build_train_loader(cfg):
     raise ValueError(f"Unsupported DATA.XLSA.PROTOCOL_MODE='{cfg.DATA.XLSA.PROTOCOL_MODE}'.")
 
 
+def _to_percent(value: float) -> float:
+    return float(value) * 100.0
+
+
+def _harmonic_mean(a: float, b: float) -> float:
+    a = float(a)
+    b = float(b)
+    if a + b <= 0.0:
+        return 0.0
+    return float(2.0 * a * b / (a + b + 1e-8))
+
+
+def evaluate_after_diagnosis(cfg, trainer: Trainer, logger) -> Dict[str, float]:
+    """
+    在短跑训练结束后补一次正式评测。
+
+    这个函数对应“方案 1”的核心：
+    - 前面仍然只跑 max_batches 个训练 batch，用来收集 GraphProbPrior 监测量；
+    - 训练截断后，不再继续完整 epoch，而是直接跑一次当前模型的评测；
+    - final_gzsl 协议下同时评测 test_seen / test_unseen，并计算 H。
+
+    返回值里的准确率统一使用百分数，例如 52.3 表示 52.3%。
+    这样生成的字段和之前 grid summary 里的 gzsl_seen_last/gzsl_unseen_last/gzsl_h_last 口径一致。
+    """
+    protocol_mode = str(cfg.DATA.XLSA.PROTOCOL_MODE).lower()
+    trainer.model.eval()
+    trainer.evaluator.update_iteration(0)
+
+    performance: Dict[str, float] = {
+        "eval_ran": 1.0,
+    }
+
+    if protocol_mode == "final_gzsl":
+        logger.info("Running post-diagnosis GZSL eval: test_seen + test_unseen")
+        test_seen_loader = data_loader.construct_test_seen_loader(cfg)
+        test_unseen_loader = data_loader.construct_test_unseen_loader(cfg)
+        seen_metrics = trainer.eval_classifier(test_seen_loader, "test_seen")
+        unseen_metrics = trainer.eval_classifier(test_unseen_loader, "test_unseen")
+
+        seen = float(seen_metrics["gzsl_seen"])
+        unseen = float(unseen_metrics["gzsl_unseen"])
+        h = _harmonic_mean(seen, unseen)
+        trainer._update_gzsl_record_metrics(0, test_unseen_loader, seen_metrics, unseen_metrics)
+
+        performance.update(
+            {
+                "gzsl_seen_last": _to_percent(seen),
+                "gzsl_unseen_last": _to_percent(unseen),
+                "gzsl_h_last": _to_percent(h),
+                "gzsl_seen_best": _to_percent(seen),
+                "gzsl_unseen_best": _to_percent(unseen),
+                "gzsl_h_best": _to_percent(h),
+                "eval_seen_top1": _to_percent(float(seen_metrics["top1"])),
+                "eval_unseen_top1": _to_percent(float(unseen_metrics["top1"])),
+            }
+        )
+        logger.info(
+            "Post-diagnosis GZSL eval: seen=%.2f unseen=%.2f H=%.2f",
+            performance["gzsl_seen_last"],
+            performance["gzsl_unseen_last"],
+            performance["gzsl_h_last"],
+        )
+        return performance
+
+    if protocol_mode == "final_zsl":
+        logger.info("Running post-diagnosis ZSL eval: test_unseen")
+        test_unseen_loader = data_loader.construct_test_unseen_loader(cfg)
+        unseen_metrics = trainer.eval_classifier(test_unseen_loader, "test_unseen")
+        zsl_unseen = _to_percent(float(unseen_metrics["zsl_unseen"]))
+        performance.update(
+            {
+                "zsl_unseen_last": zsl_unseen,
+                "zsl_unseen_best": zsl_unseen,
+                "eval_unseen_top1": _to_percent(float(unseen_metrics["top1"])),
+            }
+        )
+        logger.info("Post-diagnosis ZSL eval: unseen=%.2f", zsl_unseen)
+        return performance
+
+    if protocol_mode == "dev":
+        logger.info("Running post-diagnosis dev eval: val_unseen")
+        val_loader = data_loader.construct_val_loader(cfg)
+        val_metrics = trainer.eval_classifier(val_loader, "val_unseen")
+        dev_unseen = _to_percent(float(val_metrics["dev_unseen"]))
+        performance.update(
+            {
+                "dev_unseen_last": dev_unseen,
+                "dev_unseen_best": dev_unseen,
+                "eval_unseen_top1": _to_percent(float(val_metrics["top1"])),
+            }
+        )
+        logger.info("Post-diagnosis dev eval: val_unseen=%.2f", dev_unseen)
+        return performance
+
+    raise ValueError(f"Unsupported DATA.XLSA.PROTOCOL_MODE='{cfg.DATA.XLSA.PROTOCOL_MODE}'.")
+
+
 def collect_graph_prob_prior_stats(stats: Dict[str, float]) -> Dict[str, float]:
     """
     从 loss 的 _last_loss_stats 中筛出本脚本关心的字段。
@@ -308,6 +405,8 @@ def main():
         random.seed(0)
 
     train_loader = build_train_loader(cfg)
+    if len(train_loader) <= 0:
+        raise RuntimeError("Train loader is empty; cannot run GraphProbPrior diagnosis.")
     logger.info("Constructing model for GraphProbPrior temperature diagnosis...")
     model, cur_device = build_model(cfg)
     class_attr = train_loader.dataset.class_attributes
@@ -334,50 +433,74 @@ def main():
         str(output_dir),
     )
 
-    for idx, input_data in enumerate(train_loader):
-        if max_batches > 0 and idx >= max_batches:
-            break
-        # 这些 trace 字段主要给 Trainer 内部的调试/日志逻辑使用。
-        # 本脚本只跑一个短诊断循环，所以 epoch 固定为 0。
-        trainer._trace_epoch = 0
-        trainer._trace_iter = int(idx)
-        trainer._trace_global_step += 1
+    target_batches = len(train_loader) if max_batches <= 0 else max_batches
+    epoch_idx = 0
+    while len(rows) < target_batches:
+        if epoch_idx > 0:
+            data_loader.shuffle(train_loader, epoch_idx)
+        for iter_idx, input_data in enumerate(train_loader):
+            if len(rows) >= target_batches:
+                break
+            # 这些 trace 字段主要给 Trainer 内部的调试/日志逻辑使用。
+            # 现在 max_batches 可以跨过一个完整 loader，因此这里记录真实的短跑 epoch / iter。
+            trainer._trace_epoch = int(epoch_idx)
+            trainer._trace_iter = int(iter_idx)
+            trainer._trace_global_step += 1
 
-        x, targets, attributes = trainer.get_input(input_data)
-        if args.no_train_step:
-            # 只采集当前模型状态下的温度监测量，不更新参数。
-            # 适合想看“初始化/已有 checkpoint 的静态分布”的情况。
-            trainer.model.train()
-            with torch.enable_grad():
+            x, targets, attributes = trainer.get_input(input_data)
+            if args.no_train_step:
+                # 只采集当前模型状态下的温度监测量，不更新参数。
+                # 适合想看“初始化/已有 checkpoint 的静态分布”的情况。
+                trainer.model.train()
+                with torch.enable_grad():
+                    loss, _ = trainer.forward_one_batch(
+                        x,
+                        targets,
+                        False,
+                        attributes=attributes,
+                        dataset=train_loader.dataset,
+                    )
+            else:
+                # 默认走一次完整训练 step：
+                # forward -> loss -> backward -> optimizer step。
+                # 这样采集到的是“模型边训练边变化”的温度统计。
                 loss, _ = trainer.forward_one_batch(
                     x,
                     targets,
-                    False,
+                    True,
                     attributes=attributes,
                     dataset=train_loader.dataset,
                 )
-        else:
-            # 默认走一次完整训练 step：
-            # forward -> loss -> backward -> optimizer step。
-            # 这样采集到的是“模型边训练边变化”的温度统计。
-            loss, _ = trainer.forward_one_batch(
-                x,
-                targets,
-                True,
-                attributes=attributes,
-                dataset=train_loader.dataset,
-            )
 
-        # GraphProbPriorLossComputer 每次 forward 后会把监测量合并到
-        # cls_criterion._last_loss_stats；这里把它抽出来形成一行 CSV。
-        stats = collect_graph_prob_prior_stats(getattr(trainer.cls_criterion, "_last_loss_stats", {}))
-        stats.update({"batch": float(idx + 1), "loss": float(loss.detach().item())})
-        rows.append(stats)
-        if (idx + 1) % max(1, int(cfg.SOLVER.LOG_EVERY_N)) == 0:
-            logger.info("diagnosis batch %d loss=%.6f monitor_keys=%d", idx + 1, float(loss.detach().item()), len(stats))
+            batch_number = len(rows) + 1
+            # GraphProbPriorLossComputer 每次 forward 后会把监测量合并到
+            # cls_criterion._last_loss_stats；这里把它抽出来形成一行 CSV。
+            stats = collect_graph_prob_prior_stats(getattr(trainer.cls_criterion, "_last_loss_stats", {}))
+            stats.update(
+                {
+                    "batch": float(batch_number),
+                    "epoch": float(epoch_idx + 1),
+                    "iter": float(iter_idx + 1),
+                    "loss": float(loss.detach().item()),
+                }
+            )
+            rows.append(stats)
+            if batch_number % max(1, int(cfg.SOLVER.LOG_EVERY_N)) == 0:
+                logger.info(
+                    "diagnosis batch %d/%d epoch=%d iter=%d loss=%.6f monitor_keys=%d",
+                    batch_number,
+                    target_batches,
+                    epoch_idx + 1,
+                    iter_idx + 1,
+                    float(loss.detach().item()),
+                    len(stats),
+                )
+        epoch_idx += 1
 
     if not rows:
         raise RuntimeError("No diagnosis rows collected. Check the train loader and max-batches.")
+
+    performance = evaluate_after_diagnosis(cfg, trainer, logger)
 
     if not du.is_master_process(cfg.NUM_GPUS):
         return
@@ -389,11 +512,13 @@ def main():
     # aggregate_monitor_rows 会对每个数值字段做整体统计，
     # 方便不打开 CSV 时也能快速看全局均值、分位数、范围等。
     summary = aggregate_monitor_rows(rows)
+    summary.update(performance)
     payload = {
         "config_file": args.config_file,
         "opts": list(args.opts),
         "num_batches": len(rows),
         "mode": str(cfg.MODEL.GRAPH_PROB_PRIOR.MODE),
+        "performance": performance,
         "temperatures": {
             # 记录本次温度配置，避免之后只看 JSON 不知道当时跑的是哪组温度。
             "TAU_GRAPH": float(cfg.MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH),

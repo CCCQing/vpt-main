@@ -52,7 +52,7 @@ MODE_ALIASES = {
     "factorized_latent": "fact",
     "dual_metric_semantic_distribution": "dual",
 }
-SEARCH_STAGES = {"temperature", "other", "all"}
+LEGACY_SEARCH_STAGES = ["temperature", "other"]
 
 
 def _default_dist_backend() -> str:
@@ -226,9 +226,52 @@ def _cartesian_grid(grid: Mapping[str, Any]) -> List[Dict[str, Any]]:
     return combos
 
 
-def _stage_specs(spec: Mapping[str, Any], selected_stage: str) -> List[Dict[str, Any]]:
+def _configured_stage_names(grid_cfg: Mapping[str, Any]) -> List[str]:
+    """Return the stage order declared by the YAML, with legacy fallback."""
+    raw_order = grid_cfg.get("STAGE_ORDER", grid_cfg.get("SEARCH_STAGES", None))
+    if raw_order is not None:
+        order = [str(item).lower() for item in _as_list(raw_order)]
+        if not order:
+            raise ValueError("STAGE_ORDER / SEARCH_STAGES is set but empty.")
+        return order
+
+    mode_space = grid_cfg.get("MODE_SEARCH_SPACE", {})
+    discovered: List[str] = []
+    seen = set()
+    if isinstance(mode_space, Mapping):
+        for spec in mode_space.values():
+            if not isinstance(spec, Mapping):
+                continue
+            stage_map = spec.get("STAGES", None)
+            if not isinstance(stage_map, Mapping):
+                continue
+            for stage_name in stage_map.keys():
+                stage_name = str(stage_name).lower()
+                if stage_name not in seen:
+                    seen.add(stage_name)
+                    discovered.append(stage_name)
+    return discovered or list(LEGACY_SEARCH_STAGES)
+
+
+def _stage_specs(spec: Mapping[str, Any], selected_stage: str, stage_order: Sequence[str]) -> List[Dict[str, Any]]:
     base_fixed = dict(spec.get("FIXED_OPTS", {}) or {})
     stages: List[Dict[str, Any]] = []
+    explicit_stages = spec.get("STAGES", None)
+    if isinstance(explicit_stages, Mapping):
+        selected = [str(item).lower() for item in stage_order] if selected_stage == "all" else [str(selected_stage).lower()]
+        for stage_name in selected:
+            stage_cfg = explicit_stages.get(stage_name, explicit_stages.get(str(stage_name), None))
+            if stage_cfg is None:
+                continue
+            if not isinstance(stage_cfg, Mapping):
+                raise ValueError(f"Stage spec must be a mapping: {stage_name}")
+            fixed = dict(base_fixed)
+            fixed.update(dict(stage_cfg.get("FIXED_OPTS", {}) or {}))
+            grid = stage_cfg.get("GRID", stage_cfg.get("PARAM_GRID", {}) or {}) or {}
+            if grid or selected_stage in {"all", stage_name}:
+                stages.append({"stage": stage_name, "fixed": fixed, "grid": grid})
+        return stages
+
     if selected_stage in {"temperature", "all"}:
         grid = spec.get("TEMPERATURE_GRID", spec.get("GRID", {}) or {}) or {}
         fixed = dict(base_fixed)
@@ -301,7 +344,8 @@ def _trial_name(index: int, stage: str, graph_method: str, mode: str, combo: Map
     combo_hash = hashlib.md5(combo_json.encode("utf-8")).hexdigest()[:8]
     graph_alias = GRAPH_METHOD_ALIASES.get(str(graph_method), _sanitize(graph_method)[:12])
     mode_alias = MODE_ALIASES.get(str(mode), _sanitize(mode)[:12])
-    return f"t{index:04d}_{stage[:4]}_{graph_alias}_{mode_alias}_{combo_hash}"
+    stage_alias = _sanitize(stage)[:12]
+    return f"t{index:04d}_{stage_alias}_{graph_alias}_{mode_alias}_{combo_hash}"
 
 
 def _build_trials(
@@ -317,6 +361,7 @@ def _build_trials(
     no_train_step: bool,
     extra_opts: Sequence[str],
     stage: str,
+    stage_order: Sequence[str],
 ) -> List[Dict[str, Any]]:
     fixed_opts = dict(grid_cfg.get("FIXED_OPTS", {}) or {})
     mode_space = grid_cfg["MODE_SEARCH_SPACE"]
@@ -326,7 +371,7 @@ def _build_trials(
     for graph_method in graph_methods:
         for mode in modes:
             spec = mode_space[mode] or {}
-            for stage_spec in _stage_specs(spec, stage):
+            for stage_spec in _stage_specs(spec, stage, stage_order):
                 stage_name = str(stage_spec["stage"])
                 mode_fixed = dict(stage_spec["fixed"])
                 combos = _cartesian_grid(stage_spec.get("grid", {}) or {})
@@ -408,6 +453,10 @@ def _trial_has_complete_output(trial: Mapping[str, Any], expected_batches: int) 
         return False
     if num_batches <= 0:
         return False
+    if int(expected_batches) > 0 and num_batches < int(expected_batches):
+        return False
+    if not isinstance(payload.get("performance"), dict):
+        return False
     return isinstance(payload.get("summary"), dict)
 
 
@@ -416,8 +465,9 @@ def _existing_trial_result(
     gpu_id: str,
     command: Sequence[str],
     num_gpus: int,
+    expected_batches: int,
 ) -> Optional[Dict[str, Any]]:
-    if not _trial_has_complete_output(trial, expected_batches=0):
+    if not _trial_has_complete_output(trial, expected_batches=expected_batches):
         return None
     return _flatten_result(
         trial,
@@ -439,6 +489,8 @@ def _resume_status(trial: Mapping[str, Any]) -> str:
         return f"unreadable diagnosis json {json_path}"
     if not isinstance(payload.get("summary"), dict):
         return f"diagnosis json has no summary {json_path}"
+    if not isinstance(payload.get("performance"), dict):
+        return f"diagnosis json has no post-diagnosis eval performance {json_path}"
     return f"complete {json_path}"
 
 
@@ -471,6 +523,9 @@ def _flatten_result(
     payload = _summary_payload(Path(str(trial["output_dir"])))
     if payload:
         row["num_batches"] = payload.get("num_batches", "")
+        for key, value in (payload.get("performance") or {}).items():
+            if isinstance(value, (int, float, str, bool)):
+                row[key] = value
         for key, value in (payload.get("temperatures") or {}).items():
             row[f"temperature_{key}"] = value
         for key, value in (payload.get("summary") or {}).items():
@@ -523,6 +578,8 @@ def _with_monitor_scores(row: MutableMapping[str, Any]) -> Dict[str, Any]:
     if int(scored.get("returncode", 0)) != 0:
         scored["monitor_score"] = 1.0e9
         scored["selection_score"] = 1.0e9
+        scored["primary_score"] = float("-inf")
+        scored["primary_score_key"] = "failed"
         return scored
 
     score = 0.0
@@ -561,7 +618,27 @@ def _with_monitor_scores(row: MutableMapping[str, Any]) -> Dict[str, Any]:
     loss_term = 0.0 if loss is None else 0.01 * np.log1p(max(loss, 0.0))
     scored["monitor_score"] = float(score)
     scored["selection_score"] = float(score + loss_term)
+    primary = _row_float(scored, "gzsl_h_last")
+    if primary is not None:
+        scored["primary_score"] = float(primary)
+        scored["primary_score_key"] = "gzsl_h_last"
+    else:
+        primary = _row_float(scored, "zsl_unseen_last")
+        if primary is not None:
+            scored["primary_score"] = float(primary)
+            scored["primary_score_key"] = "zsl_unseen_last"
+        else:
+            primary = _row_float(scored, "dev_unseen_last")
+            scored["primary_score"] = float(primary) if primary is not None else float("-inf")
+            scored["primary_score_key"] = "dev_unseen_last" if primary is not None else "monitor_only"
     return scored
+
+
+def _rank_metric(row: Mapping[str, Any], key: str) -> tuple[bool, float]:
+    value = _row_float(row, key)
+    if value is None:
+        return True, 0.0
+    return False, -float(value)
 
 
 def _rank_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -570,6 +647,11 @@ def _rank_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         scored,
         key=lambda row: (
             int(row.get("returncode", 0)) != 0,
+            *_rank_metric(row, "gzsl_h_last"),
+            *_rank_metric(row, "gzsl_unseen_last"),
+            *_rank_metric(row, "gzsl_seen_last"),
+            *_rank_metric(row, "zsl_unseen_last"),
+            *_rank_metric(row, "dev_unseen_last"),
             float(row.get("selection_score", 1.0e9)),
             str(row.get("stage", "")),
             str(row.get("graph_method", "")),
@@ -696,7 +778,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--graph-methods", default="all")
     parser.add_argument("--modes", default="all")
-    parser.add_argument("--stage", default="", choices=["", "temperature", "other", "all"])
+    parser.add_argument("--stage", default="", help="Stage name from the YAML, or all.")
     parser.add_argument("--gpus", default="", help="Comma-separated GPU ids for parallel trials.")
     parser.add_argument(
         "--gpu-groups",
@@ -737,9 +819,11 @@ def main() -> None:
     max_batches = int(args.max_batches if args.max_batches is not None else int(grid_cfg.get("MAX_BATCHES", 111)))
     no_train_step = bool(grid_cfg.get("NO_TRAIN_STEP", False)) or bool(args.no_train_step)
     extra_opts = _validate_extra_opts(args.opts)
-    stage = str(args.stage or grid_cfg.get("STAGE", "temperature")).lower()
-    if stage not in SEARCH_STAGES:
-        raise ValueError(f"--stage must be one of {sorted(SEARCH_STAGES)}, got {stage}.")
+    stage_order = _configured_stage_names(grid_cfg)
+    stage = str(args.stage or grid_cfg.get("STAGE", stage_order[0])).lower()
+    valid_stages = set(stage_order) | {"all"}
+    if stage not in valid_stages:
+        raise ValueError(f"--stage must be one of {sorted(valid_stages)}, got {stage}.")
 
     graph_methods = _load_graph_methods(grid_cfg, args.graph_methods)
     modes = _load_modes(grid_cfg, args.modes)
@@ -768,6 +852,7 @@ def main() -> None:
         no_train_step=no_train_step,
         extra_opts=extra_opts,
         stage=stage,
+        stage_order=stage_order,
     )
     if args.limit > 0:
         trials = trials[: int(args.limit)]
@@ -797,6 +882,7 @@ def main() -> None:
         "max_batches": max_batches,
         "no_train_step": no_train_step,
         "stage": stage,
+        "stage_order": stage_order,
         "total_trials": len(trials),
         "dry_run": bool(args.dry_run),
         "resume": not bool(args.no_resume),
@@ -809,10 +895,12 @@ def main() -> None:
         "fixed_opts": grid_cfg.get("FIXED_OPTS", {}),
         "commands_path": str(commands_path),
         "ranking": {
+            "primary_order": "gzsl_h_last desc, gzsl_unseen_last desc, gzsl_seen_last desc, then monitor selection_score asc",
             "selection_score": "monitor_score + 0.01*log1p(graph_prob_prior_match_loss)",
             "notes": [
-                "lower selection_score is better",
-                "score prefers balanced graph-neighbor entropy/top1, informative latent probabilities, non-saturated MMD kernel, low prior overlap, low false-high residue, low dual beta violation, and reasonable weighted loss scale",
+                "ranked_summary is performance-first when post-diagnosis eval metrics are present",
+                "lower selection_score is only a tie-breaker after final seen/unseen/H metrics",
+                "monitor score prefers balanced graph-neighbor entropy/top1, informative latent probabilities, non-saturated MMD kernel, low prior overlap, low false-high residue, low dual beta violation, and reasonable weighted loss scale",
             ],
         },
     }
@@ -842,7 +930,13 @@ def main() -> None:
                 nproc_per_trial=int(args.nproc_per_trial),
                 dist_backend=str(args.dist_backend),
             )
-            existing = None if bool(args.no_resume) else _existing_trial_result(trial, gpu, run_cmd, run_nproc)
+            existing = None if bool(args.no_resume) else _existing_trial_result(
+                trial,
+                gpu,
+                run_cmd,
+                run_nproc,
+                expected_batches=max_batches,
+            )
             if existing is not None:
                 print(f"[{idx + 1}/{len(trials)}] skip existing {trial['trial_name']} gpu={gpu} nproc={run_nproc}", flush=True)
                 rows.append(existing)
@@ -879,7 +973,13 @@ def main() -> None:
                     nproc_per_trial=int(args.nproc_per_trial),
                     dist_backend=str(args.dist_backend),
                 )
-                existing = None if bool(args.no_resume) else _existing_trial_result(trial, gpu, run_cmd, run_nproc)
+                existing = None if bool(args.no_resume) else _existing_trial_result(
+                    trial,
+                    gpu,
+                    run_cmd,
+                    run_nproc,
+                    expected_batches=max_batches,
+                )
                 if existing is not None:
                     print(
                         f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "

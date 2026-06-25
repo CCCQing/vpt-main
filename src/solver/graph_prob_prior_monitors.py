@@ -597,6 +597,159 @@ def prior_health_monitor(
     return stats
 
 
+def residual_anchor_prior_monitor(
+    residual_attr: torch.Tensor,
+    anchor: torch.Tensor,
+    prior_mu: torch.Tensor,
+    delta: Optional[torch.Tensor] = None,
+    context: Optional[torch.Tensor] = None,
+    graph: Optional[torch.Tensor] = None,
+    positive_weight: Optional[torch.Tensor] = None,
+    threshold: float = 0.9,
+) -> Dict[str, float]:
+    """
+    residual-anchor prior 专用监测。
+
+    这组指标回答三个问题：
+    1. 312 维标准化属性残差是否数值健康；
+    2. anchor_head 生成的类别锚点是否已经把类别拉开；
+    3. delta_head 的小修正是否过强，是否又把空间推回自由 MLP。
+    """
+    stats: Dict[str, float] = {}
+    if not torch.is_tensor(residual_attr) or not torch.is_tensor(anchor) or not torch.is_tensor(prior_mu):
+        return stats
+    residual = residual_attr.detach().float()
+    anchor = anchor.detach().float()
+    prior = prior_mu.detach().float()
+    if residual.dim() != 2 or anchor.dim() != 2 or prior.dim() != 2:
+        return stats
+
+    # residual_attr_norm_*：看标准化后的 312 维残差有没有整体过大或过小。
+    stats.update(tensor_stats("graph_prob_prior_monitor_residual_attr_norm", residual.norm(dim=-1)))
+
+    # anchor_pair_cosine_*：只看 anchor_head 输出，不混入 delta，用来判断主锚点是否已经缓解 collapse。
+    anchor_cos = F.normalize(anchor, p=2, dim=-1, eps=1e-12).matmul(
+        F.normalize(anchor, p=2, dim=-1, eps=1e-12).t()
+    )
+    anchor_off = _offdiag_values(anchor_cos)
+    if anchor_off.numel() > 0:
+        stats.update(tensor_stats("graph_prob_prior_monitor_anchor_pair_cosine", anchor_off))
+        stats["graph_prob_prior_monitor_anchor_pairs_gt_0_9"] = _as_float(
+            (anchor_off > float(threshold)).float().sum() / 2.0
+        )
+
+    # prior_pair_cosine_*：看最终 prior_mu 是否仍然塌缩。prior_health_monitor 也会记一部分，
+    # 这里补 q05/q50/q95，方便和 anchor_pair_cosine 直接对比。
+    prior_cos = F.normalize(prior, p=2, dim=-1, eps=1e-12).matmul(
+        F.normalize(prior, p=2, dim=-1, eps=1e-12).t()
+    )
+    prior_off = _offdiag_values(prior_cos)
+    if prior_off.numel() > 0:
+        stats.update(tensor_stats("graph_prob_prior_monitor_prior_pair_cosine", prior_off))
+
+    # prior_anchor_cos_*：看最终 prior_mu 是否仍沿着 anchor 方向；过低说明 delta 修正覆盖了主锚点。
+    if anchor.shape == prior.shape:
+        anchor_n = F.normalize(anchor, p=2, dim=-1, eps=1e-12)
+        prior_n = F.normalize(prior, p=2, dim=-1, eps=1e-12)
+        stats.update(tensor_stats("graph_prob_prior_monitor_prior_anchor_cos", (anchor_n * prior_n).sum(dim=-1)))
+
+    if delta is not None and torch.is_tensor(delta) and delta.shape == anchor.shape:
+        d = delta.detach().float()
+        delta_norm = d.norm(dim=-1)
+        anchor_norm = anchor.norm(dim=-1).clamp_min(1e-12)
+        # prior_delta_to_anchor_ratio：越大说明 correction 越像自由生成器；提示词期望它只是小修正。
+        stats.update(tensor_stats("graph_prob_prior_monitor_prior_delta_norm", delta_norm))
+        stats.update(tensor_stats("graph_prob_prior_monitor_prior_delta_to_anchor_ratio", delta_norm / anchor_norm))
+
+    if context is not None and torch.is_tensor(context) and context.shape == anchor.shape:
+        ctx = context.detach().float()
+        stats.update(tensor_stats("graph_prob_prior_monitor_context_anchor_cos", (
+            F.normalize(ctx, p=2, dim=-1, eps=1e-12) * F.normalize(anchor, p=2, dim=-1, eps=1e-12)
+        ).sum(dim=-1)))
+
+    if graph is not None and torch.is_tensor(graph) and graph.shape == prior_cos.shape:
+        graph_det = graph.detach().float().to(device=prior.device)
+        stats["graph_prob_prior_monitor_graph_pos_prior_relation_spearman"] = _spearman_corr(
+            _offdiag_values(graph_det),
+            _offdiag_values(prior_cos),
+        )
+        offdiag = ~torch.eye(int(graph_det.shape[0]), dtype=torch.bool, device=graph_det.device)
+        false_high = (graph_det > float(threshold)) & offdiag
+        if bool(false_high.any().item()):
+            stats["graph_prob_prior_monitor_false_high_prior_relation_still_gt_0_9"] = _as_float(
+                (prior_cos[false_high] > float(threshold)).float().sum()
+            )
+
+    if positive_weight is not None and torch.is_tensor(positive_weight) and positive_weight.shape == prior_cos.shape:
+        pos_mask = positive_weight.detach().to(device=prior.device) > 0.0
+        eye = torch.eye(int(pos_mask.shape[0]), dtype=torch.bool, device=prior.device)
+        pos_mask = pos_mask & ~eye
+        nonpos_mask = ~pos_mask & ~eye
+        if bool(pos_mask.any().item()):
+            stats["graph_prob_prior_monitor_true_neighbor_preservation_mean"] = _as_float(prior_cos[pos_mask].mean())
+        if bool(nonpos_mask.any().item()):
+            hard_values = prior_cos[nonpos_mask]
+            stats.update(tensor_stats("graph_prob_prior_monitor_hardneg_prior_cos", hard_values))
+            stats["graph_prob_prior_monitor_hardneg_violate_rate"] = _as_float(
+                (hard_values > float(threshold)).float().mean()
+            )
+    return stats
+
+
+def graph_prior_geometry_monitor(
+    d_norm: torch.Tensor,
+    dist_mu: torch.Tensor,
+    radius: torch.Tensor,
+    prior_mu: torch.Tensor,
+    graph: Optional[torch.Tensor] = None,
+    top_indices: Optional[torch.Tensor] = None,
+    margin_min: float = 0.1,
+) -> Dict[str, float]:
+    """
+    prior distribution geometry 监测。
+
+    d_norm 是提示词里的 D_cd：均值距离除以类别分布半径之和。
+    这些指标用来判断 prior mean 是否整体分散，以及 graph top-k 邻居是否被推得过远或过近。
+    """
+    stats: Dict[str, float] = {}
+    if not all(torch.is_tensor(x) for x in (d_norm, dist_mu, radius, prior_mu)):
+        return stats
+    if d_norm.dim() != 2 or d_norm.shape[0] != d_norm.shape[1]:
+        return stats
+    n = int(d_norm.shape[0])
+    eye = torch.eye(n, dtype=torch.bool, device=d_norm.device)
+    off_d = d_norm.detach().float()[~eye]
+    if off_d.numel() > 0:
+        stats.update(tensor_stats("graph_prob_prior_monitor_geom_prior_dist", off_d))
+        stats["graph_prob_prior_monitor_geom_pairs_lt_1_ratio"] = _as_float((off_d < 1.0).float().mean())
+    stats.update(tensor_stats("graph_prob_prior_monitor_geom_mu_dist", dist_mu.detach().float()[~eye]))
+    stats.update(tensor_stats("graph_prob_prior_monitor_geom_radius", radius.detach().float()))
+
+    prior = prior_mu.detach().float()
+    prior_cos = F.normalize(prior, p=2, dim=-1, eps=1e-12).matmul(
+        F.normalize(prior, p=2, dim=-1, eps=1e-12).t()
+    )
+    off_cos = prior_cos[~eye]
+    if off_cos.numel() > 0:
+        stats.update(tensor_stats("graph_prob_prior_monitor_geom_prior_cos", off_cos))
+        stats["graph_prob_prior_monitor_geom_pairs_cos_gt_0_9"] = _as_float((off_cos > 0.9).float().sum() / 2.0)
+
+    if top_indices is not None and torch.is_tensor(top_indices):
+        row = torch.arange(n, device=d_norm.device)[:, None]
+        top_d = d_norm.detach().float()[row, top_indices.to(device=d_norm.device)]
+        stats.update(tensor_stats("graph_prob_prior_monitor_geom_topk_dist", top_d))
+        stats["graph_prob_prior_monitor_geom_topk_boundary_violate_ratio"] = _as_float(
+            (top_d < (1.0 + float(margin_min))).float().mean()
+        )
+        if graph is not None and torch.is_tensor(graph) and graph.shape == d_norm.shape:
+            graph_top = graph.detach().float().to(device=d_norm.device)[row, top_indices.to(device=d_norm.device)]
+            stats["graph_prob_prior_monitor_geom_topk_graph_prior_corr"] = _spearman_corr(
+                graph_top.reshape(-1),
+                -top_d.reshape(-1),
+            )
+    return stats
+
+
 def _index_tensor(ids, device: torch.device) -> torch.Tensor:
     """把 list/tuple/numpy/tensor 形式的类别 id 统一成 long tensor。"""
     if ids is None:
@@ -776,9 +929,22 @@ def graph_prob_prior_grad_monitor(named_parameters) -> Dict[str, float]:
     只读取参数梯度的 detach 值，判断 prior/dual/stats head 是否真的收到梯度。
     """
     groups = {
-        "dual_alpha_head": ("dual_alpha_mu_head",),
-        "dual_beta_head": ("dual_beta_mu_head",),
-        "prior_head": ("prior_head", "factorized_semantic_prior_head"),
+        "dual_alpha_head": ("dual_alpha_mu_head", "dual_alpha_anchor_head", "dual_alpha_delta_head"),
+        "dual_beta_head": ("dual_beta_mu_head", "dual_beta_anchor_head", "dual_beta_delta_head"),
+        "prior_head": (
+            "prior_head",
+            "factorized_semantic_prior_head",
+            "residual_anchor_head",
+            "residual_delta_head",
+            "residual_logvar_head",
+            "factorized_residual_anchor_head",
+            "factorized_residual_delta_head",
+            "factorized_residual_logvar_head",
+            "dual_alpha_anchor_head",
+            "dual_alpha_delta_head",
+            "dual_beta_anchor_head",
+            "dual_beta_delta_head",
+        ),
         "stats_head": ("stats_head",),
     }
     sum_sq = {key: 0.0 for key in groups}
