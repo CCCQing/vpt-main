@@ -253,12 +253,52 @@ def _configured_stage_names(grid_cfg: Mapping[str, Any]) -> List[str]:
     return discovered or list(LEGACY_SEARCH_STAGES)
 
 
-def _stage_specs(spec: Mapping[str, Any], selected_stage: str, stage_order: Sequence[str]) -> List[Dict[str, Any]]:
+def _parse_stage_selection(raw_stage: str, stage_order: Sequence[str]) -> List[str]:
+    raw_stage = str(raw_stage).strip()
+    if not raw_stage:
+        raise ValueError("Stage selection cannot be empty.")
+    if raw_stage.lower() == "all":
+        return [str(stage).lower() for stage in stage_order]
+
+    wanted = [str(item).lower() for item in _parse_csv(raw_stage)]
+    if not wanted:
+        raise ValueError("Stage selection cannot be empty.")
+    valid = set(str(stage).lower() for stage in stage_order)
+    missing = [stage for stage in wanted if stage not in valid]
+    if missing:
+        raise ValueError(f"Unknown stage values {missing}; expected subset of {list(stage_order)} or all.")
+
+    selected: List[str] = []
+    seen = set()
+    for stage in wanted:
+        if stage not in seen:
+            seen.add(stage)
+            selected.append(stage)
+    return selected
+
+
+def _stage_selection_label(selected_stages: Sequence[str], stage_order: Sequence[str]) -> str:
+    selected = [str(stage).lower() for stage in selected_stages]
+    ordered = [str(stage).lower() for stage in stage_order]
+    if selected == ordered:
+        return "all"
+    if len(selected) == 1:
+        return selected[0]
+    return "multi_" + "_".join(_sanitize(stage)[:10] for stage in selected)
+
+
+def _stage_specs(
+    spec: Mapping[str, Any],
+    selected_stages: Sequence[str],
+    stage_order: Sequence[str],
+    graph_method: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     base_fixed = dict(spec.get("FIXED_OPTS", {}) or {})
     stages: List[Dict[str, Any]] = []
+    selected_set = {str(stage).lower() for stage in selected_stages}
     explicit_stages = spec.get("STAGES", None)
     if isinstance(explicit_stages, Mapping):
-        selected = [str(item).lower() for item in stage_order] if selected_stage == "all" else [str(selected_stage).lower()]
+        selected = [str(item).lower() for item in stage_order if str(item).lower() in selected_set]
         for stage_name in selected:
             stage_cfg = explicit_stages.get(stage_name, explicit_stages.get(str(stage_name), None))
             if stage_cfg is None:
@@ -267,22 +307,35 @@ def _stage_specs(spec: Mapping[str, Any], selected_stage: str, stage_order: Sequ
                 raise ValueError(f"Stage spec must be a mapping: {stage_name}")
             fixed = dict(base_fixed)
             fixed.update(dict(stage_cfg.get("FIXED_OPTS", {}) or {}))
-            grid = stage_cfg.get("GRID", stage_cfg.get("PARAM_GRID", {}) or {}) or {}
-            if grid or selected_stage in {"all", stage_name}:
+            grid = dict(stage_cfg.get("GRID", stage_cfg.get("PARAM_GRID", {}) or {}) or {})
+            graph_stage_cfgs = stage_cfg.get("GRAPH_METHODS", None)
+            if isinstance(graph_stage_cfgs, Mapping):
+                current_graph_method = str(graph_method or "")
+                graph_stage_cfg = graph_stage_cfgs.get(current_graph_method, None)
+                if graph_stage_cfg is None:
+                    continue
+                if not isinstance(graph_stage_cfg, Mapping):
+                    raise ValueError(
+                        f"Graph-method stage spec must be a mapping: "
+                        f"stage={stage_name} graph_method={current_graph_method}"
+                    )
+                fixed.update(dict(graph_stage_cfg.get("FIXED_OPTS", {}) or {}))
+                grid.update(dict(graph_stage_cfg.get("GRID", graph_stage_cfg.get("PARAM_GRID", {}) or {}) or {}))
+            if grid or stage_name in selected_set:
                 stages.append({"stage": stage_name, "fixed": fixed, "grid": grid})
         return stages
 
-    if selected_stage in {"temperature", "all"}:
+    if "temperature" in selected_set:
         grid = spec.get("TEMPERATURE_GRID", spec.get("GRID", {}) or {}) or {}
         fixed = dict(base_fixed)
         fixed.update(dict(spec.get("TEMPERATURE_FIXED_OPTS", {}) or {}))
-        if grid or selected_stage == "temperature":
+        if grid:
             stages.append({"stage": "temperature", "fixed": fixed, "grid": grid})
-    if selected_stage in {"other", "all"}:
+    if "other" in selected_set:
         grid = spec.get("OTHER_GRID", {}) or {}
         fixed = dict(base_fixed)
         fixed.update(dict(spec.get("OTHER_FIXED_OPTS", {}) or {}))
-        if grid or selected_stage == "other":
+        if grid:
             stages.append({"stage": "other", "fixed": fixed, "grid": grid})
     return stages
 
@@ -360,7 +413,7 @@ def _build_trials(
     max_batches: int,
     no_train_step: bool,
     extra_opts: Sequence[str],
-    stage: str,
+    selected_stages: Sequence[str],
     stage_order: Sequence[str],
 ) -> List[Dict[str, Any]]:
     fixed_opts = dict(grid_cfg.get("FIXED_OPTS", {}) or {})
@@ -371,7 +424,7 @@ def _build_trials(
     for graph_method in graph_methods:
         for mode in modes:
             spec = mode_space[mode] or {}
-            for stage_spec in _stage_specs(spec, stage, stage_order):
+            for stage_spec in _stage_specs(spec, selected_stages, stage_order, graph_method=graph_method):
                 stage_name = str(stage_spec["stage"])
                 mode_fixed = dict(stage_spec["fixed"])
                 combos = _cartesian_grid(stage_spec.get("grid", {}) or {})
@@ -779,6 +832,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--graph-methods", default="all")
     parser.add_argument("--modes", default="all")
     parser.add_argument("--stage", default="", help="Stage name from the YAML, or all.")
+    parser.add_argument(
+        "--stages",
+        default="",
+        help="Comma-separated stage names from the YAML. Overrides --stage when set. Example: stage0_temperature_coarse,stage1_temperature_fine.",
+    )
     parser.add_argument("--gpus", default="", help="Comma-separated GPU ids for parallel trials.")
     parser.add_argument(
         "--gpu-groups",
@@ -820,10 +878,9 @@ def main() -> None:
     no_train_step = bool(grid_cfg.get("NO_TRAIN_STEP", False)) or bool(args.no_train_step)
     extra_opts = _validate_extra_opts(args.opts)
     stage_order = _configured_stage_names(grid_cfg)
-    stage = str(args.stage or grid_cfg.get("STAGE", stage_order[0])).lower()
-    valid_stages = set(stage_order) | {"all"}
-    if stage not in valid_stages:
-        raise ValueError(f"--stage must be one of {sorted(valid_stages)}, got {stage}.")
+    raw_stage_selection = str(args.stages or args.stage or grid_cfg.get("STAGE", stage_order[0])).lower()
+    selected_stages = _parse_stage_selection(raw_stage_selection, stage_order)
+    stage_label = _stage_selection_label(selected_stages, stage_order)
 
     graph_methods = _load_graph_methods(grid_cfg, args.graph_methods)
     modes = _load_modes(grid_cfg, args.modes)
@@ -851,14 +908,14 @@ def main() -> None:
         max_batches=max_batches,
         no_train_step=no_train_step,
         extra_opts=extra_opts,
-        stage=stage,
+        selected_stages=selected_stages,
         stage_order=stage_order,
     )
     if args.limit > 0:
         trials = trials[: int(args.limit)]
 
     out_root.mkdir(parents=True, exist_ok=True)
-    stage_suffix = f"_{stage}"
+    stage_suffix = f"_{stage_label}"
     commands_path = out_root / f"commands{stage_suffix}.txt"
     with commands_path.open("w", encoding="utf-8") as handle:
         for trial in trials:
@@ -881,7 +938,8 @@ def main() -> None:
         "modes": modes,
         "max_batches": max_batches,
         "no_train_step": no_train_step,
-        "stage": stage,
+        "stage": stage_label,
+        "selected_stages": selected_stages,
         "stage_order": stage_order,
         "total_trials": len(trials),
         "dry_run": bool(args.dry_run),
