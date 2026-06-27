@@ -115,16 +115,105 @@ def _diagnose_with_ddp_attr_forward(argv: Sequence[str], _unused: Any = None) ->
         sys.argv = old_argv
 
 
-def _train_with_ddp_attr_forward(argv: Sequence[str], _unused: Any = None) -> None:
-    _patch_ddp_forward_missing_attrs()
+def _set_cli_opt(opts: Sequence[str], key: str, value: Any) -> List[str]:
+    updated = list(opts)
+    for idx, item in enumerate(updated):
+        if item == key:
+            if idx + 1 >= len(updated):
+                raise ValueError(f"Malformed CLI opts: key {key} has no value.")
+            updated[idx + 1] = str(value)
+            return updated
+    updated.extend([key, str(value)])
+    return updated
+
+
+def _rebuild_train_argv(train_args: Any, opts: Sequence[str]) -> List[str]:
+    argv: List[str] = []
+    if getattr(train_args, "config_file", ""):
+        argv.extend(["--config-file", str(train_args.config_file)])
+    if getattr(train_args, "train_type", ""):
+        argv.extend(["--train-type", str(train_args.train_type)])
+    argv.extend(list(opts))
+    return argv
+
+
+def _select_fixed_train_output(train_argv: Sequence[str], nproc: int) -> Dict[str, Any]:
     import train as train_entry
     from launch import default_argument_parser
 
+    train_args = default_argument_parser().parse_args(list(train_argv))
+    cfg = train_entry.get_cfg()
+    cfg.merge_from_file(train_args.config_file)
+    train_entry._merge_local_path_cfg_if_exists(cfg)
+    cfg.merge_from_list(train_args.opts)
+    train_entry._sync_xlsa_protocol(cfg)
+
+    base_output_dir = str(cfg.OUTPUT_DIR)
+    lr = cfg.SOLVER.BASE_LR
+    wd = cfg.SOLVER.WEIGHT_DECAY
+    output_folder = os.path.join(cfg.DATA.NAME, cfg.DATA.FEATURE, f"lr{lr}_wd{wd}")
+
+    # 网格搜索里每个 trial 的 OUTPUT_DIR 已经唯一；这里的 runN 只表示该 trial 下的第几次尝试。
+    # 如果上次 DDP 启动在 run1 中留下半截日志，继续选下一个空 runN，避免再次触发 train.py 的重复运行检查。
+    count = 1
+    while True:
+        fixed_output_dir = os.path.join(base_output_dir, output_folder, f"run{count}")
+        if not train_entry.PathManager.exists(fixed_output_dir):
+            train_entry.PathManager.mkdirs(fixed_output_dir)
+            break
+        count += 1
+        if count > 1000:
+            raise RuntimeError(f"Too many existing run directories under {base_output_dir}.")
+
+    opts = _set_cli_opt(train_args.opts, "OUTPUT_DIR", fixed_output_dir)
+    opts = _set_cli_opt(opts, "NUM_GPUS", int(nproc))
+    return {
+        "argv": _rebuild_train_argv(train_args, opts),
+        "output_dir": fixed_output_dir,
+        "nproc": int(nproc),
+    }
+
+
+def _train_with_ddp_attr_forward(payload: Any, _unused: Any = None) -> None:
+    _patch_ddp_forward_missing_attrs()
+    import train as train_entry
+    from launch import default_argument_parser
+    from src.utils.distributed import get_rank
+
     old_argv = sys.argv
     try:
-        sys.argv = [str(ROOT / "train.py")] + list(argv)
-        train_args = default_argument_parser().parse_args(list(argv))
-        train_entry.main(train_args)
+        if isinstance(payload, Mapping):
+            train_argv = list(payload["argv"])
+            fixed_output_dir = str(payload["output_dir"])
+            nproc = int(payload.get("nproc", 1))
+        else:
+            train_argv = list(payload)
+            fixed_output_dir = ""
+            nproc = 1
+
+        sys.argv = [str(ROOT / "train.py")] + list(train_argv)
+        train_args = default_argument_parser().parse_args(list(train_argv))
+
+        if not fixed_output_dir:
+            train_entry.main(train_args)
+            return
+
+        # DDP 子进程不能再调用 train.main()->setup()，否则每个进程都会竞争创建 run1。
+        # 这里复用 train.setup() 的配置合并流程，但直接使用父进程已经选好的 fixed_output_dir。
+        cfg = train_entry.get_cfg()
+        cfg.merge_from_file(train_args.config_file)
+        train_entry._merge_local_path_cfg_if_exists(cfg)
+        cfg.merge_from_list(train_args.opts)
+        train_entry._sync_xlsa_protocol(cfg)
+
+        node = os.environ.get("SLURMD_NODENAME")
+        if node:
+            cfg.DIST_INIT_PATH = f"tcp://{node}:12399"
+        cfg.OUTPUT_DIR = fixed_output_dir
+        cfg.NUM_GPUS = int(nproc)
+        cfg.DIST_RANK = int(get_rank())
+        cfg.freeze()
+        train_entry.train(cfg, train_args)
     finally:
         sys.argv = old_argv
 
@@ -183,6 +272,7 @@ def _ddp_train_main(argv: Sequence[str]) -> None:
 
     from src.utils import distributed as du
 
+    train_payload = _select_fixed_train_output(train_argv, int(known.nproc_per_node))
     init_method = known.dist_url or "tcp://127.0.0.1:{}".format(_pick_free_port())
     mp.spawn(
         du.run,
@@ -194,7 +284,7 @@ def _ddp_train_main(argv: Sequence[str]) -> None:
             0,
             1,
             str(known.dist_backend),
-            list(train_argv),
+            train_payload,
             None,
         ),
         join=True,
