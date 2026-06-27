@@ -1,10 +1,11 @@
 BASE_CONFIG_FILE: "configs/prompt/cub.yaml"
 DIAGNOSE_SCRIPT: "src/tools/diagnose_graph_prob_prior_temperatures.py"
+TRAIN_SCRIPT: "train.py"
+RUNNER: "train"
 PYTHON_BIN: ""
 OUTPUT_DIR: "output/gpp_v6_residual_anchor_merged_10epoch_grid"
 
-# CUB 在 DATA.BATCH_SIZE=64、NUM_GPUS=2 的当前设置下，len(train_loader)=111。
-# 1110 batch 对应 10 个完整 train_loader pass，用于替代之前 2 epoch 粗筛。
+# 仅 RUNNER=diagnose 时使用。RUNNER=train 时由 SOLVER.TOTAL_EPOCH=10 控制完整训练轮数。
 MAX_BATCHES: 1110
 NO_TRAIN_STEP: false
 

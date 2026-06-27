@@ -14,6 +14,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -114,6 +115,20 @@ def _diagnose_with_ddp_attr_forward(argv: Sequence[str], _unused: Any = None) ->
         sys.argv = old_argv
 
 
+def _train_with_ddp_attr_forward(argv: Sequence[str], _unused: Any = None) -> None:
+    _patch_ddp_forward_missing_attrs()
+    import train as train_entry
+    from launch import default_argument_parser
+
+    old_argv = sys.argv
+    try:
+        sys.argv = [str(ROOT / "train.py")] + list(argv)
+        train_args = default_argument_parser().parse_args(list(argv))
+        train_entry.main(train_args)
+    finally:
+        sys.argv = old_argv
+
+
 def _ddp_diagnose_main(argv: Sequence[str]) -> None:
     parser = argparse.ArgumentParser("grid_search_graph_prob_prior_v5_temperatures ddp diagnose")
     parser.add_argument("--nproc-per-node", type=int, required=True)
@@ -144,6 +159,42 @@ def _ddp_diagnose_main(argv: Sequence[str]) -> None:
             1,
             str(known.dist_backend),
             list(diagnose_argv),
+            None,
+        ),
+        join=True,
+    )
+
+
+def _ddp_train_main(argv: Sequence[str]) -> None:
+    parser = argparse.ArgumentParser("grid_search_graph_prob_prior_v5_temperatures ddp train")
+    parser.add_argument("--nproc-per-node", type=int, required=True)
+    parser.add_argument("--dist-backend", default=_default_dist_backend(), choices=["nccl", "gloo"])
+    parser.add_argument("--dist-url", default="")
+    known, train_argv = parser.parse_known_args(list(argv))
+    if known.nproc_per_node <= 1:
+        raise ValueError("--nproc-per-node must be greater than 1 in DDP train mode.")
+    if not train_argv:
+        raise ValueError("Missing train.py arguments after DDP launcher options.")
+
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+
+    import torch.multiprocessing as mp
+
+    from src.utils import distributed as du
+
+    init_method = known.dist_url or "tcp://127.0.0.1:{}".format(_pick_free_port())
+    mp.spawn(
+        du.run,
+        nprocs=int(known.nproc_per_node),
+        args=(
+            int(known.nproc_per_node),
+            _train_with_ddp_attr_forward,
+            init_method,
+            0,
+            1,
+            str(known.dist_backend),
+            list(train_argv),
             None,
         ),
         join=True,
@@ -408,6 +459,8 @@ def _build_trials(
     modes: Sequence[str],
     config_file: str,
     diagnose_script: str,
+    train_script: str,
+    runner: str,
     python_bin: str,
     out_root: Path,
     max_batches: int,
@@ -419,6 +472,9 @@ def _build_trials(
     fixed_opts = dict(grid_cfg.get("FIXED_OPTS", {}) or {})
     mode_space = grid_cfg["MODE_SEARCH_SPACE"]
     graph_path = str(grid_cfg["EXTERNAL_GRAPH"]["PATH"])
+    runner = str(runner).lower()
+    if runner not in {"diagnose", "train"}:
+        raise ValueError(f"RUNNER must be 'diagnose' or 'train', got {runner}.")
     trials: List[Dict[str, Any]] = []
     index = 0
     for graph_method in graph_methods:
@@ -442,19 +498,31 @@ def _build_trials(
                     overrides.update(combo)
                     trial_name = _trial_name(index, stage_name, graph_method, mode, combo)
                     output_dir = out_root / stage_name / graph_method / mode / trial_name
-                    cmd = [
-                        python_bin,
-                        diagnose_script,
-                        "--config-file",
-                        config_file,
-                        "--max-batches",
-                        str(max_batches),
-                        "--output-dir",
-                        str(output_dir),
-                    ]
-                    if no_train_step:
-                        cmd.append("--no-train-step")
-                    cmd.extend(_mapping_to_opts(overrides))
+                    if runner == "train":
+                        run_overrides = dict(overrides)
+                        run_overrides["OUTPUT_DIR"] = str(output_dir)
+                        cmd = [
+                            python_bin,
+                            train_script,
+                            "--config-file",
+                            config_file,
+                        ]
+                        cmd.extend(_mapping_to_opts(run_overrides))
+                    else:
+                        run_overrides = dict(overrides)
+                        cmd = [
+                            python_bin,
+                            diagnose_script,
+                            "--config-file",
+                            config_file,
+                            "--max-batches",
+                            str(max_batches),
+                            "--output-dir",
+                            str(output_dir),
+                        ]
+                        if no_train_step:
+                            cmd.append("--no-train-step")
+                        cmd.extend(_mapping_to_opts(run_overrides))
                     cmd.extend(extra_opts)
                     trials.append(
                         {
@@ -465,11 +533,12 @@ def _build_trials(
                             "graph_method": graph_method,
                             "mode": mode,
                             "combo": dict(combo),
-                            "overrides": overrides,
+                            "overrides": dict(run_overrides),
                             "output_dir": str(output_dir),
                             "stdout_path": str(output_dir / "launcher_stdout.txt"),
                             "cmd": cmd,
                             "repo_root": str(repo_root),
+                            "runner": runner,
                         }
                     )
                     index += 1
@@ -496,10 +565,104 @@ def _diagnosis_json_path(output_dir: Path) -> Optional[Path]:
     return path
 
 
+_GZSL_RECORD_RE = re.compile(
+    r"\[gzsl-record\]\s+epoch=(?P<epoch>\d+)\s+"
+    r"gzsl_seen=(?P<seen>[-+0-9.eE]+)\s+"
+    r"gzsl_unseen=(?P<unseen>[-+0-9.eE]+)\s+"
+    r"gzsl_h=(?P<h>[-+0-9.eE]+)\s+"
+    r"best_seen_recorded=(?P<best_seen>[-+0-9.eE]+)\s+"
+    r"best_unseen_recorded=(?P<best_unseen>[-+0-9.eE]+)\s+"
+    r"gzsl_h_recorded=(?P<best_h_recorded>[-+0-9.eE]+)"
+)
+
+
+def _train_log_paths(output_dir: Path) -> List[Path]:
+    if not output_dir.is_dir():
+        return []
+    logs = sorted(output_dir.rglob("logs.txt"), key=lambda path: (path.stat().st_mtime, str(path)))
+    if logs:
+        return logs
+    stdout_path = output_dir / "launcher_stdout.txt"
+    return [stdout_path] if stdout_path.is_file() else []
+
+
+def _parse_train_gzsl_records(path: Path) -> List[Dict[str, float]]:
+    records: List[Dict[str, float]] = []
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="ignore")
+    except OSError:
+        return records
+    for match in _GZSL_RECORD_RE.finditer(text):
+        record = {
+            "epoch": float(match.group("epoch")),
+            "gzsl_seen": float(match.group("seen")) * 100.0,
+            "gzsl_unseen": float(match.group("unseen")) * 100.0,
+            "gzsl_h": float(match.group("h")) * 100.0,
+            "best_seen_recorded": float(match.group("best_seen")) * 100.0,
+            "best_unseen_recorded": float(match.group("best_unseen")) * 100.0,
+            "gzsl_h_recorded": float(match.group("best_h_recorded")) * 100.0,
+        }
+        records.append(record)
+    return records
+
+
+def _training_summary_payload(output_dir: Path) -> Dict[str, Any]:
+    records: List[Dict[str, float]] = []
+    log_paths = _train_log_paths(output_dir)
+    for path in log_paths:
+        records.extend(_parse_train_gzsl_records(path))
+    if not records:
+        return {}
+
+    records.sort(key=lambda row: (int(row.get("epoch", 0)), row.get("gzsl_h", 0.0)))
+    last = records[-1]
+    best = max(records, key=lambda row: float(row.get("gzsl_h", float("-inf"))))
+    performance = {
+        "eval_ran": 1.0,
+        "gzsl_seen_last": float(last["gzsl_seen"]),
+        "gzsl_unseen_last": float(last["gzsl_unseen"]),
+        "gzsl_h_last": float(last["gzsl_h"]),
+        "gzsl_seen_best": float(best["gzsl_seen"]),
+        "gzsl_unseen_best": float(best["gzsl_unseen"]),
+        "gzsl_h_best": float(best["gzsl_h"]),
+        "gzsl_best_epoch": float(best["epoch"]),
+        "gzsl_seen_recorded_best": float(last["best_seen_recorded"]),
+        "gzsl_unseen_recorded_best": float(last["best_unseen_recorded"]),
+        "gzsl_h_recorded_best": float(last["gzsl_h_recorded"]),
+    }
+    return {
+        "runner": "train",
+        "log_paths": [str(path) for path in log_paths],
+        "num_epochs": int(max(int(row["epoch"]) for row in records)),
+        "num_batches": "",
+        "performance": performance,
+        "temperatures": {},
+        "summary": {},
+        "records": records,
+    }
+
+
+def _trial_payload(trial: Mapping[str, Any]) -> Dict[str, Any]:
+    output_dir = Path(str(trial["output_dir"]))
+    if str(trial.get("runner", "diagnose")).lower() == "train":
+        return _training_summary_payload(output_dir)
+    return _summary_payload(output_dir)
+
+
 def _trial_has_complete_output(trial: Mapping[str, Any], expected_batches: int) -> bool:
-    payload = _summary_payload(Path(str(trial["output_dir"])))
+    payload = _trial_payload(trial)
     if not payload:
         return False
+    if str(trial.get("runner", "diagnose")).lower() == "train":
+        performance = payload.get("performance")
+        if not isinstance(performance, dict):
+            return False
+        try:
+            expected_epochs = int((trial.get("overrides") or {}).get("SOLVER.TOTAL_EPOCH", 0))
+            num_epochs = int(payload.get("num_epochs", 0))
+        except (TypeError, ValueError):
+            return False
+        return expected_epochs <= 0 or num_epochs >= expected_epochs
     try:
         num_batches = int(payload.get("num_batches", 0))
     except (TypeError, ValueError):
@@ -534,6 +697,11 @@ def _existing_trial_result(
 
 def _resume_status(trial: Mapping[str, Any]) -> str:
     output_dir = Path(str(trial["output_dir"]))
+    if str(trial.get("runner", "diagnose")).lower() == "train":
+        payload = _training_summary_payload(output_dir)
+        if not payload:
+            return f"missing train gzsl-record under {output_dir}"
+        return f"complete train logs {payload.get('log_paths', [])}"
     json_path = _diagnosis_json_path(output_dir)
     if json_path is None:
         return f"missing diagnosis json under {output_dir}"
@@ -573,9 +741,15 @@ def _flatten_result(
     }
     for key, value in trial["combo"].items():
         row[key] = value
-    payload = _summary_payload(Path(str(trial["output_dir"])))
+    payload = _trial_payload(trial)
     if payload:
+        if payload.get("runner"):
+            row["runner"] = payload.get("runner")
+        if payload.get("num_epochs", "") != "":
+            row["num_epochs"] = payload.get("num_epochs", "")
         row["num_batches"] = payload.get("num_batches", "")
+        if payload.get("log_paths"):
+            row["log_paths"] = ";".join(str(path) for path in payload.get("log_paths", []))
         for key, value in (payload.get("performance") or {}).items():
             if isinstance(value, (int, float, str, bool)):
                 row[key] = value
@@ -736,19 +910,21 @@ def _build_run_command(
     if nproc <= 1:
         return list(trial["cmd"]), 1
 
-    diagnose_cmd = list(trial["cmd"])
-    diagnose_args = diagnose_cmd[2:]
+    child_cmd = list(trial["cmd"])
+    child_args = child_cmd[2:]
+    runner = str(trial.get("runner", "diagnose")).lower()
+    ddp_flag = "--ddp-train" if runner == "train" else "--ddp-diagnose"
     return (
         [
             python_bin,
             str(Path(__file__).resolve()),
-            "--ddp-diagnose",
+            ddp_flag,
             "--nproc-per-node",
             str(nproc),
             "--dist-backend",
             str(dist_backend),
         ]
-        + diagnose_args
+        + child_args
         + [
             "NUM_GPUS",
             str(nproc),
@@ -870,6 +1046,10 @@ def main() -> None:
 
     config_file = args.config_file or str(grid_cfg.get("BASE_CONFIG_FILE", "configs/prompt/cub.yaml"))
     diagnose_script = str(grid_cfg.get("DIAGNOSE_SCRIPT", "src/tools/diagnose_graph_prob_prior_temperatures.py"))
+    train_script = str(grid_cfg.get("TRAIN_SCRIPT", "train.py"))
+    runner = str(grid_cfg.get("RUNNER", "diagnose")).lower()
+    if runner not in {"diagnose", "train"}:
+        raise ValueError(f"RUNNER must be 'diagnose' or 'train', got {runner}.")
     python_bin = str(args.python_bin or grid_cfg.get("PYTHON_BIN") or sys.executable)
     out_root = Path(args.out_root or str(grid_cfg.get("OUTPUT_DIR", "output/gpp_v5_temperature_grid")))
     if not out_root.is_absolute():
@@ -903,6 +1083,8 @@ def main() -> None:
         modes=modes,
         config_file=config_file,
         diagnose_script=diagnose_script,
+        train_script=train_script,
+        runner=runner,
         python_bin=python_bin,
         out_root=out_root,
         max_batches=max_batches,
@@ -932,6 +1114,8 @@ def main() -> None:
         "grid_config": str(grid_config),
         "base_config_file": config_file,
         "diagnose_script": diagnose_script,
+        "train_script": train_script,
+        "runner": runner,
         "python_bin": python_bin,
         "external_graph_npz": str(graph_npz),
         "graph_methods": graph_methods,
@@ -1123,5 +1307,7 @@ def main() -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--ddp-diagnose":
         _ddp_diagnose_main(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--ddp-train":
+        _ddp_train_main(sys.argv[2:])
     else:
         main()
