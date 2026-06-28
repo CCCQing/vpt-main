@@ -5,14 +5,15 @@ RUNNER: "train"
 PYTHON_BIN: ""
 OUTPUT_DIR: "output/gpp_v6_residual_norm_stage01_temperature_grid"
 
-# RUNNER=train 时由 SOLVER.TOTAL_EPOCH=10 控制完整训练轮数；该值只作为 resume/诊断兼容字段。
+# 这里不是把 coarse stage0 和 fine stage1 简单相加。
+# 本文件复用上一轮 merged 10epoch 的 80 组 method-specific 温度搜索空间，
+# 只把 prior 半径模式显式固定为 residual_norm，重新验证温度最优区域。
 MAX_BATCHES: 1110
 NO_TRAIN_STEP: false
 
-STAGE: "stage0_temperature_coarse"
+STAGE: "merged_temperature_10epoch"
 STAGE_ORDER:
-  - "stage0_temperature_coarse"
-  - "stage1_temperature_fine"
+  - "merged_temperature_10epoch"
 
 EXTERNAL_GRAPH:
   PATH: "cub_attribute_localization/05_hparam_searches/diff_only_graphs_v1/diff_only_method_matrices_v1.npz"
@@ -87,11 +88,7 @@ FIXED_OPTS:
 MODE_SEARCH_SPACE:
   graph_conditioned_semantic_prior:
     STAGES:
-      stage0_temperature_coarse:
-        GRID:
-          MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH: [0.08, 0.10, 0.12]
-          MODEL.GRAPH_PROB_PRIOR.TAU_LATENT: [0.03, 0.05, 0.08]
-      stage1_temperature_fine:
+      merged_temperature_10epoch:
         GRAPH_METHODS:
           method1_diff:
             GRID:
@@ -111,11 +108,7 @@ MODE_SEARCH_SPACE:
 
   class_aggregate_mmd:
     STAGES:
-      stage0_temperature_coarse:
-        GRID:
-          MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH: [0.08, 0.10, 0.12]
-          MODEL.GRAPH_PROB_PRIOR.MMD_SIGMA: [24.0, 32.0, 48.0, 64.0]
-      stage1_temperature_fine:
+      merged_temperature_10epoch:
         GRAPH_METHODS:
           method1_diff:
             GRID:
@@ -134,11 +127,7 @@ MODE_SEARCH_SPACE:
     FIXED_OPTS:
       MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE: true
     STAGES:
-      stage0_temperature_coarse:
-        GRID:
-          MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH: [0.08, 0.10, 0.12]
-          MODEL.GRAPH_PROB_PRIOR.TAU_LATENT: [0.03, 0.05, 0.08]
-      stage1_temperature_fine:
+      merged_temperature_10epoch:
         GRAPH_METHODS:
           method1_diff:
             GRID:
