@@ -646,6 +646,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE must be non-negative.")
         if float(prior_cfg.PRIOR_MU_SCALE) <= 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE must be positive.")
+        if str(prior_cfg.PRIOR_RADIUS_MODE).lower() not in {"fixed", "residual_norm"}:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_RADIUS_MODE must be fixed / residual_norm.")
         if float(prior_cfg.GEOM_LOSS_WEIGHT) < 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT must be non-negative.")
         if str(prior_cfg.GEOM_LOSS_TYPE).lower() not in {
@@ -787,6 +789,25 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         residual = (class_attributes - mean) / std
         return residual.clamp(min=-float(prior_cfg.RESIDUAL_CLIP), max=float(prior_cfg.RESIDUAL_CLIP))
 
+    def _residual_radius_scale(self, residual_attr: torch.Tensor) -> torch.Tensor:
+        """
+        根据类别属性残差强度生成 prior_mu 半径因子。
+
+        fixed: 旧行为，所有类别使用同一个 PRIOR_MU_SCALE 半径。
+        residual_norm: 用 ||residual_attr_c|| / mean_c ||residual_attr_c|| 表示类别 c
+        相对“平均鸟”的偏离强度；偏离越大，prior center 半径越大。这里不再做
+        min/max 截断，让属性残差本身决定类别间半径差异。
+        """
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        mode = str(prior_cfg.PRIOR_RADIUS_MODE).lower()
+        if mode == "fixed":
+            return residual_attr.new_ones((int(residual_attr.shape[0]), 1))
+
+        eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
+        strength = residual_attr.norm(p=2, dim=-1, keepdim=True)
+        mean_strength = strength.mean().clamp_min(eps)
+        return strength / mean_strength
+
     def _fixed_or_learned_logvar(
         self,
         reference: torch.Tensor,
@@ -824,7 +845,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         3. graph top-k -> P_plus，只聚合少数正邻域，不做 dense smoothing；
         4. context = P_plus @ anchor；
         5. delta_head(cat(anchor, context, anchor-context)) 给出小修正；
-        6. prior_mu = PRIOR_MU_SCALE * normalize(anchor + scale*tanh(delta))。
+        6. radius_scale 由 residual_attr 的 norm 产生，表示该类别偏离平均鸟的强弱；
+        7. prior_mu = PRIOR_MU_SCALE * radius_scale * normalize(anchor + scale*tanh(delta))。
         """
         prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
         eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
@@ -847,9 +869,15 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         delta_input = torch.cat((anchor, context, anchor - context), dim=-1)
         delta = delta_head(delta_input)
 
-        # tanh(delta) 把修正方向限制在有界范围内；PRIOR_DELTA_SCALE 控制修正只能是 anchor 的小偏移。
+        # PRIOR_DELTA_SCALE 作用在归一化之前：控制 graph-context delta 能把类别 prior
+        # 从自身属性 anchor 方向上修正多远；设为 0 时 prior_mu 只由 anchor 决定方向。
         raw_mu = anchor + float(prior_cfg.PRIOR_DELTA_SCALE) * torch.tanh(delta)
-        prior_mu = float(prior_cfg.PRIOR_MU_SCALE) * F.normalize(raw_mu, p=2, dim=-1, eps=eps)
+        # radius_scale 来自 residual_attr 的 L2 norm：越偏离平均鸟的类别，prior center
+        # 半径越大；这里不做 min/max 截断，先完整保留属性残差带来的半径差异。
+        radius_scale = self._residual_radius_scale(residual_attr)
+        # PRIOR_MU_SCALE 作用在归一化之后：控制 prior_mu 的基础半径；radius_scale
+        # 在此基础上做类别级半径调制，不改变 normalize(raw_mu) 得到的方向。
+        prior_mu = float(prior_cfg.PRIOR_MU_SCALE) * radius_scale * F.normalize(raw_mu, p=2, dim=-1, eps=eps)
         prior_logvar = self._fixed_or_learned_logvar(prior_mu, logvar_input=delta_input, factorized=factorized)
 
         # 仅缓存监测需要的中间张量。loss 仍从 prior_mu/prior_logvar 正常回传。
@@ -858,6 +886,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             "anchor": anchor,
             "context": context,
             "delta": delta,
+            "radius_scale": radius_scale,
             "positive_weight": positive_weight,
         }
         return prior_mu, prior_logvar
@@ -1006,13 +1035,16 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         beta_delta = self.dual_beta_delta_head(beta_input)
 
         eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
-        alpha_mu = float(prior_cfg.PRIOR_MU_SCALE) * F.normalize(
+        # dual_metric 也沿用 residual_norm 半径：alpha/beta 的方向由各自 raw_mu 决定，
+        # 半径仍由同一个类别属性残差强度控制，避免两套 prior 自行学出不可解释的长度。
+        radius_scale = self._residual_radius_scale(residual_attr)
+        alpha_mu = float(prior_cfg.PRIOR_MU_SCALE) * radius_scale * F.normalize(
             alpha_anchor + float(prior_cfg.DUAL_ALPHA_DELTA_SCALE) * torch.tanh(alpha_delta),
             p=2,
             dim=-1,
             eps=eps,
         )
-        beta_mu = float(prior_cfg.PRIOR_MU_SCALE) * F.normalize(
+        beta_mu = float(prior_cfg.PRIOR_MU_SCALE) * radius_scale * F.normalize(
             beta_anchor + float(prior_cfg.DUAL_BETA_DELTA_SCALE) * torch.tanh(beta_delta),
             p=2,
             dim=-1,
@@ -1025,6 +1057,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             "positive_weight": positive_weight,
             "negative_weight": negative_weight,
             "residual_attr": residual_attr,
+            "radius_scale": radius_scale,
             "alpha_anchor": alpha_anchor,
             "alpha_context": alpha_context,
             "alpha_delta": alpha_delta,

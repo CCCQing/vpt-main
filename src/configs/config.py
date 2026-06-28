@@ -146,7 +146,8 @@ _C.MODEL.GRAPH_PROB_PRIOR.RESIDUAL_SIGMA_MIN = 0.05     # 312维属性残差标�
 _C.MODEL.GRAPH_PROB_PRIOR.RESIDUAL_CLIP = 3.0           # 标准化属性残差的截断范围 [-clip, clip]
 _C.MODEL.GRAPH_PROB_PRIOR.PRIOR_CONTEXT_TOPK = 16       # residual_anchor 中每个类别聚合多少个 graph top-k 正邻域 anchor
 _C.MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE = 0.1       # small correction 强度：prior_mu 由 anchor + scale*tanh(delta) 得到
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE = 2.0          # normalize 后 prior_mu 的整体半径，控制 Gaussian KL/几何距离尺度
+_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE = 2.0          # prior_mu 的全局基础半径，控制 Gaussian KL/几何距离的整体尺度
+_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_RADIUS_MODE = "residual_norm" # fixed=所有类别同半径；residual_norm=属性残差越大，类别 prior 半径越大
 _C.MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH = 0.07              # 用 G[c] 构造 graph top-k context / 旧 neighbor_bank 时的 softmax 温度
 _C.MODEL.GRAPH_PROB_PRIOR.TAU_LATENT = 1.0              # softmax(-KL(q||p_c)/tau) 的温度，控制 latent matching 分布尖锐程度
 _C.MODEL.GRAPH_PROB_PRIOR.REL_WEIGHT = 0.0              # class_aggregate_* 专用全类 prior 关系正则权重；0 表示关闭

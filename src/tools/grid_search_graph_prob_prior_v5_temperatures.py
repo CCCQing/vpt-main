@@ -665,6 +665,37 @@ _GZSL_RECORD_RE = re.compile(
     r"gzsl_h_recorded=(?P<best_h_recorded>[-+0-9.eE]+)"
 )
 
+_GPP_MONITOR_ALIASES = {
+    "gEnt": "graph_prob_prior_monitor_tau_graph_neighbor_entropy_norm_mean",
+    "gTop1": "graph_prob_prior_monitor_tau_graph_neighbor_top1_mean",
+    "gHub": "graph_prob_prior_monitor_neighbor_hubness_gini",
+    "gQ95": "graph_prob_prior_monitor_graph_offdiag_q95",
+    "tEnt": "graph_prob_prior_monitor_tau_acc_target_entropy_norm_mean",
+    "tTrue": "graph_prob_prior_monitor_tau_acc_target_true_mean",
+    "lEnt": "graph_prob_prior_monitor_tau_latent_entropy_norm_mean",
+    "lTrue": "graph_prob_prior_monitor_tau_latent_true_mean",
+    "klQ50": "graph_prob_prior_monitor_tau_latent_distance_q50",
+    "rank1": "graph_prob_prior_monitor_posterior_true_rank_top1",
+    "klMargin": "graph_prob_prior_monitor_posterior_kl_margin_mean",
+    "pOv": "graph_prob_prior_monitor_prior_overlap_risk_rate",
+    "pRank": "graph_prob_prior_monitor_prior_effective_rank",
+    "pEnt": "graph_prob_prior_monitor_tau_prior_entropy_norm_mean",
+    "mmdK": "graph_prob_prior_monitor_mmd_kernel_mean",
+    "agg1": "graph_prob_prior_monitor_agg_single_sample_class_ratio",
+    "facCov": "graph_prob_prior_monitor_factorized_cross_cov_fro",
+    "betaV": "graph_prob_prior_monitor_dual_sample_beta_hardneg_violation_rate",
+    "abJS": "graph_prob_prior_monitor_dual_pos_neg_js_divergence_mean",
+    "gzsl": "graph_prob_prior_monitor_prior_gzsl_unseen_to_seen_bias_risk_mean",
+    "fhG": "graph_prob_prior_monitor_false_high_graph_relation_still_gt_0_9_count",
+    "fhP": "graph_prob_prior_monitor_false_high_prior_relation_still_gt_0_9_count",
+    "wRatio": "graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio",
+    "gPrior": "graph_prob_prior_monitor_grad_prior_head_norm",
+}
+_GPP_MONITOR_LINE_RE = re.compile(r"\[graph-prob-prior-monitor\]\s+(?P<body>.+)")
+_GPP_MONITOR_KV_RE = re.compile(
+    r"(?P<key>[A-Za-z][A-Za-z0-9]*)=(?P<value>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
+)
+
 
 def _train_log_paths(output_dir: Path) -> List[Path]:
     if not output_dir.is_dir():
@@ -696,11 +727,55 @@ def _parse_train_gzsl_records(path: Path) -> List[Dict[str, float]]:
     return records
 
 
+def _parse_train_monitor_records(path: Path) -> List[Dict[str, float]]:
+    records: List[Dict[str, float]] = []
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="ignore")
+    except OSError:
+        return records
+    for match in _GPP_MONITOR_LINE_RE.finditer(text):
+        record: Dict[str, float] = {}
+        body = match.group("body")
+        for kv in _GPP_MONITOR_KV_RE.finditer(body):
+            raw_key = kv.group("key")
+            key = _GPP_MONITOR_ALIASES.get(raw_key)
+            if not key:
+                continue
+            try:
+                value = float(kv.group("value"))
+            except ValueError:
+                continue
+            if np.isfinite(value):
+                record[key] = value
+        if record:
+            records.append(record)
+    return records
+
+
+def _summarize_train_monitor_records(records: Sequence[Mapping[str, float]]) -> Dict[str, float]:
+    summary: Dict[str, float] = {}
+    if not records:
+        return summary
+    summary["graph_prob_prior_monitor_log_count"] = float(len(records))
+    keys = sorted({key for record in records for key in record.keys()})
+    for key in keys:
+        values = [float(record[key]) for record in records if key in record and np.isfinite(float(record[key]))]
+        if not values:
+            continue
+        last = float(values[-1])
+        summary[key] = last
+        summary[f"{key}_log_last"] = last
+        summary[f"{key}_log_mean"] = float(np.mean(values))
+    return summary
+
+
 def _training_summary_payload(output_dir: Path) -> Dict[str, Any]:
     records: List[Dict[str, float]] = []
+    monitor_records: List[Dict[str, float]] = []
     log_paths = _train_log_paths(output_dir)
     for path in log_paths:
         records.extend(_parse_train_gzsl_records(path))
+        monitor_records.extend(_parse_train_monitor_records(path))
     if not records:
         return {}
 
@@ -727,7 +802,7 @@ def _training_summary_payload(output_dir: Path) -> Dict[str, Any]:
         "num_batches": "",
         "performance": performance,
         "temperatures": {},
-        "summary": {},
+        "summary": _summarize_train_monitor_records(monitor_records),
         "records": records,
     }
 
