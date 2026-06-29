@@ -253,7 +253,7 @@ class SemanticGraphBuilder:
         """
         从语义图中为 batch 构造全类 target T。
 
-        每个样本取 graph[y]，仅保留 top-k 类别做 softmax，再与 one-hot(y) 混合。
+        每个样本取 graph[y]，排除自身类后仅保留 top-k 类别做 softmax，再与 one-hot(y) 混合。
         该 target 既服务旧 semantic graph loss，也服务新的 GraphProbPrior。
         """
         graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
@@ -262,11 +262,14 @@ class SemanticGraphBuilder:
         # rows 是当前 batch 每个真实类别 y 在全类语义图里的那一行，形状 [B, C]。
         rows = graph.index_select(0, targets_global)
         topk = int(graph_cfg.TOPK)
-        if topk <= 0 or topk > self.num_classes:
-            raise ValueError("MODEL.SEMANTIC_GRAPH.TOPK must be in [1, NUM_CLASSES].")
+        if topk <= 0 or topk > self.num_classes - 1:
+            raise ValueError("MODEL.SEMANTIC_GRAPH.TOPK must be in [1, NUM_CLASSES-1].")
 
-        # 只让每个样本的 top-k 语义邻居进入 soft target，其余类别置为 -inf。
-        values, indices = torch.topk(rows, k=topk, dim=-1)
+        # 只让每个样本的非自身 top-k 语义邻居进入 soft target，其余类别置为 -inf。
+        candidate_rows = rows.clone()
+        row_idx = torch.arange(candidate_rows.shape[0], device=candidate_rows.device)
+        candidate_rows[row_idx, targets_global] = float("-inf")
+        values, indices = torch.topk(candidate_rows, k=topk, dim=-1)
         masked = torch.full_like(rows, float("-inf"))
         masked.scatter_(1, indices, values)
 
@@ -559,7 +562,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
 
     - _relation_regularization: class-aggregate 模式专用，用全类 prior Gaussian symKL 对齐语义图关系。
     - compute_prior_distribution_distance: 计算 prior 类别分布之间的标准化几何距离 D_cd。
-    - compute_graph_prior_geometry_loss: 可选几何正则入口，支持 uniform_topk / graph_supcon / soft_distribution_matching。
+    - compute_graph_prior_geometry_loss: 可选几何正则入口，支持 soft_distribution_matching / graph_ordinal_ranking。
     - _true_class_kl_loss: 逐样本只对齐真类 prior 的最简 KL matching。
     - _samplewise_latent_matching_loss: 逐样本 all-class KL matching，服务 graph_conditioned_semantic_prior 和 factorized semantic loss。
 
@@ -640,8 +643,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.RESIDUAL_SIGMA_MIN must be positive.")
         if float(prior_cfg.RESIDUAL_CLIP) <= 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.RESIDUAL_CLIP must be positive.")
-        if int(prior_cfg.PRIOR_CONTEXT_TOPK) <= 0 or int(prior_cfg.PRIOR_CONTEXT_TOPK) > self.num_classes - 1:
-            raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_CONTEXT_TOPK must be in [1, NUM_CLASSES-1].")
+        if int(graph_cfg.TOPK) <= 0 or int(graph_cfg.TOPK) > self.num_classes - 1:
+            raise ValueError("MODEL.SEMANTIC_GRAPH.TOPK must be in [1, NUM_CLASSES-1].")
         if float(prior_cfg.PRIOR_DELTA_SCALE) < 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE must be non-negative.")
         if float(prior_cfg.PRIOR_MU_SCALE) <= 0.0:
@@ -651,33 +654,35 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         if float(prior_cfg.GEOM_LOSS_WEIGHT) < 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT must be non-negative.")
         if str(prior_cfg.GEOM_LOSS_TYPE).lower() not in {
-            "uniform_topk",
-            "graph_supcon",
             "soft_distribution_matching",
+            "graph_ordinal_ranking",
         }:
-            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE must be uniform_topk / graph_supcon / soft_distribution_matching.")
-        if int(prior_cfg.GEOM_TOPK) <= 0 or int(prior_cfg.GEOM_TOPK) > self.num_classes - 1:
-            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_TOPK must be in [1, NUM_CLASSES-1].")
+            raise ValueError(
+                "MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE must be soft_distribution_matching / graph_ordinal_ranking."
+            )
+        if int(prior_cfg.GEOM_TOPK) <= 0:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_TOPK must be positive.")
         for key in (
-            "GEOM_TAU_UNI",
-            "GEOM_TAU_GRAPH_TOP",
-            "GEOM_MARGIN_GAMMA",
             "GEOM_SIGMA_PRIOR",
-            "GEOM_TAU_CON",
-            "GEOM_TAU_GRAPH_POS",
             "GEOM_TAU_BARRIER",
             "GEOM_TAU_GRAPH_DIST",
             "GEOM_TAU_DIST",
+            "GEOM_ORD_GRAPH_GAP_EPS",
+            "GEOM_ORD_EPS",
+            "GEOM_ORD_NON_OVERLAP_MIN_DIST",
         ):
             if float(getattr(prior_cfg, key)) <= 0.0:
                 raise ValueError(f"MODEL.GRAPH_PROB_PRIOR.{key} must be positive.")
+        if str(prior_cfg.GEOM_ORD_DISTANCE_TYPE).lower() not in {"clearance", "cosine", "euclidean"}:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE must be clearance / cosine / euclidean.")
+        if str(prior_cfg.GEOM_ORD_NON_OVERLAP_SCOPE).lower() not in {"topk", "all"}:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_SCOPE must be topk / all.")
         for key in (
-            "GEOM_UNI_WEIGHT",
-            "GEOM_TOP_WEIGHT",
             "GEOM_MARGIN_MIN",
-            "GEOM_MARGIN_SCALE",
-            "GEOM_CLEAR_WEIGHT",
             "GEOM_BOUND_WEIGHT",
+            "GEOM_ORD_MARGIN_BASE",
+            "GEOM_ORD_MARGIN_SCALE",
+            "GEOM_ORD_NON_OVERLAP_WEIGHT",
         ):
             if float(getattr(prior_cfg, key)) < 0.0:
                 raise ValueError(f"MODEL.GRAPH_PROB_PRIOR.{key} must be non-negative.")
@@ -697,10 +702,6 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             # dual_metric_semantic_distribution 使用 factorized posterior 的两段：
             # semantic_mu/logvar 是 alpha/context posterior，variation_mu/logvar 是 beta/separation posterior。
             # 这里不做旧 posterior 兜底，因此一旦进入该模式，就把所有双分布专用超参先校验清楚。
-            if int(graph_cfg.TOPK) <= 0 or int(graph_cfg.TOPK) > self.num_classes - 1:
-                raise ValueError(
-                    "MODEL.SEMANTIC_GRAPH.TOPK must be in [1, NUM_CLASSES-1] for dual_metric_semantic_distribution."
-                )
             if int(prior_cfg.DUAL_NEG_TOPK) <= 0 or int(prior_cfg.DUAL_NEG_TOPK) > self.num_classes - 1:
                 raise ValueError("MODEL.GRAPH_PROB_PRIOR.DUAL_NEG_TOPK must be in [1, NUM_CLASSES-1].")
             if float(prior_cfg.DUAL_TAU_NEG) <= 0.0:
@@ -861,7 +862,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
 
         positive_weight = self._masked_topk_distribution(
             graph,
-            topk=int(prior_cfg.PRIOR_CONTEXT_TOPK),
+            topk=int(self.cfg.MODEL.SEMANTIC_GRAPH.TOPK),
             tau=float(prior_cfg.TAU_GRAPH),
             exclude_self=True,
         )
@@ -1007,7 +1008,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
 
         positive_weight = self._masked_topk_distribution(
             graph,
-            topk=int(prior_cfg.PRIOR_CONTEXT_TOPK),
+            topk=int(self.cfg.MODEL.SEMANTIC_GRAPH.TOPK),
             tau=float(prior_cfg.TAU_GRAPH),
             exclude_self=True,
         )
@@ -1169,10 +1170,13 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         因为三种 geometry loss 都要在 D_cd 或 similarity 矩阵里 gather 对应类别对。
         """
         class_count = int(graph.shape[0])
+        topk = min(int(topk), class_count - 1)
+        if topk <= 0:
+            raise ValueError("geometry topk must be positive after excluding self.")
         logits = graph.clone()
         diag = torch.arange(class_count, device=graph.device)
         logits[diag, diag] = float("-inf")
-        values, indices = torch.topk(logits, k=int(topk), dim=-1)
+        values, indices = torch.topk(logits, k=topk, dim=-1)
         weights = F.softmax(values / float(tau), dim=-1)
         return values, indices, weights
 
@@ -1235,6 +1239,151 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             margin_min=float(prior_cfg.GEOM_MARGIN_MIN),
         )
 
+    def graph_ordinal_ranking_loss(
+        self,
+        prior_mu: torch.Tensor,
+        graph: torch.Tensor,
+        d_norm: torch.Tensor,
+        dist_mu: torch.Tensor,
+        eye: torch.Tensor,
+    ):
+        """
+        局部 graph ordinal ranking loss。
+
+        这个 loss 只回答一个问题：在 semantic graph 的局部 top-k 邻域内，
+        graph 认为更相似的类别，是否在 class prior 空间里也更近。
+
+        重要设计：
+        - 半径/方差相关距离不在这里重新实现，而是复用
+          compute_prior_distribution_distance() 传入的 d_norm/dist_mu。
+        - GEOM_ORD_DISTANCE_TYPE=clearance 时直接使用 d_norm，
+          即 ||mu_i-mu_j|| / (radius_i+radius_j)，天然考虑 prior 分布宽度。
+        - non-overlap 弱边界也固定使用 d_norm，因为它的语义就是“分布间隔”
+          而不是单纯的均值方向或均值欧氏距离。
+        """
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        eps = float(prior_cfg.GEOM_ORD_EPS)
+        class_count = int(prior_mu.shape[0])
+        topk = min(int(prior_cfg.GEOM_TOPK), class_count - 1)
+        row = torch.arange(class_count, device=prior_mu.device)[:, None]
+
+        # graph 只提供排序目标，不应该从 geometry loss 反向更新 graph 构造过程。
+        # clone 后再屏蔽对角线，避免对传入的原始 graph 做原地修改。
+        graph_detached = graph.detach()
+        graph_for_topk = graph_detached.clone()
+        diag = torch.arange(class_count, device=prior_mu.device)
+        graph_for_topk[diag, diag] = float("-inf")
+        top_values, top_indices = torch.topk(graph_for_topk, k=topk, dim=-1)
+
+        # 选择 ranking 使用的 prior 距离矩阵。
+        # clearance 直接复用 compute_prior_distribution_distance() 的 d_norm；
+        # euclidean 复用同一个函数返回的 dist_mu；
+        # cosine 只作为备选方向距离，不参与半径计算。
+        distance_type = str(prior_cfg.GEOM_ORD_DISTANCE_TYPE).lower()
+        if distance_type == "clearance":
+            distance = d_norm
+        elif distance_type == "euclidean":
+            distance = dist_mu
+        elif distance_type == "cosine":
+            prior_dir = F.normalize(prior_mu, p=2, dim=-1, eps=eps)
+            distance = (1.0 - prior_dir.matmul(prior_dir.t())).masked_fill(eye, 0.0)
+        else:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE must be clearance / cosine / euclidean.")
+
+        # d[c, t] 是类别 c 到第 t 个 graph top-k 邻居的 prior 距离。
+        d = distance[row, top_indices]
+
+        # 构造 top-k 内所有有序 pair：
+        # 如果 graph gap 满足 G[c,i] > G[c,j] + eps，
+        # 就希望 prior distance 满足 D[c,i] + margin < D[c,j]。
+        g_i = top_values.unsqueeze(2)
+        g_j = top_values.unsqueeze(1)
+        d_i = d.unsqueeze(2)
+        d_j = d.unsqueeze(1)
+        eye_k = torch.eye(topk, dtype=torch.bool, device=prior_mu.device).view(1, topk, topk)
+        valid = (g_i > g_j + float(prior_cfg.GEOM_ORD_GRAPH_GAP_EPS)) & (~eye_k)
+        valid_float = valid.to(dtype=prior_mu.dtype)
+
+        # 每一行 graph 的 top-k 相似度范围不同，先做行内归一化；
+        # 这样 gap_norm 只表达“这一行内部谁明显更像”，不会被不同类别的图尺度影响。
+        row_range = (top_values.max(dim=-1).values - top_values.min(dim=-1).values).clamp_min(eps)
+        row_range = row_range.view(class_count, 1, 1)
+        gap_norm = ((g_i - g_j).clamp_min(0.0) / row_range).clamp(0.0, 1.0)
+
+        # graph gap 越大，排序间隔越大；如果关闭 gap weighting，
+        # 所有有效 pair 权重相同，但 margin 仍然可以随 gap 增大。
+        margin = float(prior_cfg.GEOM_ORD_MARGIN_BASE) + float(prior_cfg.GEOM_ORD_MARGIN_SCALE) * gap_norm
+        if bool(prior_cfg.GEOM_ORD_WEIGHT_BY_GAP):
+            pair_weight = gap_norm
+        else:
+            pair_weight = torch.ones_like(gap_norm)
+
+        # ReLU hinge ranking：只有排序错误或间隔不足时才产生惩罚。
+        # violation <= 0 表示 D(c,i)+margin <= D(c,j)，该 pair 已满足 graph 排序要求；
+        # violation > 0 表示更相似的 i 没有比 j 足够近，按违反幅度线性惩罚。
+        violation = d_i - d_j + margin
+        pair_loss = F.relu(violation)
+        weighted_valid = pair_weight * valid_float
+        valid_weight_sum = weighted_valid.sum()
+        ordinal_loss = (pair_loss * weighted_valid).sum() / valid_weight_sum.clamp_min(eps)
+
+        # non-overlap 是可选弱边界项。它不改变 ordinal ranking 的主体逻辑，
+        # 只在明确打开权重时，防止 top-k 或 all 非自身类别的分布间隔 d_norm 过小。
+        non_overlap_scope = str(prior_cfg.GEOM_ORD_NON_OVERLAP_SCOPE).lower()
+        if non_overlap_scope == "topk":
+            overlap_dist = d_norm[row, top_indices]
+        elif non_overlap_scope == "all":
+            overlap_dist = d_norm[~eye]
+        else:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_SCOPE must be topk / all.")
+
+        non_overlap_enabled = float(prior_cfg.GEOM_ORD_NON_OVERLAP_WEIGHT) > 0.0
+        if bool(non_overlap_enabled):
+            # ReLU hinge non-overlap：只有分布间隔 d_norm 小于最小安全距离时才惩罚。
+            non_overlap_loss = F.relu(float(prior_cfg.GEOM_ORD_NON_OVERLAP_MIN_DIST) - overlap_dist).mean()
+        else:
+            # 保持 device/dtype 和反向图兼容；默认关闭时该项不产生梯度。
+            non_overlap_loss = prior_mu.sum() * 0.0
+        total_loss = ordinal_loss + float(prior_cfg.GEOM_ORD_NON_OVERLAP_WEIGHT) * non_overlap_loss
+
+        # 下面的 stats 全部 detach，只用于日志诊断，不参与反向传播。
+        valid_count = valid_float.sum()
+        valid_denom = valid_count.clamp_min(1.0)
+        valid_mask = valid_float > 0.0
+        violation_rate = ((violation > 0.0).to(dtype=prior_mu.dtype) * valid_float).sum() / valid_denom
+        rank_acc = ((d_i < d_j).to(dtype=prior_mu.dtype) * valid_float).sum() / valid_denom
+        gap_mean = (gap_norm * valid_float).sum() / valid_denom
+        margin_mean = (margin * valid_float).sum() / valid_denom
+        if bool(valid_mask.any().item()):
+            valid_violation_mean = violation[valid_mask].mean()
+        else:
+            valid_violation_mean = prior_mu.sum() * 0.0
+        non_overlap_violation_rate = (
+            (overlap_dist < float(prior_cfg.GEOM_ORD_NON_OVERLAP_MIN_DIST)).to(dtype=prior_mu.dtype).mean()
+            if overlap_dist.numel() > 0
+            else prior_mu.sum() * 0.0
+        )
+        non_overlap_dist_mean = overlap_dist.mean() if overlap_dist.numel() > 0 else prior_mu.sum() * 0.0
+
+        stats = {
+            "graph_prob_prior_geom_ord_loss": float(ordinal_loss.detach().item()),
+            "graph_prob_prior_geom_ord_total_loss": float(total_loss.detach().item()),
+            "graph_prob_prior_geom_ord_valid_pair_count": float(valid_count.detach().item()),
+            "graph_prob_prior_geom_ord_violation_rate": float(violation_rate.detach().item()),
+            "graph_prob_prior_geom_ord_rank_acc": float(rank_acc.detach().item()),
+            "graph_prob_prior_geom_ord_gap_mean": float(gap_mean.detach().item()),
+            "graph_prob_prior_geom_ord_margin_mean": float(margin_mean.detach().item()),
+            "graph_prob_prior_geom_ord_violation_mean": float(valid_violation_mean.detach().item()),
+            "graph_prob_prior_geom_ord_top1_dist_mean": float(d[:, 0].detach().mean().item()),
+            "graph_prob_prior_geom_ord_topk_last_dist_mean": float(d[:, -1].detach().mean().item()),
+            "graph_prob_prior_geom_ord_topk_dist_mean": float(d.detach().mean().item()),
+            "graph_prob_prior_geom_ord_non_overlap_loss": float(non_overlap_loss.detach().item()),
+            "graph_prob_prior_geom_ord_non_overlap_enabled": 1.0 if bool(non_overlap_enabled) else 0.0,
+            "graph_prob_prior_geom_ord_non_overlap_violation_rate": float(non_overlap_violation_rate.detach().item()),
+            "graph_prob_prior_geom_ord_non_overlap_dist_mean": float(non_overlap_dist_mean.detach().item()),
+        }
+        return total_loss, stats, top_indices
+
     def compute_graph_prior_geometry_loss(
         self,
         prior_mu: torch.Tensor,
@@ -1245,9 +1394,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         prior_mu 几何校准正则统一入口。
 
         它不生成 prior_mu，只在 residual-anchor 已经得到 prior_mu 后追加轻量约束：
-        - uniform_topk: 全局 soft repulsion + graph top-k 距离校准；
-        - graph_supcon: graph top-k 作为 soft positives，其他类进入 contrastive denominator；
         - soft_distribution_matching: 让 graph top-k 分布与 prior-distance 诱导分布一致。
+        - graph_ordinal_ranking: 只约束 graph top-k 内的 prior 距离相对排序。
         """
         if self.mode == "dual_metric_semantic_distribution":
             raise RuntimeError("GEOM_LOSS_ENABLE=True is not connected to dual_metric_semantic_distribution in this version.")
@@ -1268,89 +1416,6 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             graph=graph,
             margin_min=float(prior_cfg.GEOM_MARGIN_MIN),
         )
-
-        if method == "uniform_topk":
-            off_d = d_norm[~eye]
-            uni_logits = -float(prior_cfg.GEOM_TAU_UNI) * off_d.pow(2)
-            uniform_loss = torch.logsumexp(uni_logits, dim=0) - math.log(float(max(int(off_d.numel()), 1)))
-
-            top_values, top_indices, top_weight = self._geometry_topk(
-                graph,
-                topk=int(prior_cfg.GEOM_TOPK),
-                tau=float(prior_cfg.GEOM_TAU_GRAPH_TOP),
-            )
-            top_d = d_norm[row, top_indices]
-            denom = (top_values[:, :1] - top_values[:, -1:]).clamp_min(eps)
-            local_rank_score = (top_values - top_values[:, -1:]) / denom
-            target_d = 1.0 + float(prior_cfg.GEOM_MARGIN_MIN) + float(prior_cfg.GEOM_MARGIN_SCALE) * (
-                1.0 - local_rank_score
-            ).pow(float(prior_cfg.GEOM_MARGIN_GAMMA))
-            top_loss = top_weight.mul(F.smooth_l1_loss(top_d, target_d.detach(), reduction="none")).sum(dim=-1).mean()
-            loss = float(prior_cfg.GEOM_UNI_WEIGHT) * uniform_loss + float(prior_cfg.GEOM_TOP_WEIGHT) * top_loss
-            stats.update(
-                {
-                    "graph_prob_prior_geom_uniform_loss": float(uniform_loss.detach().item()),
-                    "graph_prob_prior_geom_top_loss": float(top_loss.detach().item()),
-                    "graph_prob_prior_geom_loss": float(loss.detach().item()),
-                }
-            )
-            stats.update(
-                graph_prior_geometry_monitor(
-                    d_norm,
-                    dist_mu,
-                    radius,
-                    prior_mu,
-                    graph=graph,
-                    top_indices=top_indices,
-                    margin_min=float(prior_cfg.GEOM_MARGIN_MIN),
-                )
-            )
-            return loss, stats
-
-        if method == "graph_supcon":
-            top_values, top_indices, positive_weight = self._geometry_topk(
-                graph,
-                topk=int(prior_cfg.GEOM_TOPK),
-                tau=float(prior_cfg.GEOM_TAU_GRAPH_POS),
-            )
-            if bool(prior_cfg.GEOM_USE_DISTANCE_SIM):
-                similarity = -d_norm
-            else:
-                similarity = F.normalize(prior_mu, p=2, dim=-1, eps=eps).matmul(
-                    F.normalize(prior_mu, p=2, dim=-1, eps=eps).t()
-                )
-            logits = similarity / float(prior_cfg.GEOM_TAU_CON)
-            logits = logits.masked_fill(eye, float("-inf"))
-            log_den = torch.logsumexp(logits, dim=-1)
-            pos_logits = logits[row, top_indices]
-            gcon_loss = -positive_weight.mul(pos_logits - log_den[:, None]).sum(dim=-1).mean()
-
-            top_d = d_norm[row, top_indices]
-            clear_loss = F.softplus(
-                (1.0 + float(prior_cfg.GEOM_MARGIN_MIN) - top_d) / float(prior_cfg.GEOM_TAU_BARRIER)
-            ).mul(positive_weight).sum(dim=-1).mean()
-            loss = gcon_loss + float(prior_cfg.GEOM_CLEAR_WEIGHT) * clear_loss
-            stats.update(
-                {
-                    "graph_prob_prior_geom_gcon_loss": float(gcon_loss.detach().item()),
-                    "graph_prob_prior_geom_gcon_clear_loss": float(clear_loss.detach().item()),
-                    "graph_prob_prior_geom_loss": float(loss.detach().item()),
-                    "graph_prob_prior_geom_gcon_den_logsumexp_mean": float(log_den.detach().mean().item()),
-                    "graph_prob_prior_geom_gcon_pos_sim_mean": float(similarity[row, top_indices].detach().mean().item()),
-                }
-            )
-            stats.update(
-                graph_prior_geometry_monitor(
-                    d_norm,
-                    dist_mu,
-                    radius,
-                    prior_mu,
-                    graph=graph,
-                    top_indices=top_indices,
-                    margin_min=float(prior_cfg.GEOM_MARGIN_MIN),
-                )
-            )
-            return loss, stats
 
         if method == "soft_distribution_matching":
             top_values, top_indices, target_weight = self._geometry_topk(
@@ -1393,7 +1458,33 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             )
             return loss, stats
 
-        raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE must be uniform_topk / graph_supcon / soft_distribution_matching.")
+        if method == "graph_ordinal_ranking":
+            ordinal_loss, ordinal_stats, top_indices = self.graph_ordinal_ranking_loss(
+                prior_mu=prior_mu,
+                graph=graph,
+                d_norm=d_norm,
+                dist_mu=dist_mu,
+                eye=eye,
+            )
+            loss = ordinal_loss
+            stats.update(ordinal_stats)
+            stats.update(
+                graph_prior_geometry_monitor(
+                    d_norm,
+                    dist_mu,
+                    radius,
+                    prior_mu,
+                    graph=graph,
+                    top_indices=top_indices,
+                    margin_min=float(prior_cfg.GEOM_MARGIN_MIN),
+                )
+            )
+            stats["graph_prob_prior_geom_loss"] = float(loss.detach().item())
+            return loss, stats
+
+        raise ValueError(
+            "MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE must be soft_distribution_matching / graph_ordinal_ranking."
+        )
 
     def _samplewise_latent_matching_loss(
         self,
