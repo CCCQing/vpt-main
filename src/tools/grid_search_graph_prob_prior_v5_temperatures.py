@@ -757,9 +757,12 @@ _GPP_MONITOR_ALIASES = {
     "fhP": "graph_prob_prior_monitor_false_high_prior_relation_still_gt_0_9_count",
     "wLoss": "graph_prob_prior_monitor_loss_weighted_graph_prob_prior_loss",
     "wRatio": "graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio",
+    "muS": "graph_prob_prior_monitor_learnable_prior_mu_scale_value",
+    "dS": "graph_prob_prior_monitor_learnable_prior_delta_scale_value",
     "gPrior": "graph_prob_prior_monitor_grad_prior_head_norm",
     "gAnchor": "graph_prob_prior_monitor_grad_anchor_head_norm",
     "gDelta": "graph_prob_prior_monitor_grad_delta_head_norm",
+    "gScalar": "graph_prob_prior_monitor_grad_learnable_scalar_norm",
     "gFinite": "graph_prob_prior_monitor_grad_finite_ratio",
 }
 _GPP_MONITOR_LINE_RE = re.compile(r"\[graph-prob-prior-monitor\]\s+(?P<body>.+)")
@@ -1437,75 +1440,95 @@ def main() -> None:
         rows = []
         worker_count = int(args.max_workers)
         worker_gpus = gpu_groups[:worker_count] if gpu_groups else [""] * worker_count
-        worker_trials = [[] for _ in range(worker_count)]
-        for idx, trial in enumerate(trials):
-            worker_trials[idx % worker_count].append(trial)
 
-        def _run_worker(worker_idx: int, gpu: str, assigned_trials: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-            worker_rows = []
-            for local_idx, trial in enumerate(assigned_trials, start=1):
-                run_cmd, run_nproc = _build_run_command(
-                    trial,
-                    python_bin=python_bin,
-                    gpu_group=gpu,
-                    nproc_per_trial=int(args.nproc_per_trial),
-                    dist_backend=str(args.dist_backend),
-                )
-                existing = None if bool(args.no_resume) else _existing_trial_result(
-                    trial,
-                    gpu,
-                    run_cmd,
-                    run_nproc,
-                    expected_batches=max_batches,
-                )
-                if existing is not None:
-                    print(
-                        f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
-                        f"skip existing {local_idx}/{len(assigned_trials)} {trial['trial_name']} nproc={run_nproc}",
-                        flush=True,
-                    )
-                    worker_rows.append(existing)
-                    continue
-                if bool(args.resume_debug) and not bool(args.no_resume):
-                    print(
-                        f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
-                        f"resume miss {local_idx}/{len(assigned_trials)} {trial['trial_name']}: {_resume_status(trial)}",
-                        flush=True,
-                    )
+        def _run_one_on_worker(
+            worker_idx: int,
+            gpu: str,
+            trial_idx: int,
+            trial: Mapping[str, Any],
+        ) -> Dict[str, Any]:
+            run_cmd, run_nproc = _build_run_command(
+                trial,
+                python_bin=python_bin,
+                gpu_group=gpu,
+                nproc_per_trial=int(args.nproc_per_trial),
+                dist_backend=str(args.dist_backend),
+            )
+            existing = None if bool(args.no_resume) else _existing_trial_result(
+                trial,
+                gpu,
+                run_cmd,
+                run_nproc,
+                expected_batches=max_batches,
+            )
+            if existing is not None:
                 print(
                     f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
-                    f"started {local_idx}/{len(assigned_trials)} {trial['trial_name']}",
+                    f"skip existing {trial_idx + 1}/{len(trials)} {trial['trial_name']} nproc={run_nproc}",
                     flush=True,
                 )
-                result = _run_trial(
-                    trial,
-                    gpu_id=gpu,
-                    python_bin=python_bin,
-                    nproc_per_trial=int(args.nproc_per_trial),
-                    dist_backend=str(args.dist_backend),
-                    expected_batches=max_batches,
-                    resume=not bool(args.no_resume),
-                )
+                return existing
+            if bool(args.resume_debug) and not bool(args.no_resume):
                 print(
                     f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
-                    f"finished {local_idx}/{len(assigned_trials)} {trial['trial_name']} "
-                    f"returncode={result['returncode']}",
+                    f"resume miss {trial_idx + 1}/{len(trials)} {trial['trial_name']}: {_resume_status(trial)}",
                     flush=True,
                 )
-                worker_rows.append(result)
-            return worker_rows
+            print(
+                f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
+                f"started {trial_idx + 1}/{len(trials)} {trial['trial_name']}",
+                flush=True,
+            )
+            result = _run_trial(
+                trial,
+                gpu_id=gpu,
+                python_bin=python_bin,
+                nproc_per_trial=int(args.nproc_per_trial),
+                dist_backend=str(args.dist_backend),
+                expected_batches=max_batches,
+                resume=not bool(args.no_resume),
+            )
+            print(
+                f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
+                f"finished {trial_idx + 1}/{len(trials)} {trial['trial_name']} "
+                f"returncode={result['returncode']}",
+                flush=True,
+            )
+            return result
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [
-                executor.submit(_run_worker, worker_idx, worker_gpus[worker_idx], assigned_trials)
-                for worker_idx, assigned_trials in enumerate(worker_trials)
-            ]
+            pending_trial_idx = 0
+            future_to_worker: Dict[Any, int] = {}
+
+            def _submit_next(worker_idx: int) -> bool:
+                nonlocal pending_trial_idx
+                if pending_trial_idx >= len(trials):
+                    return False
+                trial_idx = pending_trial_idx
+                pending_trial_idx += 1
+                gpu = worker_gpus[worker_idx]
+                future = executor.submit(
+                    _run_one_on_worker,
+                    worker_idx,
+                    gpu,
+                    trial_idx,
+                    trials[trial_idx],
+                )
+                future_to_worker[future] = worker_idx
+                return True
+
+            for worker_idx in range(worker_count):
+                _submit_next(worker_idx)
+
             finished = 0
-            for future in as_completed(futures):
-                worker_rows = future.result()
-                rows.extend(worker_rows)
-                finished += len(worker_rows)
-                print(f"[{finished}/{len(trials)}] collected worker results", flush=True)
+            while future_to_worker:
+                for future in as_completed(list(future_to_worker.keys())):
+                    worker_idx = future_to_worker.pop(future)
+                    rows.append(future.result())
+                    finished += 1
+                    print(f"[{finished}/{len(trials)}] collected worker result", flush=True)
+                    _submit_next(worker_idx)
+                    break
         rows.sort(key=lambda row: int(row["trial_index"]))
 
     ranked_rows = _rank_rows(rows)

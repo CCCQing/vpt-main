@@ -945,6 +945,10 @@ def graph_prob_prior_grad_monitor(named_parameters) -> Dict[str, float]:
             "dual_beta_anchor_head",
             "dual_beta_delta_head",
         ),
+        "learnable_scalar": (
+            "learnable_prior_mu_scale_raw",
+            "learnable_prior_delta_scale_raw",
+        ),
         "stats_head": ("stats_head",),
     }
     sum_sq = {key: 0.0 for key in groups}

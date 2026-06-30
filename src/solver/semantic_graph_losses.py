@@ -649,6 +649,26 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE must be non-negative.")
         if float(prior_cfg.PRIOR_MU_SCALE) <= 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE must be positive.")
+        self.learn_prior_mu_scale = bool(prior_cfg.LEARN_PRIOR_MU_SCALE)
+        self.learn_prior_delta_scale = bool(prior_cfg.LEARN_PRIOR_DELTA_SCALE)
+        self._validate_bounded_scalar(
+            "PRIOR_MU_SCALE",
+            value=float(prior_cfg.PRIOR_MU_SCALE),
+            min_value=float(prior_cfg.PRIOR_MU_SCALE_MIN),
+            max_value=float(prior_cfg.PRIOR_MU_SCALE_MAX),
+            learnable=self.learn_prior_mu_scale,
+        )
+        self._validate_bounded_scalar(
+            "PRIOR_DELTA_SCALE",
+            value=float(prior_cfg.PRIOR_DELTA_SCALE),
+            min_value=float(prior_cfg.PRIOR_DELTA_SCALE_MIN),
+            max_value=float(prior_cfg.PRIOR_DELTA_SCALE_MAX),
+            learnable=self.learn_prior_delta_scale,
+        )
+        if (self.learn_prior_mu_scale or self.learn_prior_delta_scale) and self.prior_mean_mode != "residual_anchor":
+            raise ValueError(
+                "MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_*_SCALE currently requires PRIOR_MEAN_MODE=residual_anchor."
+            )
         if str(prior_cfg.PRIOR_RADIUS_MODE).lower() not in {"fixed", "residual_norm"}:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_RADIUS_MODE must be fixed / residual_norm.")
         if float(prior_cfg.GEOM_LOSS_WEIGHT) < 0.0:
@@ -735,6 +755,29 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         if self.monitor_every_n <= 0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N must be positive.")
 
+        if self.learn_prior_mu_scale:
+            self.learnable_prior_mu_scale_raw = torch.nn.Parameter(
+                torch.tensor(
+                    self._bounded_scalar_init_raw(
+                        float(prior_cfg.PRIOR_MU_SCALE),
+                        float(prior_cfg.PRIOR_MU_SCALE_MIN),
+                        float(prior_cfg.PRIOR_MU_SCALE_MAX),
+                    ),
+                    dtype=torch.float32,
+                )
+            )
+        if self.learn_prior_delta_scale:
+            self.learnable_prior_delta_scale_raw = torch.nn.Parameter(
+                torch.tensor(
+                    self._bounded_scalar_init_raw(
+                        float(prior_cfg.PRIOR_DELTA_SCALE),
+                        float(prior_cfg.PRIOR_DELTA_SCALE_MIN),
+                        float(prior_cfg.PRIOR_DELTA_SCALE_MAX),
+                    ),
+                    dtype=torch.float32,
+                )
+            )
+
         def make_mlp(input_dim: int, output_dim: int) -> torch.nn.Sequential:
             return torch.nn.Sequential(
                 torch.nn.Linear(input_dim, self.hidden_dim),
@@ -776,6 +819,62 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         self._debug_logged = False
         self._monitor_step = 0
         self._last_prior_debug: Dict[str, torch.Tensor] = {}
+
+    @staticmethod
+    def _validate_bounded_scalar(
+        name: str,
+        value: float,
+        min_value: float,
+        max_value: float,
+        learnable: bool,
+    ) -> None:
+        if min_value >= max_value:
+            raise ValueError(f"MODEL.GRAPH_PROB_PRIOR.{name}_MIN must be smaller than {name}_MAX.")
+        if bool(learnable) and not (min_value < value < max_value):
+            raise ValueError(
+                f"MODEL.GRAPH_PROB_PRIOR.{name} must be inside ({name}_MIN, {name}_MAX) when learnable."
+            )
+
+    @staticmethod
+    def _bounded_scalar_init_raw(value: float, min_value: float, max_value: float) -> float:
+        eps = 1e-6
+        ratio = (float(value) - float(min_value)) / max(float(max_value) - float(min_value), eps)
+        ratio = min(max(ratio, eps), 1.0 - eps)
+        return math.log(ratio / (1.0 - ratio))
+
+    @staticmethod
+    def _bounded_scalar_value(
+        raw_value: torch.Tensor,
+        min_value: float,
+        max_value: float,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        raw_value = raw_value.to(device=reference.device, dtype=reference.dtype)
+        min_tensor = reference.new_tensor(float(min_value))
+        span_tensor = reference.new_tensor(float(max_value) - float(min_value))
+        return min_tensor + span_tensor * torch.sigmoid(raw_value)
+
+    def _prior_mu_scale_value(self, reference: torch.Tensor) -> torch.Tensor:
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        if self.learn_prior_mu_scale:
+            return self._bounded_scalar_value(
+                self.learnable_prior_mu_scale_raw,
+                float(prior_cfg.PRIOR_MU_SCALE_MIN),
+                float(prior_cfg.PRIOR_MU_SCALE_MAX),
+                reference,
+            )
+        return reference.new_tensor(float(prior_cfg.PRIOR_MU_SCALE))
+
+    def _prior_delta_scale_value(self, reference: torch.Tensor) -> torch.Tensor:
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        if self.learn_prior_delta_scale:
+            return self._bounded_scalar_value(
+                self.learnable_prior_delta_scale_raw,
+                float(prior_cfg.PRIOR_DELTA_SCALE_MIN),
+                float(prior_cfg.PRIOR_DELTA_SCALE_MAX),
+                reference,
+            )
+        return reference.new_tensor(float(prior_cfg.PRIOR_DELTA_SCALE))
 
     def _standardized_residual_attributes(self, class_attributes: torch.Tensor) -> torch.Tensor:
         """
@@ -872,13 +971,15 @@ class GraphProbPriorLossComputer(torch.nn.Module):
 
         # PRIOR_DELTA_SCALE 作用在归一化之前：控制 graph-context delta 能把类别 prior
         # 从自身属性 anchor 方向上修正多远；设为 0 时 prior_mu 只由 anchor 决定方向。
-        raw_mu = anchor + float(prior_cfg.PRIOR_DELTA_SCALE) * torch.tanh(delta)
+        prior_delta_scale = self._prior_delta_scale_value(anchor)
+        raw_mu = anchor + prior_delta_scale * torch.tanh(delta)
         # radius_scale 来自 residual_attr 的 L2 norm：越偏离平均鸟的类别，prior center
         # 半径越大；这里不做 min/max 截断，先完整保留属性残差带来的半径差异。
         radius_scale = self._residual_radius_scale(residual_attr)
         # PRIOR_MU_SCALE 作用在归一化之后：控制 prior_mu 的基础半径；radius_scale
         # 在此基础上做类别级半径调制，不改变 normalize(raw_mu) 得到的方向。
-        prior_mu = float(prior_cfg.PRIOR_MU_SCALE) * radius_scale * F.normalize(raw_mu, p=2, dim=-1, eps=eps)
+        prior_mu_scale = self._prior_mu_scale_value(anchor)
+        prior_mu = prior_mu_scale * radius_scale * F.normalize(raw_mu, p=2, dim=-1, eps=eps)
         prior_logvar = self._fixed_or_learned_logvar(prior_mu, logvar_input=delta_input, factorized=factorized)
 
         # 仅缓存监测需要的中间张量。loss 仍从 prior_mu/prior_logvar 正常回传。
@@ -889,6 +990,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             "delta": delta,
             "radius_scale": radius_scale,
             "positive_weight": positive_weight,
+            "prior_mu_scale_value": prior_mu_scale.detach(),
+            "prior_delta_scale_value": prior_delta_scale.detach(),
         }
         return prior_mu, prior_logvar
 
@@ -1039,13 +1142,14 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         # dual_metric 也沿用 residual_norm 半径：alpha/beta 的方向由各自 raw_mu 决定，
         # 半径仍由同一个类别属性残差强度控制，避免两套 prior 自行学出不可解释的长度。
         radius_scale = self._residual_radius_scale(residual_attr)
-        alpha_mu = float(prior_cfg.PRIOR_MU_SCALE) * radius_scale * F.normalize(
+        prior_mu_scale = self._prior_mu_scale_value(alpha_anchor)
+        alpha_mu = prior_mu_scale * radius_scale * F.normalize(
             alpha_anchor + float(prior_cfg.DUAL_ALPHA_DELTA_SCALE) * torch.tanh(alpha_delta),
             p=2,
             dim=-1,
             eps=eps,
         )
-        beta_mu = float(prior_cfg.PRIOR_MU_SCALE) * radius_scale * F.normalize(
+        beta_mu = prior_mu_scale * radius_scale * F.normalize(
             beta_anchor + float(prior_cfg.DUAL_BETA_DELTA_SCALE) * torch.tanh(beta_delta),
             p=2,
             dim=-1,
@@ -2258,6 +2362,14 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                 )
             if self.prior_mean_mode == "residual_anchor" and self.mode != "dual_metric_semantic_distribution":
                 prior_debug = self._last_prior_debug
+                if "prior_mu_scale_value" in prior_debug:
+                    monitor_stats["graph_prob_prior_monitor_learnable_prior_mu_scale_value"] = float(
+                        prior_debug["prior_mu_scale_value"].detach().item()
+                    )
+                if "prior_delta_scale_value" in prior_debug:
+                    monitor_stats["graph_prob_prior_monitor_learnable_prior_delta_scale_value"] = float(
+                        prior_debug["prior_delta_scale_value"].detach().item()
+                    )
                 monitor_stats.update(
                     residual_anchor_prior_monitor(
                         prior_debug["residual_attr"],

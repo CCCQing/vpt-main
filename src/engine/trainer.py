@@ -51,6 +51,7 @@ from ..solver.lr_scheduler import make_scheduler
 from ..solver.optimizer import make_optimizer
 from ..solver.losses import build_loss
 from ..utils import logging
+from ..utils import distributed as du
 from ..utils.train_utils import AverageMeter, gpu_mem_usage
 
 from ..utils.vis_pipeline import (
@@ -765,6 +766,19 @@ class Trainer():
             )
         self._debug_step_logged = True
 
+    def _sync_cls_criterion_grads(self) -> None:
+        if int(getattr(self.cfg, "NUM_GPUS", 1)) <= 1:
+            return
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return
+        grads = [
+            param.grad
+            for param in self.cls_criterion.parameters()
+            if param.requires_grad and param.grad is not None
+        ]
+        if grads:
+            du.scaled_all_reduce(self.cfg, grads)
+
     def _format_graph_prob_prior_monitor_log(self) -> str:
         if not bool(self.cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE):
             return ""
@@ -863,9 +877,12 @@ class Trainer():
             ("fhP", "graph_prob_prior_monitor_false_high_prior_relation_still_gt_0_9_count"),
             ("wLoss", "graph_prob_prior_monitor_loss_weighted_graph_prob_prior_loss"),
             ("wRatio", "graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio"),
+            ("muS", "graph_prob_prior_monitor_learnable_prior_mu_scale_value"),
+            ("dS", "graph_prob_prior_monitor_learnable_prior_delta_scale_value"),
             ("gPrior", "graph_prob_prior_monitor_grad_prior_head_norm"),
             ("gAnchor", "graph_prob_prior_monitor_grad_anchor_head_norm"),
             ("gDelta", "graph_prob_prior_monitor_grad_delta_head_norm"),
+            ("gScalar", "graph_prob_prior_monitor_grad_learnable_scalar_norm"),
             ("gFinite", "graph_prob_prior_monitor_grad_finite_ratio"),
         ]
         parts = []
@@ -2190,6 +2207,7 @@ class Trainer():
         if is_train:
             self.optimizer.zero_grad()
             loss.backward()
+            self._sync_cls_criterion_grads()
             if bool(self.cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE):
                 monitor_every = max(1, int(self.cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N))
                 if int(self._trace_global_step) % monitor_every == 0:
@@ -2197,7 +2215,12 @@ class Trainer():
 
                     loss_stats = getattr(self.cls_criterion, "_last_loss_stats", None)
                     if isinstance(loss_stats, dict):
-                        loss_stats.update(graph_prob_prior_grad_monitor(self.model.named_parameters()))
+                        named_parameters = list(self.model.named_parameters())
+                        named_parameters.extend(
+                            (f"cls_criterion.{name}", param)
+                            for name, param in self.cls_criterion.named_parameters()
+                        )
+                        loss_stats.update(graph_prob_prior_grad_monitor(named_parameters))
             refs = None
             before_norms = None
             if self.debug_grad_norm:
