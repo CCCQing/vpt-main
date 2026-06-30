@@ -394,6 +394,44 @@ def _configured_stage_names(grid_cfg: Mapping[str, Any]) -> List[str]:
     return discovered or list(LEGACY_SEARCH_STAGES)
 
 
+def _configured_stage_groups(grid_cfg: Mapping[str, Any], stage_order: Sequence[str]) -> List[List[str]]:
+    raw_groups = grid_cfg.get("STAGE_GROUP_ORDER", None)
+    if raw_groups is None:
+        return [[str(stage).lower()] for stage in stage_order]
+
+    valid = {str(stage).lower() for stage in stage_order}
+    groups: List[List[str]] = []
+    seen = set()
+    for raw_group in _as_list(raw_groups):
+        group_items = raw_group if isinstance(raw_group, (list, tuple)) else [raw_group]
+        group: List[str] = []
+        for raw_stage in group_items:
+            stage = str(raw_stage).lower()
+            if stage not in valid:
+                raise ValueError(f"Unknown stage in STAGE_GROUP_ORDER: {stage}; expected subset of {list(stage_order)}.")
+            if stage in seen:
+                raise ValueError(f"Duplicate stage in STAGE_GROUP_ORDER: {stage}.")
+            seen.add(stage)
+            group.append(stage)
+        if group:
+            groups.append(group)
+
+    for stage in [str(item).lower() for item in stage_order]:
+        if stage not in seen:
+            groups.append([stage])
+    return groups
+
+
+def _selected_stage_groups(stage_groups: Sequence[Sequence[str]], selected_stages: Sequence[str]) -> List[List[str]]:
+    selected = {str(stage).lower() for stage in selected_stages}
+    groups: List[List[str]] = []
+    for group in stage_groups:
+        filtered = [str(stage).lower() for stage in group if str(stage).lower() in selected]
+        if filtered:
+            groups.append(filtered)
+    return groups
+
+
 def _parse_stage_selection(raw_stage: str, stage_order: Sequence[str]) -> List[str]:
     raw_stage = str(raw_stage).strip()
     if not raw_stage:
@@ -558,6 +596,8 @@ def _build_trials(
     extra_opts: Sequence[str],
     selected_stages: Sequence[str],
     stage_order: Sequence[str],
+    stage_groups: Sequence[Sequence[str]],
+    trial_order: str,
 ) -> List[Dict[str, Any]]:
     fixed_opts = dict(grid_cfg.get("FIXED_OPTS", {}) or {})
     mode_space = grid_cfg["MODE_SEARCH_SPACE"]
@@ -567,71 +607,95 @@ def _build_trials(
         raise ValueError(f"RUNNER must be 'diagnose' or 'train', got {runner}.")
     trials: List[Dict[str, Any]] = []
     index = 0
-    for graph_method in graph_methods:
-        for mode in modes:
-            spec = mode_space[mode] or {}
-            for stage_spec in _stage_specs(spec, selected_stages, stage_order, graph_method=graph_method):
-                stage_name = str(stage_spec["stage"])
-                mode_fixed = dict(stage_spec["fixed"])
-                combos = _cartesian_grid(stage_spec.get("grid", {}) or {})
-                for combo_index, combo in enumerate(combos):
-                    overrides: Dict[str, Any] = {}
-                    overrides.update(fixed_opts)
-                    overrides.update(mode_fixed)
-                    overrides.update(
-                        {
-                            "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_PATH": graph_path,
-                            "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_KEY": graph_method,
-                            "MODEL.GRAPH_PROB_PRIOR.MODE": mode,
-                        }
-                    )
-                    overrides.update(combo)
-                    trial_name = _trial_name(index, stage_name, graph_method, mode, combo)
-                    output_dir = out_root / stage_name / graph_method / mode / trial_name
-                    if runner == "train":
-                        run_overrides = dict(overrides)
-                        run_overrides["OUTPUT_DIR"] = str(output_dir)
-                        cmd = [
-                            python_bin,
-                            train_script,
-                            "--config-file",
-                            config_file,
-                        ]
-                        cmd.extend(_mapping_to_opts(run_overrides))
-                    else:
-                        run_overrides = dict(overrides)
-                        cmd = [
-                            python_bin,
-                            diagnose_script,
-                            "--config-file",
-                            config_file,
-                            "--max-batches",
-                            str(max_batches),
-                            "--output-dir",
-                            str(output_dir),
-                        ]
-                        if no_train_step:
-                            cmd.append("--no-train-step")
-                        cmd.extend(_mapping_to_opts(run_overrides))
-                    cmd.extend(extra_opts)
-                    trials.append(
-                        {
-                            "trial_index": index,
-                            "stage": stage_name,
-                            "combo_index": combo_index,
-                            "trial_name": trial_name,
-                            "graph_method": graph_method,
-                            "mode": mode,
-                            "combo": dict(combo),
-                            "overrides": dict(run_overrides),
-                            "output_dir": str(output_dir),
-                            "stdout_path": str(output_dir / "launcher_stdout.txt"),
-                            "cmd": cmd,
-                            "repo_root": str(repo_root),
-                            "runner": runner,
-                        }
-                    )
-                    index += 1
+    trial_order = str(trial_order or "graph_mode_stage").lower()
+
+    def append_trials(
+        graph_method: str,
+        mode: str,
+        active_selected_stages: Sequence[str],
+        active_stage_order: Sequence[str],
+    ) -> None:
+        nonlocal index
+        spec = mode_space[mode] or {}
+        for stage_spec in _stage_specs(
+            spec,
+            active_selected_stages,
+            active_stage_order,
+            graph_method=graph_method,
+        ):
+            stage_name = str(stage_spec["stage"])
+            mode_fixed = dict(stage_spec["fixed"])
+            combos = _cartesian_grid(stage_spec.get("grid", {}) or {})
+            for combo_index, combo in enumerate(combos):
+                overrides: Dict[str, Any] = {}
+                overrides.update(fixed_opts)
+                overrides.update(mode_fixed)
+                overrides.update(
+                    {
+                        "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_PATH": graph_path,
+                        "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_KEY": graph_method,
+                        "MODEL.GRAPH_PROB_PRIOR.MODE": mode,
+                    }
+                )
+                overrides.update(combo)
+                trial_name = _trial_name(index, stage_name, graph_method, mode, combo)
+                output_dir = out_root / stage_name / graph_method / mode / trial_name
+                if runner == "train":
+                    run_overrides = dict(overrides)
+                    run_overrides["OUTPUT_DIR"] = str(output_dir)
+                    cmd = [
+                        python_bin,
+                        train_script,
+                        "--config-file",
+                        config_file,
+                    ]
+                    cmd.extend(_mapping_to_opts(run_overrides))
+                else:
+                    run_overrides = dict(overrides)
+                    cmd = [
+                        python_bin,
+                        diagnose_script,
+                        "--config-file",
+                        config_file,
+                        "--max-batches",
+                        str(max_batches),
+                        "--output-dir",
+                        str(output_dir),
+                    ]
+                    if no_train_step:
+                        cmd.append("--no-train-step")
+                    cmd.extend(_mapping_to_opts(run_overrides))
+                cmd.extend(extra_opts)
+                trials.append(
+                    {
+                        "trial_index": index,
+                        "stage": stage_name,
+                        "combo_index": combo_index,
+                        "trial_name": trial_name,
+                        "graph_method": graph_method,
+                        "mode": mode,
+                        "combo": dict(combo),
+                        "overrides": dict(run_overrides),
+                        "output_dir": str(output_dir),
+                        "stdout_path": str(output_dir / "launcher_stdout.txt"),
+                        "cmd": cmd,
+                        "repo_root": str(repo_root),
+                        "runner": runner,
+                    }
+                )
+                index += 1
+
+    if trial_order == "graph_mode_stage":
+        for graph_method in graph_methods:
+            for mode in modes:
+                append_trials(graph_method, mode, selected_stages, stage_order)
+    elif trial_order == "stage_group":
+        for stage_group in _selected_stage_groups(stage_groups, selected_stages):
+            for graph_method in graph_methods:
+                for mode in modes:
+                    append_trials(graph_method, mode, stage_group, stage_group)
+    else:
+        raise ValueError("TRIAL_ORDER must be 'graph_mode_stage' or 'stage_group'.")
     return trials
 
 
@@ -759,6 +823,12 @@ _GPP_MONITOR_ALIASES = {
     "wRatio": "graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio",
     "muS": "graph_prob_prior_monitor_learnable_prior_mu_scale_value",
     "dS": "graph_prob_prior_monitor_learnable_prior_delta_scale_value",
+    "tauG": "graph_prob_prior_monitor_learnable_tau_graph_value",
+    "tauL": "graph_prob_prior_monitor_learnable_tau_latent_value",
+    "gTauD": "graph_prob_prior_monitor_learnable_geom_tau_dist_value",
+    "gBound": "graph_prob_prior_monitor_learnable_geom_bound_weight_value",
+    "ordM": "graph_prob_prior_monitor_learnable_geom_ord_margin_scale_value",
+    "ordO": "graph_prob_prior_monitor_learnable_geom_ord_non_overlap_weight_value",
     "gPrior": "graph_prob_prior_monitor_grad_prior_head_norm",
     "gAnchor": "graph_prob_prior_monitor_grad_anchor_head_norm",
     "gDelta": "graph_prob_prior_monitor_grad_delta_head_norm",
@@ -1297,6 +1367,8 @@ def main() -> None:
     no_train_step = bool(grid_cfg.get("NO_TRAIN_STEP", False)) or bool(args.no_train_step)
     extra_opts = _validate_extra_opts(args.opts)
     stage_order = _configured_stage_names(grid_cfg)
+    stage_groups = _configured_stage_groups(grid_cfg, stage_order)
+    trial_order = str(grid_cfg.get("TRIAL_ORDER", "graph_mode_stage")).lower()
     raw_stage_selection = str(args.stages or args.stage or grid_cfg.get("STAGE", stage_order[0])).lower()
     selected_stages = _parse_stage_selection(raw_stage_selection, stage_order)
     stage_label = _stage_selection_label(selected_stages, stage_order)
@@ -1331,6 +1403,8 @@ def main() -> None:
         extra_opts=extra_opts,
         selected_stages=selected_stages,
         stage_order=stage_order,
+        stage_groups=stage_groups,
+        trial_order=trial_order,
     )
     if args.limit > 0:
         trials = trials[: int(args.limit)]
@@ -1364,6 +1438,8 @@ def main() -> None:
         "stage": stage_label,
         "selected_stages": selected_stages,
         "stage_order": stage_order,
+        "stage_groups": stage_groups,
+        "trial_order": trial_order,
         "total_trials": len(trials),
         "dry_run": bool(args.dry_run),
         "resume": not bool(args.no_resume),

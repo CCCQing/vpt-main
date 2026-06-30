@@ -3,15 +3,38 @@ DIAGNOSE_SCRIPT: "src/tools/diagnose_graph_prob_prior_temperatures.py"
 TRAIN_SCRIPT: "train.py"
 RUNNER: "train"
 PYTHON_BIN: ""
-OUTPUT_DIR: "output/gpp_v8_learnable_stageA_prior_shape_30epoch_grid"
+OUTPUT_DIR: "output/gpp_v8_learnable_stageABCDE_grid"
 
 MAX_BATCHES: 1110
 NO_TRAIN_STEP: false
 
-STAGE: "stagea_soft_distribution_matching"
+STAGE: "all"
 STAGE_ORDER:
   - "stagea_soft_distribution_matching"
   - "stagea_graph_ordinal_ranking"
+  - "stageb_tau_latent_only"
+  - "stageb_stagea_tau_latent"
+  - "stagec_tau_graph_only"
+  - "stagec_tau_latent_tau_graph"
+  - "stagec_stagea_best_tau_graph"
+  - "stagec_stagea_best_tau_latent_tau_graph"
+  - "staged_geom_tau_dist_only"
+  - "staged_geom_bound_weight_only"
+  - "staged_geom_tau_dist_bound_weight"
+  - "staged_stagea_best_geom_tau_dist"
+  - "staged_stagea_best_geom_bound_weight"
+  - "stagee_ord_margin_scale_only"
+  - "stagee_ord_non_overlap_weight_only"
+  - "stagee_stagea_best_ord_margin_scale"
+  - "stagee_stagea_best_ord_non_overlap_weight"
+  - "stagee_regression_stagea_best_ord_margin_non_overlap"
+TRIAL_ORDER: "stage_group"
+STAGE_GROUP_ORDER:
+  - ["stagea_soft_distribution_matching", "stagea_graph_ordinal_ranking"]
+  - ["stageb_tau_latent_only", "stageb_stagea_tau_latent"]
+  - ["stagec_tau_graph_only", "stagec_tau_latent_tau_graph", "stagec_stagea_best_tau_graph", "stagec_stagea_best_tau_latent_tau_graph"]
+  - ["staged_geom_tau_dist_only", "staged_geom_bound_weight_only", "staged_geom_tau_dist_bound_weight", "staged_stagea_best_geom_tau_dist", "staged_stagea_best_geom_bound_weight"]
+  - ["stagee_ord_margin_scale_only", "stagee_ord_non_overlap_weight_only", "stagee_stagea_best_ord_margin_scale", "stagee_stagea_best_ord_non_overlap_weight", "stagee_regression_stagea_best_ord_margin_non_overlap"]
 
 EXTERNAL_GRAPH:
   PATH: "cub_attribute_localization/05_hparam_searches/diff_only_graphs_v1/diff_only_method_matrices_v1.npz"
@@ -19,6 +42,77 @@ EXTERNAL_GRAPH:
     - "method1_diff"
     - "method2_diff"
     - "method3_diff"
+
+MONITOR_FIELDS:
+  learnable_scalars:
+    - "graph_prob_prior_monitor_learnable_prior_mu_scale_value"
+    - "graph_prob_prior_monitor_learnable_prior_delta_scale_value"
+    - "graph_prob_prior_monitor_learnable_tau_graph_value"
+    - "graph_prob_prior_monitor_learnable_tau_latent_value"
+    - "graph_prob_prior_monitor_learnable_geom_tau_dist_value"
+    - "graph_prob_prior_monitor_learnable_geom_bound_weight_value"
+    - "graph_prob_prior_monitor_learnable_geom_ord_margin_scale_value"
+    - "graph_prob_prior_monitor_learnable_geom_ord_non_overlap_weight_value"
+    - "graph_prob_prior_monitor_grad_learnable_scalar_norm"
+    - "graph_prob_prior_monitor_grad_learnable_scalar_param_count"
+  prior_shape:
+    - "graph_prob_prior_monitor_prior_mu_norm_mean"
+    - "graph_prob_prior_monitor_prior_mu_norm_q95"
+    - "graph_prob_prior_monitor_prior_delta_norm_mean"
+    - "graph_prob_prior_monitor_prior_delta_norm_q95"
+    - "graph_prob_prior_monitor_prior_delta_to_anchor_ratio_mean"
+    - "graph_prob_prior_monitor_prior_delta_to_anchor_ratio_q95"
+    - "graph_prob_prior_monitor_context_anchor_cos_mean"
+    - "graph_prob_prior_monitor_prior_anchor_cos_mean"
+    - "graph_prob_prior_monitor_prior_pair_cosine_pairs_gt_0_9"
+    - "graph_prob_prior_monitor_prior_overlap_risk_rate"
+    - "graph_prob_prior_monitor_prior_symkl_q50"
+    - "graph_prob_prior_monitor_prior_symkl_q95"
+    - "graph_prob_prior_monitor_prior_symkl_min_offdiag"
+    - "graph_prob_prior_monitor_prior_effective_rank"
+    - "graph_prob_prior_monitor_prior_center_collapse_score"
+  latent_temperature:
+    - "graph_prob_prior_monitor_tau_latent_entropy_norm_mean"
+    - "graph_prob_prior_monitor_tau_latent_top1_mean"
+    - "graph_prob_prior_monitor_tau_latent_top5_mass_mean"
+    - "graph_prob_prior_monitor_tau_latent_true_mean"
+    - "graph_prob_prior_monitor_tau_latent_distance_q50"
+    - "graph_prob_prior_monitor_tau_latent_distance_q95"
+    - "graph_prob_prior_monitor_posterior_true_rank_top1"
+    - "graph_prob_prior_monitor_posterior_true_rank_top5"
+    - "graph_prob_prior_monitor_posterior_true_rank_top10"
+    - "graph_prob_prior_monitor_posterior_kl_margin_mean"
+    - "graph_prob_prior_monitor_posterior_kl_margin_positive_ratio"
+  graph_temperature:
+    - "graph_prob_prior_monitor_tau_graph_neighbor_entropy_norm_mean"
+    - "graph_prob_prior_monitor_tau_graph_neighbor_top1_mean"
+    - "graph_prob_prior_monitor_tau_graph_neighbor_top5_mass_mean"
+    - "graph_prob_prior_monitor_neighbor_hubness_gini"
+    - "graph_prob_prior_monitor_neighbor_mutual_top5_ratio"
+    - "graph_prob_prior_monitor_graph_pos_prior_relation_spearman"
+    - "graph_prob_prior_monitor_true_neighbor_preservation_mean"
+  soft_geometry:
+    - "graph_prob_prior_geom_dist_match_kl"
+    - "graph_prob_prior_geom_dist_match_q_entropy_mean"
+    - "graph_prob_prior_geom_dist_match_q_top_prob_mean"
+    - "graph_prob_prior_geom_dist_match_top_prob_mean"
+    - "graph_prob_prior_geom_dist_match_bound_loss"
+    - "graph_prob_prior_monitor_geom_topk_graph_prior_corr"
+    - "graph_prob_prior_monitor_geom_topk_dist_mean"
+    - "graph_prob_prior_monitor_geom_topk_dist_q95"
+    - "graph_prob_prior_monitor_geom_topk_boundary_violate_ratio"
+  ordinal_geometry:
+    - "graph_prob_prior_geom_ord_loss"
+    - "graph_prob_prior_geom_ord_total_loss"
+    - "graph_prob_prior_geom_ord_valid_pair_count"
+    - "graph_prob_prior_geom_ord_rank_acc"
+    - "graph_prob_prior_geom_ord_violation_rate"
+    - "graph_prob_prior_geom_ord_gap_mean"
+    - "graph_prob_prior_geom_ord_margin_mean"
+    - "graph_prob_prior_geom_ord_violation_mean"
+    - "graph_prob_prior_geom_ord_non_overlap_loss"
+    - "graph_prob_prior_geom_ord_non_overlap_violation_rate"
+    - "graph_prob_prior_geom_ord_non_overlap_dist_mean"
 
 FIXED_OPTS:
   RUN_N_TIMES: 2
@@ -57,14 +151,20 @@ FIXED_OPTS:
   MODEL.GRAPH_PROB_PRIOR.PRIOR_RADIUS_MODE: "residual_norm"
   MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE: 2.5
   MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE: 0.15
-  MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+  MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: false
   MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE_MIN: 0.5
   MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE_MAX: 5.0
-  MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+  MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: false
   MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE_MIN: 0.0
   MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE_MAX: 0.8
   MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH: 0.10
+  MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_GRAPH: false
+  MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH_MIN: 0.02
+  MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH_MAX: 0.40
   MODEL.GRAPH_PROB_PRIOR.TAU_LATENT: 0.05
+  MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_LATENT: false
+  MODEL.GRAPH_PROB_PRIOR.TAU_LATENT_MIN: 0.01
+  MODEL.GRAPH_PROB_PRIOR.TAU_LATENT_MAX: 0.30
   MODEL.GRAPH_PROB_PRIOR.REL_WEIGHT: 0.0
   MODEL.GRAPH_PROB_PRIOR.TAU_PRIOR: 0.07
   MODEL.GRAPH_PROB_PRIOR.MMD_SAMPLES: 1
@@ -76,155 +176,244 @@ FIXED_OPTS:
   MODEL.GRAPH_PROB_PRIOR.GEOM_SIGMA_PRIOR: 0.2
   MODEL.GRAPH_PROB_PRIOR.GEOM_DETACH_RADIUS: true
   MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_BARRIER: 0.10
+  MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_DIST: 0.05
+  MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_TAU_DIST: false
+  MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_DIST_MIN: 0.01
+  MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_DIST_MAX: 0.30
+  MODEL.GRAPH_PROB_PRIOR.GEOM_BOUND_WEIGHT: 0.10
+  MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_BOUND_WEIGHT: false
+  MODEL.GRAPH_PROB_PRIOR.GEOM_BOUND_WEIGHT_MIN: 0.0
+  MODEL.GRAPH_PROB_PRIOR.GEOM_BOUND_WEIGHT_MAX: 0.50
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.10
+  MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_ORD_MARGIN_SCALE: false
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE_MIN: 0.0
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE_MAX: 0.50
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.0
+  MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_ORD_NON_OVERLAP_WEIGHT: false
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT_MIN: 0.0
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT_MAX: 0.08
   MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_EPS: 1e-8
   MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE: true
-  MODEL.GRAPH_PROB_PRIOR.MONITOR_INACTIVE: false
+  MODEL.GRAPH_PROB_PRIOR.MONITOR_INACTIVE: true
   MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N: 37
   MODEL.GRAPH_PROB_PRIOR.MONITOR_TOPK: 5
 
+SOFT_COMMON: &soft_common
+  MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE: "soft_distribution_matching"
+  MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_GRAPH_DIST: 0.10
+  MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_DIST: 0.05
+  MODEL.GRAPH_PROB_PRIOR.GEOM_BOUND_WEIGHT: 0.10
+  MODEL.GRAPH_PROB_PRIOR.GEOM_MARGIN_MIN: 0.10
+
+ORDINAL_COMMON: &ordinal_common
+  MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE: "graph_ordinal_ranking"
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_BASE: 0.00
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_GRAPH_GAP_EPS: 0.000001
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_WEIGHT_BY_GAP: true
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_MIN_DIST: 0.05
+  MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_SCOPE: "topk"
+
+SOFT_GRAPH_METHODS: &soft_graph_methods
+  method1_diff:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0005
+  method2_diff:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
+  method3_diff:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
+
+ORDINAL_GRAPH_METHODS: &ordinal_graph_methods
+  method1_diff:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "euclidean"
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.10
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
+  method2_diff:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "clearance"
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.20
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
+  method3_diff:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "clearance"
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.20
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.00
+
+ORDINAL_GRAPH_METHODS_NON_OVERLAP_LEARN: &ordinal_graph_methods_non_overlap_learn
+  method1_diff:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "euclidean"
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.10
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
+  method2_diff:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "clearance"
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.20
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
+  method3_diff:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "clearance"
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.20
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
+
+BEST_GRAPH_METHODS: &best_graph_methods
+  method1_diff:
+    FIXED_OPTS:
+      <<: *ordinal_common
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "euclidean"
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.10
+      MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
+  method2_diff:
+    FIXED_OPTS:
+      <<: *soft_common
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
+  method3_diff:
+    FIXED_OPTS:
+      <<: *soft_common
+      MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
+
+STAGE_SET: &stage_set
+  stagea_soft_distribution_matching:
+    FIXED_OPTS:
+      <<: *soft_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+    GRAPH_METHODS: *soft_graph_methods
+
+  stagea_graph_ordinal_ranking:
+    FIXED_OPTS:
+      <<: *ordinal_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+    GRAPH_METHODS: *ordinal_graph_methods
+
+  stageb_tau_latent_only:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_LATENT: true
+    GRAPH_METHODS: *best_graph_methods
+
+  stageb_stagea_tau_latent:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_LATENT: true
+    GRAPH_METHODS: *best_graph_methods
+
+  stagec_tau_graph_only:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_GRAPH: true
+    GRAPH_METHODS: *best_graph_methods
+
+  stagec_tau_latent_tau_graph:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_LATENT: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_GRAPH: true
+    GRAPH_METHODS: *best_graph_methods
+
+  stagec_stagea_best_tau_graph:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_GRAPH: true
+    GRAPH_METHODS: *best_graph_methods
+
+  stagec_stagea_best_tau_latent_tau_graph:
+    FIXED_OPTS:
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_LATENT: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_GRAPH: true
+    GRAPH_METHODS: *best_graph_methods
+
+  staged_geom_tau_dist_only:
+    FIXED_OPTS:
+      <<: *soft_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_TAU_DIST: true
+    GRAPH_METHODS: *soft_graph_methods
+
+  staged_geom_bound_weight_only:
+    FIXED_OPTS:
+      <<: *soft_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_BOUND_WEIGHT: true
+    GRAPH_METHODS: *soft_graph_methods
+
+  staged_geom_tau_dist_bound_weight:
+    FIXED_OPTS:
+      <<: *soft_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_TAU_DIST: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_BOUND_WEIGHT: true
+    GRAPH_METHODS: *soft_graph_methods
+
+  staged_stagea_best_geom_tau_dist:
+    FIXED_OPTS:
+      <<: *soft_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_TAU_DIST: true
+    GRAPH_METHODS: *soft_graph_methods
+
+  staged_stagea_best_geom_bound_weight:
+    FIXED_OPTS:
+      <<: *soft_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_BOUND_WEIGHT: true
+    GRAPH_METHODS: *soft_graph_methods
+
+  stagee_ord_margin_scale_only:
+    FIXED_OPTS:
+      <<: *ordinal_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_ORD_MARGIN_SCALE: true
+    GRAPH_METHODS: *ordinal_graph_methods
+
+  stagee_ord_non_overlap_weight_only:
+    FIXED_OPTS:
+      <<: *ordinal_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_ORD_NON_OVERLAP_WEIGHT: true
+    GRAPH_METHODS: *ordinal_graph_methods_non_overlap_learn
+
+  stagee_stagea_best_ord_margin_scale:
+    FIXED_OPTS:
+      <<: *ordinal_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_ORD_MARGIN_SCALE: true
+    GRAPH_METHODS: *ordinal_graph_methods
+
+  stagee_stagea_best_ord_non_overlap_weight:
+    FIXED_OPTS:
+      <<: *ordinal_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_ORD_NON_OVERLAP_WEIGHT: true
+    GRAPH_METHODS: *ordinal_graph_methods_non_overlap_learn
+
+  stagee_regression_stagea_best_ord_margin_non_overlap:
+    FIXED_OPTS:
+      <<: *ordinal_common
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_ORD_MARGIN_SCALE: true
+      MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_ORD_NON_OVERLAP_WEIGHT: true
+    GRAPH_METHODS: *ordinal_graph_methods_non_overlap_learn
+
 MODE_SEARCH_SPACE:
   graph_conditioned_semantic_prior:
-    STAGES:
-      stagea_soft_distribution_matching:
-        FIXED_OPTS:
-          MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE: "soft_distribution_matching"
-          MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_GRAPH_DIST: 0.10
-          MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_DIST: 0.05
-          MODEL.GRAPH_PROB_PRIOR.GEOM_BOUND_WEIGHT: 0.10
-          MODEL.GRAPH_PROB_PRIOR.GEOM_MARGIN_MIN: 0.10
-        GRAPH_METHODS:
-          method1_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0005
-          method2_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
-          method3_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
-
-      stagea_graph_ordinal_ranking:
-        FIXED_OPTS:
-          MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE: "graph_ordinal_ranking"
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_BASE: 0.00
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_GRAPH_GAP_EPS: 0.000001
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_WEIGHT_BY_GAP: true
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_MIN_DIST: 0.05
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_SCOPE: "topk"
-        GRAPH_METHODS:
-          method1_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "euclidean"
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.10
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
-          method2_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "clearance"
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.20
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
-          method3_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "clearance"
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.20
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.00
+    STAGES: *stage_set
 
   class_aggregate_mmd:
-    STAGES:
-      stagea_soft_distribution_matching:
-        FIXED_OPTS:
-          MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE: "soft_distribution_matching"
-          MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_GRAPH_DIST: 0.10
-          MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_DIST: 0.05
-          MODEL.GRAPH_PROB_PRIOR.GEOM_BOUND_WEIGHT: 0.10
-          MODEL.GRAPH_PROB_PRIOR.GEOM_MARGIN_MIN: 0.10
-        GRAPH_METHODS:
-          method1_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0005
-          method2_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
-          method3_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
-
-      stagea_graph_ordinal_ranking:
-        FIXED_OPTS:
-          MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE: "graph_ordinal_ranking"
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_BASE: 0.00
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_GRAPH_GAP_EPS: 0.000001
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_WEIGHT_BY_GAP: true
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_MIN_DIST: 0.05
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_SCOPE: "topk"
-        GRAPH_METHODS:
-          method1_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "euclidean"
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.10
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
-          method2_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "clearance"
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.20
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
-          method3_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "clearance"
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.20
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.00
+    STAGES: *stage_set
 
   factorized_latent:
     FIXED_OPTS:
       MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE: true
-    STAGES:
-      stagea_soft_distribution_matching:
-        FIXED_OPTS:
-          MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE: "soft_distribution_matching"
-          MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_GRAPH_DIST: 0.10
-          MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_DIST: 0.05
-          MODEL.GRAPH_PROB_PRIOR.GEOM_BOUND_WEIGHT: 0.10
-          MODEL.GRAPH_PROB_PRIOR.GEOM_MARGIN_MIN: 0.10
-        GRAPH_METHODS:
-          method1_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0005
-          method2_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
-          method3_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
-
-      stagea_graph_ordinal_ranking:
-        FIXED_OPTS:
-          MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE: "graph_ordinal_ranking"
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_BASE: 0.00
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_GRAPH_GAP_EPS: 0.000001
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_WEIGHT_BY_GAP: true
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_MIN_DIST: 0.05
-          MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_SCOPE: "topk"
-        GRAPH_METHODS:
-          method1_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "euclidean"
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.10
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
-          method2_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0001
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "clearance"
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.20
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.01
-          method3_diff:
-            FIXED_OPTS:
-              MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT: 0.0003
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE: "clearance"
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE: 0.20
-              MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT: 0.00
+    STAGES: *stage_set

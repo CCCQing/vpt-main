@@ -651,6 +651,12 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE must be positive.")
         self.learn_prior_mu_scale = bool(prior_cfg.LEARN_PRIOR_MU_SCALE)
         self.learn_prior_delta_scale = bool(prior_cfg.LEARN_PRIOR_DELTA_SCALE)
+        self.learn_tau_graph = bool(prior_cfg.LEARN_TAU_GRAPH)
+        self.learn_tau_latent = bool(prior_cfg.LEARN_TAU_LATENT)
+        self.learn_geom_tau_dist = bool(prior_cfg.LEARN_GEOM_TAU_DIST)
+        self.learn_geom_bound_weight = bool(prior_cfg.LEARN_GEOM_BOUND_WEIGHT)
+        self.learn_geom_ord_margin_scale = bool(prior_cfg.LEARN_GEOM_ORD_MARGIN_SCALE)
+        self.learn_geom_ord_non_overlap_weight = bool(prior_cfg.LEARN_GEOM_ORD_NON_OVERLAP_WEIGHT)
         self._validate_bounded_scalar(
             "PRIOR_MU_SCALE",
             value=float(prior_cfg.PRIOR_MU_SCALE),
@@ -664,6 +670,48 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             min_value=float(prior_cfg.PRIOR_DELTA_SCALE_MIN),
             max_value=float(prior_cfg.PRIOR_DELTA_SCALE_MAX),
             learnable=self.learn_prior_delta_scale,
+        )
+        self._validate_bounded_scalar(
+            "TAU_GRAPH",
+            value=float(prior_cfg.TAU_GRAPH),
+            min_value=float(prior_cfg.TAU_GRAPH_MIN),
+            max_value=float(prior_cfg.TAU_GRAPH_MAX),
+            learnable=self.learn_tau_graph,
+        )
+        self._validate_bounded_scalar(
+            "TAU_LATENT",
+            value=float(prior_cfg.TAU_LATENT),
+            min_value=float(prior_cfg.TAU_LATENT_MIN),
+            max_value=float(prior_cfg.TAU_LATENT_MAX),
+            learnable=self.learn_tau_latent,
+        )
+        self._validate_bounded_scalar(
+            "GEOM_TAU_DIST",
+            value=float(prior_cfg.GEOM_TAU_DIST),
+            min_value=float(prior_cfg.GEOM_TAU_DIST_MIN),
+            max_value=float(prior_cfg.GEOM_TAU_DIST_MAX),
+            learnable=self.learn_geom_tau_dist,
+        )
+        self._validate_bounded_scalar(
+            "GEOM_BOUND_WEIGHT",
+            value=float(prior_cfg.GEOM_BOUND_WEIGHT),
+            min_value=float(prior_cfg.GEOM_BOUND_WEIGHT_MIN),
+            max_value=float(prior_cfg.GEOM_BOUND_WEIGHT_MAX),
+            learnable=self.learn_geom_bound_weight,
+        )
+        self._validate_bounded_scalar(
+            "GEOM_ORD_MARGIN_SCALE",
+            value=float(prior_cfg.GEOM_ORD_MARGIN_SCALE),
+            min_value=float(prior_cfg.GEOM_ORD_MARGIN_SCALE_MIN),
+            max_value=float(prior_cfg.GEOM_ORD_MARGIN_SCALE_MAX),
+            learnable=self.learn_geom_ord_margin_scale,
+        )
+        self._validate_bounded_scalar(
+            "GEOM_ORD_NON_OVERLAP_WEIGHT",
+            value=float(prior_cfg.GEOM_ORD_NON_OVERLAP_WEIGHT),
+            min_value=float(prior_cfg.GEOM_ORD_NON_OVERLAP_WEIGHT_MIN),
+            max_value=float(prior_cfg.GEOM_ORD_NON_OVERLAP_WEIGHT_MAX),
+            learnable=self.learn_geom_ord_non_overlap_weight,
         )
         if (self.learn_prior_mu_scale or self.learn_prior_delta_scale) and self.prior_mean_mode != "residual_anchor":
             raise ValueError(
@@ -777,6 +825,66 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     dtype=torch.float32,
                 )
             )
+        bounded_specs = (
+            (
+                self.learn_tau_graph,
+                "learnable_tau_graph_raw",
+                "TAU_GRAPH",
+                "TAU_GRAPH_MIN",
+                "TAU_GRAPH_MAX",
+            ),
+            (
+                self.learn_tau_latent,
+                "learnable_tau_latent_raw",
+                "TAU_LATENT",
+                "TAU_LATENT_MIN",
+                "TAU_LATENT_MAX",
+            ),
+            (
+                self.learn_geom_tau_dist,
+                "learnable_geom_tau_dist_raw",
+                "GEOM_TAU_DIST",
+                "GEOM_TAU_DIST_MIN",
+                "GEOM_TAU_DIST_MAX",
+            ),
+            (
+                self.learn_geom_bound_weight,
+                "learnable_geom_bound_weight_raw",
+                "GEOM_BOUND_WEIGHT",
+                "GEOM_BOUND_WEIGHT_MIN",
+                "GEOM_BOUND_WEIGHT_MAX",
+            ),
+            (
+                self.learn_geom_ord_margin_scale,
+                "learnable_geom_ord_margin_scale_raw",
+                "GEOM_ORD_MARGIN_SCALE",
+                "GEOM_ORD_MARGIN_SCALE_MIN",
+                "GEOM_ORD_MARGIN_SCALE_MAX",
+            ),
+            (
+                self.learn_geom_ord_non_overlap_weight,
+                "learnable_geom_ord_non_overlap_weight_raw",
+                "GEOM_ORD_NON_OVERLAP_WEIGHT",
+                "GEOM_ORD_NON_OVERLAP_WEIGHT_MIN",
+                "GEOM_ORD_NON_OVERLAP_WEIGHT_MAX",
+            ),
+        )
+        for learnable, raw_attr, value_key, min_key, max_key in bounded_specs:
+            if bool(learnable):
+                setattr(
+                    self,
+                    raw_attr,
+                    torch.nn.Parameter(
+                        torch.tensor(
+                            self._bounded_scalar_init_raw(
+                                float(getattr(prior_cfg, value_key)),
+                                float(getattr(prior_cfg, min_key)),
+                                float(getattr(prior_cfg, max_key)),
+                            ),
+                            dtype=torch.float32,
+                        )
+                    ),
+                )
 
         def make_mlp(input_dim: int, output_dim: int) -> torch.nn.Sequential:
             return torch.nn.Sequential(
@@ -876,6 +984,85 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             )
         return reference.new_tensor(float(prior_cfg.PRIOR_DELTA_SCALE))
 
+    def _cfg_bounded_value(
+        self,
+        reference: torch.Tensor,
+        learnable: bool,
+        raw_attr: str,
+        value_key: str,
+        min_key: str,
+        max_key: str,
+    ) -> torch.Tensor:
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        if bool(learnable):
+            return self._bounded_scalar_value(
+                getattr(self, raw_attr),
+                float(getattr(prior_cfg, min_key)),
+                float(getattr(prior_cfg, max_key)),
+                reference,
+            )
+        return reference.new_tensor(float(getattr(prior_cfg, value_key)))
+
+    def _tau_graph_value(self, reference: torch.Tensor) -> torch.Tensor:
+        return self._cfg_bounded_value(
+            reference,
+            self.learn_tau_graph,
+            "learnable_tau_graph_raw",
+            "TAU_GRAPH",
+            "TAU_GRAPH_MIN",
+            "TAU_GRAPH_MAX",
+        )
+
+    def _tau_latent_value(self, reference: torch.Tensor) -> torch.Tensor:
+        return self._cfg_bounded_value(
+            reference,
+            self.learn_tau_latent,
+            "learnable_tau_latent_raw",
+            "TAU_LATENT",
+            "TAU_LATENT_MIN",
+            "TAU_LATENT_MAX",
+        )
+
+    def _geom_tau_dist_value(self, reference: torch.Tensor) -> torch.Tensor:
+        return self._cfg_bounded_value(
+            reference,
+            self.learn_geom_tau_dist,
+            "learnable_geom_tau_dist_raw",
+            "GEOM_TAU_DIST",
+            "GEOM_TAU_DIST_MIN",
+            "GEOM_TAU_DIST_MAX",
+        )
+
+    def _geom_bound_weight_value(self, reference: torch.Tensor) -> torch.Tensor:
+        return self._cfg_bounded_value(
+            reference,
+            self.learn_geom_bound_weight,
+            "learnable_geom_bound_weight_raw",
+            "GEOM_BOUND_WEIGHT",
+            "GEOM_BOUND_WEIGHT_MIN",
+            "GEOM_BOUND_WEIGHT_MAX",
+        )
+
+    def _geom_ord_margin_scale_value(self, reference: torch.Tensor) -> torch.Tensor:
+        return self._cfg_bounded_value(
+            reference,
+            self.learn_geom_ord_margin_scale,
+            "learnable_geom_ord_margin_scale_raw",
+            "GEOM_ORD_MARGIN_SCALE",
+            "GEOM_ORD_MARGIN_SCALE_MIN",
+            "GEOM_ORD_MARGIN_SCALE_MAX",
+        )
+
+    def _geom_ord_non_overlap_weight_value(self, reference: torch.Tensor) -> torch.Tensor:
+        return self._cfg_bounded_value(
+            reference,
+            self.learn_geom_ord_non_overlap_weight,
+            "learnable_geom_ord_non_overlap_weight_raw",
+            "GEOM_ORD_NON_OVERLAP_WEIGHT",
+            "GEOM_ORD_NON_OVERLAP_WEIGHT_MIN",
+            "GEOM_ORD_NON_OVERLAP_WEIGHT_MAX",
+        )
+
     def _standardized_residual_attributes(self, class_attributes: torch.Tensor) -> torch.Tensor:
         """
         构造提示词中的 312 维标准化属性残差。
@@ -948,7 +1135,6 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         6. radius_scale 由 residual_attr 的 norm 产生，表示该类别偏离平均鸟的强弱；
         7. prior_mu = PRIOR_MU_SCALE * radius_scale * normalize(anchor + scale*tanh(delta))。
         """
-        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
         eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
         residual_attr = self._standardized_residual_attributes(class_attributes)
 
@@ -962,7 +1148,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         positive_weight = self._masked_topk_distribution(
             graph,
             topk=int(self.cfg.MODEL.SEMANTIC_GRAPH.TOPK),
-            tau=float(prior_cfg.TAU_GRAPH),
+            tau=self._tau_graph_value(graph),
             exclude_self=True,
         )
         context = positive_weight.matmul(anchor)
@@ -1003,7 +1189,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         再由 prior_head 直接输出 prior_mu/prior_logvar。
         """
         prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
-        neighbor_weight = F.softmax(graph / float(prior_cfg.TAU_GRAPH), dim=-1)
+        eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
+        neighbor_weight = F.softmax(graph / self._tau_graph_value(graph).clamp_min(eps), dim=-1)
         neighbor_bank = neighbor_weight.matmul(bank)
         prior_input = torch.cat((bank, neighbor_bank), dim=-1)
         prior_head = self.factorized_semantic_prior_head if bool(factorized) else self.prior_head
@@ -1037,7 +1224,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         self,
         graph: torch.Tensor,
         topk: int,
-        tau: float,
+        tau: torch.Tensor,
         exclude_self: bool = True,
     ) -> torch.Tensor:
         """
@@ -1060,7 +1247,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         """
         class_count = int(graph.shape[0])
         topk = int(topk)
-        tau = float(tau)
+        tau = torch.as_tensor(tau, device=graph.device, dtype=graph.dtype)
         eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
         if graph.dim() != 2 or int(graph.shape[1]) != class_count:
             raise RuntimeError(f"GraphProbPrior expects square graph [C,C], got {tuple(graph.shape)}.")
@@ -1069,7 +1256,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         max_topk = class_count - 1 if exclude_self else class_count
         if topk > max_topk:
             raise ValueError(f"topk must be <= {max_topk}, got {topk}.")
-        if tau <= 0.0:
+        if bool((tau.detach() <= 0.0).any().item()):
             raise ValueError("tau must be positive.")
 
         # candidate_logits 是可被选择的原始关系值。
@@ -1085,7 +1272,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         values, indices = torch.topk(candidate_logits, k=topk, dim=-1)
         masked_logits = torch.full_like(graph, float("-inf"))
         masked_logits.scatter_(1, indices, values)
-        prob = F.softmax(masked_logits / tau, dim=-1)
+        prob = F.softmax(masked_logits / tau.clamp_min(eps), dim=-1)
 
         # 数值安全归一化：理论上 softmax 后每行已经为 1；这里仅防止极端 dtype/输入导致行和轻微漂移。
         prob = prob.masked_fill(~torch.isfinite(masked_logits), 0.0)
@@ -1112,7 +1299,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         positive_weight = self._masked_topk_distribution(
             graph,
             topk=int(self.cfg.MODEL.SEMANTIC_GRAPH.TOPK),
-            tau=float(prior_cfg.TAU_GRAPH),
+            tau=self._tau_graph_value(graph),
             exclude_self=True,
         )
         negative_weight = self._masked_topk_distribution(
@@ -1233,7 +1420,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
 
         # 语义图 target 是固定监督信号，不让梯度回传到 graph。
-        target_rel = F.softmax(graph / float(prior_cfg.TAU_GRAPH), dim=-1).detach()
+        target_rel = F.softmax(graph / self._tau_graph_value(graph).clamp_min(eps), dim=-1).detach()
 
         # 以下用矩阵公式计算所有类别 prior 两两之间的 KL，避免构造 [C,C,D] 大张量。
         # KL(P_c || P_d) = 0.5 * sum[logvar_d - logvar_c + var_c / var_d + (mu_c - mu_d)^2 / var_d - 1]
@@ -1266,7 +1453,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         monitor_stats = relation_monitor(sym_kl, pred_rel, topk=self.monitor_topk) if monitor else {}
         return _kl_target_pred(target_rel, pred_rel, eps), monitor_stats
 
-    def _geometry_topk(self, graph: torch.Tensor, topk: int, tau: float):
+    def _geometry_topk(self, graph: torch.Tensor, topk: int, tau: torch.Tensor):
         """
         geometry loss 专用 top-k 读取。
 
@@ -1277,11 +1464,15 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         topk = min(int(topk), class_count - 1)
         if topk <= 0:
             raise ValueError("geometry topk must be positive after excluding self.")
+        tau = torch.as_tensor(tau, device=graph.device, dtype=graph.dtype)
+        if bool((tau.detach() <= 0.0).any().item()):
+            raise ValueError("geometry tau must be positive.")
         logits = graph.clone()
         diag = torch.arange(class_count, device=graph.device)
         logits[diag, diag] = float("-inf")
         values, indices = torch.topk(logits, k=topk, dim=-1)
-        weights = F.softmax(values / float(tau), dim=-1)
+        eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
+        weights = F.softmax(values / tau.clamp_min(eps), dim=-1)
         return values, indices, weights
 
     def compute_prior_distribution_distance(
@@ -1416,7 +1607,9 @@ class GraphProbPriorLossComputer(torch.nn.Module):
 
         # graph gap 越大，排序间隔越大；如果关闭 gap weighting，
         # 所有有效 pair 权重相同，但 margin 仍然可以随 gap 增大。
-        margin = float(prior_cfg.GEOM_ORD_MARGIN_BASE) + float(prior_cfg.GEOM_ORD_MARGIN_SCALE) * gap_norm
+        margin_base = prior_mu.new_tensor(float(prior_cfg.GEOM_ORD_MARGIN_BASE))
+        margin_scale = self._geom_ord_margin_scale_value(prior_mu)
+        margin = margin_base + margin_scale * gap_norm
         if bool(prior_cfg.GEOM_ORD_WEIGHT_BY_GAP):
             pair_weight = gap_norm
         else:
@@ -1441,14 +1634,15 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         else:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_SCOPE must be topk / all.")
 
-        non_overlap_enabled = float(prior_cfg.GEOM_ORD_NON_OVERLAP_WEIGHT) > 0.0
+        non_overlap_weight = self._geom_ord_non_overlap_weight_value(prior_mu)
+        non_overlap_enabled = float(non_overlap_weight.detach().item()) > 0.0
         if bool(non_overlap_enabled):
             # ReLU hinge non-overlap：只有分布间隔 d_norm 小于最小安全距离时才惩罚。
             non_overlap_loss = F.relu(float(prior_cfg.GEOM_ORD_NON_OVERLAP_MIN_DIST) - overlap_dist).mean()
         else:
             # 保持 device/dtype 和反向图兼容；默认关闭时该项不产生梯度。
             non_overlap_loss = prior_mu.sum() * 0.0
-        total_loss = ordinal_loss + float(prior_cfg.GEOM_ORD_NON_OVERLAP_WEIGHT) * non_overlap_loss
+        total_loss = ordinal_loss + non_overlap_weight * non_overlap_loss
 
         # 下面的 stats 全部 detach，只用于日志诊断，不参与反向传播。
         valid_count = valid_float.sum()
@@ -1527,7 +1721,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                 topk=int(prior_cfg.GEOM_TOPK),
                 tau=float(prior_cfg.GEOM_TAU_GRAPH_DIST),
             )
-            logits = (-d_norm / float(prior_cfg.GEOM_TAU_DIST)).masked_fill(eye, float("-inf"))
+            geom_tau_dist = self._geom_tau_dist_value(d_norm).clamp_min(eps)
+            logits = (-d_norm / geom_tau_dist).masked_fill(eye, float("-inf"))
             log_q = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
             log_q_top = log_q[row, top_indices]
             dist_match_kl = target_weight.mul(target_weight.clamp_min(eps).log() - log_q_top).sum(dim=-1).mean()
@@ -1536,7 +1731,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             bound_loss = F.softplus(
                 (1.0 + float(prior_cfg.GEOM_MARGIN_MIN) - top_d) / float(prior_cfg.GEOM_TAU_BARRIER)
             ).mul(target_weight).sum(dim=-1).mean()
-            loss = dist_match_kl + float(prior_cfg.GEOM_BOUND_WEIGHT) * bound_loss
+            geom_bound_weight = self._geom_bound_weight_value(d_norm)
+            loss = dist_match_kl + geom_bound_weight * bound_loss
             q_top = log_q_top.exp()
             q_entropy = -(log_q.exp() * log_q).masked_fill(eye, 0.0).sum(dim=-1).mean()
             stats.update(
@@ -1615,7 +1811,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
 
         # 把“距离”变成“类别概率”：距离越小 -> -distance 越大 -> softmax 后概率越高。
         # TAU_LATENT 是 prediction 侧温度：tau 小 -> latent_prob 更尖，更偏向 KL 最小的类别； tau 大 -> latent_prob 更平，多个类别会分到概率。
-        latent_prob = F.softmax(-distance / float(prior_cfg.TAU_LATENT), dim=-1)
+        latent_prob = F.softmax(-distance / self._tau_latent_value(distance).clamp_min(eps), dim=-1)
 
         # target 是 SemanticGraphBuilder 根据 graph[y] 构造的语义监督分布 [B, C]。
         # 这里训练 latent_prob 去贴近 target：
@@ -1985,7 +2181,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         # alpha 分布匹配：计算 KL(q_x^alpha || p_c^alpha)，再用 softmax(-KL/TAU_LATENT)
         # 得到模型预测的全类语义上下文分布。
         alpha_distance = self._gaussian_kl_all_classes(alpha_mu, alpha_logvar, alpha_prior_mu, alpha_prior_logvar)
-        alpha_prob = F.softmax(-alpha_distance / float(prior_cfg.TAU_LATENT), dim=-1)
+        eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
+        alpha_prob = F.softmax(-alpha_distance / self._tau_latent_value(alpha_distance).clamp_min(eps), dim=-1)
         alpha_loss = _kl_target_pred(alpha_target, alpha_prob, eps)
 
         # beta 距离矩阵：distance_beta[i, c] = KL(q_i^beta || p_c^beta)。
@@ -2335,8 +2532,25 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             )
         if monitor_active:
             graph_cfg = self.cfg.MODEL.SEMANTIC_GRAPH
-            monitor_stats.update(graph_neighbor_monitor(graph, float(prior_cfg.TAU_GRAPH), topk=self.monitor_topk))
-            monitor_stats.update(graph_health_monitor(graph, float(prior_cfg.TAU_GRAPH), topk=self.monitor_topk))
+            tau_graph_value = float(self._tau_graph_value(graph).detach().item())
+            monitor_stats.update(graph_neighbor_monitor(graph, tau_graph_value, topk=self.monitor_topk))
+            monitor_stats.update(graph_health_monitor(graph, tau_graph_value, topk=self.monitor_topk))
+            monitor_stats["graph_prob_prior_monitor_learnable_tau_graph_value"] = tau_graph_value
+            monitor_stats["graph_prob_prior_monitor_learnable_tau_latent_value"] = float(
+                self._tau_latent_value(posterior_mu).detach().item()
+            )
+            monitor_stats["graph_prob_prior_monitor_learnable_geom_tau_dist_value"] = float(
+                self._geom_tau_dist_value(posterior_mu).detach().item()
+            )
+            monitor_stats["graph_prob_prior_monitor_learnable_geom_bound_weight_value"] = float(
+                self._geom_bound_weight_value(posterior_mu).detach().item()
+            )
+            monitor_stats["graph_prob_prior_monitor_learnable_geom_ord_margin_scale_value"] = float(
+                self._geom_ord_margin_scale_value(posterior_mu).detach().item()
+            )
+            monitor_stats["graph_prob_prior_monitor_learnable_geom_ord_non_overlap_weight_value"] = float(
+                self._geom_ord_non_overlap_weight_value(posterior_mu).detach().item()
+            )
             monitor_stats.update(
                 false_high_pair_monitor(
                     acc,
@@ -2491,7 +2705,11 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             "dual_metric_semantic_distribution",
         }:
             inactive_distance = self._gaussian_kl_all_classes(posterior_mu, posterior_logvar, prior_mu, prior_logvar)
-            inactive_latent_prob = F.softmax(-inactive_distance / float(prior_cfg.TAU_LATENT), dim=-1)
+            eps = float(self.cfg.MODEL.SEMANTIC_GRAPH.OT_DELTA)
+            inactive_latent_prob = F.softmax(
+                -inactive_distance / self._tau_latent_value(inactive_distance).clamp_min(eps),
+                dim=-1,
+            )
             monitor_stats.update(
                 latent_matching_monitor(
                     inactive_distance,

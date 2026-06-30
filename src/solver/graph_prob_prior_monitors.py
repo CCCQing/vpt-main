@@ -948,6 +948,12 @@ def graph_prob_prior_grad_monitor(named_parameters) -> Dict[str, float]:
         "learnable_scalar": (
             "learnable_prior_mu_scale_raw",
             "learnable_prior_delta_scale_raw",
+            "learnable_tau_graph_raw",
+            "learnable_tau_latent_raw",
+            "learnable_geom_tau_dist_raw",
+            "learnable_geom_bound_weight_raw",
+            "learnable_geom_ord_margin_scale_raw",
+            "learnable_geom_ord_non_overlap_weight_raw",
         ),
         "stats_head": ("stats_head",),
     }
