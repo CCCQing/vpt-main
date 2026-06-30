@@ -797,6 +797,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         self.monitor_enable = bool(prior_cfg.MONITOR_ENABLE)
         self.monitor_inactive = bool(prior_cfg.MONITOR_INACTIVE)
         self.monitor_topk = int(prior_cfg.MONITOR_TOPK)
+        self.monitor_effective_rank = bool(getattr(prior_cfg, "MONITOR_EFFECTIVE_RANK", False))
         self.monitor_every_n = int(prior_cfg.MONITOR_EVERY_N)
         if self.monitor_topk <= 0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.MONITOR_TOPK must be positive.")
@@ -2433,6 +2434,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     variation_mu,
                     variation_logvar,
                     targets_global=targets_global,
+                    compute_effective_rank=self.monitor_effective_rank,
                 )
             )
         debug.update(
@@ -2729,6 +2731,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     logvar_min=self.logvar_min,
                     logvar_max=self.logvar_max,
                     topk=self.monitor_topk,
+                    compute_effective_rank=self.monitor_effective_rank,
                 )
             )
             monitor_stats.update(

@@ -69,7 +69,6 @@ MONITOR_FIELDS:
     - "graph_prob_prior_monitor_prior_symkl_q50"
     - "graph_prob_prior_monitor_prior_symkl_q95"
     - "graph_prob_prior_monitor_prior_symkl_min_offdiag"
-    - "graph_prob_prior_monitor_prior_effective_rank"
     - "graph_prob_prior_monitor_prior_center_collapse_score"
   latent_temperature:
     - "graph_prob_prior_monitor_tau_latent_entropy_norm_mean"
@@ -195,6 +194,7 @@ FIXED_OPTS:
   MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_EPS: 1e-8
   MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE: true
   MODEL.GRAPH_PROB_PRIOR.MONITOR_INACTIVE: true
+  MODEL.GRAPH_PROB_PRIOR.MONITOR_EFFECTIVE_RANK: false
   MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N: 37
   MODEL.GRAPH_PROB_PRIOR.MONITOR_TOPK: 5
 

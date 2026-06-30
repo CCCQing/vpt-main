@@ -216,6 +216,7 @@ _C.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE = False        # 是否记录 GraphProb
 _C.MODEL.GRAPH_PROB_PRIOR.MONITOR_INACTIVE = False      # 是否额外计算当前 MODE 未使用的温度位置；默认关闭以避免额外开销
 _C.MODEL.GRAPH_PROB_PRIOR.MONITOR_TOPK = 5              # 监测 top-k mass 时使用的 k
 _C.MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N = 37           # 每多少次 GraphProbPrior forward 记录一次监测量；1 表示每次都记录
+_C.MODEL.GRAPH_PROB_PRIOR.MONITOR_EFFECTIVE_RANK = False # 是否计算 effective-rank 监测；关闭可避免 SVD/MAGMA 日志
 _C.MODEL.GRAPH_PROB_PRIOR.DEBUG = False                 # 打印一次 GraphProbPrior 的关键 shape 和 loss 标量
 
 _C.MODEL.AFFINITY = CfgNode()

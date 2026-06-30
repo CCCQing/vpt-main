@@ -436,7 +436,12 @@ def _effective_rank(x: torch.Tensor, center: bool = True) -> float:
     """
     if not torch.is_tensor(x) or x.dim() != 2:
         return 0.0
-    values = x.detach().float()
+    values = x.detach()
+    if values.numel() == 0:
+        return 0.0
+    # This rank metric is diagnostic only. CPU SVD avoids noisy CUDA MAGMA logs.
+    values = values.to(device="cpu", dtype=torch.float64)
+    values = torch.where(torch.isfinite(values), values, torch.zeros_like(values))
     if center:
         values = values - values.mean(dim=0, keepdim=True)
     try:
@@ -445,7 +450,16 @@ def _effective_rank(x: torch.Tensor, center: bool = True) -> float:
         else:
             singular = torch.svd(values).S
     except RuntimeError:
-        return 0.0
+        try:
+            gram = values.matmul(values.t()) if values.shape[0] <= values.shape[1] else values.t().matmul(values)
+            gram = 0.5 * (gram + gram.t())
+            if hasattr(torch, "linalg") and hasattr(torch.linalg, "eigvalsh"):
+                eigvals = torch.linalg.eigvalsh(gram)
+            else:
+                eigvals = torch.symeig(gram, eigenvectors=False).eigenvalues
+            singular = eigvals.clamp_min(0.0).sqrt()
+        except RuntimeError:
+            return 0.0
     total = singular.sum()
     if float(total.item()) <= 1e-12:
         return 0.0
@@ -549,6 +563,7 @@ def prior_health_monitor(
     logvar_max: Optional[float] = None,
     topk: int = 5,
     overlap_margin: float = 0.0,
+    compute_effective_rank: bool = False,
 ) -> Dict[str, float]:
     """
     Prior health：看每个类别的高斯 prior 是否塌缩、方差是否异常、不同类别分布是否重叠。
@@ -593,7 +608,8 @@ def prior_health_monitor(
     if class_count > 1:
         eye = torch.eye(class_count, dtype=torch.bool, device=mu.device)
         stats["graph_prob_prior_monitor_prior_overlap_risk_rate"] = _as_float(risk[~eye].float().mean())
-    stats["graph_prob_prior_monitor_prior_effective_rank"] = _effective_rank(mu, center=True)
+    if bool(compute_effective_rank):
+        stats["graph_prob_prior_monitor_prior_effective_rank"] = _effective_rank(mu, center=True)
     return stats
 
 
@@ -1077,6 +1093,7 @@ def factorized_health_monitor(
     variation_mu: torch.Tensor,
     variation_logvar: torch.Tensor,
     targets_global: Optional[torch.Tensor] = None,
+    compute_effective_rank: bool = False,
 ) -> Dict[str, float]:
     """
     Factorized latent：看 semantic factor 和 variation factor 是否各司其职，
@@ -1098,8 +1115,9 @@ def factorized_health_monitor(
     vm_centered = vm - vm.mean(dim=0, keepdim=True)
     cross_cov = sm_centered.t().matmul(vm_centered) / float(max(sm.shape[0], 1))
     stats["graph_prob_prior_monitor_factorized_cross_cov_fro"] = _as_float(cross_cov.pow(2).sum().sqrt())
-    stats["graph_prob_prior_monitor_factorized_semantic_batch_effective_rank"] = _effective_rank(sm, center=True)
-    stats["graph_prob_prior_monitor_factorized_variation_batch_effective_rank"] = _effective_rank(vm, center=True)
+    if bool(compute_effective_rank):
+        stats["graph_prob_prior_monitor_factorized_semantic_batch_effective_rank"] = _effective_rank(sm, center=True)
+        stats["graph_prob_prior_monitor_factorized_variation_batch_effective_rank"] = _effective_rank(vm, center=True)
     if targets_global is not None and torch.is_tensor(targets_global):
         y = targets_global.detach().to(device=vm.device, dtype=torch.long)
         class_ids = torch.unique(y, sorted=True)
