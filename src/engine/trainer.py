@@ -2185,7 +2185,7 @@ class Trainer():
                 if bad_rows is not None:
                     logger.info("[nan-debug] bad_rows=%s", bad_rows)
                 if model_ref_dbg is not None:
-                    bad_enc_rows = model_ref_dbg._last_bad_enc_rows
+                    bad_enc_rows = getattr(model_ref_dbg, "_last_bad_enc_rows", None)
                     if bad_enc_rows is not None:
                         logger.info("[nan-debug] bad_enc_rows=%s", bad_enc_rows)
                 if r_head_dbg is not None:

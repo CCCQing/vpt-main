@@ -1268,15 +1268,15 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             diag = torch.arange(class_count, device=graph.device)
             candidate_logits[diag, diag] = float("-inf")
 
-        # 只把每行 top-k 的关系值保留下来，其余位置保持 -inf。
-        # 这样 softmax 后非 top-k 位置概率严格为 0，不会像 clamp 归一化那样给所有类漏一点概率。
+        # 只在有限的 top-k values 上做 softmax，再 scatter 回完整矩阵。
+        # 不要对含 -inf 的 masked_logits 除以 learnable tau；否则 tau 反传会遇到 -inf，
+        # 容易出现 0 * inf 形式的 NaN 梯度，导致 LEARN_TAU_GRAPH 首批训练崩溃。
         values, indices = torch.topk(candidate_logits, k=topk, dim=-1)
-        masked_logits = torch.full_like(graph, float("-inf"))
-        masked_logits.scatter_(1, indices, values)
-        prob = F.softmax(masked_logits / tau.clamp_min(eps), dim=-1)
+        topk_prob = F.softmax(values / tau.clamp_min(eps), dim=-1)
 
-        # 数值安全归一化：理论上 softmax 后每行已经为 1；这里仅防止极端 dtype/输入导致行和轻微漂移。
-        prob = prob.masked_fill(~torch.isfinite(masked_logits), 0.0)
+        # 非 top-k 位置保持严格为 0，top-k 行和理论上为 1。
+        prob = torch.zeros_like(graph)
+        prob.scatter_(1, indices, topk_prob)
         return prob / prob.sum(dim=-1, keepdim=True).clamp_min(eps)
 
     def _dual_class_priors(self, class_attributes: torch.Tensor, graph: torch.Tensor) -> Dict[str, torch.Tensor]:
