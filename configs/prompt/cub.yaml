@@ -11,7 +11,7 @@ MODEL:
     ENABLE: True
     BACKEND: "dynamic"             # dynamic / vpt_deep
     INIT_SOURCE: "distributor_mean"    # learned / distributor_mean
-    DEEP: True
+    DEEP: False
     NUM_TOKENS: 32
     DROPOUT: 0.0
     DISTRIBUTOR:
@@ -37,23 +37,8 @@ MODEL:
     ENABLE: True
     DETACH: False
 
-  AFFINITY_EVOLUTION:
-    ENABLE: False
-    PROMPT_ENABLE: True
-    SEMANTIC_ENABLE: True
-    PROMPT_TARGET: "QpQv"
-    SEMANTIC_TARGET: "QpKv"
-    PROMPT_LAMBDA: 0.0
-    SEMANTIC_LAMBDA: 0.0
-    PROMPT_GAMMA_INIT: 0.0
-    SEMANTIC_GAMMA_INIT: 0.0
-    PROMPT_DETACH: "mediated"
-    SEMANTIC_DETACH: "direct"
-    SEMANTIC_COMPOSE: "prob"
-
   ATTENTION_MEDIATION:
     # 新的 block 内 mediated attention correction 分支。
-    # 开启时必须关闭 AFFINITY_EVOLUTION，避免层间 evolution 和层内 correction 混在一起。
     # 当前代码支持 attention_parallel/block_parallel、visual_block/full_row、row_preserve/block_redistribute。
     # block_parallel 需要 MLP_POLICY=enter_mlp；full_row 不能配合 block_redistribute。
     ENABLE: True
@@ -88,8 +73,6 @@ SOLVER:
   LOSS_VSPCN_AR_WEIGHT: 0.0005
   LOSS_SEM_MED_WEIGHT: 0.0
   LOSS_SPV_WEIGHT: 0.0
-  LOSS_ROUTE_TS_PROMPT_WEIGHT: 0.0
-  LOSS_ROUTE_TS_SEMANTIC_WEIGHT: 0.0
   SEM_MED:
     TARGET: "QpQv"           # QpKv / QpQv / KpKv
     METRIC: "kl"            # mse / kl / cosine
@@ -102,11 +85,6 @@ SOLVER:
     METRIC: "kl"             # mse / kl / cosine
     NORM: "softmax"
     DETACH: "none"           # mediated / direct / none
-    LAYERS: []
-  ROUTE_TS:
-    PROMPT_ENABLE: True
-    SEMANTIC_ENABLE: True
-    METRIC: "kl"             # mse / kl / cosine
     LAYERS: []
   LOSS_CM_WEIGHT: 0.05
   LOSS_CONS_WEIGHT: 0.00

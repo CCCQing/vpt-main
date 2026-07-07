@@ -29,12 +29,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_GRID_CONFIG = "configs/graph_prob_prior/cub_v5_temperature_grid.yaml"
 GRAPH_PROB_PRIOR_MODES = [
-    "true_class_kl",
     "graph_conditioned_semantic_prior",
-    "class_aggregate_moment",
     "class_aggregate_mmd",
     "factorized_latent",
-    "dual_metric_semantic_distribution",
 ]
 GRAPH_METHOD_ALIASES = {
     "method1_diff": "m1d",
@@ -46,12 +43,9 @@ GRAPH_METHOD_ALIASES = {
     "method3_diff_llm_gate": "m3dlg",
 }
 MODE_ALIASES = {
-    "true_class_kl": "tckl",
     "graph_conditioned_semantic_prior": "gcsp",
-    "class_aggregate_moment": "cam",
     "class_aggregate_mmd": "mmd",
     "factorized_latent": "fact",
-    "dual_metric_semantic_distribution": "dual",
 }
 LEGACY_SEARCH_STAGES = ["temperature", "other"]
 
@@ -341,7 +335,7 @@ def _sanitize(value: Any) -> str:
     text = str(value)
     for old, new in [
         ("MODEL.", ""),
-        ("SEMANTIC_GRAPH.", "sg_"),
+        ("GRAPH_INPUT.", "gi_"),
         ("GRAPH_PROB_PRIOR.", "gpp_"),
         ("PROMPT.DISTRIBUTOR.", "dist_"),
         (".", "_"),
@@ -632,8 +626,8 @@ def _build_trials(
                 overrides.update(mode_fixed)
                 overrides.update(
                     {
-                        "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_PATH": graph_path,
-                        "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_KEY": graph_method,
+                        "MODEL.GRAPH_INPUT.EXTERNAL_GRAPH_PATH": graph_path,
+                        "MODEL.GRAPH_INPUT.GRAPH_SOURCE": graph_method,
                         "MODEL.GRAPH_PROB_PRIOR.MODE": mode,
                     }
                 )
@@ -813,8 +807,6 @@ _GPP_MONITOR_ALIASES = {
     "facSemRank": "graph_prob_prior_monitor_factorized_semantic_batch_effective_rank",
     "facVarRank": "graph_prob_prior_monitor_factorized_variation_batch_effective_rank",
     "facClass": "graph_prob_prior_monitor_factorized_variation_class_ratio",
-    "betaV": "graph_prob_prior_monitor_dual_sample_beta_hardneg_violation_rate",
-    "abJS": "graph_prob_prior_monitor_dual_pos_neg_js_divergence_mean",
     "gzsl": "graph_prob_prior_monitor_prior_gzsl_unseen_to_seen_bias_risk_mean",
     "gGzsl": "graph_prob_prior_monitor_graph_gzsl_unseen_to_seen_bias_risk_mean",
     "fhG": "graph_prob_prior_monitor_false_high_graph_relation_still_gt_0_9_count",
@@ -1143,9 +1135,6 @@ def _with_monitor_scores(row: MutableMapping[str, Any]) -> Dict[str, Any]:
     score += _lower_is_better(scored, "graph_prob_prior_monitor_prior_gzsl_unseen_to_seen_bias_risk_mean", 1.0, 0.5)
 
     # Dual mode: prefer P+/P- separation and fewer hard-negative violations.
-    score += _lower_is_better(scored, "graph_prob_prior_monitor_dual_sample_beta_hardneg_violation_rate", 1.0, 1.0)
-    score += _higher_is_better(scored, "graph_prob_prior_monitor_dual_pos_neg_js_divergence_mean", 0.20, 0.6)
-    score += _lower_is_better(scored, "graph_prob_prior_monitor_dual_alpha_beta_conflict_rate", 1.0, 0.8)
 
     # Keep auxiliary loss from overpowering classification when the monitor is available.
     score += _upper_penalty(scored, "graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio", 0.10, 1.0)

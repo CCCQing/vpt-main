@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 trainer.py
 
@@ -68,19 +68,19 @@ from ..utils.vis_pipeline import (
 logger = logging.get_logger("visual_prompt")
 
 
-def _load_semantic_graph_attr_name_embeddings(cfg: CfgNode) -> torch.Tensor:
+def _load_graph_attr_name_embeddings(cfg: CfgNode) -> torch.Tensor:
     """
     Trainer 侧一次性读取属性名文本 embedding。
 
-    这样 SemanticGraphLossComputer 只消费张量，不再读路径；
+    这样 GraphProbPriorLossComputer 只消费张量，不再读路径；
     后续如果 dataset 自带 attr_name_embeddings，也可以在 batch 侧优先使用 dataset 的版本。
     """
-    graph_cfg = cfg.MODEL.SEMANTIC_GRAPH
+    graph_cfg = cfg.MODEL.GRAPH_INPUT
     path = str(graph_cfg.ATTR_NAME_EMBED_PATH)
     if not path:
-        raise ValueError("MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH must be set when semantic graph loss is enabled.")
+        raise ValueError("MODEL.GRAPH_INPUT.ATTR_NAME_EMBED_PATH must be set when GraphProbPrior is enabled.")
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH not found: {path}")
+        raise FileNotFoundError(f"MODEL.GRAPH_INPUT.ATTR_NAME_EMBED_PATH not found: {path}")
 
     ext = os.path.splitext(path)[1].lower()
     if ext == ".npy":
@@ -105,18 +105,12 @@ def _load_semantic_graph_attr_name_embeddings(cfg: CfgNode) -> torch.Tensor:
     return embeddings
 
 
-def _semantic_graph_loss_enabled(cfg: CfgNode) -> bool:
+def _graph_prior_inputs_enabled(cfg: CfgNode) -> bool:
     """Trainer 侧判断是否需要预加载属性名文本 embedding。"""
-    semantic_graph_enabled = (
-        bool(cfg.MODEL.SEMANTIC_GRAPH.ENABLE)
-        and float(cfg.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT) > 0
-        and str(cfg.MODEL.SEMANTIC_GRAPH.LOSS_TYPE).lower() != "none"
-    )
-    graph_prob_prior_enabled = (
+    return (
         bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE)
         and float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT) > 0
     )
-    return semantic_graph_enabled or graph_prob_prior_enabled
 
 
 class Trainer():
@@ -140,9 +134,9 @@ class Trainer():
         if self.affinity_aux_needed and bool(cfg.MODEL.AFFINITY.DETACH):
             raise ValueError("Affinity auxiliary losses require MODEL.AFFINITY.DETACH=False.")
         self._last_semantic_length = 0
-        self.semantic_graph_attr_name_embeddings = (
-            _load_semantic_graph_attr_name_embeddings(cfg)
-            if _semantic_graph_loss_enabled(cfg)
+        self.graph_attr_name_embeddings = (
+            _load_graph_attr_name_embeddings(cfg)
+            if _graph_prior_inputs_enabled(cfg)
             else None
         )
 
@@ -162,7 +156,7 @@ class Trainer():
 
         # solver related
         # ================== optimizer / scheduler / loss ==================
-        # semantic graph loss 内部有 1 个可学习 prompt_logit_scale 标量。
+        # GraphProbPrior 的 prior head / 可学习温度等参数也挂在 loss module 内，需要交给 optimizer。
         self.optimizer = make_optimizer([self.model, self.cls_criterion], cfg.SOLVER)
         self.scheduler = make_scheduler(self.optimizer, cfg.SOLVER)
 
@@ -515,8 +509,7 @@ class Trainer():
         2. posterior mu / logvar
         3. prompt generator
         4. r_similarity_head  visual / semantic proj
-        5. semantic side branch
-        6. prompt_update_layers """
+        5. semantic side branch """
         refs = {}
         refs["head.last_layer.weight"] = self._find_param_by_name_contains(
             ["head.last_layer.weight"]
@@ -542,31 +535,6 @@ class Trainer():
         refs["r_head.logit_scale"] = self._find_param_by_name_contains(
             ["r_similarity_head.logit_scale"]
         )
-        # Track layer-wise prompt evolution with first/middle/last layers.
-        prompt_layers = [
-            name for name in self._named_params().keys()
-            if "prompt_update_layers." in name and name.endswith(".weight")
-        ]
-        layer_ids = sorted(
-            set(
-                int(name.split("prompt_update_layers.")[1].split(".")[0])
-                for name in prompt_layers
-                if "prompt_update_layers." in name
-            )
-        )
-        if layer_ids:
-            first_id = layer_ids[0]
-            mid_id = layer_ids[len(layer_ids) // 2]
-            last_id = layer_ids[-1]
-            refs["prompt_update.first"] = self._find_param_by_name_contains(
-                [f"prompt_update_layers.{first_id}.weight"]
-            )
-            refs["prompt_update.mid"] = self._find_param_by_name_contains(
-                [f"prompt_update_layers.{mid_id}.weight"]
-            )
-            refs["prompt_update.last"] = self._find_param_by_name_contains(
-                [f"prompt_update_layers.{last_id}.weight"]
-            )
         return refs
 
     def _log_semantic_param_names_once(self):
@@ -655,7 +623,7 @@ class Trainer():
             params = group.get("params", [])
             names = [id2name.get(id(p), "<unnamed>") for p in params]
             logger.info(
-                "  group[%d]: lr=%s wd=%s params=%d (head=%s, r_head=%s, prompt_dist=%s, prompt_update=%s, semantic=%s)",
+                "  group[%d]: lr=%s wd=%s params=%d (head=%s, r_head=%s, prompt_dist=%s, semantic=%s)",
                 idx,
                 group.get("lr", None),
                 group.get("weight_decay", None),
@@ -663,7 +631,6 @@ class Trainer():
                 any("head." in n for n in names),
                 any("r_similarity_head" in n for n in names),
                 any("prompt_init_provider" in n for n in names),
-                any("prompt_update_layers" in n for n in names),
                 any(("semantic_token_projector" in n) or ("prototype_proj" in n) for n in names),
             )
 
@@ -857,6 +824,22 @@ class Trainer():
             ("uuDist", "graph_prob_prior_monitor_prior_unseen_unseen_dist_mean"),
             ("suDist", "graph_prob_prior_monitor_prior_seen_unseen_dist_mean"),
             ("unNearSeen", "graph_prob_prior_monitor_unseen_nearest_seen_distance_mean"),
+            ("unNearRatio", "graph_prob_prior_monitor_unseen_nearest_seen_ratio_mean"),
+            ("gpKRank", "graph_prob_prior_monitor_graph_gp_kernel_effective_rank"),
+            ("gpKCond", "graph_prob_prior_monitor_graph_gp_kernel_condition"),
+            ("gpSysCond", "graph_prob_prior_monitor_graph_gp_system_condition"),
+            ("gpRowEnt", "graph_prob_prior_monitor_graph_gp_kernel_row_entropy_norm_mean"),
+            ("gpKus5", "graph_prob_prior_monitor_graph_gp_k_us_support_top5_mass_mean"),
+            ("gpSmooth", "graph_prob_prior_monitor_graph_gp_smoothing_strength_mean"),
+            ("gpMRank", "graph_prob_prior_monitor_graph_gp_mstar_effective_rank"),
+            ("gpSp", "graph_prob_prior_monitor_graph_gp_mstar_graph_prior_spearman"),
+            ("gpPUloss", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_match_loss"),
+            ("gpPUacc", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_acc"),
+            ("gpSupAcc", "graph_prob_prior_monitor_graph_gp_support_seen_acc"),
+            ("gpGap", "graph_prob_prior_monitor_graph_gp_support_pseudo_acc_gap"),
+            ("gpPUCos", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_center_cos_mean"),
+            ("gpPUMse", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_center_mse_mean"),
+            ("gpBias", "graph_prob_prior_monitor_graph_gp_seen_unseen_logit_bias_mean"),
             ("mmdK", "graph_prob_prior_monitor_mmd_kernel_mean"),
             ("mmdKStd", "graph_prob_prior_monitor_mmd_kernel_std"),
             ("mmdLow", "graph_prob_prior_monitor_mmd_kernel_saturation_low_ratio"),
@@ -869,8 +852,6 @@ class Trainer():
             ("facSemRank", "graph_prob_prior_monitor_factorized_semantic_batch_effective_rank"),
             ("facVarRank", "graph_prob_prior_monitor_factorized_variation_batch_effective_rank"),
             ("facClass", "graph_prob_prior_monitor_factorized_variation_class_ratio"),
-            ("betaV", "graph_prob_prior_monitor_dual_sample_beta_hardneg_violation_rate"),
-            ("abJS", "graph_prob_prior_monitor_dual_pos_neg_js_divergence_mean"),
             ("gzsl", "graph_prob_prior_monitor_prior_gzsl_unseen_to_seen_bias_risk_mean"),
             ("gGzsl", "graph_prob_prior_monitor_graph_gzsl_unseen_to_seen_bias_risk_mean"),
             ("fhG", "graph_prob_prior_monitor_false_high_graph_relation_still_gt_0_9_count"),
@@ -2111,7 +2092,7 @@ class Trainer():
             dataset_class_attributes = None
             if dataset is not None and hasattr(dataset, "class_attributes"):
                 # XLSA/CUB 下这里通常是 [200,312] 的全局类别属性矩阵。
-                # semantic graph loss 直接复用 dataloader 已加载的全类属性矩阵；
+                # GraphProbPrior 直接复用 dataloader 已加载的全类属性矩阵；
                 # 不再提供路径兜底，避免和语义分支的数据来源分叉。
                 dataset_class_attributes = dataset.class_attributes
             dataset_attr_name_embeddings = None
@@ -2120,20 +2101,21 @@ class Trainer():
             attr_name_embeddings = (
                 dataset_attr_name_embeddings
                 if dataset_attr_name_embeddings is not None
-                else self.semantic_graph_attr_name_embeddings
+                else self.graph_attr_name_embeddings
             )
             dataset_seen_classes = getattr(dataset, "seen_classes", None) if dataset is not None else None
             dataset_unseen_classes = getattr(dataset, "unseen_classes", None) if dataset is not None else None
             loss_kwargs = {
                 "model": model_ref,
                 "raw_targets": targets,
-                # semantic graph 使用全局类别 id；不能使用 local-output remap 后的 loss_targets。
+                # GraphProbPrior 使用全局类别 id；不能使用 local-output remap 后的 loss_targets。
                 "targets_global": effective_targets.detach(),
                 "class_attributes": dataset_class_attributes,
                 "attr_name_embeddings": attr_name_embeddings,
                 "seen_class_ids": dataset_seen_classes,
                 "unseen_class_ids": dataset_unseen_classes,
                 "epoch": int(self._trace_epoch + 1),
+                "is_train": bool(is_train),
                 # 属性重建辅助损失使用 batch 真实类别属性 a_y 作为监督目标。
                 # attributes 来自 xlsa_dataset.__getitem__ 返回的 class_attributes[label]。
                 "target_attributes": attributes.to(self.device, non_blocking=True).float() if torch.is_tensor(attributes) else None,
@@ -2578,7 +2560,3 @@ class Trainer():
         )
         self.evaluator.log_and_update(log_results, metrics, test_name)
         return metrics
-
-
-
-

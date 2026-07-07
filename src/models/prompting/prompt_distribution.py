@@ -518,7 +518,7 @@ class PreViTPromptDistributor(nn.Module):
         """
         split-latent prompt 生成路径。
         当前 posterior 仍是原始 q(z|x)=N(mu,diag(v))，但把 768 维通道切成：
-        - semantic factor: 负责类别语义和 semantic graph prior matching；
+        - semantic factor: 负责类别语义和 GraphProbPrior matching；
         - variation factor: 负责姿态、背景、局部外观等类内变化。
 
         prompt 由两段 latent 分别投影后相加：
@@ -631,7 +631,7 @@ class PreViTPromptDistributor(nn.Module):
         统一 forward 入口。
 
         不接收 label，不计算 loss，只负责生成 prompt 和缓存 stats。
-        KL / semantic graph 等约束在 trainer/loss 侧读取 stats 后计算。
+        KL / GraphProbPrior 等约束在 trainer/loss 侧读取 stats 后计算。
         """
         # 1. 先根据 DISTRIBUTOR.SOURCE 选择视觉统计输入，并通过 stats_head 得到分布参数。
         #   - vit_cls_prepass: 使用 ViT prepass 得到的 CLS 表征；
@@ -701,7 +701,7 @@ class PreViTPromptDistributor(nn.Module):
         # stats 会被 PromptedTransformer 缓存，再由 trainer/loss 读取。
         #
         # 这里返回的 stats 有两个用途：
-        #   1. PromptKLAuxLoss / SemanticGraphAuxLoss / GraphProbPriorAuxLoss 读取 mu/logvar；
+        #   1. PromptKLAuxLoss / GraphProbPriorAuxLoss 读取 mu/logvar；
         #   2. debug、可视化或监控读取 visual_input、prompt_tokens、factorized stats。
         #
         # 注意：forward 本身不接收 targets，也不在这里计算任何 loss。

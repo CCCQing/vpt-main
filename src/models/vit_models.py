@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 
 """
 ViT-related models ViT
@@ -36,7 +36,6 @@ class ViT(nn.Module):
             prompt_cfg.DEBUG_SHAPES = cfg.SOLVER.DEBUG_SHAPES
             prompt_cfg.SEMANTIC_TOKENS = cfg.MODEL.SEMANTIC_TOKENS.clone()
             prompt_cfg.AFFINITY = cfg.MODEL.AFFINITY.clone()
-            prompt_cfg.AFFINITY_EVOLUTION = cfg.MODEL.AFFINITY_EVOLUTION.clone()
             prompt_cfg.ATTENTION_MEDIATION = cfg.MODEL.ATTENTION_MEDIATION.clone()
             prompt_cfg.freeze()
 
@@ -76,7 +75,7 @@ class ViT(nn.Module):
         """
         返回最近一次 forward 产生的 prompt distribution 统计量。
 
-        典型内容包括 mu/logvar/std/prompt_tokens。KL loss 和 semantic graph loss
+        典型内容包括 mu/logvar/std/prompt_tokens。KL loss 和 GraphProbPrior loss
         都从这里读取 mu/logvar，避免把 label 传进 distributor.forward。
         """
         return self._runtime_prompt_distribution_stats
@@ -95,7 +94,6 @@ class ViT(nn.Module):
         trainable_keys = []
         if cfg.MODEL.PROMPT.ENABLE:
             prompt_backend = cfg.MODEL.PROMPT.BACKEND.lower()
-            affinity_evolution_enable = bool(cfg.MODEL.AFFINITY_EVOLUTION.ENABLE)
             attention_mediation_enable = bool(cfg.MODEL.ATTENTION_MEDIATION.ENABLE)
             if prompt_backend == "dynamic":
                 prompt_init_source = cfg.MODEL.PROMPT.INIT_SOURCE.lower()
@@ -107,10 +105,6 @@ class ViT(nn.Module):
                     raise ValueError(
                         f"Unsupported MODEL.PROMPT.INIT_SOURCE='{cfg.MODEL.PROMPT.INIT_SOURCE}'"
                     )
-                if affinity_evolution_enable:
-                    trainable_keys.append("affinity_evolution")
-                else:
-                    trainable_keys.append("prompt_update_layers")
                 if attention_mediation_enable:
                     # ATTENTION_MEDIATION 的新增可训练量只有每层 P/S gamma gate。
                     # ViT block 的 Q/K/V/out/MLP 仍被冻结，不把主干 attention 参数加入 optimizer。
@@ -290,5 +284,3 @@ class ViT(nn.Module):
         if not vis:
             return logits, affinities
         return logits, attn_weights, affinities
-
-

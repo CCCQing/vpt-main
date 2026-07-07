@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved
 """
 models for vits, borrowed from
@@ -908,7 +908,6 @@ class Block(nn.Module):
         取当前层的 gamma gate，并整理成可广播到 [B,N,D] 的形状。
 
         attention mediation 是“当前层内”的修正，因此 gamma 长度等于 ViT block 数；
-        这和旧 affinity_evolution 的“层间”更新不同，旧分支通常只有 num_layers-1 个 gamma。
         """
         if name not in config:
             raise ValueError(f"ATTENTION_MEDIATION missing gamma field: {name}.")

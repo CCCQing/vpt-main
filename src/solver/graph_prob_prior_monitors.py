@@ -167,6 +167,295 @@ def probability_stats(
     return stats
 
 
+def _membership_mask(values: torch.Tensor, members: torch.Tensor) -> torch.Tensor:
+    """
+    判断 values 中每个类别 id 是否属于 members。
+
+    这里不用 torch.isin，是为了兼容旧版 PyTorch。Graph-GP 的 support/pseudo
+    监测需要按类别集合切分当前 batch，所以用广播比较构造布尔 mask。
+    """
+    if not torch.is_tensor(values) or not torch.is_tensor(members) or members.numel() == 0:
+        return torch.zeros_like(values, dtype=torch.bool)
+    members = members.to(device=values.device, dtype=values.dtype)
+    return (values[:, None] == members[None, :]).any(dim=1)
+
+
+def _matrix_condition_number(x: torch.Tensor) -> float:
+    """用奇异值估计条件数；只作为监测项，失败时返回 0。"""
+    if not torch.is_tensor(x) or x.dim() != 2 or x.numel() == 0:
+        return 0.0
+    values = x.detach().to(device="cpu", dtype=torch.float64)
+    values = torch.where(torch.isfinite(values), values, torch.zeros_like(values))
+    try:
+        if hasattr(torch, "linalg") and hasattr(torch.linalg, "svdvals"):
+            singular = torch.linalg.svdvals(values)
+        else:
+            singular = torch.svd(values).S
+    except RuntimeError:
+        return 0.0
+    singular = singular[torch.isfinite(singular)]
+    if singular.numel() == 0:
+        return 0.0
+    max_s = singular.max()
+    min_s = singular[singular > 1e-12].min() if bool((singular > 1e-12).any().item()) else singular.new_tensor(1e-12)
+    return _as_float(max_s / min_s.clamp_min(1e-12))
+
+
+def _row_probability_from_nonnegative(x: torch.Tensor) -> torch.Tensor:
+    values = x.detach().float().clamp_min(0.0)
+    return values / values.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _abs_row_probability(x: torch.Tensor) -> torch.Tensor:
+    values = x.detach().float().abs()
+    return values / values.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _batch_class_center_stats(
+    prefix: str,
+    posterior_mu: torch.Tensor,
+    prior_mu: torch.Tensor,
+    targets: torch.Tensor,
+    sample_mask: torch.Tensor,
+) -> Dict[str, float]:
+    stats: Dict[str, float] = {}
+    if not bool(sample_mask.any().item()):
+        return stats
+    mu = posterior_mu.detach().float()
+    prior = prior_mu.detach().float().to(device=mu.device)
+    cls = torch.unique(targets[sample_mask], sorted=True)
+    centers = []
+    proto = []
+    for cid in cls:
+        vals = mu[(targets == cid) & sample_mask]
+        if vals.numel() == 0:
+            continue
+        centers.append(vals.mean(dim=0))
+        proto.append(prior[int(cid.item())])
+    if not centers:
+        return stats
+    centers_t = torch.stack(centers, dim=0)
+    proto_t = torch.stack(proto, dim=0).to(device=centers_t.device)
+    center_cos = F.cosine_similarity(centers_t, proto_t, dim=-1, eps=1e-12)
+    center_mse = (centers_t - proto_t).pow(2).mean(dim=-1)
+    stats.update(tensor_stats(f"{prefix}_center_cos", center_cos))
+    stats.update(tensor_stats(f"{prefix}_center_mse", center_mse))
+    return stats
+
+
+def graph_gp_prototype_monitor(
+    prior_mu: torch.Tensor,
+    prior_logvar: Optional[torch.Tensor],
+    support_ids: torch.Tensor,
+    pseudo_unseen_ids: torch.Tensor,
+    observed_support_ids: torch.Tensor,
+    support_count: torch.Tensor,
+    center_var: torch.Tensor,
+    obs_noise: torch.Tensor,
+    solve_residual: torch.Tensor,
+    uncertainty_diag: torch.Tensor,
+    system_diag_ratio: torch.Tensor,
+    kernel: Optional[torch.Tensor] = None,
+    system: Optional[torch.Tensor] = None,
+    k_all_s: Optional[torch.Tensor] = None,
+    smoothing_coeff: Optional[torch.Tensor] = None,
+    graph: Optional[torch.Tensor] = None,
+    distance: Optional[torch.Tensor] = None,
+    sample_match_loss: Optional[torch.Tensor] = None,
+    posterior_mu: Optional[torch.Tensor] = None,
+    targets_global: Optional[torch.Tensor] = None,
+    seen_class_ids=None,
+    unseen_class_ids=None,
+    topk: int = 5,
+    prefix: str = "graph_prob_prior_monitor_graph_gp",
+) -> Dict[str, float]:
+    """
+    Graph-GP prototype 推断专属监测量。
+
+    这些统计不参与 loss，只回答四个问题：
+    1. support-seen 中有多少类已经被 posterior_mu 观测到；
+    2. V_support 的类内方差和观测噪声 R_s 是否异常；
+    3. 线性方程求解是否稳定，Graph-GP predictive uncertainty 是否过大；
+    4. 推断出的 M_star 是否仍然同向扎堆，以及 pseudo-unseen 样本能否找到真类 prototype。
+    """
+    stats: Dict[str, float] = {}
+    if not torch.is_tensor(prior_mu):
+        return stats
+
+    device = prior_mu.device
+    support_ids = support_ids.to(device=device, dtype=torch.long) if torch.is_tensor(support_ids) else torch.empty(0, device=device, dtype=torch.long)
+    pseudo_unseen_ids = (
+        pseudo_unseen_ids.to(device=device, dtype=torch.long)
+        if torch.is_tensor(pseudo_unseen_ids)
+        else torch.empty(0, device=device, dtype=torch.long)
+    )
+    observed_support_ids = (
+        observed_support_ids.to(device=device, dtype=torch.long)
+        if torch.is_tensor(observed_support_ids)
+        else torch.empty(0, device=device, dtype=torch.long)
+    )
+
+    stats[f"{prefix}_support_class_count"] = float(support_ids.numel())
+    stats[f"{prefix}_pseudo_unseen_class_count"] = float(pseudo_unseen_ids.numel())
+    stats[f"{prefix}_support_observed_class_count"] = float(observed_support_ids.numel())
+    stats[f"{prefix}_support_observed_ratio"] = float(observed_support_ids.numel()) / float(max(int(support_ids.numel()), 1))
+    if support_ids.numel() > 0 and torch.is_tensor(support_count):
+        selected_count = support_count.detach().float().to(device=device).index_select(0, support_ids)
+        stats.update(tensor_stats(f"{prefix}_support_count", selected_count))
+
+    if torch.is_tensor(center_var) and center_var.numel() > 0:
+        stats.update(tensor_stats(f"{prefix}_seen_center_var", center_var))
+    if torch.is_tensor(obs_noise) and obs_noise.numel() > 0:
+        stats.update(tensor_stats(f"{prefix}_obs_noise", obs_noise))
+        reliability = 1.0 / obs_noise.detach().float().clamp_min(1e-12)
+        stats.update(tensor_stats(f"{prefix}_seen_center_reliability", reliability))
+
+    if torch.is_tensor(solve_residual):
+        stats[f"{prefix}_solve_residual"] = _as_float(solve_residual)
+    if torch.is_tensor(system_diag_ratio):
+        stats[f"{prefix}_kernel_diag_ratio"] = _as_float(system_diag_ratio)
+    if torch.is_tensor(uncertainty_diag) and uncertainty_diag.numel() > 0:
+        stats.update(tensor_stats(f"{prefix}_uncertainty_diag", uncertainty_diag))
+
+    if torch.is_tensor(kernel) and kernel.dim() == 2 and kernel.shape[0] == kernel.shape[1]:
+        k = kernel.detach().float().to(device=device)
+        class_count = int(k.shape[0])
+        eye = torch.eye(class_count, dtype=torch.bool, device=device)
+        stats.update(tensor_stats(f"{prefix}_kernel_offdiag", k[~eye]))
+        stats[f"{prefix}_kernel_effective_rank"] = _effective_rank(k, center=False)
+        stats[f"{prefix}_kernel_condition"] = _matrix_condition_number(k)
+        kernel_prob = _row_probability_from_nonnegative(k)
+        stats.update(probability_stats(f"{prefix}_kernel_row", kernel_prob, topk=topk))
+
+    if torch.is_tensor(system) and system.dim() == 2 and system.shape[0] == system.shape[1]:
+        stats[f"{prefix}_system_condition"] = _matrix_condition_number(system)
+
+    if torch.is_tensor(k_all_s) and k_all_s.dim() == 2 and k_all_s.numel() > 0:
+        support_prob = _row_probability_from_nonnegative(k_all_s.to(device=device))
+        stats.update(probability_stats(f"{prefix}_k_all_s_support", support_prob, topk=topk))
+        if pseudo_unseen_ids.numel() > 0 and int(k_all_s.shape[0]) > int(pseudo_unseen_ids.max().item()):
+            pseudo_support_prob = support_prob.index_select(0, pseudo_unseen_ids)
+            stats.update(probability_stats(f"{prefix}_k_us_support", pseudo_support_prob, topk=topk))
+
+    if torch.is_tensor(smoothing_coeff) and smoothing_coeff.dim() == 2 and smoothing_coeff.numel() > 0:
+        coeff_prob = _abs_row_probability(smoothing_coeff.to(device=device))
+        stats.update(probability_stats(f"{prefix}_smoothing_coeff_abs", coeff_prob, topk=topk))
+        top1_mass = coeff_prob.max(dim=-1).values
+        stats[f"{prefix}_smoothing_strength_mean"] = _as_float((1.0 - top1_mass).mean())
+        stats.update(tensor_stats(f"{prefix}_smoothing_coeff_l1", smoothing_coeff.detach().float().abs().sum(dim=-1)))
+
+    mu = prior_mu.detach().float()
+    stats.update(tensor_stats(f"{prefix}_mstar_norm", mu.norm(dim=-1)))
+    if mu.dim() == 2 and int(mu.shape[0]) > 1:
+        class_count = int(mu.shape[0])
+        eye = torch.eye(class_count, dtype=torch.bool, device=mu.device)
+        stats[f"{prefix}_mstar_effective_rank"] = _effective_rank(mu, center=True)
+
+        # pair cosine 用来看 M_star 是否全都朝同一个方向。offdiag 越高，越像一团同向云。
+        mu_dir = F.normalize(mu, p=2, dim=-1, eps=1e-12)
+        pair_cos = mu_dir.matmul(mu_dir.t())
+        offdiag_cos = pair_cos[~eye]
+        stats.update(tensor_stats(f"{prefix}_mstar_pair_cos_offdiag", offdiag_cos))
+        stats[f"{prefix}_mstar_pair_cos_gt_0_9"] = _as_float((offdiag_cos > 0.9).float().mean())
+        if torch.is_tensor(graph) and graph.shape == pair_cos.shape:
+            stats[f"{prefix}_mstar_graph_prior_spearman"] = _spearman_corr(
+                graph.detach().float().to(device=pair_cos.device)[~eye],
+                offdiag_cos,
+            )
+
+        # 标准化欧氏距离用来看 prototype 在 latent 空间里实际隔多远，避免只看 cosine。
+        dist = torch.cdist(mu, mu, p=2) / math.sqrt(float(max(int(mu.shape[1]), 1)))
+        offdiag_dist = dist[~eye]
+        stats.update(tensor_stats(f"{prefix}_mstar_dist_offdiag", offdiag_dist))
+        if torch.is_tensor(prior_logvar) and prior_logvar.shape == prior_mu.shape:
+            logvar = prior_logvar.detach().float().to(device=mu.device)
+            symkl = _pairwise_symkl(mu, logvar)
+            off_symkl = symkl[~eye]
+            stats.update(tensor_stats(f"{prefix}_mstar_symkl", off_symkl))
+            if off_symkl.numel() > 0:
+                stats[f"{prefix}_mstar_symkl_min_offdiag"] = _as_float(off_symkl.min())
+            radius = logvar.exp().mean(dim=-1).clamp_min(1e-12).sqrt()
+            raw_dist = torch.cdist(mu, mu, p=2)
+            overlap = raw_dist < (radius[:, None] + radius[None, :])
+            stats[f"{prefix}_mstar_overlap_risk_rate"] = _as_float(overlap[~eye].float().mean())
+
+    if torch.is_tensor(distance) and torch.is_tensor(targets_global):
+        targets = targets_global.to(device=distance.device, dtype=torch.long)
+        if distance.dim() == 2 and targets.dim() == 1 and int(distance.shape[0]) == int(targets.numel()):
+            pred = distance.argmin(dim=-1)
+            hit = (pred == targets).float()
+            row = torch.arange(distance.shape[0], device=distance.device)
+            true_dist = distance[row, targets]
+            neg_distance = distance.clone()
+            neg_distance[row, targets] = float("inf")
+            best_neg = neg_distance.min(dim=-1).values
+            margin = best_neg - true_dist
+
+            pseudo_mask = _membership_mask(targets, pseudo_unseen_ids)
+            support_mask = _membership_mask(targets, support_ids)
+            if bool(pseudo_mask.any().item()):
+                stats[f"{prefix}_pseudo_unseen_rank1"] = _as_float(hit[pseudo_mask].mean())
+                stats[f"{prefix}_pseudo_unseen_acc"] = stats[f"{prefix}_pseudo_unseen_rank1"]
+                stats[f"{prefix}_pseudo_unseen_true_kl_mean"] = _as_float(true_dist[pseudo_mask].mean())
+                stats.update(tensor_stats(f"{prefix}_pseudo_unseen_margin", margin[pseudo_mask]))
+                if torch.is_tensor(sample_match_loss) and sample_match_loss.numel() == targets.numel():
+                    stats[f"{prefix}_pseudo_unseen_match_loss"] = _as_float(
+                        sample_match_loss.detach().float().to(device=targets.device)[pseudo_mask].mean()
+                    )
+            if bool(support_mask.any().item()):
+                stats[f"{prefix}_support_seen_rank1"] = _as_float(hit[support_mask].mean())
+                stats[f"{prefix}_support_seen_acc"] = stats[f"{prefix}_support_seen_rank1"]
+                stats[f"{prefix}_support_seen_true_kl_mean"] = _as_float(true_dist[support_mask].mean())
+                stats.update(tensor_stats(f"{prefix}_support_seen_margin", margin[support_mask]))
+                if torch.is_tensor(sample_match_loss) and sample_match_loss.numel() == targets.numel():
+                    stats[f"{prefix}_support_seen_match_loss"] = _as_float(
+                        sample_match_loss.detach().float().to(device=targets.device)[support_mask].mean()
+                    )
+            if bool(pseudo_mask.any().item()) and bool(support_mask.any().item()):
+                stats[f"{prefix}_support_pseudo_rank1_gap"] = (
+                    stats[f"{prefix}_support_seen_rank1"] - stats[f"{prefix}_pseudo_unseen_rank1"]
+                )
+                stats[f"{prefix}_support_pseudo_acc_gap"] = (
+                    stats[f"{prefix}_support_seen_acc"] - stats[f"{prefix}_pseudo_unseen_acc"]
+                )
+                if f"{prefix}_support_seen_match_loss" in stats and f"{prefix}_pseudo_unseen_match_loss" in stats:
+                    stats[f"{prefix}_support_pseudo_match_loss_gap"] = (
+                        stats[f"{prefix}_pseudo_unseen_match_loss"] - stats[f"{prefix}_support_seen_match_loss"]
+                    )
+
+            if torch.is_tensor(posterior_mu) and posterior_mu.dim() == 2 and posterior_mu.shape[0] == targets.numel():
+                stats.update(
+                    _batch_class_center_stats(
+                        f"{prefix}_pseudo_unseen",
+                        posterior_mu,
+                        prior_mu,
+                        targets,
+                        pseudo_mask,
+                    )
+                )
+                stats.update(
+                    _batch_class_center_stats(
+                        f"{prefix}_support_seen",
+                        posterior_mu,
+                        prior_mu,
+                        targets,
+                        support_mask,
+                    )
+                )
+
+            seen = _index_tensor(seen_class_ids, distance.device)
+            unseen = _index_tensor(unseen_class_ids, distance.device)
+            seen = seen[(seen >= 0) & (seen < int(distance.shape[1]))]
+            unseen = unseen[(unseen >= 0) & (unseen < int(distance.shape[1]))]
+            if seen.numel() > 0 and unseen.numel() > 0:
+                logits = -distance.detach().float()
+                max_seen = logits.index_select(1, seen).max(dim=-1).values
+                max_unseen = logits.index_select(1, unseen).max(dim=-1).values
+                stats.update(tensor_stats(f"{prefix}_seen_unseen_logit_bias", max_seen - max_unseen))
+
+    return stats
+
+
 def graph_neighbor_monitor(
     graph: torch.Tensor,
     tau_graph: float,
@@ -216,7 +505,7 @@ def semantic_target_monitor(
     """
     监测 TAU_ACC 和 TARGET_MIX_ALPHA 构造监督 target 的效果。
 
-    对应 SemanticGraphBuilder.build_target() 的逻辑：
+    对应 GraphPriorInputBuilder.build_target() 的逻辑：
         rows = graph[y]
         masked = 只保留 TOPK 个语义近邻，其余置为 -inf
         target_sem = softmax(masked / TAU_ACC)
@@ -306,25 +595,6 @@ def latent_matching_monitor(
         )
     )
     return stats
-
-
-def true_class_kl_monitor(true_kl_per_sample: torch.Tensor) -> Dict[str, float]:
-    """
-    监测 true_class_kl 模式下的逐样本真类 KL。
-
-    对应：
-        KL(q_i || p_{y_i})
-
-    输出字段：
-    - graph_prob_prior_monitor_true_class_kl_mean/std/q05/q50/q95 等。
-
-    读法：
-    - true_class_kl_mean 很大：
-      posterior 和真类 prior 距离较远，可能是 LOSS_WEIGHT 太小、prior 不合理或 posterior 尺度异常。
-    - true_class_kl_q95 远大于 q50：
-      少数样本 KL 很大，需要检查是否有类别/样本异常。
-    """
-    return tensor_stats("graph_prob_prior_monitor_true_class_kl", true_kl_per_sample)
 
 
 def relation_monitor(sym_kl: torch.Tensor, pred_rel: torch.Tensor, topk: int = 5) -> Dict[str, float]:
@@ -825,8 +1095,13 @@ def seen_unseen_prior_monitor(
         ).min(dim=-1).values
         stats["graph_prob_prior_monitor_unseen_nearest_unseen_distance_mean"] = _as_float(nearest_unseen.mean())
     seen_unseen_dist = torch.cdist(unseen_mu, seen_mu, p=2)
+    nearest_seen = seen_unseen_dist.min(dim=-1).values
     stats["graph_prob_prior_monitor_prior_seen_unseen_dist_mean"] = _as_float(seen_unseen_dist.mean())
-    stats["graph_prob_prior_monitor_unseen_nearest_seen_distance_mean"] = _as_float(seen_unseen_dist.min(dim=-1).values.mean())
+    stats["graph_prob_prior_monitor_unseen_nearest_seen_distance_mean"] = _as_float(nearest_seen.mean())
+    if unseen.numel() > 1:
+        stats["graph_prob_prior_monitor_unseen_nearest_seen_ratio_mean"] = _as_float(
+            (nearest_seen / nearest_unseen.clamp_min(1e-12)).mean()
+        )
 
     sim = F.normalize(mu, p=2, dim=-1, eps=1e-12).matmul(F.normalize(mu, p=2, dim=-1, eps=1e-12).t())
     unseen_to_seen = sim.index_select(0, unseen).index_select(1, seen).mean(dim=-1)
@@ -942,11 +1217,9 @@ def false_high_pair_monitor(
 def graph_prob_prior_grad_monitor(named_parameters) -> Dict[str, float]:
     """
     backward 之后调用的梯度健康监测。
-    只读取参数梯度的 detach 值，判断 prior/dual/stats head 是否真的收到梯度。
+    只读取参数梯度的 detach 值，判断 prior/stats head 是否真的收到梯度。
     """
     groups = {
-        "dual_alpha_head": ("dual_alpha_mu_head", "dual_alpha_anchor_head", "dual_alpha_delta_head"),
-        "dual_beta_head": ("dual_beta_mu_head", "dual_beta_anchor_head", "dual_beta_delta_head"),
         "prior_head": (
             "prior_head",
             "factorized_semantic_prior_head",
@@ -956,10 +1229,6 @@ def graph_prob_prior_grad_monitor(named_parameters) -> Dict[str, float]:
             "factorized_residual_anchor_head",
             "factorized_residual_delta_head",
             "factorized_residual_logvar_head",
-            "dual_alpha_anchor_head",
-            "dual_alpha_delta_head",
-            "dual_beta_anchor_head",
-            "dual_beta_delta_head",
         ),
         "learnable_scalar": (
             "learnable_prior_mu_scale_raw",
@@ -995,10 +1264,6 @@ def graph_prob_prior_grad_monitor(named_parameters) -> Dict[str, float]:
     for key, value in sum_sq.items():
         stats[f"graph_prob_prior_monitor_grad_{key}_norm"] = math.sqrt(max(value, 0.0))
         stats[f"graph_prob_prior_monitor_grad_{key}_param_count"] = float(counts[key])
-    denom = max(stats["graph_prob_prior_monitor_grad_dual_beta_head_norm"], 1e-12)
-    stats["graph_prob_prior_monitor_grad_alpha_beta_ratio"] = (
-        stats["graph_prob_prior_monitor_grad_dual_alpha_head_norm"] / denom
-    )
     stats["graph_prob_prior_monitor_grad_finite_ratio"] = float(finite_num) / float(max(finite_den, 1))
     return stats
 
@@ -1038,52 +1303,6 @@ def posterior_prior_alignment_monitor(
     stats["graph_prob_prior_monitor_posterior_kl_margin_positive_ratio"] = _as_float((margin > 0.0).float().mean())
     if latent_prob is not None and torch.is_tensor(latent_prob):
         stats.update(probability_stats("graph_prob_prior_monitor_latent_prob", latent_prob.detach(), true_index=y, topk=topk))
-    return stats
-
-
-def aggregate_moment_monitor(
-    posterior_mu: torch.Tensor,
-    posterior_logvar: torch.Tensor,
-    targets_global: torch.Tensor,
-    aggregate_mu: torch.Tensor,
-    aggregate_var: torch.Tensor,
-    class_ids: torch.Tensor,
-    prior_mu: Optional[torch.Tensor] = None,
-    prior_logvar: Optional[torch.Tensor] = None,
-) -> Dict[str, float]:
-    """
-    Aggregate moment：看同一类别的一批图像聚合后，均值和方差是否能对上类别 prior；
-    同时拆开 E[var_i] 和 Var(mu_i)，判断聚合方差来自图像不确定性还是同类样本离散。
-    """
-    stats: Dict[str, float] = {"graph_prob_prior_monitor_agg_class_count": float(class_ids.numel())}
-    if class_ids.numel() == 0:
-        return stats
-    counts = torch.stack([(targets_global == cid).float().sum() for cid in class_ids]).to(device=posterior_mu.device)
-    stats.update(tensor_stats("graph_prob_prior_monitor_agg_samples_per_class", counts))
-    stats["graph_prob_prior_monitor_agg_single_sample_class_ratio"] = _as_float((counts <= 1.0).float().mean())
-
-    posterior_var = posterior_logvar.detach().float().exp()
-    var_components = []
-    spread_components = []
-    for cid in class_ids:
-        mask = targets_global == cid
-        mu_c = posterior_mu.detach().float()[mask]
-        var_c = posterior_var[mask]
-        mean_c = mu_c.mean(dim=0)
-        var_components.append(var_c.mean())
-        spread_components.append((mu_c - mean_c).pow(2).mean())
-    stats["graph_prob_prior_monitor_agg_posterior_var_component_mean"] = _as_float(torch.stack(var_components).mean())
-    stats["graph_prob_prior_monitor_agg_mu_spread_component_mean"] = _as_float(torch.stack(spread_components).mean())
-    stats["graph_prob_prior_monitor_agg_total_var_mean"] = _as_float(aggregate_var.detach().float().mean())
-    if prior_mu is not None and torch.is_tensor(prior_mu):
-        selected_mu = prior_mu.detach().float().index_select(0, class_ids.to(device=prior_mu.device))
-        dist = (aggregate_mu.detach().float().to(selected_mu.device) - selected_mu).norm(dim=-1)
-        stats.update(tensor_stats("graph_prob_prior_monitor_agg_mu_to_prior_dist", dist))
-    if prior_logvar is not None and torch.is_tensor(prior_logvar):
-        eps = 1e-12
-        selected_logvar = prior_logvar.detach().float().index_select(0, class_ids.to(device=prior_logvar.device))
-        mse = (aggregate_var.detach().float().to(selected_logvar.device).clamp_min(eps).log() - selected_logvar).pow(2).mean()
-        stats["graph_prob_prior_monitor_agg_var_to_prior_logvar_mse"] = _as_float(mse)
     return stats
 
 
@@ -1138,156 +1357,12 @@ def factorized_health_monitor(
     return stats
 
 
-def dual_sample_beta_monitor(
-    beta_distance: torch.Tensor,
-    targets_global: torch.Tensor,
-    p_neg: Optional[torch.Tensor] = None,
-    margin: Optional[torch.Tensor] = None,
-    topk: int = 5,
-) -> Dict[str, float]:
-    """
-    Dual sample beta：直接检查当前 beta loss 的样本级目标是否生效。
-    class-level beta prior 分开不代表样本 posterior 已经分到正确类别。
-    """
-    stats = posterior_prior_alignment_monitor(beta_distance, None, targets_global, topk=topk)
-    renamed = {}
-    for key, value in stats.items():
-        renamed[key.replace("graph_prob_prior_monitor_posterior_", "graph_prob_prior_monitor_dual_sample_beta_")] = value
-    stats = renamed
-    if p_neg is not None and torch.is_tensor(p_neg):
-        d = beta_distance.detach().float()
-        y = targets_global.detach().to(device=d.device, dtype=torch.long).view(-1)
-        neg = p_neg.detach().float().to(device=d.device)
-        if neg.shape == d.shape:
-            true_d = d.gather(1, y[:, None])
-            neg_mask = neg > 0.0
-            weighted_margin = (d - true_d).mul(neg).sum(dim=-1)
-            stats.update(tensor_stats("graph_prob_prior_monitor_dual_sample_beta_hardneg_weighted_margin", weighted_margin))
-            masked_d = d.masked_fill(~neg_mask, float("inf"))
-            nearest_hardneg = masked_d.min(dim=-1).values
-            finite = nearest_hardneg[torch.isfinite(nearest_hardneg)]
-            if finite.numel() > 0:
-                stats.update(tensor_stats("graph_prob_prior_monitor_dual_sample_beta_nearest_hardneg_distance", finite))
-            if margin is not None and torch.is_tensor(margin) and margin.shape == d.shape:
-                violation = F.relu(true_d + margin.detach().float().to(device=d.device) - d)
-                values = violation[neg_mask]
-                if values.numel() > 0:
-                    stats["graph_prob_prior_monitor_dual_sample_beta_hardneg_violation_rate"] = _as_float((values > 0.0).float().mean())
-    return stats
-
-
-def dual_metric_distribution_monitor(
-    mu_alpha: torch.Tensor,
-    logvar_alpha: Optional[torch.Tensor],
-    mu_beta: torch.Tensor,
-    logvar_beta: Optional[torch.Tensor],
-    t_alpha: Optional[torch.Tensor] = None,
-    p_pos: Optional[torch.Tensor] = None,
-    p_neg: Optional[torch.Tensor] = None,
-    bank: Optional[torch.Tensor] = None,
-    topk: int = 5,
-    margin: float = 0.0,
-) -> Dict[str, float]:
-    """
-    Dual distribution：看 alpha 是否保留上下文关系，beta 是否把 hard negative 分开；
-    理想状态是语义近邻可以相近，但类别分布不能交叠。
-    """
-    stats: Dict[str, float] = {}
-    if p_pos is not None and torch.is_tensor(p_pos):
-        stats.update(probability_stats("graph_prob_prior_monitor_dual_p_pos", p_pos.detach(), topk=topk))
-        stats.update(_row_entropy_stats("graph_prob_prior_monitor_dual_p_pos", p_pos.detach()))
-        stats["graph_prob_prior_monitor_dual_p_pos_nonzero_mean"] = _as_float((p_pos.detach() > 0).float().sum(dim=-1).mean())
-        stats["graph_prob_prior_monitor_dual_p_pos_self_mass_mean"] = _as_float(torch.diagonal(p_pos.detach().float()).mean())
-    if p_neg is not None and torch.is_tensor(p_neg):
-        stats.update(probability_stats("graph_prob_prior_monitor_dual_p_neg", p_neg.detach(), topk=topk))
-        stats.update(_row_entropy_stats("graph_prob_prior_monitor_dual_p_neg", p_neg.detach()))
-        stats["graph_prob_prior_monitor_dual_p_neg_nonzero_mean"] = _as_float((p_neg.detach() > 0).float().sum(dim=-1).mean())
-    if p_pos is not None and p_neg is not None and torch.is_tensor(p_pos) and torch.is_tensor(p_neg):
-        pos = p_pos.detach().float()
-        neg = p_neg.detach().float()
-        pos_mask = pos > 0.0
-        neg_mask = neg > 0.0
-        inter = (pos_mask & neg_mask).float().sum(dim=-1)
-        union = (pos_mask | neg_mask).float().sum(dim=-1).clamp_min(1.0)
-        stats["graph_prob_prior_monitor_dual_pos_neg_topk_jaccard_mean"] = _as_float((inter / union).mean())
-        stats["graph_prob_prior_monitor_dual_pos_neg_overlap_mass_mean"] = _as_float((neg * pos_mask.float()).sum(dim=-1).mean())
-        stats["graph_prob_prior_monitor_dual_pos_neg_top1_same_ratio"] = _as_float((pos.argmax(dim=-1) == neg.argmax(dim=-1)).float().mean())
-        p = pos / pos.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        q = neg / neg.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        m = 0.5 * (p + q)
-        js = 0.5 * (p * (p.clamp_min(1e-12).log() - m.clamp_min(1e-12).log())).sum(dim=-1)
-        js = js + 0.5 * (q * (q.clamp_min(1e-12).log() - m.clamp_min(1e-12).log())).sum(dim=-1)
-        stats["graph_prob_prior_monitor_dual_pos_neg_js_divergence_mean"] = _as_float(js.mean())
-
-    if torch.is_tensor(mu_alpha) and torch.is_tensor(mu_beta):
-        alpha_dist = torch.cdist(mu_alpha.detach().float(), mu_alpha.detach().float(), p=2).pow(2)
-        alpha_sim = torch.exp(-alpha_dist / alpha_dist.detach().median().clamp_min(1e-12))
-        if t_alpha is not None and torch.is_tensor(t_alpha):
-            stats["graph_prob_prior_monitor_dual_alpha_relation_spearman_all"] = _spearman_corr(_offdiag_values(alpha_sim), _offdiag_values(t_alpha.detach().float()))
-        if p_pos is not None and torch.is_tensor(p_pos):
-            pos_mask = p_pos.detach() > 0.0
-            nonpos_mask = ~pos_mask
-            eye = torch.eye(pos_mask.shape[0], dtype=torch.bool, device=pos_mask.device)
-            nonpos_mask = nonpos_mask & ~eye
-            if bool(pos_mask.any().item()):
-                stats.update(tensor_stats("graph_prob_prior_monitor_dual_alpha_pos_similarity", alpha_sim[pos_mask]))
-            if bool(nonpos_mask.any().item()):
-                nonpos_mean = alpha_sim[nonpos_mask].mean()
-                stats["graph_prob_prior_monitor_dual_alpha_nonpos_similarity_mean"] = _as_float(nonpos_mean)
-                if bool(pos_mask.any().item()):
-                    stats["graph_prob_prior_monitor_dual_alpha_pos_nonpos_gap"] = _as_float(alpha_sim[pos_mask].mean() - nonpos_mean)
-
-        beta_dist = torch.cdist(mu_beta.detach().float(), mu_beta.detach().float(), p=2)
-        if logvar_beta is not None and torch.is_tensor(logvar_beta):
-            radius = logvar_beta.detach().float().exp().mean(dim=-1).clamp_min(1e-12).sqrt()
-        else:
-            radius = beta_dist.new_zeros(beta_dist.shape[0])
-        overlap_risk = beta_dist < (radius[:, None] + radius[None, :] + float(margin))
-        eye = torch.eye(beta_dist.shape[0], dtype=torch.bool, device=beta_dist.device)
-        stats["graph_prob_prior_monitor_dual_beta_all_overlap_risk_rate"] = _as_float(overlap_risk[~eye].float().mean())
-        if p_neg is not None and torch.is_tensor(p_neg):
-            neg_mask = p_neg.detach().to(device=beta_dist.device) > 0.0
-            if bool(neg_mask.any().item()):
-                hard_dist = beta_dist[neg_mask]
-                stats.update(tensor_stats("graph_prob_prior_monitor_dual_beta_hardneg_distance", hard_dist))
-                margin_value = beta_dist - radius[:, None] - radius[None, :] - float(margin)
-                stats.update(tensor_stats("graph_prob_prior_monitor_dual_beta_hardneg_margin", margin_value[neg_mask]))
-                stats["graph_prob_prior_monitor_dual_beta_hardneg_overlap_risk_rate"] = _as_float(overlap_risk[neg_mask].float().mean())
-        if p_pos is not None and p_neg is not None and torch.is_tensor(p_pos) and torch.is_tensor(p_neg):
-            pos_mask = p_pos.detach().to(device=beta_dist.device) > 0.0
-            neg_mask = p_neg.detach().to(device=beta_dist.device) > 0.0
-            if bool(pos_mask.any().item()) and bool(neg_mask.any().item()):
-                stats["graph_prob_prior_monitor_dual_beta_hardneg_suppression_gap"] = _as_float(beta_dist[neg_mask].mean() - beta_dist[pos_mask].mean())
-                alpha_high_beta_risk = pos_mask & overlap_risk
-                stats["graph_prob_prior_monitor_dual_alpha_beta_conflict_rate"] = _as_float(alpha_high_beta_risk.float().sum() / pos_mask.float().sum().clamp_min(1.0))
-                stats["graph_prob_prior_monitor_dual_alpha_high_beta_safe_rate"] = 1.0 - stats["graph_prob_prior_monitor_dual_alpha_beta_conflict_rate"]
-        if bank is not None and torch.is_tensor(bank) and bank.shape == mu_alpha.shape:
-            bank_n = F.normalize(bank.detach().float(), p=2, dim=-1, eps=1e-12)
-            alpha_n = F.normalize(mu_alpha.detach().float(), p=2, dim=-1, eps=1e-12)
-            cos = (alpha_n * bank_n).sum(dim=-1)
-            stats["graph_prob_prior_monitor_dual_alpha_bank_cosine_mean"] = _as_float(cos.mean())
-            stats["graph_prob_prior_monitor_dual_alpha_bank_drift_mean"] = _as_float((1.0 - cos).mean())
-        if bank is not None and torch.is_tensor(bank) and bank.shape == mu_beta.shape:
-            bank_n = F.normalize(bank.detach().float(), p=2, dim=-1, eps=1e-12)
-            beta_n = F.normalize(mu_beta.detach().float(), p=2, dim=-1, eps=1e-12)
-            cos = (beta_n * bank_n).sum(dim=-1)
-            stats["graph_prob_prior_monitor_dual_beta_bank_cosine_mean"] = _as_float(cos.mean())
-            stats["graph_prob_prior_monitor_dual_beta_bank_drift_mean"] = _as_float((1.0 - cos).mean())
-    return stats
-
-
 def loss_scale_monitor(
     main_loss: Optional[float] = None,
     graph_prob_prior_loss: Optional[float] = None,
-    alpha_loss: Optional[float] = None,
-    beta_lower_loss: Optional[float] = None,
-    beta_upper_loss: Optional[float] = None,
     loss_weight: float = 1.0,
-    alpha_weight: float = 1.0,
-    beta_lower_weight: float = 1.0,
-    beta_upper_weight: float = 0.0,
 ) -> Dict[str, float]:
-    """监测 GraphProbPrior 各子项乘权重后的尺度，以及它相对主分类 loss 的强度。"""
+    """监测 GraphProbPrior 乘权重后的尺度，以及它相对主分类 loss 的强度。"""
     stats: Dict[str, float] = {}
     eps = 1e-12
     if graph_prob_prior_loss is not None:
@@ -1295,14 +1370,6 @@ def loss_scale_monitor(
         stats["graph_prob_prior_monitor_loss_weighted_graph_prob_prior_loss"] = weighted
         if main_loss is not None:
             stats["graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio"] = weighted / max(abs(float(main_loss)), eps)
-    if alpha_loss is not None:
-        stats["graph_prob_prior_monitor_loss_weighted_alpha_loss"] = float(alpha_loss) * float(alpha_weight) * float(loss_weight)
-    if beta_lower_loss is not None:
-        stats["graph_prob_prior_monitor_loss_weighted_beta_lower_loss"] = float(beta_lower_loss) * float(beta_lower_weight) * float(loss_weight)
-    if beta_upper_loss is not None:
-        stats["graph_prob_prior_monitor_loss_weighted_beta_upper_loss"] = float(beta_upper_loss) * float(beta_upper_weight) * float(loss_weight)
-    if alpha_loss is not None and beta_lower_loss is not None:
-        stats["graph_prob_prior_monitor_loss_alpha_to_beta_lower_loss_ratio"] = float(alpha_loss) / max(abs(float(beta_lower_loss)), eps)
     return stats
 
 

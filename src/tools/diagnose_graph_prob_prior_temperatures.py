@@ -63,12 +63,9 @@ from train import _merge_local_path_cfg_if_exists, _sync_xlsa_protocol
 
 
 GRAPH_PROB_PRIOR_MODES = [
-    "true_class_kl",
     "graph_conditioned_semantic_prior",
-    "class_aggregate_moment",
     "class_aggregate_mmd",
     "factorized_latent",
-    "dual_metric_semantic_distribution",
 ]
 
 
@@ -134,7 +131,7 @@ def run_multiple_modes(args, modes: List[str]) -> None:
             "MODEL.GRAPH_PROB_PRIOR.MODE",
             mode,
         ]
-        if mode in {"factorized_latent", "dual_metric_semantic_distribution"}:
+        if mode == "factorized_latent":
             child_opts.extend([
                 "MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE",
                 "True",
@@ -357,7 +354,6 @@ def write_csv(path: Path, rows: List[Dict[str, float]]) -> None:
     rows 中每个 batch 可能拥有不同字段：
         例如 graph_conditioned_semantic_prior 有 TAU_LATENT 监测，
         class_aggregate_mmd 有 MMD kernel 监测，
-        true_class_kl 可能只有真类 KL 监测。
 
     因此这里先合并所有 row 的 key，再统一作为 CSV 表头。
     缺失的字段会在对应 batch 行里留空。
@@ -525,10 +521,8 @@ def main():
             "TAU_LATENT": float(cfg.MODEL.GRAPH_PROB_PRIOR.TAU_LATENT),
             "TAU_PRIOR": float(cfg.MODEL.GRAPH_PROB_PRIOR.TAU_PRIOR),
             "MMD_SIGMA": float(cfg.MODEL.GRAPH_PROB_PRIOR.MMD_SIGMA),
-            "DUAL_TAU_NEG": float(cfg.MODEL.GRAPH_PROB_PRIOR.DUAL_TAU_NEG),
-            "DUAL_NEG_TOPK": int(cfg.MODEL.GRAPH_PROB_PRIOR.DUAL_NEG_TOPK),
-            "TAU_ACC": float(cfg.MODEL.SEMANTIC_GRAPH.TAU_ACC),
-            "TARGET_MIX_ALPHA": float(cfg.MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA),
+            "TAU_ACC": float(cfg.MODEL.GRAPH_INPUT.TAU_ACC),
+            "TARGET_MIX_ALPHA": float(cfg.MODEL.GRAPH_INPUT.TARGET_MIX_ALPHA),
         },
         "csv_path": str(csv_path),
         "summary": summary,

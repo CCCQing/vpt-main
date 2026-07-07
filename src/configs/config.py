@@ -30,10 +30,9 @@ _C.MODEL.PROMPT.ENABLE = True
 _C.MODEL.PROMPT.BACKEND = "dynamic"   # dynamic / vpt_deep
 _C.MODEL.PROMPT.INIT_SOURCE = "learned"   # learned / distributor_mean
 _C.MODEL.PROMPT.NUM_TOKENS = 50
-_C.MODEL.PROMPT.DEEP = True
+_C.MODEL.PROMPT.DEEP = False
 _C.MODEL.PROMPT.DROPOUT = 0.0
 _C.MODEL.PROMPT.DEBUG_SHAPES = False
-_C.MODEL.PROMPT.EVOLVE_INIT_MODE = "identity"
 _C.MODEL.LOG_TRAINABLE = True
 
 _C.MODEL.PROMPT.DISTRIBUTOR = CfgNode()
@@ -104,42 +103,27 @@ _C.MODEL.CONSISTENCY.ENABLE = False
 _C.MODEL.CONSISTENCY.PROJ = "linear"
 _C.MODEL.CONSISTENCY.DIST = "cosine"
 
-_C.MODEL.SEMANTIC_GRAPH = CfgNode()
-_C.MODEL.SEMANTIC_GRAPH.ENABLE = False                  # 是否启用 prompt distribution 语义图辅助约束
-_C.MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH = "datasets/xlsa17/xlsa17/data/CUB/cub_attributes_sbert_all_mpnet_base_v2.pt" # 属性名文本 embedding 路径；默认与 ORTHO.TEXT_EMBED_PATH 指向同一缓存
-_C.MODEL.SEMANTIC_GRAPH.NUM_CLASSES = 200               # CUB 全局类别数；语义图 G 的尺寸为 [NUM_CLASSES, NUM_CLASSES]
-_C.MODEL.SEMANTIC_GRAPH.ATTR_DIM = 312                  # CUB 属性维度
-_C.MODEL.SEMANTIC_GRAPH.TEXT_DIM = 768                  # 属性名文本 embedding 维度，也对应 prompt mu 维度
-_C.MODEL.SEMANTIC_GRAPH.GRAPH_SOURCE = "fuse"           # 语义图来源：acc=属性置信图；acssc=属性文本语义图；fuse=rho 融合 acc / acssc / fuse
-_C.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_PATH = ""        # GRAPH_SOURCE=external 时读取的 [C,C] 语义关系矩阵文件；支持 .npz/.npy/.pt/.pth
-_C.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_KEY = "graph"    # .npz 或 dict 文件中的矩阵 key
-_C.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_SYMMETRIZE = True # 是否强制 external graph 对称化
-_C.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_CLAMP = True     # 是否把 external graph 截断到 [0,1]
-_C.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_DIAG_VALUE = 1.0 # external graph 对角线值；负数表示不改对角线
-_C.MODEL.SEMANTIC_GRAPH.RHO = 0.0                       # fuse 图中 Acc 的融合权重；G=rho*Acc+(1-rho)*Acssc
-_C.MODEL.SEMANTIC_GRAPH.TOPK = 16                       # 从 G[y] 中保留的语义相近类别数
-_C.MODEL.SEMANTIC_GRAPH.TAU_ACC = 0.07                  # 构造语义 target T_y 时的 softmax 温度
-_C.MODEL.SEMANTIC_GRAPH.TAU_SEM = 0.07                  # rel_kl 中 batch 语义关系 R_s 的 softmax 温度
-_C.MODEL.SEMANTIC_GRAPH.TAU_PROMPT = 0.07               # prompt 关系/原型 logits 的初始温度；若 PROMPT_SCALE_LEARNABLE=True，仅作为初始化
-_C.MODEL.SEMANTIC_GRAPH.PROMPT_SCALE_LEARNABLE = True   # 控制 prompt 关系相似度温度/尺度是否可学习 的开关；True 时 scale 初始为 1/TAU_PROMPT
-_C.MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE = "mu"        # semantic graph 约束使用的 prompt 统计量：mu / instance_mean
-_C.MODEL.SEMANTIC_GRAPH.TARGET_MIX_ALPHA = 0.1          # semantic target 与 one-hot 的混合比例；0=纯 one-hot，1=纯语义近邻分布
-_C.MODEL.SEMANTIC_GRAPH.LOSS_TYPE = "none"              # 候选：none / acc_hidden / rel_kl / rel_all / ot / gw / fgw
-_C.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT = 0.0               # 语义图辅助损失总权重；0 表示不参与训练
-_C.MODEL.SEMANTIC_GRAPH.OT_EPS = 0.05                   # Sinkhorn 熵正则系数；越大运输计划越平滑
-_C.MODEL.SEMANTIC_GRAPH.OT_ITERS = 20                   # Sinkhorn 迭代次数
-_C.MODEL.SEMANTIC_GRAPH.OT_PRIOR_ETA = 1.0              # FGW 中语义先验强度；作用于 prior_cost=M-eta*log(T+delta)
-_C.MODEL.SEMANTIC_GRAPH.OT_ALPHA = 0.5                  # FGW 中结构项权重；loss=(1-alpha)*node+alpha*gw
-_C.MODEL.SEMANTIC_GRAPH.OT_DELTA = 1e-8                 # OT/KL 概率归一化与 log 的数值稳定下界
-_C.MODEL.SEMANTIC_GRAPH.OT_BALANCED_MODE = "batch_semantic_mean" # OT 目标边界 b 的构造方式；当前支持 batch_semantic_mean
-_C.MODEL.SEMANTIC_GRAPH.OT_DETACH_PLAN = True           # 是否停止 Sinkhorn plan 的梯度；True 时只让 cost/GW 项回传到 mu
-_C.MODEL.SEMANTIC_GRAPH.DEBUG = False                   # 打印一次 A_conf/E_attr/G/T/OT plan 等调试形状
+_C.MODEL.GRAPH_INPUT = CfgNode()
+_C.MODEL.GRAPH_INPUT.ATTR_NAME_EMBED_PATH = "datasets/xlsa17/xlsa17/data/CUB/cub_attributes_sbert_all_mpnet_base_v2.pt" # 属性名文本 embedding 路径；默认与 ORTHO.TEXT_EMBED_PATH 指向同一缓存
+_C.MODEL.GRAPH_INPUT.NUM_CLASSES = 200               # CUB 全局类别数；类别关系图 G 的尺寸为 [NUM_CLASSES, NUM_CLASSES]
+_C.MODEL.GRAPH_INPUT.ATTR_DIM = 312                  # CUB 属性维度
+_C.MODEL.GRAPH_INPUT.TEXT_DIM = 768                  # 属性名文本 embedding 维度，也对应 prompt latent 维度
+_C.MODEL.GRAPH_INPUT.GRAPH_SOURCE = "fuse"           # 图来源：acc/acssc/fuse；或外部矩阵 key，如 method1_diff/method2_diff/method3_diff；external 兼容读取 key=graph
+_C.MODEL.GRAPH_INPUT.EXTERNAL_GRAPH_PATH = ""        # GRAPH_SOURCE 指向外部 key 时读取的 [C,C] 类别关系矩阵文件；支持 .npz/.npy/.pt/.pth
+_C.MODEL.GRAPH_INPUT.EXTERNAL_GRAPH_SYMMETRIZE = True # 是否强制 external graph 对称化
+_C.MODEL.GRAPH_INPUT.EXTERNAL_GRAPH_CLAMP = True     # 是否把 external graph 截断到 [0,1]
+_C.MODEL.GRAPH_INPUT.EXTERNAL_GRAPH_DIAG_VALUE = 1.0 # external graph 对角线值；负数表示不改对角线
+_C.MODEL.GRAPH_INPUT.RHO = 0.0                       # fuse 图中 Acc 的融合权重；G=rho*Acc+(1-rho)*Acssc
+_C.MODEL.GRAPH_INPUT.TOPK = 16                       # 从 G[y] 中保留的语义相近类别数
+_C.MODEL.GRAPH_INPUT.TAU_ACC = 0.07                  # 构造语义 target T_y 时的 softmax 温度
+_C.MODEL.GRAPH_INPUT.TARGET_MIX_ALPHA = 0.1          # semantic target 与 one-hot 的混合比例；0=纯 one-hot，1=纯语义近邻分布
+_C.MODEL.GRAPH_INPUT.EPS = 1e-8                      # GraphProbPrior 概率归一化与 log 的数值稳定下界
 
 _C.MODEL.GRAPH_PROB_PRIOR = CfgNode()
-_C.MODEL.GRAPH_PROB_PRIOR.ENABLE = True                # 是否启用 GraphProbPrior；默认关闭，不影响标准 Prompt KL 和旧 semantic graph loss
-_C.MODEL.GRAPH_PROB_PRIOR.MODE = "graph_conditioned_semantic_prior" # 候选：true_class_kl / graph_conditioned_semantic_prior / class_aggregate_moment / class_aggregate_mmd / factorized_latent / dual_metric_semantic_distribution
+_C.MODEL.GRAPH_PROB_PRIOR.ENABLE = True                # 是否启用 GraphProbPrior；可单独替代标准 Prompt KL
+_C.MODEL.GRAPH_PROB_PRIOR.MODE = "graph_conditioned_semantic_prior" # 候选：graph_conditioned_semantic_prior / class_aggregate_mmd / factorized_latent
 _C.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT = 0.001             # GraphProbPrior 辅助损失权重；用于替代标准 N(0,I) KL 时单独开启
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_MEAN_MODE = "residual_anchor" # prior mean 构造方式：learned=旧 prior_head；residual_anchor=312维属性残差锚点+小修正
+_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_MEAN_MODE = "residual_anchor" # prior mean 构造方式：learned=旧 prior_head；residual_anchor=312维属性残差锚点+小修正；graph_gp_conditioned=用 support-seen 视觉中心经 Graph-GP 条件推断全类 prototype
 _C.MODEL.GRAPH_PROB_PRIOR.PRIOR_VAR_MODE = "unit"       # prior 方差策略：learned=MLP预测；unit=logvar=0；constant=固定 PRIOR_LOGVAR_CONST
 _C.MODEL.GRAPH_PROB_PRIOR.PRIOR_LOGVAR_CONST = 0.0      # PRIOR_VAR_MODE=constant 时使用的固定 logvar
 _C.MODEL.GRAPH_PROB_PRIOR.RESIDUAL_SIGMA_MIN = 0.05     # 312维属性残差标准化时的 std 下界，防止低方差属性被放大
@@ -153,6 +137,22 @@ _C.MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE = False
 _C.MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE_MIN = 0.0
 _C.MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE_MAX = 0.8
 _C.MODEL.GRAPH_PROB_PRIOR.PRIOR_RADIUS_MODE = "residual_norm" # fixed=所有类别同半径；residual_norm=属性残差越大，类别 prior 半径越大
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_SUPPORT_RATIO = 0.8  # graph_gp_conditioned 中 seen 类划为 support-seen 的比例；剩余 seen 类作为 pseudo-unseen 诊断外推能力
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_SPLIT_EVERY_EPOCH = 1 # 每多少个 epoch 重新划分一次 support-seen / pseudo-unseen；1 表示每个 epoch 换一次
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_SPLIT_SEED = 2027    # Graph-GP 类别 split 的随机种子；保证 support/pseudo 划分可复现
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_CENTER_SOURCE = "posterior_mu" # Graph-GP 视觉中心来源；第一版只支持 posterior_mu，保证和 KL 对齐空间一致
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_DETACH_CENTERS = True # 统计 V_support 时截断 posterior_mu 梯度，避免 prior target 和 posterior 相互追逐
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_OBS_NOISE_MODE = "class_var_over_count" # R_s 观测噪声：constant / class_var_over_count
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_OBS_NOISE_CONST = 0.05 # constant 模式下每个 support center 的观测噪声标量
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_OBS_NOISE_MIN = 1e-4 # R_s 下界；防止 K_ss + R_s 对角线过小导致 solve 不稳定
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_OBS_NOISE_MAX = 1.0  # R_s 上界；防止某些类被过大噪声完全忽略
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_RIDGE = 1e-4         # 加到 K_ss + R_s 对角线上的数值稳定项；只服务线性方程求解
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_KERNEL_SYMMETRIZE = True # 条件推断前是否对 graph kernel 做对称化
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_KERNEL_CLAMP = True  # 条件推断前是否把 graph kernel 裁到非负，避免负边直接进入协方差
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_KERNEL_NORMALIZE = "diag" # Graph-GP kernel 归一化：diag 让对角线尺度接近 1；none 保留原始尺度
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_SOURCE = "unit" # Graph-GP prior_logvar 来源；第一版只建议 unit / constant / current_prior_var_mode
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_USE_PSEUDO_UNSEEN = True # 训练期是否在 seen 类内部划 pseudo-unseen，用来模拟 ZSL 外推
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_MATCH_DETACH_PRIOR = True # posterior 对齐 M_star 时是否 detach；第一版应保持 True
 _C.MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH = 0.07              # 用 G[c] 构造 graph top-k context / 旧 neighbor_bank 时的 softmax 温度
 _C.MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_GRAPH = False
 _C.MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH_MIN = 0.02
@@ -163,23 +163,10 @@ _C.MODEL.GRAPH_PROB_PRIOR.TAU_LATENT_MIN = 0.01
 _C.MODEL.GRAPH_PROB_PRIOR.TAU_LATENT_MAX = 0.30
 _C.MODEL.GRAPH_PROB_PRIOR.REL_WEIGHT = 0.0              # class_aggregate_* 专用全类 prior 关系正则权重；0 表示关闭
 _C.MODEL.GRAPH_PROB_PRIOR.TAU_PRIOR = 0.07              # prior Gaussian symKL 关系分布 softmax 温度，仅 REL_WEIGHT>0 时生效
-_C.MODEL.GRAPH_PROB_PRIOR.MOMENT_VAR_WEIGHT = 1.0       # class_aggregate_moment 中 log-variance matching 项权重
 _C.MODEL.GRAPH_PROB_PRIOR.MMD_SAMPLES = 1               # class_aggregate_mmd 中每个 posterior/prior 高斯采样次数
 _C.MODEL.GRAPH_PROB_PRIOR.MMD_SIGMA = 1.0               # class_aggregate_mmd 的 RBF kernel sigma
 _C.MODEL.GRAPH_PROB_PRIOR.FACTORIZED_VARIATION_WEIGHT = 0.0 # factorized_latent 中 variation aggregate matching 权重；第一版默认关闭
 _C.MODEL.GRAPH_PROB_PRIOR.FACTORIZED_DECOUPLE_WEIGHT = 0.0  # factorized_latent 中 semantic/variation 去相关权重；0 表示不启用
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_NEG_TOPK = 16            # dual_metric 中每个类别选多少个 hard negative 类；不包含自身类
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_TAU_NEG = 0.10           # dual_metric 中 hard negative 图行 softmax 温度；越小越集中到高风险负类
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_ALPHA_WEIGHT = 1.0       # dual_metric 中 alpha/context 分布对齐项权重
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_BETA_LOWER_WEIGHT = 1.0  # dual_metric 中 beta hard-negative 下界间隔项权重
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_BETA_UPPER_WEIGHT = 0.0  # dual_metric 中 beta context 弱上界项权重；第一版默认关闭
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_MARGIN_BASE = 1.0        # dual_metric beta 下界基础间隔 m0
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_MARGIN_RISK_WEIGHT = 1.0 # dual_metric beta 下界风险加权 m1，margin=m0+m1*R_minus
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_UPPER_BASE = 2.0         # dual_metric beta context 弱上界基础值 u0
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_UPPER_CONTEXT_WEIGHT = 1.0 # dual_metric beta context 弱上界语义调制 u1
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_PRIOR_VAR_MODE = "unit"  # dual_metric 先验方差策略；当前只允许 unit，即 prior logvar 固定为 0
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_ALPHA_DELTA_SCALE = 0.1  # dual alpha prior 的 residual-anchor 小修正强度
-_C.MODEL.GRAPH_PROB_PRIOR.DUAL_BETA_DELTA_SCALE = 0.1   # dual beta prior 的 residual-anchor 小修正强度
 _C.MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_ENABLE = False      # 是否启用 prior_mu 几何校准正则；默认关闭
 _C.MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE = "soft_distribution_matching" # soft_distribution_matching / graph_ordinal_ranking
 _C.MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT = 1e-4       # geometry loss 加到 GraphProbPrior 内部的权重
@@ -223,20 +210,6 @@ _C.MODEL.AFFINITY = CfgNode()
 _C.MODEL.AFFINITY.ENABLE = False
 _C.MODEL.AFFINITY.DETACH = True
 _C.MODEL.AFFINITY.VIS = True
-
-_C.MODEL.AFFINITY_EVOLUTION = CfgNode()
-_C.MODEL.AFFINITY_EVOLUTION.ENABLE = False
-_C.MODEL.AFFINITY_EVOLUTION.PROMPT_ENABLE = True
-_C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_ENABLE = True
-_C.MODEL.AFFINITY_EVOLUTION.PROMPT_TARGET = "QpQv"      # QpKv / QpQv / KpKv
-_C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_TARGET = "QpKv"    # QpKv / QpQv / KpKv
-_C.MODEL.AFFINITY_EVOLUTION.PROMPT_LAMBDA = 0.0     # teacher correction 强度，范围 [0, 1]
-_C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_LAMBDA = 0.0   # teacher correction 强度，范围 [0, 1]
-_C.MODEL.AFFINITY_EVOLUTION.PROMPT_GAMMA_INIT = 0.0
-_C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_GAMMA_INIT = 0.0
-_C.MODEL.AFFINITY_EVOLUTION.PROMPT_DETACH = "none"       # mediated / direct / none；非 none 时表示 teacher 选择
-_C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_DETACH = "none"     # via_prompt / direct / none；非 none 时表示 teacher 选择
-_C.MODEL.AFFINITY_EVOLUTION.SEMANTIC_COMPOSE = "prob"    # prob / raw_then_norm
 
 _C.MODEL.ATTENTION_MEDIATION = CfgNode()
 # ATTENTION_MEDIATION 是新增的 block 内 mediated attention correction 分支。
@@ -282,8 +255,6 @@ _C.SOLVER.LOSS_CM_WEIGHT = 0.05
 _C.SOLVER.LOSS_VSPCN_AR_WEIGHT = 0.0005
 _C.SOLVER.LOSS_SEM_MED_WEIGHT = 0.0
 _C.SOLVER.LOSS_SPV_WEIGHT = 0.0
-_C.SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT = 0.0
-_C.SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT = 0.0
 _C.SOLVER.LOSS_ATTR_WEIGHT = 0.0
 _C.SOLVER.LOSS_PROMPT_KL_WEIGHT = 0.0              # prompt distribution KL 权重；只约束 instance prompt 的 mu/logvar
 
@@ -301,12 +272,6 @@ _C.SOLVER.SPV.METRIC = "kl"                       # mse / kl / cosine
 _C.SOLVER.SPV.NORM = "softmax"                    # "none"raw affinity 直接相乘
 _C.SOLVER.SPV.DETACH = "none"                     # mediated / direct / none
 _C.SOLVER.SPV.LAYERS = []                         # empty means all shared layers
-
-_C.SOLVER.ROUTE_TS = CfgNode()
-_C.SOLVER.ROUTE_TS.PROMPT_ENABLE = True           # 对 prompt evolution 的 student/teacher route 做显式对齐
-_C.SOLVER.ROUTE_TS.SEMANTIC_ENABLE = True         # 对 semantic evolution 的 student/teacher route 做显式对齐
-_C.SOLVER.ROUTE_TS.METRIC = "kl"                  # mse / kl / cosine
-_C.SOLVER.ROUTE_TS.LAYERS = []                    # empty means all shared layers
 
 _C.SOLVER.ATTR = CfgNode()
 _C.SOLVER.ATTR.METRIC = "mse"                     # 第一版只支持 mse：约束 ViT 交互后的 decoded attributes 接近真实类别属性

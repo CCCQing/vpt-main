@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 
 import torch
 import torch.nn as nn
@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 from ..models.prompting.prompt_distribution import prompt_kl_loss
 from .graph_prob_prior_monitors import loss_scale_monitor
-from .semantic_graph_losses import GraphProbPriorLossComputer, SemanticGraphLossComputer
+from .semantic_graph_losses import GraphProbPriorLossComputer
 
 
 def _extract_logits_and_aux(pred_logits: Any, kwargs: Optional[Dict[str, Any]]):
@@ -370,155 +370,6 @@ def _compute_semantic_prompt_visual_cycle_loss(aux: Optional[Dict[str, Any]], cf
     return torch.stack(layer_losses).mean()
 
 
-def _compute_route_teacher_student_loss(aux: Optional[Dict[str, Any]], cfg, route_side: str) -> torch.Tensor:
-    """
-    轻量 route teacher-student 对齐损失。
-
-    该损失只约束当前 AFFINITY_EVOLUTION 实际使用的 teacher/student 路径：
-    - prompt: direct(Apv) 与 mediated(QsKp^T @ QsKv)
-    - semantic: direct(QsKv) 与 via_prompt(QsKp @ Apv)
-    """
-    if not isinstance(aux, Dict):
-        raise RuntimeError("Route teacher-student loss requires affinity aux dict.")
-    if not bool(cfg.MODEL.AFFINITY_EVOLUTION.ENABLE):
-        raise RuntimeError("Route teacher-student loss requires MODEL.AFFINITY_EVOLUTION.ENABLE=True.")
-    if route_side not in {"prompt", "semantic"}:
-        raise ValueError(f"Unsupported route teacher-student side='{route_side}'. Expected prompt / semantic.")
-
-    prompt_enable = route_side == "prompt"
-    semantic_enable = route_side == "semantic"
-    if prompt_enable and not bool(cfg.SOLVER.ROUTE_TS.PROMPT_ENABLE):
-        raise ValueError("SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT > 0 requires SOLVER.ROUTE_TS.PROMPT_ENABLE=True.")
-    if semantic_enable and not bool(cfg.SOLVER.ROUTE_TS.SEMANTIC_ENABLE):
-        raise ValueError("SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT > 0 requires SOLVER.ROUTE_TS.SEMANTIC_ENABLE=True.")
-
-    target_map = {
-        "QpKv": "aff_qpkv",
-        "QpQv": "aff_qpqv",
-        "KpKv": "aff_kpkv",
-    }
-    prompt_target = str(cfg.MODEL.AFFINITY_EVOLUTION.PROMPT_TARGET)
-    semantic_target = str(cfg.MODEL.AFFINITY_EVOLUTION.SEMANTIC_TARGET)
-
-    prompt_detach = str(cfg.MODEL.AFFINITY_EVOLUTION.PROMPT_DETACH).lower()
-    semantic_detach = str(cfg.MODEL.AFFINITY_EVOLUTION.SEMANTIC_DETACH).lower()
-    compose_mode = str(cfg.MODEL.AFFINITY_EVOLUTION.SEMANTIC_COMPOSE).lower()
-    if prompt_enable and prompt_detach not in {"mediated", "direct"}:
-        raise ValueError("SOLVER.ROUTE_TS prompt loss requires AFFINITY_EVOLUTION.PROMPT_DETACH to be mediated or direct.")
-    if semantic_enable and semantic_detach not in {"via_prompt", "direct"}:
-        raise ValueError("SOLVER.ROUTE_TS semantic loss requires AFFINITY_EVOLUTION.SEMANTIC_DETACH to be via_prompt or direct.")
-    if semantic_enable and compose_mode not in {"prob", "raw_then_norm"}:
-        raise ValueError(f"Unsupported MODEL.AFFINITY_EVOLUTION.SEMANTIC_COMPOSE='{compose_mode}'. Expected prob / raw_then_norm.")
-
-    required_keys = {"aff_qskp", "aff_qskv"}
-    if prompt_enable:
-        required_keys.add(target_map[prompt_target])
-    if semantic_enable:
-        required_keys.add(target_map[semantic_target])
-    missing = [k for k in sorted(required_keys) if k not in aux or not isinstance(aux[k], Dict)]
-    if missing:
-        raise RuntimeError(f"Route teacher-student loss missing aux keys: {missing}.")
-
-    layer_sets = [set(aux[k].keys()) for k in sorted(required_keys)]
-    shared_layers = sorted(set.intersection(*layer_sets))
-    requested_layers = list(cfg.SOLVER.ROUTE_TS.LAYERS)
-    if requested_layers:
-        requested_layers = [int(x) for x in requested_layers]
-        shared_layers = [x for x in shared_layers if x in requested_layers]
-    if not shared_layers:
-        raise RuntimeError("Route teacher-student loss found no shared layers.")
-
-    metric = str(cfg.SOLVER.ROUTE_TS.METRIC).lower()
-    route_losses = []
-    for layer_idx in shared_layers:
-        qskp = aux["aff_qskp"][layer_idx]
-        qskv = aux["aff_qskv"][layer_idx]
-        if qskp.dim() != 3 or qskv.dim() != 3:
-            raise RuntimeError(
-                "Route teacher-student loss expects QsKp/QsKv shapes [B,S,P]/[B,S,V], got {}, {} at layer {}.".format(
-                    tuple(qskp.shape),
-                    tuple(qskv.shape),
-                    int(layer_idx),
-                )
-            )
-        if qskp.shape[0] != qskv.shape[0] or qskp.shape[1] != qskv.shape[1]:
-            raise RuntimeError(f"Route teacher-student QsKp/QsKv shape mismatch at layer {layer_idx}.")
-
-        if prompt_enable:
-            apv_prompt = aux[target_map[prompt_target]][layer_idx]
-            if apv_prompt.dim() != 3:
-                raise RuntimeError(f"Route teacher-student prompt target must be [B,P,V] at layer {layer_idx}, got {tuple(apv_prompt.shape)}.")
-            if qskp.shape[0] != apv_prompt.shape[0] or qskp.shape[2] != apv_prompt.shape[1] or qskv.shape[2] != apv_prompt.shape[2]:
-                raise RuntimeError(
-                    "Route teacher-student prompt shape mismatch at layer {}: QsKp={}, QsKv={}, Apv={}.".format(
-                        int(layer_idx),
-                        tuple(qskp.shape),
-                        tuple(qskv.shape),
-                        tuple(apv_prompt.shape),
-                    )
-                )
-            mediated_prompt = _normalize_affinity_for_aux_loss(
-                torch.bmm(qskp.transpose(1, 2), qskv),
-                "softmax",
-                "SOLVER.ROUTE_TS",
-            )
-            direct_prompt = _normalize_affinity_for_aux_loss(apv_prompt, "softmax", "SOLVER.ROUTE_TS")
-            if prompt_detach == "mediated":
-                student_prompt, teacher_prompt = direct_prompt, mediated_prompt
-            else:
-                student_prompt, teacher_prompt = mediated_prompt, direct_prompt
-            # teacher 路径 stopgrad，只让 student 承担显式对齐梯度。
-            route_losses.append(
-                _semantic_mediated_distance(
-                    student_prompt,
-                    teacher_prompt.detach(),
-                    metric,
-                    "SOLVER.ROUTE_TS.METRIC",
-                )
-            )
-
-        if semantic_enable:
-            apv_semantic = aux[target_map[semantic_target]][layer_idx]
-            if apv_semantic.dim() != 3:
-                raise RuntimeError(f"Route teacher-student semantic target must be [B,P,V] at layer {layer_idx}, got {tuple(apv_semantic.shape)}.")
-            if qskp.shape[0] != apv_semantic.shape[0] or qskp.shape[2] != apv_semantic.shape[1] or qskv.shape[2] != apv_semantic.shape[2]:
-                raise RuntimeError(
-                    "Route teacher-student semantic shape mismatch at layer {}: QsKp={}, QsKv={}, Apv={}.".format(
-                        int(layer_idx),
-                        tuple(qskp.shape),
-                        tuple(qskv.shape),
-                        tuple(apv_semantic.shape),
-                    )
-                )
-            if compose_mode == "prob":
-                via_prompt = torch.bmm(
-                    _normalize_affinity_for_aux_loss(qskp, "softmax", "SOLVER.ROUTE_TS"),
-                    _normalize_affinity_for_aux_loss(apv_semantic, "softmax", "SOLVER.ROUTE_TS"),
-                )
-            else:
-                via_prompt = _normalize_affinity_for_aux_loss(
-                    torch.bmm(qskp, apv_semantic),
-                    "softmax",
-                    "SOLVER.ROUTE_TS",
-                )
-            direct_semantic = _normalize_affinity_for_aux_loss(qskv, "softmax", "SOLVER.ROUTE_TS")
-            if semantic_detach == "via_prompt":
-                student_semantic, teacher_semantic = direct_semantic, via_prompt
-            else:
-                student_semantic, teacher_semantic = via_prompt, direct_semantic
-            # teacher 路径 stopgrad，只让 student 承担显式对齐梯度。
-            route_losses.append(
-                _semantic_mediated_distance(
-                    student_semantic,
-                    teacher_semantic.detach(),
-                    metric,
-                    "SOLVER.ROUTE_TS.METRIC",
-                )
-            )
-
-    return torch.stack(route_losses).mean()
-
-
 def _compute_attribute_reconstruction_loss(kwargs: Optional[Dict[str, Any]], cfg) -> torch.Tensor:
     """
     语义属性重建损失 L_attr。
@@ -834,58 +685,6 @@ class SemanticPromptVisualCycleAuxLoss(nn.Module):
         return _compute_semantic_prompt_visual_cycle_loss(aux, self.cfg)
 
 
-class RouteTeacherStudentPromptAuxLoss(nn.Module):
-    """
-    prompt evolution route 的轻量 teacher-student 对齐损失。
-
-    它复用 MODEL.AFFINITY_EVOLUTION 的 route 来源配置，
-    只对 prompt route 额外提供显式对齐梯度。
-    """
-    def __init__(self, cfg=None):
-        """读取 prompt route teacher-student loss 的权重和开关。"""
-        super().__init__()
-        self.name = "route_ts_prompt_loss"
-        self.requires_affinity_aux = True
-        self.route_ts_prompt_weight = float(cfg.SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT)
-        self.cfg = cfg
-
-    @property
-    def weight(self) -> float:
-        """返回当前辅助损失权重，供 CompositeLoss 判断是否启用。"""
-        return self.route_ts_prompt_weight
-
-    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
-        """从模型输出中取 aux，并计算 prompt route teacher-student loss。"""
-        _, aux = _extract_logits_and_aux(pred_logits, kwargs)
-        return _compute_route_teacher_student_loss(aux, self.cfg, "prompt")
-
-
-class RouteTeacherStudentSemanticAuxLoss(nn.Module):
-    """
-    semantic evolution route 的轻量 teacher-student 对齐损失。
-
-    它复用 MODEL.AFFINITY_EVOLUTION 的 route 来源配置，
-    只对 semantic route 额外提供显式对齐梯度。
-    """
-    def __init__(self, cfg=None):
-        """读取 semantic route teacher-student loss 的权重和开关。"""
-        super().__init__()
-        self.name = "route_ts_semantic_loss"
-        self.requires_affinity_aux = True
-        self.route_ts_semantic_weight = float(cfg.SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT)
-        self.cfg = cfg
-
-    @property
-    def weight(self) -> float:
-        """返回当前辅助损失权重，供 CompositeLoss 判断是否启用。"""
-        return self.route_ts_semantic_weight
-
-    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
-        """从模型输出中取 aux，并计算 semantic route teacher-student loss。"""
-        _, aux = _extract_logits_and_aux(pred_logits, kwargs)
-        return _compute_route_teacher_student_loss(aux, self.cfg, "semantic")
-
-
 class AttributeReconstructionAuxLoss(nn.Module):
     """
     ViT 交互后语义属性重建辅助损失。
@@ -963,70 +762,6 @@ class PromptKLAuxLoss(nn.Module):
         return _compute_prompt_kl_aux_loss(kwargs)
 
 
-class SemanticGraphAuxLoss(nn.Module):
-    """
-    prompt distribution 统计量的语义图辅助损失。
-
-    该损失不依赖 affinity aux，而是读取:
-    - model runtime stats 中由 MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE 指定的 prompt 表示；
-    - trainer 传入的 targets_global；
-    - dataset.class_attributes；
-    - trainer 或 dataset 显式传入的 attr_name_embeddings。
-    """
-
-    def __init__(self, cfg=None):
-        super().__init__()
-        self.name = "semantic_graph_loss"
-        self.requires_affinity_aux = False
-        self.graph_weight = float(cfg.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT)
-        self.prompt_stat_source = str(cfg.MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE)
-        if self.prompt_stat_source not in ("mu", "instance_mean"):
-            raise ValueError("MODEL.SEMANTIC_GRAPH.PROMPT_STAT_SOURCE must be mu / instance_mean.")
-        self.computer = SemanticGraphLossComputer(cfg)
-
-    @property
-    def weight(self) -> float:
-        return self.graph_weight
-
-    def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
-        if not isinstance(kwargs, Dict):
-            raise RuntimeError("Semantic graph loss requires loss kwargs.")
-        if "model" not in kwargs:
-            raise RuntimeError("Semantic graph loss requires kwargs['model'].")
-        if "targets_global" not in kwargs:
-            raise RuntimeError("Semantic graph loss requires kwargs['targets_global'].")
-
-        model = kwargs["model"]
-        if not hasattr(model, "get_runtime_prompt_distribution_stats"):
-            raise RuntimeError("Semantic graph loss requires model.get_runtime_prompt_distribution_stats().")
-        stats = model.get_runtime_prompt_distribution_stats()
-        if not isinstance(stats, Dict):
-            raise RuntimeError("Semantic graph loss requires runtime prompt distribution stats dict.")
-        if self.prompt_stat_source == "mu":
-            if "mu" not in stats:
-                raise RuntimeError("Semantic graph loss with PROMPT_STAT_SOURCE=mu requires stats['mu'].")
-            prompt_stat = stats["mu"]
-        else:
-            if "instance_prompt" not in stats:
-                raise RuntimeError(
-                    "Semantic graph loss with PROMPT_STAT_SOURCE=instance_mean requires stats['instance_prompt']."
-                )
-            instance_prompt = stats["instance_prompt"]
-            if instance_prompt.dim() != 3:
-                raise RuntimeError("stats['instance_prompt'] must be [B, instance_tokens, D].")
-            # instance_mean 让 semantic graph 直接约束实际采样后的 instance prompts 均值。
-            prompt_stat = instance_prompt.mean(dim=1)
-
-        # class_attributes 必须由 trainer 从 dataset.class_attributes 传入；
-        # attr_name_embeddings 必须由 trainer 或 dataset 显式传入，loss 内部不读路径。
-        return self.computer(
-            mu=prompt_stat,
-            targets_global=kwargs["targets_global"],
-            class_attributes=kwargs.get("class_attributes", None),
-            attr_name_embeddings=kwargs.get("attr_name_embeddings", None),
-        )
-
-
 class GraphProbPriorAuxLoss(nn.Module):
     """
     GraphProbPrior 辅助损失。
@@ -1034,14 +769,10 @@ class GraphProbPriorAuxLoss(nn.Module):
     该分支不替换 PromptKLAuxLoss 的代码，而是作为独立 aux loss 接入：
     - posterior: prompt distributor runtime stats 中的 mu/logvar；
     - prior: 由 semantic graph 的 A_conf/E_attr/G 生成 all-class Gaussian prior；
-    - true_class_kl: 每个样本只对齐自己的真类 graph-conditioned prior；
     - graph_conditioned_semantic_prior: 用 T_i 监督逐样本 latent matching；
-    - class_aggregate_moment / class_aggregate_mmd: 对 batch 内同类 posterior 聚合后做分布匹配。
+    - class_aggregate_mmd: 对 batch 内同类 posterior 聚合后做 MMD 分布匹配。
     - factorized_latent: 只让 semantic factor 接受 semantic graph prior matching，
       variation factor 默认不做逐样本 KL。
-    - dual_metric_semantic_distribution: 把 factorized 的 semantic/variation 两段分别作为
-      alpha context posterior 和 beta separation posterior；该模式强制要求 factorized stats，
-      不使用完整 768 维 posterior 做兜底。
 
     因此它可以单独开启，用来替代标准 N(0,I) KL；也可以和标准 KL 同时开启，
     但同时开启时训练目标会变成“双 prior 约束”。
@@ -1087,6 +818,22 @@ class GraphProbPriorAuxLoss(nn.Module):
         # CompositeLoss 统一通过 aux_loss.weight 判断是否启用并决定外层加权。
         return self.graph_prob_prior_weight
 
+    @staticmethod
+    def _zero_loss_like(pred_logits, targets):
+        if torch.is_tensor(pred_logits):
+            return pred_logits.new_zeros(())
+        if isinstance(pred_logits, (list, tuple)):
+            for item in pred_logits:
+                if torch.is_tensor(item):
+                    return item.new_zeros(())
+        if isinstance(pred_logits, dict):
+            for item in pred_logits.values():
+                if torch.is_tensor(item):
+                    return item.new_zeros(())
+        if torch.is_tensor(targets):
+            return torch.zeros((), device=targets.device, dtype=torch.float32)
+        return torch.tensor(0.0)
+
     def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):
         # pred_logits / targets / per_cls_weights 是 CompositeLoss 的统一接口参数。
         # GraphProbPrior 自己不直接使用分类 logits，也不使用 remap 后的 local targets；
@@ -1117,14 +864,14 @@ class GraphProbPriorAuxLoss(nn.Module):
         if not isinstance(stats, dict):
             raise RuntimeError("GraphProbPrior loss requires runtime prompt distribution stats dict.")
 
-        factorized_stats_modes = {"factorized_latent", "dual_metric_semantic_distribution"}
-        if self.mode in factorized_stats_modes:
-            # factorized_latent 和 dual_metric_semantic_distribution 都不把完整 768 维 posterior
-            # 当作 GraphProbPrior 的直接训练对象，而是强制使用 distributor 切出来的两段：
-            #   semantic_mu/logvar  -> factorized_latent 的 semantic factor；
-            #                      -> dual_metric 的 alpha/context posterior；
-            #   variation_mu/logvar -> factorized_latent 的 variation factor；
-            #                      -> dual_metric 的 beta/separation posterior。
+        is_train = bool(kwargs.get("is_train", self.training))
+        if (not is_train) and self.computer.prior_mean_mode == "graph_gp_conditioned":
+            self._last_loss_stats = {"graph_prob_prior_eval_skipped": 1.0}
+            return self._zero_loss_like(pred_logits, targets)
+
+        if self.mode == "factorized_latent":
+            # factorized_latent 不把完整 768 维 posterior 当作 GraphProbPrior 的直接训练对象，
+            # 而是强制使用 distributor 切出来的 semantic/variation 两段。
             # 这里故意不做“缺了 factorized stats 就回退 stats['mu']”的保底设计；
             # 如果配置没开 FACTORIZED_ENABLE，就让错误尽早暴露。
             required_keys = (
@@ -1143,8 +890,7 @@ class GraphProbPriorAuxLoss(nn.Module):
                 )
 
             # 传给 computer 的 posterior_mu/logvar 固定是 semantic/alpha factor；
-            # variation_mu/logvar 固定额外传入，factorized_latent 用它做可选正则，
-            # dual_metric_semantic_distribution 用它构造 beta separation loss。
+            # variation_mu/logvar 固定额外传入，factorized_latent 用它做可选正则。
             loss = self.computer(
                 posterior_mu=stats["semantic_mu"],
                 posterior_logvar=stats["semantic_logvar"],
@@ -1155,12 +901,14 @@ class GraphProbPriorAuxLoss(nn.Module):
                 variation_logvar=stats["variation_logvar"],
                 seen_class_ids=kwargs.get("seen_class_ids", None),
                 unseen_class_ids=kwargs.get("unseen_class_ids", None),
+                # Graph-GP prior generator 需要 epoch 来稳定划分 support/pseudo 类；
+                # is_train 用于禁止评测阶段误触发训练期 center buffer 更新。
+                epoch=kwargs.get("epoch", None),
+                is_train=is_train,
             )
         else:
             # 非 factorized mode 使用完整 posterior：
-            #   true_class_kl: 逐样本 q(z|x) 只和对应真类 prior 做 KL；
             #   graph_conditioned_semantic_prior: 逐样本 q(z|x) 到 all-class prior 的 KL matching；
-            #   class_aggregate_moment: batch 内同类 posterior 聚合后做 moment matching；
             #   class_aggregate_mmd: batch 内同类 posterior 聚合后做 RBF-MMD matching。
             if "mu" not in stats or "logvar" not in stats:
                 raise RuntimeError("GraphProbPrior loss requires stats['mu'] and stats['logvar'].")
@@ -1172,6 +920,10 @@ class GraphProbPriorAuxLoss(nn.Module):
                 attr_name_embeddings=kwargs["attr_name_embeddings"],
                 seen_class_ids=kwargs.get("seen_class_ids", None),
                 unseen_class_ids=kwargs.get("unseen_class_ids", None),
+                # Graph-GP prior generator 需要 epoch 来稳定划分 support/pseudo 类；
+                # is_train 用于禁止评测阶段误触发训练期 center buffer 更新。
+                epoch=kwargs.get("epoch", None),
+                is_train=is_train,
             )
 
         # GraphProbPriorLossComputer 内部会记录细粒度指标，例如 match_loss、entropy、
@@ -1218,18 +970,11 @@ class CompositeLoss(nn.Module):
             stats[aux_loss.name] = float(aux_value.detach().item())
             if isinstance(aux_loss, GraphProbPriorAuxLoss):
                 stats.update(aux_loss._last_loss_stats)
-                prior_cfg = aux_loss.cfg.MODEL.GRAPH_PROB_PRIOR
                 stats.update(
                     loss_scale_monitor(
                         main_loss=main_loss_value,
                         graph_prob_prior_loss=float(aux_value.detach().item()),
-                        alpha_loss=aux_loss._last_loss_stats.get("graph_prob_prior_dual_alpha_loss"),
-                        beta_lower_loss=aux_loss._last_loss_stats.get("graph_prob_prior_dual_beta_lower_loss"),
-                        beta_upper_loss=aux_loss._last_loss_stats.get("graph_prob_prior_dual_beta_upper_loss"),
                         loss_weight=weight,
-                        alpha_weight=float(prior_cfg.DUAL_ALPHA_WEIGHT),
-                        beta_lower_weight=float(prior_cfg.DUAL_BETA_LOWER_WEIGHT),
-                        beta_upper_weight=float(prior_cfg.DUAL_BETA_UPPER_WEIGHT),
                     )
                 )
         self._last_loss_stats = stats
@@ -1364,16 +1109,6 @@ def _spv_enabled(cfg) -> bool:
     return float(cfg.SOLVER.LOSS_SPV_WEIGHT) > 0
 
 
-def _route_ts_prompt_enabled(cfg) -> bool:
-    """判断 prompt route teacher-student 辅助损失是否启用。"""
-    return float(cfg.SOLVER.LOSS_ROUTE_TS_PROMPT_WEIGHT) > 0
-
-
-def _route_ts_semantic_enabled(cfg) -> bool:
-    """判断 semantic route teacher-student 辅助损失是否启用。"""
-    return float(cfg.SOLVER.LOSS_ROUTE_TS_SEMANTIC_WEIGHT) > 0
-
-
 def _attr_reconstruction_enabled(cfg) -> bool:
     """判断 ViT 交互后语义属性重建损失是否启用。"""
     return float(cfg.SOLVER.LOSS_ATTR_WEIGHT) > 0
@@ -1382,15 +1117,6 @@ def _attr_reconstruction_enabled(cfg) -> bool:
 def _prompt_kl_enabled(cfg) -> bool:
     """判断 prompt distribution KL 是否启用。"""
     return float(cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT) > 0
-
-
-def _semantic_graph_enabled(cfg) -> bool:
-    """判断 prompt distribution 语义图辅助损失是否启用。"""
-    return (
-        bool(cfg.MODEL.SEMANTIC_GRAPH.ENABLE)
-        and float(cfg.MODEL.SEMANTIC_GRAPH.LOSS_WEIGHT) > 0
-        and str(cfg.MODEL.SEMANTIC_GRAPH.LOSS_TYPE).lower() != "none"
-    )
 
 
 def _graph_prob_prior_enabled(cfg) -> bool:
@@ -1413,16 +1139,10 @@ def _build_aux_losses(cfg):
         aux_losses.append(SemanticMediatedAffinityAuxLoss(cfg))
     if _spv_enabled(cfg):
         aux_losses.append(SemanticPromptVisualCycleAuxLoss(cfg))
-    if _route_ts_prompt_enabled(cfg):
-        aux_losses.append(RouteTeacherStudentPromptAuxLoss(cfg))
-    if _route_ts_semantic_enabled(cfg):
-        aux_losses.append(RouteTeacherStudentSemanticAuxLoss(cfg))
     if _attr_reconstruction_enabled(cfg):
         aux_losses.append(AttributeReconstructionAuxLoss(cfg))
     if _prompt_kl_enabled(cfg):
         aux_losses.append(PromptKLAuxLoss(cfg))
-    if _semantic_graph_enabled(cfg):
-        aux_losses.append(SemanticGraphAuxLoss(cfg))
     if _graph_prob_prior_enabled(cfg):
         aux_losses.append(GraphProbPriorAuxLoss(cfg))
     return aux_losses
