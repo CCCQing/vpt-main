@@ -570,8 +570,31 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                 raise ValueError("MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_RIDGE must be positive.")
             if str(prior_cfg.GRAPH_GP_KERNEL_NORMALIZE).lower() not in {"diag", "none"}:
                 raise ValueError("MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_KERNEL_NORMALIZE must be diag / none.")
-            if str(prior_cfg.GRAPH_GP_PRIOR_VAR_SOURCE).lower() not in {"unit", "constant", "current_prior_var_mode"}:
-                raise ValueError("MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_SOURCE must be unit / constant / current_prior_var_mode.")
+            if str(prior_cfg.GRAPH_GP_PRIOR_VAR_SOURCE).lower() not in {
+                "unit",
+                "constant",
+                "current_prior_var_mode",
+                "dynamic_uncertainty",
+            }:
+                raise ValueError(
+                    "MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_SOURCE must be "
+                    "unit / constant / current_prior_var_mode / dynamic_uncertainty."
+                )
+            for key in (
+                "GRAPH_GP_PRIOR_VAR_FLOOR",
+                "GRAPH_GP_PRIOR_VAR_MIN",
+                "GRAPH_GP_PRIOR_VAR_MAX",
+            ):
+                if float(getattr(prior_cfg, key)) <= 0.0:
+                    raise ValueError(f"MODEL.GRAPH_PROB_PRIOR.{key} must be positive.")
+            if float(prior_cfg.GRAPH_GP_PRIOR_VAR_MAX) < float(prior_cfg.GRAPH_GP_PRIOR_VAR_MIN):
+                raise ValueError("GRAPH_GP_PRIOR_VAR_MAX must be >= GRAPH_GP_PRIOR_VAR_MIN.")
+            for key in (
+                "GRAPH_GP_PRIOR_VAR_PROTO_WEIGHT",
+                "GRAPH_GP_PRIOR_VAR_VISUAL_WEIGHT",
+            ):
+                if float(getattr(prior_cfg, key)) < 0.0:
+                    raise ValueError(f"MODEL.GRAPH_PROB_PRIOR.{key} must be non-negative.")
             if not bool(prior_cfg.GRAPH_GP_MATCH_DETACH_PRIOR):
                 raise ValueError("MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_MATCH_DETACH_PRIOR must be True in first version.")
         if float(prior_cfg.GEOM_LOSS_WEIGHT) < 0.0:
@@ -753,6 +776,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         # 不把 all_reduce 结果写回本地 buffer，避免下一次同步时把已经同步过的全局值重复累加。
         self.register_buffer("_graph_gp_support_sum", torch.zeros(self.num_classes, self.text_dim), persistent=False)
         self.register_buffer("_graph_gp_support_sq_sum", torch.zeros(self.num_classes, self.text_dim), persistent=False)
+        self.register_buffer("_graph_gp_support_var_sum", torch.zeros(self.num_classes, self.text_dim), persistent=False)
         self.register_buffer("_graph_gp_support_count", torch.zeros(self.num_classes), persistent=False)
         self._graph_gp_split_id: Optional[int] = None
         self._graph_gp_support_ids: Optional[torch.Tensor] = None
@@ -1110,6 +1134,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             # split 变化时必须重置本进程 buffer；否则旧 support 划分的视觉中心会混入新 episode。
             self._graph_gp_support_sum.zero_()
             self._graph_gp_support_sq_sum.zero_()
+            self._graph_gp_support_var_sum.zero_()
             self._graph_gp_support_count.zero_()
             self._graph_gp_split_id = split_id
             self._graph_gp_support_ids = support_ids_cpu
@@ -1130,6 +1155,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
     def _update_graph_gp_support_buffers(
         self,
         posterior_mu: torch.Tensor,
+        posterior_logvar: torch.Tensor,
         targets_global: torch.Tensor,
         support_ids: torch.Tensor,
     ) -> None:
@@ -1144,8 +1170,10 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             return
         cls = targets_global[support_mask].to(dtype=torch.long)
         values = posterior_mu[support_mask].detach()
+        variances = posterior_logvar[support_mask].detach().exp()
         self._graph_gp_support_sum.index_add_(0, cls, values)
         self._graph_gp_support_sq_sum.index_add_(0, cls, values.pow(2))
+        self._graph_gp_support_var_sum.index_add_(0, cls, variances)
         self._graph_gp_support_count.index_add_(0, cls, torch.ones_like(cls, dtype=self._graph_gp_support_count.dtype))
 
     @staticmethod
@@ -1197,7 +1225,54 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             raise RuntimeError("Graph-GP kernel contains NaN or Inf after preprocessing.")
         return kernel
 
-    def _graph_gp_prior_logvar(self, reference: torch.Tensor) -> torch.Tensor:
+    def _graph_gp_dynamic_prior_var(
+        self,
+        reference: torch.Tensor,
+        prototype_uncertainty: torch.Tensor,
+        visual_within_var: torch.Tensor,
+    ):
+        """
+        根据 Graph-GP 外推不确定性和类内视觉不确定性构造动态 prior variance。
+
+        prototype_uncertainty 是 [C]，表示类别 prototype 均值由 support 类外推时的不确定性；
+        visual_within_var 是 [C, D]，表示 support 类内视觉方差传播到所有类别后的结果。
+        """
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        if not torch.is_tensor(prototype_uncertainty) or not torch.is_tensor(visual_within_var):
+            raise RuntimeError(
+                "GRAPH_GP_PRIOR_VAR_SOURCE=dynamic_uncertainty requires prototype_uncertainty and visual_within_var."
+            )
+        if prototype_uncertainty.dim() != 1 or int(prototype_uncertainty.shape[0]) != int(reference.shape[0]):
+            raise RuntimeError("Graph-GP prototype_uncertainty must have shape [num_classes].")
+        if tuple(visual_within_var.shape) != tuple(reference.shape):
+            raise RuntimeError("Graph-GP visual_within_var must have the same shape as prior_mu/reference.")
+
+        proto = prototype_uncertainty.to(device=reference.device, dtype=reference.dtype).clamp_min(0.0)[:, None]
+        proto = proto.expand_as(reference)
+        visual = visual_within_var.to(device=reference.device, dtype=reference.dtype).clamp_min(0.0)
+        proto_term = float(prior_cfg.GRAPH_GP_PRIOR_VAR_PROTO_WEIGHT) * proto
+        visual_term = float(prior_cfg.GRAPH_GP_PRIOR_VAR_VISUAL_WEIGHT) * visual
+        floor = reference.new_tensor(float(prior_cfg.GRAPH_GP_PRIOR_VAR_FLOOR))
+        prior_var_raw = floor + proto_term + visual_term
+        prior_var = prior_var_raw.clamp(
+            min=float(prior_cfg.GRAPH_GP_PRIOR_VAR_MIN),
+            max=float(prior_cfg.GRAPH_GP_PRIOR_VAR_MAX),
+        )
+        return prior_var, {
+            "prototype_uncertainty_expanded": proto.detach(),
+            "visual_within_var": visual.detach(),
+            "proto_var_term": proto_term.detach(),
+            "visual_var_term": visual_term.detach(),
+            "prior_var_raw": prior_var_raw.detach(),
+            "prior_var": prior_var.detach(),
+        }
+
+    def _graph_gp_prior_logvar(
+        self,
+        reference: torch.Tensor,
+        prototype_uncertainty: Optional[torch.Tensor] = None,
+        visual_within_var: Optional[torch.Tensor] = None,
+    ):
         """
         Graph-GP 第一版只让条件推断负责 prior_mu，不把 Sigma_{u|s} 直接塞进 prior_logvar。
 
@@ -1207,19 +1282,31 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
         source = str(prior_cfg.GRAPH_GP_PRIOR_VAR_SOURCE).lower()
         if source == "unit":
-            return torch.zeros_like(reference)
+            return torch.zeros_like(reference), {}
         if source == "constant":
-            return torch.full_like(reference, float(prior_cfg.PRIOR_LOGVAR_CONST))
+            return torch.full_like(reference, float(prior_cfg.PRIOR_LOGVAR_CONST)), {}
         if source == "current_prior_var_mode":
             if self.prior_var_mode == "learned":
                 raise RuntimeError("GRAPH_GP_PRIOR_VAR_SOURCE=current_prior_var_mode does not support PRIOR_VAR_MODE=learned.")
-            return self._fixed_or_learned_logvar(reference)
-        raise ValueError("MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_SOURCE must be unit / constant / current_prior_var_mode.")
+            return self._fixed_or_learned_logvar(reference), {}
+        if source == "dynamic_uncertainty":
+            prior_var, debug = self._graph_gp_dynamic_prior_var(
+                reference,
+                prototype_uncertainty=prototype_uncertainty,
+                visual_within_var=visual_within_var,
+            )
+            prior_logvar = prior_var.log().clamp(min=self.logvar_min, max=self.logvar_max)
+            return prior_logvar, debug
+        raise ValueError(
+            "MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_SOURCE must be "
+            "unit / constant / current_prior_var_mode / dynamic_uncertainty."
+        )
 
     def _graph_gp_conditioned_class_priors(
         self,
         graph: torch.Tensor,
         posterior_mu: torch.Tensor,
+        posterior_logvar: torch.Tensor,
         targets_global: torch.Tensor,
         seen_class_ids,
         epoch: Optional[int],
@@ -1240,10 +1327,11 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             raise RuntimeError("graph_gp_conditioned first version is a training-time prior generator; eval prototype scoring is not implemented.")
         prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
         support_ids, pseudo_unseen_ids, split_id = self._get_graph_gp_episode_split(epoch, seen_class_ids, posterior_mu.device)
-        self._update_graph_gp_support_buffers(posterior_mu, targets_global, support_ids)
+        self._update_graph_gp_support_buffers(posterior_mu, posterior_logvar, targets_global, support_ids)
 
         synced_sum = self._distributed_sum_clone(self._graph_gp_support_sum.to(device=posterior_mu.device, dtype=posterior_mu.dtype))
         synced_sq_sum = self._distributed_sum_clone(self._graph_gp_support_sq_sum.to(device=posterior_mu.device, dtype=posterior_mu.dtype))
+        synced_var_sum = self._distributed_sum_clone(self._graph_gp_support_var_sum.to(device=posterior_mu.device, dtype=posterior_mu.dtype))
         synced_count = self._distributed_sum_clone(self._graph_gp_support_count.to(device=posterior_mu.device, dtype=posterior_mu.dtype))
 
         support_count_all = synced_count.index_select(0, support_ids)
@@ -1257,9 +1345,12 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         observed_count = support_count_all[observed_mask].clamp_min(1.0)
         center_sum = synced_sum.index_select(0, observed_support_ids)
         center_sq_sum = synced_sq_sum.index_select(0, observed_support_ids)
+        center_var_sum = synced_var_sum.index_select(0, observed_support_ids)
         v_support = center_sum / observed_count[:, None]
 
         center_var_dim = (center_sq_sum / observed_count[:, None] - v_support.pow(2)).clamp_min(0.0)
+        support_post_var_dim = (center_var_sum / observed_count[:, None]).clamp_min(0.0)
+        support_visual_var_dim = center_var_dim + support_post_var_dim
         center_var = center_var_dim.mean(dim=-1)
         obs_mode = str(prior_cfg.GRAPH_GP_OBS_NOISE_MODE).lower()
         if obs_mode == "constant":
@@ -1286,13 +1377,28 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         solved_k = self._solve_graph_gp_system(system, k_all_s.t())
         smoothing_coeff = solved_k.t()
         uncertainty_diag = (kernel.diag() - (k_all_s * solved_k.t()).sum(dim=1)).clamp_min(0.0)
+        eps = float(self.cfg.MODEL.GRAPH_INPUT.EPS)
+        var_weight = smoothing_coeff.clamp_min(0.0)
+        fallback_weight = k_all_s.clamp_min(0.0)
+        var_weight_sum = var_weight.sum(dim=1, keepdim=True)
+        fallback_sum = fallback_weight.sum(dim=1, keepdim=True)
+        var_weight = torch.where(
+            var_weight_sum > eps,
+            var_weight / var_weight_sum.clamp_min(eps),
+            fallback_weight / fallback_sum.clamp_min(eps),
+        )
+        visual_within_var = var_weight.matmul(support_visual_var_dim).clamp_min(0.0)
         solve_residual = (system.matmul(solved_v) - v_support).norm() / v_support.norm().clamp_min(1e-12)
         system_diag = system.diag().abs().clamp_min(1e-12)
         system_diag_ratio = system_diag.max() / system_diag.min()
 
         if bool(prior_cfg.GRAPH_GP_MATCH_DETACH_PRIOR):
             prior_mu = prior_mu.detach()
-        prior_logvar = self._graph_gp_prior_logvar(prior_mu)
+        prior_logvar, prior_var_debug = self._graph_gp_prior_logvar(
+            prior_mu,
+            prototype_uncertainty=uncertainty_diag,
+            visual_within_var=visual_within_var,
+        )
         self._last_prior_debug = {}
         self._last_graph_gp_debug = {
             "support_ids": support_ids.detach(),
@@ -1300,19 +1406,24 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             "observed_support_ids": observed_support_ids.detach(),
             "support_count": synced_count.detach(),
             "center_var": center_var.detach(),
+            "support_post_var": support_post_var_dim.mean(dim=-1).detach(),
+            "support_visual_var": support_visual_var_dim.mean(dim=-1).detach(),
             "obs_noise": obs_noise.detach(),
             "solve_residual": solve_residual.detach(),
             "uncertainty_diag": uncertainty_diag.detach(),
+            "visual_within_var": visual_within_var.detach(),
             "system_diag_ratio": system_diag_ratio.detach(),
             "kernel": kernel.detach(),
             "system": system.detach(),
             "k_all_s": k_all_s.detach(),
             "smoothing_coeff": smoothing_coeff.detach(),
+            "var_weight": var_weight.detach(),
             "split_id": posterior_mu.new_tensor(float(split_id)),
             "observed_support_ratio": posterior_mu.new_tensor(
                 float(observed_support_ids.numel()) / float(max(int(support_ids.numel()), 1))
             ),
         }
+        self._last_graph_gp_debug.update(prior_var_debug)
         return prior_mu, prior_logvar
 
     def _masked_topk_distribution(
@@ -2160,6 +2271,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             prior_mu, prior_logvar = self._graph_gp_conditioned_class_priors(
                 graph=graph,
                 posterior_mu=posterior_mu,
+                posterior_logvar=posterior_logvar,
                 targets_global=targets_global,
                 seen_class_ids=seen_class_ids,
                 epoch=epoch,
@@ -2300,6 +2412,13 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     solve_residual=graph_gp_debug["solve_residual"],
                     uncertainty_diag=graph_gp_debug["uncertainty_diag"],
                     system_diag_ratio=graph_gp_debug["system_diag_ratio"],
+                    support_post_var=graph_gp_debug.get("support_post_var"),
+                    support_visual_var=graph_gp_debug.get("support_visual_var"),
+                    visual_within_var=graph_gp_debug.get("visual_within_var"),
+                    proto_var_term=graph_gp_debug.get("proto_var_term"),
+                    visual_var_term=graph_gp_debug.get("visual_var_term"),
+                    prior_var_raw=graph_gp_debug.get("prior_var_raw"),
+                    dynamic_prior_var=graph_gp_debug.get("prior_var"),
                     kernel=graph_gp_debug["kernel"],
                     system=graph_gp_debug["system"],
                     k_all_s=graph_gp_debug["k_all_s"],

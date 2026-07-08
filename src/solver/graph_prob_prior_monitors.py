@@ -255,6 +255,13 @@ def graph_gp_prototype_monitor(
     solve_residual: torch.Tensor,
     uncertainty_diag: torch.Tensor,
     system_diag_ratio: torch.Tensor,
+    support_post_var: Optional[torch.Tensor] = None,
+    support_visual_var: Optional[torch.Tensor] = None,
+    visual_within_var: Optional[torch.Tensor] = None,
+    proto_var_term: Optional[torch.Tensor] = None,
+    visual_var_term: Optional[torch.Tensor] = None,
+    prior_var_raw: Optional[torch.Tensor] = None,
+    dynamic_prior_var: Optional[torch.Tensor] = None,
     kernel: Optional[torch.Tensor] = None,
     system: Optional[torch.Tensor] = None,
     k_all_s: Optional[torch.Tensor] = None,
@@ -316,6 +323,32 @@ def graph_gp_prototype_monitor(
         stats[f"{prefix}_kernel_diag_ratio"] = _as_float(system_diag_ratio)
     if torch.is_tensor(uncertainty_diag) and uncertainty_diag.numel() > 0:
         stats.update(tensor_stats(f"{prefix}_uncertainty_diag", uncertainty_diag))
+    if torch.is_tensor(support_post_var) and support_post_var.numel() > 0:
+        stats.update(tensor_stats(f"{prefix}_support_post_var", support_post_var))
+    if torch.is_tensor(support_visual_var) and support_visual_var.numel() > 0:
+        stats.update(tensor_stats(f"{prefix}_support_visual_var", support_visual_var))
+    if torch.is_tensor(visual_within_var) and visual_within_var.numel() > 0:
+        visual_var = visual_within_var.detach().float()
+        stats.update(tensor_stats(f"{prefix}_visual_within_var", visual_var))
+    if torch.is_tensor(proto_var_term) and proto_var_term.numel() > 0:
+        stats.update(tensor_stats(f"{prefix}_prior_var_proto_term", proto_var_term.detach().float()))
+    if torch.is_tensor(visual_var_term) and visual_var_term.numel() > 0:
+        stats.update(tensor_stats(f"{prefix}_prior_var_visual_term", visual_var_term.detach().float()))
+    if torch.is_tensor(prior_var_raw) and prior_var_raw.numel() > 0:
+        stats.update(tensor_stats(f"{prefix}_prior_var_raw", prior_var_raw.detach().float()))
+    if torch.is_tensor(dynamic_prior_var) and dynamic_prior_var.numel() > 0:
+        dyn_var = dynamic_prior_var.detach().float()
+        stats.update(tensor_stats(f"{prefix}_prior_var_dynamic", dyn_var))
+        if torch.is_tensor(prior_var_raw) and tuple(prior_var_raw.shape) == tuple(dynamic_prior_var.shape):
+            raw_var = prior_var_raw.detach().float().to(device=dyn_var.device)
+            stats[f"{prefix}_prior_var_clamp_rate"] = _as_float((raw_var != dyn_var).float().mean())
+            stats[f"{prefix}_prior_var_max_clamp_rate"] = _as_float((raw_var > dyn_var).float().mean())
+            stats[f"{prefix}_prior_var_min_clamp_rate"] = _as_float((raw_var < dyn_var).float().mean())
+        denom = dyn_var.clamp_min(1e-12)
+        if torch.is_tensor(proto_var_term) and tuple(proto_var_term.shape) == tuple(dynamic_prior_var.shape):
+            stats.update(tensor_stats(f"{prefix}_prior_var_proto_share", proto_var_term.detach().float().to(device=dyn_var.device) / denom))
+        if torch.is_tensor(visual_var_term) and tuple(visual_var_term.shape) == tuple(dynamic_prior_var.shape):
+            stats.update(tensor_stats(f"{prefix}_prior_var_visual_share", visual_var_term.detach().float().to(device=dyn_var.device) / denom))
 
     if torch.is_tensor(kernel) and kernel.dim() == 2 and kernel.shape[0] == kernel.shape[1]:
         k = kernel.detach().float().to(device=device)
