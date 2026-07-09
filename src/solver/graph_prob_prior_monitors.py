@@ -268,7 +268,7 @@ def graph_gp_prototype_monitor(
     smoothing_coeff: Optional[torch.Tensor] = None,
     graph: Optional[torch.Tensor] = None,
     distance: Optional[torch.Tensor] = None,
-    sample_match_loss: Optional[torch.Tensor] = None,
+    sample_energy_loss: Optional[torch.Tensor] = None,
     posterior_mu: Optional[torch.Tensor] = None,
     targets_global: Optional[torch.Tensor] = None,
     seen_class_ids=None,
@@ -283,7 +283,7 @@ def graph_gp_prototype_monitor(
     1. support-seen 中有多少类已经被 posterior_mu 观测到；
     2. V_support 的类内方差和观测噪声 R_s 是否异常；
     3. 线性方程求解是否稳定，Graph-GP predictive uncertainty 是否过大；
-    4. 推断出的 M_star 是否仍然同向扎堆，以及 pseudo-unseen 样本能否找到真类 prototype。
+    4. 推断出的 M_star 是否仍然同向扎堆，以及 pseudo-unseen 样本能否在 energy CE 中找到真类 prototype。
     """
     stats: Dict[str, float] = {}
     if not torch.is_tensor(prior_mu):
@@ -431,18 +431,18 @@ def graph_gp_prototype_monitor(
                 stats[f"{prefix}_pseudo_unseen_acc"] = stats[f"{prefix}_pseudo_unseen_rank1"]
                 stats[f"{prefix}_pseudo_unseen_true_kl_mean"] = _as_float(true_dist[pseudo_mask].mean())
                 stats.update(tensor_stats(f"{prefix}_pseudo_unseen_margin", margin[pseudo_mask]))
-                if torch.is_tensor(sample_match_loss) and sample_match_loss.numel() == targets.numel():
-                    stats[f"{prefix}_pseudo_unseen_match_loss"] = _as_float(
-                        sample_match_loss.detach().float().to(device=targets.device)[pseudo_mask].mean()
+                if torch.is_tensor(sample_energy_loss) and sample_energy_loss.numel() == targets.numel():
+                    stats[f"{prefix}_pseudo_unseen_energy_loss"] = _as_float(
+                        sample_energy_loss.detach().float().to(device=targets.device)[pseudo_mask].mean()
                     )
             if bool(support_mask.any().item()):
                 stats[f"{prefix}_support_seen_rank1"] = _as_float(hit[support_mask].mean())
                 stats[f"{prefix}_support_seen_acc"] = stats[f"{prefix}_support_seen_rank1"]
                 stats[f"{prefix}_support_seen_true_kl_mean"] = _as_float(true_dist[support_mask].mean())
                 stats.update(tensor_stats(f"{prefix}_support_seen_margin", margin[support_mask]))
-                if torch.is_tensor(sample_match_loss) and sample_match_loss.numel() == targets.numel():
-                    stats[f"{prefix}_support_seen_match_loss"] = _as_float(
-                        sample_match_loss.detach().float().to(device=targets.device)[support_mask].mean()
+                if torch.is_tensor(sample_energy_loss) and sample_energy_loss.numel() == targets.numel():
+                    stats[f"{prefix}_support_seen_energy_loss"] = _as_float(
+                        sample_energy_loss.detach().float().to(device=targets.device)[support_mask].mean()
                     )
             if bool(pseudo_mask.any().item()) and bool(support_mask.any().item()):
                 stats[f"{prefix}_support_pseudo_rank1_gap"] = (
@@ -451,9 +451,9 @@ def graph_gp_prototype_monitor(
                 stats[f"{prefix}_support_pseudo_acc_gap"] = (
                     stats[f"{prefix}_support_seen_acc"] - stats[f"{prefix}_pseudo_unseen_acc"]
                 )
-                if f"{prefix}_support_seen_match_loss" in stats and f"{prefix}_pseudo_unseen_match_loss" in stats:
-                    stats[f"{prefix}_support_pseudo_match_loss_gap"] = (
-                        stats[f"{prefix}_pseudo_unseen_match_loss"] - stats[f"{prefix}_support_seen_match_loss"]
+                if f"{prefix}_support_seen_energy_loss" in stats and f"{prefix}_pseudo_unseen_energy_loss" in stats:
+                    stats[f"{prefix}_support_pseudo_energy_loss_gap"] = (
+                        stats[f"{prefix}_pseudo_unseen_energy_loss"] - stats[f"{prefix}_support_seen_energy_loss"]
                     )
 
             if torch.is_tensor(posterior_mu) and posterior_mu.dim() == 2 and posterior_mu.shape[0] == targets.numel():

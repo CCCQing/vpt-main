@@ -769,7 +769,8 @@ class GraphProbPriorAuxLoss(nn.Module):
     该分支不替换 PromptKLAuxLoss 的代码，而是作为独立 aux loss 接入：
     - posterior: prompt distributor runtime stats 中的 mu/logvar；
     - prior: 由 semantic graph 的 A_conf/E_attr/G 生成 all-class Gaussian prior；
-    - graph_conditioned_semantic_prior: 用 T_i 监督逐样本 latent matching；
+    - graph_gp_conditioned: 用 Graph-GP 生成的 P_c(z) 做 energy classification；
+    - graph_conditioned_semantic_prior: 非 Graph-GP 旧分支，用 T_i 监督逐样本 latent matching；
     - class_aggregate_mmd: 对 batch 内同类 posterior 聚合后做 MMD 分布匹配。
     - factorized_latent: 只让 semantic factor 接受 semantic graph prior matching，
       variation factor 默认不做逐样本 KL。
@@ -807,7 +808,7 @@ class GraphProbPriorAuxLoss(nn.Module):
         # 都放在 GraphProbPriorLossComputer 中；这个 AuxLoss 只负责和 CompositeLoss/trainer 对接。
         self.computer = GraphProbPriorLossComputer(cfg)
 
-        # mode 决定后面从 runtime stats 读取完整 posterior，还是读取 factorized posterior。
+        # Graph-GP 固定读取完整 posterior；非 Graph-GP 分支再由 mode 决定是否读取 factorized posterior。
         self.mode = str(cfg.MODEL.GRAPH_PROB_PRIOR.MODE).lower()
 
         # 保存最近一次 forward 的细粒度诊断项，CompositeLoss 会把它们合并到总 stats。
@@ -845,14 +846,14 @@ class GraphProbPriorAuxLoss(nn.Module):
         #   model:              当前 ViT 模型引用，用于读取 runtime prompt stats；
         #   targets_global:     全局类别 id，不能用 local-output remap 后的 targets；
         #   class_attributes:   全类属性矩阵 A_conf；
-        #   attr_name_embeddings: 属性名文本 embedding E_attr。
+        #   attr_name_embeddings: 属性名文本 embedding E_attr；Graph-GP energy 分支不需要。
         if "model" not in kwargs:
             raise RuntimeError("GraphProbPrior loss requires kwargs['model'].")
         if "targets_global" not in kwargs:
             raise RuntimeError("GraphProbPrior loss requires kwargs['targets_global'].")
         if "class_attributes" not in kwargs:
             raise RuntimeError("GraphProbPrior loss requires kwargs['class_attributes'].")
-        if "attr_name_embeddings" not in kwargs:
+        if self.computer.prior_mean_mode != "graph_gp_conditioned" and "attr_name_embeddings" not in kwargs:
             raise RuntimeError("GraphProbPrior loss requires kwargs['attr_name_embeddings'].")
 
         model = kwargs["model"]
@@ -869,7 +870,21 @@ class GraphProbPriorAuxLoss(nn.Module):
             self._last_loss_stats = {"graph_prob_prior_eval_skipped": 1.0}
             return self._zero_loss_like(pred_logits, targets)
 
-        if self.mode == "factorized_latent":
+        if self.computer.prior_mean_mode == "graph_gp_conditioned":
+            if "mu" not in stats or "logvar" not in stats:
+                raise RuntimeError("Graph-GP energy classification requires stats['mu'] and stats['logvar'].")
+            loss = self.computer(
+                posterior_mu=stats["mu"],
+                posterior_logvar=stats["logvar"],
+                targets_global=kwargs["targets_global"],
+                class_attributes=kwargs["class_attributes"],
+                attr_name_embeddings=kwargs.get("attr_name_embeddings", None),
+                seen_class_ids=kwargs.get("seen_class_ids", None),
+                unseen_class_ids=kwargs.get("unseen_class_ids", None),
+                epoch=kwargs.get("epoch", None),
+                is_train=is_train,
+            )
+        elif self.mode == "factorized_latent":
             # factorized_latent 不把完整 768 维 posterior 当作 GraphProbPrior 的直接训练对象，
             # 而是强制使用 distributor 切出来的 semantic/variation 两段。
             # 这里故意不做“缺了 factorized stats 就回退 stats['mu']”的保底设计；

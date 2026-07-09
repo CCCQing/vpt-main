@@ -61,7 +61,7 @@ class GraphPriorInputBuilder:
     这个类负责把 dataloader/trainer 传入的语义资源转成 GraphProbPrior 输入：
     - bank:  A_conf @ E_attr，形状 [C, D]，graph_gp_conditioned 下不构造；
     - graph: Acc / Acssc / fuse / external 得到的全类关系图，形状 [C, C]；
-    - target: 从 graph[y] 取 top-k 并混合 one-hot 后得到的监督分布，形状 [B, C]。
+    - target: 从 graph[y] 取 top-k 并混合 one-hot 后得到的监督分布，Graph-GP energy 分支不构造。
 
     GraphProbPriorLossComputer 复用这里生成 graph / target 和非 Graph-GP 分支的 bank，
     避免图输入构造逻辑散落在多个分支中。
@@ -347,6 +347,7 @@ class GraphPriorInputBuilder:
         attr_name_embeddings: Optional[torch.Tensor],
         device: torch.device,
         dtype: torch.dtype,
+        build_target: bool = True,
     ) -> Dict[str, Optional[torch.Tensor]]:
         """一次性准备 GraphProbPrior 所需的所有图输入张量。"""
         # prepare 是 loss 侧唯一需要调用的入口：
@@ -363,7 +364,7 @@ class GraphPriorInputBuilder:
             attr_name_embeddings,
             graph_gp_conditioned=graph_gp_conditioned,
         )
-        target = self.build_target(graph, targets_global)
+        target = self.build_target(graph, targets_global) if bool(build_target) else None
         return {
             "class_attributes": class_attributes,
             "attr_name_embeddings": attr_name_embeddings,
@@ -399,7 +400,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
     - _relation_regularization: class-aggregate 模式专用，用全类 prior Gaussian symKL 对齐语义图关系。
     - compute_prior_distribution_distance: 计算 prior 类别分布之间的标准化几何距离 D_cd。
     - compute_graph_prior_geometry_loss: 可选几何正则入口，支持 soft_distribution_matching / graph_ordinal_ranking。
-    - _samplewise_latent_matching_loss: 逐样本 all-class KL matching，服务 graph_conditioned_semantic_prior 和 factorized semantic loss。
+    - _graph_gp_energy_classification_loss: Graph-GP 分支用 -KL(Q_i,P_c) 做 seen-class energy CE。
+    - _samplewise_latent_matching_loss: 逐样本 all-class KL matching，服务旧 graph_conditioned_semantic_prior 和 factorized semantic loss。
 
     - _rbf_kernel: class_aggregate_mmd 使用的 RBF kernel。
     - _class_aggregate_mmd_loss: 对同类 posterior mixture 和 class prior 做 MMD 分布匹配。
@@ -430,28 +432,30 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         self.mode = str(prior_cfg.MODE).lower()
         self.prior_mean_mode = str(prior_cfg.PRIOR_MEAN_MODE).lower()
         self.prior_var_mode = str(prior_cfg.PRIOR_VAR_MODE).lower()
+        self.graph_gp_objective = str(prior_cfg.GRAPH_GP_OBJECTIVE).lower()
+        self.graph_gp_energy_class_space = str(prior_cfg.GRAPH_GP_ENERGY_CLASS_SPACE).lower()
         self.supported_modes = {
             "graph_conditioned_semantic_prior",
             "class_aggregate_mmd",
             "factorized_latent",
         }
-        if self.mode not in self.supported_modes:
-            raise ValueError(
-                "MODEL.GRAPH_PROB_PRIOR.MODE must be graph_conditioned_semantic_prior / "
-                "class_aggregate_mmd / factorized_latent."
-            )
         if self.prior_mean_mode not in {"learned", "residual_anchor", "graph_gp_conditioned"}:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_MEAN_MODE must be learned / residual_anchor / graph_gp_conditioned.")
         if self.prior_var_mode not in {"learned", "unit", "constant"}:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_VAR_MODE must be learned / unit / constant.")
         if self.prior_mean_mode == "graph_gp_conditioned":
-            if self.mode == "factorized_latent":
+            if self.graph_gp_objective != "energy_classification":
                 raise ValueError(
-                    "PRIOR_MEAN_MODE=graph_gp_conditioned first version supports only full 768-d posterior modes, "
-                    "not factorized_latent."
+                    "MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_OBJECTIVE must be energy_classification when "
+                    "PRIOR_MEAN_MODE=graph_gp_conditioned."
                 )
             if self.prior_var_mode == "learned":
                 raise ValueError("PRIOR_MEAN_MODE=graph_gp_conditioned does not support PRIOR_VAR_MODE=learned in first version.")
+        elif self.mode not in self.supported_modes:
+            raise ValueError(
+                "MODEL.GRAPH_PROB_PRIOR.MODE must be graph_conditioned_semantic_prior / "
+                "class_aggregate_mmd / factorized_latent."
+            )
 
         tau_graph = float(prior_cfg.TAU_GRAPH)
         tau_latent = float(prior_cfg.TAU_LATENT)
@@ -463,8 +467,16 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.TAU_LATENT must be positive.")
         if tau_prior <= 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.TAU_PRIOR must be positive.")
+        if float(prior_cfg.GRAPH_GP_ENERGY_TAU) <= 0.0:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_ENERGY_TAU must be positive.")
+        if self.graph_gp_energy_class_space != "seen":
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_ENERGY_CLASS_SPACE must be seen.")
+        if float(prior_cfg.GRAPH_GP_PSEUDO_WEIGHT) <= 0.0:
+            raise ValueError("MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PSEUDO_WEIGHT must be positive.")
         if float(prior_cfg.REL_WEIGHT) < 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.REL_WEIGHT must be non-negative.")
+        if self.prior_mean_mode == "graph_gp_conditioned" and float(prior_cfg.REL_WEIGHT) > 0.0:
+            raise ValueError("Graph-GP energy classification does not use MODEL.GRAPH_PROB_PRIOR.REL_WEIGHT.")
         if int(prior_cfg.MMD_SAMPLES) <= 0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.MMD_SAMPLES must be positive.")
         if float(prior_cfg.MMD_SIGMA) <= 0.0:
@@ -473,7 +485,10 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.RESIDUAL_SIGMA_MIN must be positive.")
         if float(prior_cfg.RESIDUAL_CLIP) <= 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.RESIDUAL_CLIP must be positive.")
-        if int(graph_cfg.TOPK) <= 0 or int(graph_cfg.TOPK) > self.num_classes - 1:
+        if (
+            self.prior_mean_mode != "graph_gp_conditioned"
+            and (int(graph_cfg.TOPK) <= 0 or int(graph_cfg.TOPK) > self.num_classes - 1)
+        ):
             raise ValueError("MODEL.GRAPH_INPUT.TOPK must be in [1, NUM_CLASSES-1].")
         if float(prior_cfg.PRIOR_DELTA_SCALE) < 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE must be non-negative.")
@@ -599,6 +614,8 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                 raise ValueError("MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_MATCH_DETACH_PRIOR must be True in first version.")
         if float(prior_cfg.GEOM_LOSS_WEIGHT) < 0.0:
             raise ValueError("MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT must be non-negative.")
+        if self.prior_mean_mode == "graph_gp_conditioned" and bool(prior_cfg.GEOM_LOSS_ENABLE):
+            raise ValueError("Graph-GP energy classification does not use MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_ENABLE.")
         if str(prior_cfg.GEOM_LOSS_TYPE).lower() not in {
             "soft_distribution_matching",
             "graph_ordinal_ranking",
@@ -1900,6 +1917,103 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             "MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE must be soft_distribution_matching / graph_ordinal_ranking."
         )
 
+    def _graph_gp_energy_classification_loss(
+        self,
+        posterior_mu: torch.Tensor,
+        posterior_logvar: torch.Tensor,
+        prior_mu: torch.Tensor,
+        prior_logvar: torch.Tensor,
+        targets_global: torch.Tensor,
+        seen_class_ids,
+        support_ids: torch.Tensor,
+        pseudo_unseen_ids: torch.Tensor,
+    ):
+        prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
+        eps = float(self.cfg.MODEL.GRAPH_INPUT.EPS)
+
+        class_ids = self._class_ids_tensor(seen_class_ids, device=posterior_mu.device)
+        if class_ids.numel() < 2:
+            raise RuntimeError("Graph-GP energy classification requires at least two seen classes.")
+        distance = self._gaussian_kl_all_classes(posterior_mu, posterior_logvar, prior_mu, prior_logvar)
+        energy_distance = distance.index_select(1, class_ids)
+        in_class_space = targets_global[:, None].eq(class_ids[None, :])
+        if not bool(in_class_space.any(dim=1).all().item()):
+            missing = targets_global[~in_class_space.any(dim=1)].detach().unique(sorted=True)
+            raise RuntimeError(
+                "Graph-GP energy classification requires every batch target to be in seen_class_ids; "
+                f"missing global ids={missing.detach().cpu().tolist()}."
+            )
+
+        target_local = in_class_space.to(dtype=torch.long).argmax(dim=1)
+        tau = posterior_mu.new_tensor(float(prior_cfg.GRAPH_GP_ENERGY_TAU)).clamp_min(eps)
+        logits = -energy_distance / tau
+        per_sample_loss = F.cross_entropy(logits, target_local, reduction="none")
+        weights = torch.ones_like(per_sample_loss)
+        pseudo_weight = float(prior_cfg.GRAPH_GP_PSEUDO_WEIGHT)
+        if pseudo_weight != 1.0:
+            pseudo_mask = self._class_membership_mask(targets_global, pseudo_unseen_ids)
+            weights = torch.where(pseudo_mask, weights.new_full(weights.shape, pseudo_weight), weights)
+        loss = (per_sample_loss * weights).sum() / weights.sum().clamp_min(eps)
+
+        prob = F.softmax(logits, dim=-1)
+        pred_local = prob.argmax(dim=-1)
+        pred_global = class_ids.index_select(0, pred_local)
+        hit = pred_global.eq(targets_global).to(dtype=posterior_mu.dtype)
+        row = torch.arange(targets_global.numel(), device=targets_global.device)
+        true_distance = energy_distance[row, target_local]
+        wrong_distance = energy_distance.clone()
+        wrong_distance[row, target_local] = float("inf")
+        nearest_wrong = wrong_distance.min(dim=-1).values
+        margin = nearest_wrong - true_distance
+        entropy = -(prob * prob.clamp_min(eps).log()).sum(dim=-1).mean()
+
+        stats = {
+            "graph_prob_prior_graph_gp_energy_ce": float(loss.detach().item()),
+            "graph_prob_prior_graph_gp_energy_tau": float(tau.detach().item()),
+            "graph_prob_prior_graph_gp_energy_class_count": float(class_ids.numel()),
+            "graph_prob_prior_graph_gp_energy_acc": float(hit.detach().mean().item()),
+            "graph_prob_prior_graph_gp_energy_entropy": float(entropy.detach().item()),
+            "graph_prob_prior_graph_gp_energy_true_kl_mean": float(true_distance.detach().mean().item()),
+            "graph_prob_prior_graph_gp_energy_nearest_wrong_kl_mean": float(nearest_wrong.detach().mean().item()),
+            "graph_prob_prior_graph_gp_energy_margin_mean": float(margin.detach().mean().item()),
+            "graph_prob_prior_graph_gp_energy_margin_positive_ratio": float((margin.detach() > 0.0).float().mean().item()),
+            "graph_prob_prior_graph_gp_energy_sample_weight_mean": float(weights.detach().mean().item()),
+        }
+        support_mask = self._class_membership_mask(targets_global, support_ids)
+        pseudo_mask = self._class_membership_mask(targets_global, pseudo_unseen_ids)
+        if bool(support_mask.any().item()):
+            stats["graph_prob_prior_graph_gp_energy_support_seen_acc"] = float(hit[support_mask].detach().mean().item())
+            stats["graph_prob_prior_graph_gp_energy_support_seen_ce"] = float(
+                per_sample_loss[support_mask].detach().mean().item()
+            )
+            stats["graph_prob_prior_graph_gp_energy_support_seen_margin_mean"] = float(
+                margin[support_mask].detach().mean().item()
+            )
+        if bool(pseudo_mask.any().item()):
+            stats["graph_prob_prior_graph_gp_energy_pseudo_unseen_acc"] = float(hit[pseudo_mask].detach().mean().item())
+            stats["graph_prob_prior_graph_gp_energy_pseudo_unseen_ce"] = float(
+                per_sample_loss[pseudo_mask].detach().mean().item()
+            )
+            stats["graph_prob_prior_graph_gp_energy_pseudo_unseen_margin_mean"] = float(
+                margin[pseudo_mask].detach().mean().item()
+            )
+        if bool(support_mask.any().item()) and bool(pseudo_mask.any().item()):
+            stats["graph_prob_prior_graph_gp_energy_support_pseudo_acc_gap"] = (
+                stats["graph_prob_prior_graph_gp_energy_support_seen_acc"]
+                - stats["graph_prob_prior_graph_gp_energy_pseudo_unseen_acc"]
+            )
+            stats["graph_prob_prior_graph_gp_energy_support_pseudo_ce_gap"] = (
+                stats["graph_prob_prior_graph_gp_energy_pseudo_unseen_ce"]
+                - stats["graph_prob_prior_graph_gp_energy_support_seen_ce"]
+            )
+
+        debug = {
+            "distance_shape": tuple(distance.shape),
+            "energy_logits_shape": tuple(logits.shape),
+            "energy_class_count": int(class_ids.numel()),
+        }
+        return loss, stats, debug, distance, per_sample_loss
+
     def _samplewise_latent_matching_loss(
         self,
         posterior_mu: torch.Tensor,
@@ -2213,7 +2327,11 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         # factorized_latent 下 posterior_mu/logvar 应该是 semantic factor 维度；
         # 其他 mode 下则使用完整 text_dim=768。
         # 因此和 factorized_latent 一样检查 semantic_dim，而不是完整 768 维。
-        expected_dim = self.factorized_semantic_dim if self.mode == "factorized_latent" else self.text_dim
+        expected_dim = (
+            self.factorized_semantic_dim
+            if self.mode == "factorized_latent" and self.prior_mean_mode != "graph_gp_conditioned"
+            else self.text_dim
+        )
         if posterior_mu.dim() != 2 or posterior_mu.shape[1] != expected_dim:
             raise RuntimeError(f"GraphProbPrior expects posterior mu [B,{expected_dim}], got {tuple(posterior_mu.shape)}.")
         if tuple(posterior_logvar.shape) != tuple(posterior_mu.shape):
@@ -2223,7 +2341,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     tuple(posterior_logvar.shape),
                 )
             )
-        if self.mode == "factorized_latent":
+        if self.mode == "factorized_latent" and self.prior_mean_mode != "graph_gp_conditioned":
             # factorized_latent 还需要 variation factor，供可选 variation/decouple 正则使用。
             if variation_mu is None or variation_logvar is None:
                 raise RuntimeError(f"GraphProbPrior {self.mode} requires variation_mu and variation_logvar.")
@@ -2249,13 +2367,14 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         # 统一构造语义图输入：
         #   bank:   [C,768] 类别语义原型；graph_gp_conditioned 下为 None；
         #   graph:  [C,C] 全类关系图；
-        #   target: [B,C] 当前 batch 的语义监督分布。
+        #   target: [B,C] 当前 batch 的语义监督分布；Graph-GP energy 分支下为 None。
         graph_inputs = self.graph_builder.prepare(
             targets_global=targets_global,
             class_attributes=class_attributes,
             attr_name_embeddings=attr_name_embeddings,
             device=posterior_mu.device,
             dtype=posterior_mu.dtype,
+            build_target=self.prior_mean_mode != "graph_gp_conditioned",
         )
         targets_global = graph_inputs["targets_global"]
         class_attributes = graph_inputs["class_attributes"]
@@ -2313,7 +2432,10 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     prefix="graph_prob_prior_monitor_false_high_graph_relation",
                 )
             )
-            if self.mode in {"graph_conditioned_semantic_prior", "factorized_latent"} or self.monitor_inactive:
+            if (
+                self.prior_mean_mode != "graph_gp_conditioned"
+                and (self.mode in {"graph_conditioned_semantic_prior", "factorized_latent"} or self.monitor_inactive)
+            ):
                 monitor_stats.update(
                     semantic_target_monitor(
                         graph,
@@ -2348,8 +2470,25 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     )
                 )
 
-        # 按 MODE 分派到具体 matching 目标。
-        if self.mode == "graph_conditioned_semantic_prior":
+        graph_gp_distance = None
+        graph_gp_sample_loss = None
+
+        # Graph-GP 自身闭环目标：用 P_c(z) 作为 prompt latent space 的 energy classifier。
+        if self.prior_mean_mode == "graph_gp_conditioned":
+            graph_gp_debug = self._last_graph_gp_debug
+            match_loss, match_stats, debug_info, graph_gp_distance, graph_gp_sample_loss = (
+                self._graph_gp_energy_classification_loss(
+                    posterior_mu=posterior_mu,
+                    posterior_logvar=posterior_logvar,
+                    prior_mu=prior_mu,
+                    prior_logvar=prior_logvar,
+                    targets_global=targets_global,
+                    seen_class_ids=seen_class_ids,
+                    support_ids=graph_gp_debug["support_ids"],
+                    pseudo_unseen_ids=graph_gp_debug["pseudo_unseen_ids"],
+                )
+            )
+        elif self.mode == "graph_conditioned_semantic_prior":
             match_loss, match_stats, debug_info = self._samplewise_latent_matching_loss(
                 posterior_mu,
                 posterior_logvar,
@@ -2388,16 +2527,6 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         if monitor_active and self.prior_mean_mode == "graph_gp_conditioned":
             # Graph-GP 专属监测需要当前 batch 到 M_star 的距离，用于区分 support-seen 和 pseudo-unseen 表现。
             # 这里仅在 monitor step 额外计算一次，不改变训练 loss。
-            graph_gp_distance = self._gaussian_kl_all_classes(posterior_mu, posterior_logvar, prior_mu, prior_logvar)
-            eps = float(self.cfg.MODEL.GRAPH_INPUT.EPS)
-            graph_gp_latent_prob = F.softmax(
-                -graph_gp_distance / self._tau_latent_value(graph_gp_distance).clamp_min(eps),
-                dim=-1,
-            )
-            graph_gp_sample_match_loss = (
-                _normalize_prob(target, eps)
-                * (_normalize_prob(target, eps).log() - _normalize_prob(graph_gp_latent_prob, eps).log())
-            ).sum(dim=-1)
             graph_gp_debug = self._last_graph_gp_debug
             monitor_stats.update(
                 graph_gp_prototype_monitor(
@@ -2425,7 +2554,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     smoothing_coeff=graph_gp_debug["smoothing_coeff"],
                     graph=graph_gp_debug["kernel"],
                     distance=graph_gp_distance,
-                    sample_match_loss=graph_gp_sample_match_loss,
+                    sample_energy_loss=graph_gp_sample_loss,
                     posterior_mu=posterior_mu,
                     targets_global=targets_global,
                     seen_class_ids=seen_class_ids,
@@ -2441,7 +2570,11 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             )
 
         rel_weight = float(prior_cfg.REL_WEIGHT)
-        rel_enabled = rel_weight > 0.0 and self.mode == "class_aggregate_mmd"
+        rel_enabled = (
+            rel_weight > 0.0
+            and self.mode == "class_aggregate_mmd"
+            and self.prior_mean_mode != "graph_gp_conditioned"
+        )
         if rel_enabled:
             rel_loss, rel_monitor_stats = self._relation_regularization(
                 graph,
@@ -2559,6 +2692,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         # DEBUG=True 时只打印一次关键 shape 和 loss，方便核对 mode 分支与张量维度。
         if bool(prior_cfg.DEBUG) and not self._debug_logged:
             bank_shape = None if bank is None else tuple(bank.shape)
+            target_shape = None if target is None else tuple(target.shape)
             print(
                 "[GRAPH-PROB-PRIOR-DEBUG] mode={} posterior_mu={} posterior_logvar={} bank={} graph={} "
                 "prior_mu={} prior_logvar={} target={} debug={} loss={:.6f}".format(
@@ -2569,7 +2703,7 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                     tuple(graph.shape),
                     tuple(prior_mu.shape),
                     tuple(prior_logvar.shape),
-                    tuple(target.shape),
+                    target_shape,
                     debug_info,
                     float(loss.detach().item()),
                 )

@@ -110,6 +110,7 @@ def _graph_prior_inputs_enabled(cfg: CfgNode) -> bool:
     return (
         bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE)
         and float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT) > 0
+        and str(cfg.MODEL.GRAPH_PROB_PRIOR.PRIOR_MEAN_MODE).lower() != "graph_gp_conditioned"
     )
 
 
@@ -833,7 +834,10 @@ class Trainer():
             ("gpSmooth", "graph_prob_prior_monitor_graph_gp_smoothing_strength_mean"),
             ("gpMRank", "graph_prob_prior_monitor_graph_gp_mstar_effective_rank"),
             ("gpSp", "graph_prob_prior_monitor_graph_gp_mstar_graph_prior_spearman"),
-            ("gpPUloss", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_match_loss"),
+            ("gpEce", "graph_prob_prior_graph_gp_energy_ce"),
+            ("gpEacc", "graph_prob_prior_graph_gp_energy_acc"),
+            ("gpEmar", "graph_prob_prior_graph_gp_energy_margin_mean"),
+            ("gpPUloss", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_energy_loss"),
             ("gpPUacc", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_acc"),
             ("gpSupAcc", "graph_prob_prior_monitor_graph_gp_support_seen_acc"),
             ("gpGap", "graph_prob_prior_monitor_graph_gp_support_pseudo_acc_gap"),
