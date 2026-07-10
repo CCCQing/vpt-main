@@ -1209,14 +1209,35 @@ class GraphProbPriorLossComputer(torch.nn.Module):
     @staticmethod
     def _solve_graph_gp_system(system: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
         """
-        解 Graph-GP 条件均值里的线性方程 system * X = rhs。
-
-        这是同一个数学操作的 PyTorch API 兼容层：新版本用 torch.linalg.solve，
-        旧版本用 torch.solve(...).solution。它不改变模型逻辑，也不提供替代中心或保底 prior。
+        在 CPU FP64 上解 Graph-GP 线性方程，再以 FP64 返回原 device。
         """
+        if system.dim() != 2 or int(system.shape[0]) != int(system.shape[1]):
+            raise RuntimeError(f"Graph-GP system must be square [S,S], got {tuple(system.shape)}.")
+        if rhs.dim() != 2 or int(rhs.shape[0]) != int(system.shape[0]):
+            raise RuntimeError(
+                f"Graph-GP rhs must have shape [S,K] matching system, got {tuple(rhs.shape)}."
+            )
+        if system.device != rhs.device:
+            raise RuntimeError("Graph-GP system and rhs must be on the same device before CPU solve.")
+        output_device = rhs.device
+        system_cpu = system.detach().to(device="cpu", dtype=torch.float64)
+        rhs_cpu = rhs.detach().to(device="cpu", dtype=torch.float64)
         if hasattr(torch, "linalg") and hasattr(torch.linalg, "solve"):
-            return torch.linalg.solve(system, rhs)
-        return torch.solve(rhs, system).solution
+            solution_cpu = torch.linalg.solve(system_cpu, rhs_cpu)
+        elif hasattr(torch, "solve"):
+            solution_cpu = torch.solve(rhs_cpu, system_cpu).solution
+        else:
+            raise RuntimeError("Graph-GP CPU solve requires torch.linalg.solve or torch.solve.")
+        if not bool(torch.isfinite(solution_cpu).all().item()):
+            raise RuntimeError("Graph-GP CPU solve produced NaN or Inf.")
+
+        residual = (system_cpu.matmul(solution_cpu) - rhs_cpu).norm()
+        relative_residual = residual / rhs_cpu.norm().clamp_min(1e-12)
+        if float(relative_residual.item()) > 1e-8:
+            raise RuntimeError(
+                f"Graph-GP CPU solve relative residual is too large: {float(relative_residual.item()):.6e}."
+            )
+        return solution_cpu.to(device=output_device)
 
     def _graph_gp_kernel(self, graph: torch.Tensor) -> torch.Tensor:
         """
@@ -1386,17 +1407,25 @@ class GraphProbPriorLossComputer(torch.nn.Module):
         k_ss = k_all_s.index_select(0, observed_support_ids)
         system = k_ss + torch.diag(obs_noise + float(prior_cfg.GRAPH_GP_RIDGE))
 
-        # 不显式求 inverse：solve(system, V_support) 更稳定，也避免构造完整逆矩阵。
-        solved_v = self._solve_graph_gp_system(system, v_support)
-        prior_mu = k_all_s.matmul(solved_v)
+        latent_dim = int(v_support.shape[1])
+        joint_rhs = torch.cat((v_support, k_all_s.t()), dim=1)
+        joint_solution = self._solve_graph_gp_system(system, joint_rhs)
+        solved_v = joint_solution[:, :latent_dim]
+        solved_k = joint_solution[:, latent_dim:]
+        solve_dtype = joint_solution.dtype
+        k_all_s_solve = k_all_s.to(dtype=solve_dtype)
+        kernel_diag_solve = kernel.diag().to(dtype=solve_dtype)
+        support_visual_var_solve = support_visual_var_dim.to(dtype=solve_dtype)
+        prior_mu_solve = k_all_s_solve.matmul(solved_v)
 
         # predictive uncertainty 先只做监测，不进入 prior_logvar。
-        solved_k = self._solve_graph_gp_system(system, k_all_s.t())
         smoothing_coeff = solved_k.t()
-        uncertainty_diag = (kernel.diag() - (k_all_s * solved_k.t()).sum(dim=1)).clamp_min(0.0)
+        uncertainty_diag_solve = (
+            kernel_diag_solve - (k_all_s_solve * smoothing_coeff).sum(dim=1)
+        ).clamp_min(0.0)
         eps = float(self.cfg.MODEL.GRAPH_INPUT.EPS)
         var_weight = smoothing_coeff.clamp_min(0.0)
-        fallback_weight = k_all_s.clamp_min(0.0)
+        fallback_weight = k_all_s_solve.clamp_min(0.0)
         var_weight_sum = var_weight.sum(dim=1, keepdim=True)
         fallback_sum = fallback_weight.sum(dim=1, keepdim=True)
         var_weight = torch.where(
@@ -1404,10 +1433,21 @@ class GraphProbPriorLossComputer(torch.nn.Module):
             var_weight / var_weight_sum.clamp_min(eps),
             fallback_weight / fallback_sum.clamp_min(eps),
         )
-        visual_within_var = var_weight.matmul(support_visual_var_dim).clamp_min(0.0)
-        solve_residual = (system.matmul(solved_v) - v_support).norm() / v_support.norm().clamp_min(1e-12)
-        system_diag = system.diag().abs().clamp_min(1e-12)
+        visual_within_var_solve = var_weight.matmul(support_visual_var_solve).clamp_min(0.0)
+        system_solve = system.to(dtype=solve_dtype)
+        v_support_solve = v_support.to(dtype=solve_dtype)
+        solve_residual = (
+            (system_solve.matmul(solved_v) - v_support_solve).norm()
+            / v_support_solve.norm().clamp_min(1e-12)
+        )
+        system_diag = system_solve.diag().abs().clamp_min(1e-12)
         system_diag_ratio = system_diag.max() / system_diag.min()
+
+        prior_mu = prior_mu_solve.to(dtype=posterior_mu.dtype)
+        uncertainty_diag = uncertainty_diag_solve.to(dtype=posterior_mu.dtype)
+        visual_within_var = visual_within_var_solve.to(dtype=posterior_mu.dtype)
+        smoothing_coeff = smoothing_coeff.to(dtype=posterior_mu.dtype)
+        var_weight = var_weight.to(dtype=posterior_mu.dtype)
 
         if bool(prior_cfg.GRAPH_GP_MATCH_DETACH_PRIOR):
             prior_mu = prior_mu.detach()

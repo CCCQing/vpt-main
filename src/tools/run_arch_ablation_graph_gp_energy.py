@@ -117,7 +117,6 @@ def _semantic_token_overrides(enable: bool) -> Dict[str, Any]:
         "MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS": False,
         "MODEL.SEMANTIC_TOKENS.ORTHO.GROUP_MODE": "equal",
         "MODEL.SEMANTIC_TOKENS.ORTHO.TEXT_MODE": "none",
-        "MODEL.SEMANTIC_TOKENS.ORTHO.ATTRIBUTES_PATH": "datasets/CUB/attributes.txt",
         "MODEL.SEMANTIC_TOKENS.ORTHO.CODEBOOK_TRAINABLE": False,
         "MODEL.SEMANTIC_TOKENS.ORTHO.CODEBOOK_SEED": 0,
         "MODEL.SEMANTIC_TOKENS.ORTHO.DEBUG": False,
@@ -253,21 +252,29 @@ def _trial_specs() -> List[Dict[str, Any]]:
     ]
 
 
-def _select_trial_specs(raw_trials: str) -> List[Dict[str, Any]]:
+def _select_trial_specs(raw_trials: Sequence[str]) -> List[Dict[str, Any]]:
     specs = _trial_specs()
-    requested = [item.strip() for item in str(raw_trials).split(",") if item.strip()]
+    raw_values = [raw_trials] if isinstance(raw_trials, str) else list(raw_trials or [])
+    requested = [
+        item.strip()
+        for value in raw_values
+        for item in str(value).split(",")
+        if item.strip()
+    ]
     if not requested:
         return specs
 
     selected: List[Dict[str, Any]] = []
     by_key: Dict[str, Dict[str, Any]] = {}
     for spec in specs:
-        by_key[str(spec["trial_id"])] = spec
+        trial_id = str(spec["trial_id"])
+        by_key[trial_id] = spec
+        by_key[str(int(trial_id))] = spec
         by_key[str(spec["trial_name"])] = spec
     for item in requested:
         spec = by_key.get(item)
         if spec is None:
-            raise ValueError(f"Unknown trial '{item}'. Valid values: 01,02,03,04 or trial names.")
+            raise ValueError(f"Unknown trial '{item}'. Valid values: 1-4, 01-04, or trial names.")
         selected.append(spec)
     return selected
 
@@ -367,7 +374,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python-bin", default="")
     parser.add_argument("--config-file", default=DEFAULT_CONFIG_FILE)
     parser.add_argument("--out-root", default=DEFAULT_OUT_ROOT)
-    parser.add_argument("--trials", default="", help="Comma-separated trial ids/names. Example: 01,04 or graph_gp_am.")
+    parser.add_argument(
+        "--trials",
+        nargs="+",
+        default=[],
+        help="Trial ids/names separated by commas or spaces. Example: 01,04 or 1 4.",
+    )
     parser.add_argument("--gpus", default="", help="Comma-separated GPU ids for independent trials.")
     parser.add_argument(
         "--gpu-groups",
