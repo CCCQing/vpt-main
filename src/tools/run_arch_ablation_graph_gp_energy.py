@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Run the four Graph-GP energy architecture ablations.
+"""Run the minimum Stage-1 Graph-GP x Attention Mediation experiment.
 
-The overrides in this script mirror the architecture ablation workbook. It
-reuses the GPU grouping, DDP wrapper, resume detection, and summary writers
-from grid_search_graph_prob_prior_v5_temperatures.py.
+The default design is C00/C10/C01/C11/A00 across seeds 17/29/43, for 15
+training runs. All cells share the same instance-aware dynamic distributor;
+only Graph-GP, Attention Mediation, and the A00 semantic-token anchor differ.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
+import statistics
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,7 +23,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.grid_search_graph_prob_prior_v5_temperatures import (  # noqa: E402
-    _best_rows,
     _build_run_command,
     _default_dist_backend,
     _existing_trial_result,
@@ -39,22 +40,41 @@ from src.tools.grid_search_graph_prob_prior_v5_temperatures import (  # noqa: E4
 
 
 DEFAULT_CONFIG_FILE = "configs/prompt/cub.yaml"
-DEFAULT_OUT_ROOT = "output/arch_ablation"
+DEFAULT_OUT_ROOT = "output/stage1_clean_graph_gp_am"
 TRAIN_SCRIPT = "train.py"
+DEFAULT_SEEDS = (17, 29, 43)
+SUMMARY_METRICS = (
+    "dev_unseen_last",
+    "zsl_unseen_last",
+    "gzsl_seen_last",
+    "gzsl_unseen_last",
+    "gzsl_h_last",
+    "gzsl_seen_best",
+    "gzsl_unseen_best",
+    "gzsl_h_best",
+)
+PAIRED_EFFECTS = {
+    "graph_gp_no_am": ("C10", "C00"),
+    "graph_gp_with_am": ("C11", "C01"),
+    "am_no_graph_gp": ("C01", "C00"),
+    "am_with_graph_gp": ("C11", "C10"),
+    "semantic_token_only": ("C00", "A00"),
+    "semantic_am_package": ("C01", "A00"),
+}
 
 
-def _base_overrides() -> Dict[str, Any]:
+def _base_overrides(protocol_mode: str) -> Dict[str, Any]:
     return {
         "RUN_N_TIMES": 1,
         "DATA.NAME": "CUB",
         "DATA.NUMBER_CLASSES": 200,
-        "DATA.XLSA.PROTOCOL_MODE": "final_gzsl",
+        "DATA.XLSA.PROTOCOL_MODE": str(protocol_mode),
         "DATA.BATCH_SIZE": 32,
         "MODEL.TYPE": "vit",
         "MODEL.CLASSIFIER": "vspcn_baseline",
         "SOLVER.MAIN_LOSS": "vspcn",
         "SOLVER.LOSS_VSPCN_AR_WEIGHT": 0.0005,
-        "SOLVER.LOSS_CM_WEIGHT": 0.05,
+        "SOLVER.LOSS_CM_WEIGHT": 0.0,
         "SOLVER.BASE_LR": 0.0006,
         "SOLVER.WEIGHT_DECAY": 0.00001,
         "SOLVER.WARMUP_EPOCH": 3,
@@ -64,6 +84,9 @@ def _base_overrides() -> Dict[str, Any]:
         "MODEL.PROMPT.ENABLE": True,
         "MODEL.PROMPT.NUM_TOKENS": 32,
         "MODEL.PROMPT.DROPOUT": 0.0,
+        "MODEL.AFFINITY.ENABLE": False,
+        "MODEL.AFFINITY.DETACH": False,
+        "MODEL.AFFINITY.VIS": False,
         "SOLVER.LOSS_PROMPT_KL_WEIGHT": 0.0,
         "SOLVER.LOSS_ATTR_WEIGHT": 0.0,
         "SOLVER.LOSS_SEM_MED_WEIGHT": 0.0,
@@ -75,20 +98,11 @@ def _base_overrides() -> Dict[str, Any]:
     }
 
 
-def _random_prompt_overrides(backend: str, deep: bool) -> Dict[str, Any]:
+def _instance_prompt_distributor_overrides() -> Dict[str, Any]:
     return {
-        "MODEL.PROMPT.BACKEND": backend,
-        "MODEL.PROMPT.INIT_SOURCE": "learned",
-        "MODEL.PROMPT.DEEP": bool(deep),
-        "MODEL.PROMPT.DISTRIBUTOR.ENABLE": False,
-    }
-
-
-def _graph_gp_prompt_overrides(backend: str, deep: bool) -> Dict[str, Any]:
-    return {
-        "MODEL.PROMPT.BACKEND": backend,
+        "MODEL.PROMPT.BACKEND": "dynamic",
         "MODEL.PROMPT.INIT_SOURCE": "distributor_mean",
-        "MODEL.PROMPT.DEEP": bool(deep),
+        "MODEL.PROMPT.DEEP": False,
         "MODEL.PROMPT.DISTRIBUTOR.ENABLE": True,
         "MODEL.PROMPT.DISTRIBUTOR.SOURCE": "token_mlp",
         "MODEL.PROMPT.DISTRIBUTOR.STATS_HIDDEN_DIM": 64,
@@ -97,7 +111,7 @@ def _graph_gp_prompt_overrides(backend: str, deep: bool) -> Dict[str, Any]:
         "MODEL.PROMPT.DISTRIBUTOR.OUTPUT_PARAM": "logvar",
         "MODEL.PROMPT.DISTRIBUTOR.LOGVAR_MIN": -10.0,
         "MODEL.PROMPT.DISTRIBUTOR.LOGVAR_MAX": 5.0,
-        "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": "fixed_eps",
+        "MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE": "mean",
         "MODEL.PROMPT.DISTRIBUTOR.FIXED_EPS_SEED": 0,
         "MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED": True,
         "MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE": False,
@@ -127,15 +141,9 @@ def _attention_mediation_overrides(enable: bool) -> Dict[str, Any]:
     if not enable:
         return {
             "MODEL.ATTENTION_MEDIATION.ENABLE": False,
-            "MODEL.AFFINITY.ENABLE": False,
-            "MODEL.AFFINITY.DETACH": False,
-            "MODEL.AFFINITY.VIS": False,
         }
     return {
         "MODEL.ATTENTION_MEDIATION.ENABLE": True,
-        "MODEL.AFFINITY.ENABLE": True,
-        "MODEL.AFFINITY.DETACH": False,
-        "MODEL.AFFINITY.VIS": True,
         "MODEL.ATTENTION_MEDIATION.SOURCE": "scores",
         "MODEL.ATTENTION_MEDIATION.EXECUTION_MODE": "block_parallel",
         "MODEL.ATTENTION_MEDIATION.MLP_POLICY": "enter_mlp",
@@ -211,50 +219,59 @@ def _merge_overrides(*parts: Mapping[str, Any]) -> Dict[str, Any]:
     return merged
 
 
-def _trial_specs() -> List[Dict[str, Any]]:
+def _cell_specs() -> List[Dict[str, Any]]:
     return [
         {
-            "trial_id": "01",
-            "trial_name": "random_prompt_am",
-            "graph_gp": False,
-            "attention_mediation": True,
-            "prompt": _random_prompt_overrides("dynamic", False),
-            "semantic_tokens": True,
-            "purpose": "Random initialized prompt + Attention Mediation.",
-        },
-        {
-            "trial_id": "02",
-            "trial_name": "graph_gp_vpt_deep",
-            "graph_gp": True,
-            "attention_mediation": False,
-            "prompt": _graph_gp_prompt_overrides("vpt_deep", True),
-            "semantic_tokens": False,
-            "purpose": "Graph-GP energy prior + VPT-deep.",
-        },
-        {
-            "trial_id": "03",
-            "trial_name": "random_prompt_vpt_deep",
+            "cell_id": "C00",
+            "cell_name": "c00_gp0_am0_sem1",
             "graph_gp": False,
             "attention_mediation": False,
-            "prompt": _random_prompt_overrides("vpt_deep", True),
-            "semantic_tokens": False,
-            "purpose": "Random initialized VPT-deep baseline.",
+            "semantic_tokens": True,
+            "core_2x2": True,
+            "purpose": "Distributor + semantic tokens; Graph-GP off; AM off.",
         },
         {
-            "trial_id": "04",
-            "trial_name": "graph_gp_am",
+            "cell_id": "C10",
+            "cell_name": "c10_gp1_am0_sem1",
+            "graph_gp": True,
+            "attention_mediation": False,
+            "semantic_tokens": True,
+            "core_2x2": True,
+            "purpose": "Distributor + semantic tokens + Graph-GP; AM off.",
+        },
+        {
+            "cell_id": "C01",
+            "cell_name": "c01_gp0_am1_sem1",
+            "graph_gp": False,
+            "attention_mediation": True,
+            "semantic_tokens": True,
+            "core_2x2": True,
+            "purpose": "Distributor + semantic tokens + AM; Graph-GP off.",
+        },
+        {
+            "cell_id": "C11",
+            "cell_name": "c11_gp1_am1_sem1",
             "graph_gp": True,
             "attention_mediation": True,
-            "prompt": _graph_gp_prompt_overrides("dynamic", False),
             "semantic_tokens": True,
-            "purpose": "Graph-GP energy prior + Attention Mediation.",
+            "core_2x2": True,
+            "purpose": "Distributor + semantic tokens + Graph-GP + AM.",
+        },
+        {
+            "cell_id": "A00",
+            "cell_name": "a00_gp0_am0_sem0",
+            "graph_gp": False,
+            "attention_mediation": False,
+            "semantic_tokens": False,
+            "core_2x2": False,
+            "purpose": "Distributor anchor without semantic tokens, Graph-GP, or AM.",
         },
     ]
 
 
-def _select_trial_specs(raw_trials: Sequence[str]) -> List[Dict[str, Any]]:
-    specs = _trial_specs()
-    raw_values = [raw_trials] if isinstance(raw_trials, str) else list(raw_trials or [])
+def _select_cell_specs(raw_cells: Sequence[str]) -> List[Dict[str, Any]]:
+    specs = _cell_specs()
+    raw_values = [raw_cells] if isinstance(raw_cells, str) else list(raw_cells or [])
     requested = [
         item.strip()
         for value in raw_values
@@ -266,17 +283,42 @@ def _select_trial_specs(raw_trials: Sequence[str]) -> List[Dict[str, Any]]:
 
     selected: List[Dict[str, Any]] = []
     by_key: Dict[str, Dict[str, Any]] = {}
-    for spec in specs:
-        trial_id = str(spec["trial_id"])
-        by_key[trial_id] = spec
-        by_key[str(int(trial_id))] = spec
-        by_key[str(spec["trial_name"])] = spec
+    for index, spec in enumerate(specs, start=1):
+        by_key[str(index)] = spec
+        by_key[str(spec["cell_id"]).lower()] = spec
+        by_key[str(spec["cell_name"]).lower()] = spec
+    seen = set()
     for item in requested:
-        spec = by_key.get(item)
+        spec = by_key.get(item.lower())
         if spec is None:
-            raise ValueError(f"Unknown trial '{item}'. Valid values: 1-4, 01-04, or trial names.")
-        selected.append(spec)
+            raise ValueError(
+                f"Unknown cell '{item}'. Valid values: C00,C10,C01,C11,A00; 1-5; or cell names."
+            )
+        cell_id = str(spec["cell_id"])
+        if cell_id not in seen:
+            selected.append(spec)
+            seen.add(cell_id)
     return selected
+
+
+def _parse_seeds(raw_seeds: Sequence[str]) -> List[int]:
+    raw_values = [raw_seeds] if isinstance(raw_seeds, str) else list(raw_seeds or [])
+    items = [
+        item.strip()
+        for value in raw_values
+        for item in str(value).split(",")
+        if item.strip()
+    ]
+    if not items:
+        return list(DEFAULT_SEEDS)
+    seeds: List[int] = []
+    for item in items:
+        seed = int(item)
+        if seed < 0:
+            raise ValueError("Experiment seeds must be non-negative integers.")
+        if seed not in seeds:
+            seeds.append(seed)
+    return seeds
 
 
 def _build_trials(
@@ -284,54 +326,210 @@ def _build_trials(
     python_bin: str,
     config_file: str,
     out_root: Path,
+    protocol_mode: str,
+    seeds: Sequence[int],
     extra_opts: Sequence[str],
     selected_specs: Sequence[Mapping[str, Any]],
 ) -> List[Dict[str, Any]]:
     train_script = repo_root / TRAIN_SCRIPT
     trials: List[Dict[str, Any]] = []
-    for trial_index, spec in enumerate(selected_specs):
+    for combo_index, spec in enumerate(selected_specs):
         graph_gp = bool(spec["graph_gp"])
         attention_mediation = bool(spec["attention_mediation"])
         semantic_tokens = bool(spec["semantic_tokens"])
-        output_dir = out_root / str(spec["trial_name"])
-        overrides = _merge_overrides(
-            _base_overrides(),
-            spec["prompt"],
-            _semantic_token_overrides(semantic_tokens),
-            _graph_prob_prior_overrides(graph_gp),
-            _attention_mediation_overrides(attention_mediation),
-            {"OUTPUT_DIR": str(output_dir)},
-        )
-        cmd = [
-            python_bin,
-            str(train_script),
-            "--config-file",
-            str(config_file),
-        ] + _mapping_to_opts(overrides) + list(extra_opts)
-        trials.append(
-            {
-                "trial_index": trial_index,
-                "stage": "arch_ablation_graph_gp_energy",
-                "trial_name": str(spec["trial_name"]),
-                "graph_method": "method1_diff" if graph_gp else "none",
-                "mode": "graph_gp_energy" if graph_gp else "no_graph_gp",
-                "combo_index": 0,
-                "combo": {
-                    "trial_id": str(spec["trial_id"]),
-                    "graph_gp": graph_gp,
-                    "attention_mediation": attention_mediation,
-                    "semantic_tokens": semantic_tokens,
-                    "purpose": str(spec["purpose"]),
+        for seed in seeds:
+            trial_index = len(trials)
+            cell_id = str(spec["cell_id"])
+            cell_name = str(spec["cell_name"])
+            trial_name = f"{cell_id.lower()}_seed_{int(seed)}"
+            output_dir = out_root / cell_name / f"seed_{int(seed)}"
+            overrides = _merge_overrides(
+                _base_overrides(protocol_mode),
+                _instance_prompt_distributor_overrides(),
+                _semantic_token_overrides(semantic_tokens),
+                _graph_prob_prior_overrides(graph_gp),
+                _attention_mediation_overrides(attention_mediation),
+                {
+                    "SEED": int(seed),
+                    "OUTPUT_DIR": str(output_dir),
                 },
-                "overrides": overrides,
-                "output_dir": str(output_dir),
-                "stdout_path": str(output_dir / "launcher_stdout.txt"),
-                "cmd": cmd,
-                "repo_root": str(repo_root),
-                "runner": "train",
-            }
-        )
+            )
+            cmd = [
+                python_bin,
+                str(train_script),
+                "--config-file",
+                str(config_file),
+            ] + _mapping_to_opts(overrides) + list(extra_opts)
+            trials.append(
+                {
+                    "trial_index": trial_index,
+                    "stage": "stage1_clean_graph_gp_am",
+                    "trial_name": trial_name,
+                    "graph_method": "method1_diff" if graph_gp else "none",
+                    "mode": "graph_gp_energy" if graph_gp else "no_graph_gp",
+                    "combo_index": int(combo_index),
+                    "combo": {
+                        "cell_id": cell_id,
+                        "cell_name": cell_name,
+                        "seed": int(seed),
+                        "protocol_mode": str(protocol_mode),
+                        "graph_gp": graph_gp,
+                        "attention_mediation": attention_mediation,
+                        "semantic_tokens": semantic_tokens,
+                        "core_2x2": bool(spec["core_2x2"]),
+                        "purpose": str(spec["purpose"]),
+                    },
+                    "overrides": overrides,
+                    "output_dir": str(output_dir),
+                    "stdout_path": str(output_dir / "launcher_stdout.txt"),
+                    "cmd": cmd,
+                    "repo_root": str(repo_root),
+                    "runner": "train",
+                }
+            )
     return trials
+
+
+def _metric_value(row: Mapping[str, Any], key: str):
+    value = row.get(key, "")
+    if value in {"", None}:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _mean_std(values: Sequence[float]) -> tuple[float, float]:
+    if not values:
+        return float("nan"), float("nan")
+    if len(values) == 1:
+        return float(values[0]), 0.0
+    return float(statistics.mean(values)), float(statistics.stdev(values))
+
+
+def _cell_summary_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Mapping[str, Any]]] = {}
+    for row in rows:
+        cell_id = str(row.get("cell_id", ""))
+        if cell_id:
+            grouped.setdefault(cell_id, []).append(row)
+
+    cell_order = {str(spec["cell_id"]): index for index, spec in enumerate(_cell_specs())}
+    summaries: List[Dict[str, Any]] = []
+    for cell_id in sorted(grouped, key=lambda item: cell_order.get(item, 999)):
+        cell_rows = grouped[cell_id]
+        successful = [row for row in cell_rows if int(row.get("returncode", 0)) == 0]
+        first = cell_rows[0]
+        summary: Dict[str, Any] = {
+            "cell_id": cell_id,
+            "cell_name": first.get("cell_name", ""),
+            "graph_gp": first.get("graph_gp", ""),
+            "attention_mediation": first.get("attention_mediation", ""),
+            "semantic_tokens": first.get("semantic_tokens", ""),
+            "requested_runs": len(cell_rows),
+            "successful_runs": len(successful),
+            "seeds": ",".join(str(row.get("seed", "")) for row in cell_rows),
+        }
+        for metric in SUMMARY_METRICS:
+            values = [
+                value
+                for row in successful
+                for value in [_metric_value(row, metric)]
+                if value is not None
+            ]
+            if values:
+                mean_value, std_value = _mean_std(values)
+                summary[f"{metric}_mean"] = mean_value
+                summary[f"{metric}_std"] = std_value
+        summaries.append(summary)
+    return summaries
+
+
+def _paired_effect_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    successful = [row for row in rows if int(row.get("returncode", 0)) == 0]
+    by_seed_cell = {
+        (int(row["seed"]), str(row["cell_id"])): row
+        for row in successful
+        if row.get("seed", "") != "" and row.get("cell_id", "") != ""
+    }
+    seeds = sorted({seed for seed, _ in by_seed_cell})
+    effects: List[Dict[str, Any]] = []
+    for seed in seeds:
+        for effect_name, (lhs_cell, rhs_cell) in PAIRED_EFFECTS.items():
+            lhs = by_seed_cell.get((seed, lhs_cell))
+            rhs = by_seed_cell.get((seed, rhs_cell))
+            if lhs is None or rhs is None:
+                continue
+            effect: Dict[str, Any] = {
+                "effect": effect_name,
+                "seed": int(seed),
+                "lhs_cell": lhs_cell,
+                "rhs_cell": rhs_cell,
+            }
+            for metric in SUMMARY_METRICS:
+                lhs_value = _metric_value(lhs, metric)
+                rhs_value = _metric_value(rhs, metric)
+                if lhs_value is not None and rhs_value is not None:
+                    effect[f"{metric}_delta"] = lhs_value - rhs_value
+            effects.append(effect)
+
+        required = {
+            cell_id: by_seed_cell.get((seed, cell_id))
+            for cell_id in ("C00", "C10", "C01", "C11")
+        }
+        if all(row is not None for row in required.values()):
+            interaction: Dict[str, Any] = {
+                "effect": "graph_gp_am_interaction",
+                "seed": int(seed),
+                "lhs_cell": "(C11-C01)",
+                "rhs_cell": "(C10-C00)",
+            }
+            for metric in SUMMARY_METRICS:
+                values = {
+                    cell_id: _metric_value(row, metric)
+                    for cell_id, row in required.items()
+                }
+                if all(value is not None for value in values.values()):
+                    interaction[f"{metric}_delta"] = (
+                        values["C11"] - values["C01"]
+                    ) - (
+                        values["C10"] - values["C00"]
+                    )
+            effects.append(interaction)
+    return effects
+
+
+def _paired_effect_summary_rows(effect_rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Mapping[str, Any]]] = {}
+    for row in effect_rows:
+        grouped.setdefault(str(row["effect"]), []).append(row)
+
+    summaries: List[Dict[str, Any]] = []
+    for effect_name in list(PAIRED_EFFECTS) + ["graph_gp_am_interaction"]:
+        rows_for_effect = grouped.get(effect_name, [])
+        if not rows_for_effect:
+            continue
+        summary: Dict[str, Any] = {
+            "effect": effect_name,
+            "seed_count": len(rows_for_effect),
+            "seeds": ",".join(str(row["seed"]) for row in rows_for_effect),
+        }
+        for metric in SUMMARY_METRICS:
+            key = f"{metric}_delta"
+            values = [
+                value
+                for row in rows_for_effect
+                for value in [_metric_value(row, key)]
+                if value is not None
+            ]
+            if values:
+                mean_value, std_value = _mean_std(values)
+                summary[f"{key}_mean"] = mean_value
+                summary[f"{key}_std"] = std_value
+        summaries.append(summary)
+    return summaries
 
 
 def _validate_gpu_args(gpu_groups: Sequence[str], max_workers: int, nproc_per_trial: int) -> None:
@@ -369,16 +567,32 @@ def _write_commands(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run four Graph-GP energy architecture ablations.")
+    parser = argparse.ArgumentParser(
+        description="Run Stage-1 C00/C10/C01/C11/A00 across three seeds (15 runs by default)."
+    )
     parser.add_argument("--repo-root", default=str(ROOT))
     parser.add_argument("--python-bin", default="")
     parser.add_argument("--config-file", default=DEFAULT_CONFIG_FILE)
     parser.add_argument("--out-root", default=DEFAULT_OUT_ROOT)
     parser.add_argument(
+        "--cells",
         "--trials",
+        dest="cells",
         nargs="+",
         default=[],
-        help="Trial ids/names separated by commas or spaces. Example: 01,04 or 1 4.",
+        help="Cell ids/names separated by commas or spaces. Default: C00,C10,C01,C11,A00.",
+    )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        default=[",".join(str(seed) for seed in DEFAULT_SEEDS)],
+        help="Experiment seeds separated by commas or spaces. Default: 17,29,43.",
+    )
+    parser.add_argument(
+        "--protocol-mode",
+        default="final_gzsl",
+        choices=["dev", "final_gzsl"],
+        help="XLSA protocol for all runs. Default: final_gzsl; pass dev explicitly for dev-unseen evaluation.",
     )
     parser.add_argument("--gpus", default="", help="Comma-separated GPU ids for independent trials.")
     parser.add_argument(
@@ -394,7 +608,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dist-backend", default=_default_dist_backend(), choices=["nccl", "gloo"])
     parser.add_argument("--max-workers", type=int, default=1)
-    parser.add_argument("--limit", type=int, default=0, help="Run only the first N selected trials; 0 means all.")
+    parser.add_argument("--limit", type=int, default=0, help="Run only the first N expanded cell/seed trials; 0 means all.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-resume", action="store_true", help="Rerun trials even when complete train logs already exist.")
     parser.add_argument("--resume-debug", action="store_true", help="Print why an existing trial was or was not skipped.")
@@ -404,6 +618,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if str(args.protocol_mode) == "dev":
+        print(
+            "[stage1] protocol=dev uses the repository's current dev-unseen evaluation; "
+            "dev-seen/dev-H require the separate dev-GZSL infrastructure described in the experiment plan.",
+            flush=True,
+        )
+    else:
+        print(
+            "[stage1] protocol=final_gzsl was explicitly requested; the current trainer evaluates "
+            "test seen/unseen every epoch, so do not use best-test epoch selection.",
+            flush=True,
+        )
     repo_root = Path(args.repo_root).resolve()
     python_bin = str(args.python_bin or sys.executable)
     config_file = str(args.config_file)
@@ -412,11 +638,11 @@ def main() -> None:
     out_root = Path(args.out_root)
     if not out_root.is_absolute():
         out_root = repo_root / out_root
+    out_root = out_root / str(args.protocol_mode)
 
     extra_opts = _validate_extra_opts(args.opts)
-    selected_specs = _select_trial_specs(args.trials)
-    if int(args.limit) > 0:
-        selected_specs = selected_specs[: int(args.limit)]
+    selected_specs = _select_cell_specs(args.cells)
+    seeds = _parse_seeds(args.seeds)
     gpu_groups = _parse_gpu_groups(args.gpu_groups, args.gpus)
     _validate_gpu_args(gpu_groups, int(args.max_workers), int(args.nproc_per_trial))
 
@@ -425,9 +651,13 @@ def main() -> None:
         python_bin=python_bin,
         config_file=config_file,
         out_root=out_root,
+        protocol_mode=str(args.protocol_mode),
+        seeds=seeds,
         extra_opts=extra_opts,
         selected_specs=selected_specs,
     )
+    if int(args.limit) > 0:
+        trials = trials[: int(args.limit)]
     out_root.mkdir(parents=True, exist_ok=True)
     commands_path = out_root / "commands.txt"
     _write_commands(
@@ -440,13 +670,16 @@ def main() -> None:
     )
 
     search_space = {
-        "source": "architecture_ablation_workbook",
+        "source": "stage1_clean_graph_gp_am_plan",
         "base_config_file": config_file,
         "train_script": TRAIN_SCRIPT,
         "runner": "train",
         "python_bin": python_bin,
         "output_root": str(out_root),
         "total_trials": len(trials),
+        "default_design_trials": len(_cell_specs()) * len(DEFAULT_SEEDS),
+        "protocol_mode": str(args.protocol_mode),
+        "seeds": seeds,
         "dry_run": bool(args.dry_run),
         "resume": not bool(args.no_resume),
         "gpu_groups": gpu_groups,
@@ -455,16 +688,26 @@ def main() -> None:
         "max_workers": int(args.max_workers),
         "extra_opts": extra_opts,
         "commands_path": str(commands_path),
-        "trials": [
+        "cells": [
             {
-                "trial_id": str(spec["trial_id"]),
-                "trial_name": str(spec["trial_name"]),
+                "cell_id": str(spec["cell_id"]),
+                "cell_name": str(spec["cell_name"]),
                 "graph_gp": bool(spec["graph_gp"]),
                 "attention_mediation": bool(spec["attention_mediation"]),
                 "semantic_tokens": bool(spec["semantic_tokens"]),
+                "core_2x2": bool(spec["core_2x2"]),
                 "purpose": str(spec["purpose"]),
             }
             for spec in selected_specs
+        ],
+        "trials": [
+            {
+                "trial_name": str(trial["trial_name"]),
+                "cell_id": str(trial["combo"]["cell_id"]),
+                "seed": int(trial["combo"]["seed"]),
+                "output_dir": str(trial["output_dir"]),
+            }
+            for trial in trials
         ],
     }
     _write_json(out_root / "search_space.json", search_space)
@@ -614,16 +857,19 @@ def main() -> None:
         rows.sort(key=lambda row: int(row["trial_index"]))
 
     ranked_rows = _rank_rows(rows)
-    best_by_trial = _best_rows(ranked_rows, ["trial_name"])
-    best_by_graph_gp_am = _best_rows(ranked_rows, ["graph_gp", "attention_mediation"])
+    cell_summaries = _cell_summary_rows(rows)
+    paired_effects = _paired_effect_rows(rows)
+    paired_effect_summaries = _paired_effect_summary_rows(paired_effects)
     _write_csv(out_root / "summary.csv", ranked_rows)
     _write_json(out_root / "summary.json", {"search_space": search_space, "rows": ranked_rows})
     _write_csv(out_root / "ranked_summary.csv", ranked_rows)
     _write_json(out_root / "ranked_summary.json", {"search_space": search_space, "rows": ranked_rows})
-    _write_csv(out_root / "best_by_trial.csv", best_by_trial)
-    _write_json(out_root / "best_by_trial.json", {"rows": best_by_trial})
-    _write_csv(out_root / "best_by_graph_gp_am.csv", best_by_graph_gp_am)
-    _write_json(out_root / "best_by_graph_gp_am.json", {"rows": best_by_graph_gp_am})
+    _write_csv(out_root / "cell_summary.csv", cell_summaries)
+    _write_json(out_root / "cell_summary.json", {"rows": cell_summaries})
+    _write_csv(out_root / "paired_effects.csv", paired_effects)
+    _write_json(out_root / "paired_effects.json", {"rows": paired_effects})
+    _write_csv(out_root / "paired_effect_summary.csv", paired_effect_summaries)
+    _write_json(out_root / "paired_effect_summary.json", {"rows": paired_effect_summaries})
 
     failures = [row for row in rows if int(row.get("returncode", 0)) not in {0, -1}]
     if failures:
@@ -631,6 +877,8 @@ def main() -> None:
         raise SystemExit(f"{len(failures)} trials failed; see {out_root / 'failures.json'}")
     print(f"wrote {out_root / 'summary.csv'}")
     print(f"wrote {out_root / 'summary.json'}")
+    print(f"wrote {out_root / 'cell_summary.csv'}")
+    print(f"wrote {out_root / 'paired_effect_summary.csv'}")
     print(f"wrote {commands_path}")
 
 
