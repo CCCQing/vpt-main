@@ -468,6 +468,49 @@ class PreViTPromptDistributor(nn.Module):
             instance_prompt = instance_prompt + self.slot_embed.to(device=mu.device, dtype=mu.dtype)
         return instance_prompt
 
+    def prompt_from_distribution(
+        self,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        eps: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if self.factorized_enable:
+            raise ValueError("External prompt distributions currently require FACTORIZED_ENABLE=False.")
+        if mu.dim() != 2 or tuple(logvar.shape) != tuple(mu.shape) or mu.shape[1] != self.dim:
+            raise ValueError(
+                f"External mu/logvar must be aligned [B,{self.dim}], got {tuple(mu.shape)} and {tuple(logvar.shape)}."
+            )
+        logvar = logvar.clamp(min=self.logvar_min, max=self.logvar_max)
+        std = torch.exp(0.5 * logvar)
+        if eps is None:
+            eps = mu.new_zeros((mu.shape[0], self.instance_tokens, self.dim))
+        if tuple(eps.shape) != (mu.shape[0], self.instance_tokens, self.dim):
+            raise ValueError(
+                f"External eps must be [B,{self.instance_tokens},{self.dim}], got {tuple(eps.shape)}."
+            )
+        instance_prompt = mu[:, None, :] + std[:, None, :] * eps
+        if self.use_slot_embed:
+            instance_prompt = instance_prompt + self.slot_embed.to(device=mu.device, dtype=mu.dtype)
+        domain_prompt = self.domain_prompt.to(device=mu.device, dtype=mu.dtype).expand(mu.shape[0], -1, -1)
+        prompt_tokens = torch.cat((instance_prompt, domain_prompt), dim=1)
+        if tuple(prompt_tokens.shape) != (mu.shape[0], self.prompt_len, self.dim):
+            raise ValueError(
+                f"External prompt_tokens must be [B,{self.prompt_len},{self.dim}], got {tuple(prompt_tokens.shape)}."
+            )
+        return prompt_tokens, {
+            "visual_source": "external_distribution",
+            "visual_input": mu,
+            "visual_input_shape": tuple(mu.shape),
+            "stats_out": torch.cat((mu, logvar), dim=-1),
+            "mu": mu,
+            "logvar": logvar,
+            "std": std,
+            "instance_prompt": instance_prompt,
+            "domain_prompt": domain_prompt,
+            "prompt_tokens": prompt_tokens,
+            "factorized_enable": False,
+        }
+
     def _sample_factor_latent(
         self,
         mu: torch.Tensor,

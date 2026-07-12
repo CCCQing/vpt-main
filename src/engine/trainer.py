@@ -2411,6 +2411,47 @@ class Trainer():
             if str(self.evaluator.task_type).lower() == "gzsl":
                 self._update_gzsl_record_metrics(epoch, test_unseen_loader, seen_metrics, unseen_metrics)
 
+        if bool(self.cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT):
+            self._save_trainable_final_checkpoint(total_epoch)
+
+    def _save_trainable_final_checkpoint(self, total_epoch):
+        model_ref = self._model_ref(self.model)
+        trainable_names = [name for name, param in model_ref.named_parameters() if param.requires_grad]
+        state = model_ref.state_dict()
+        trainable_state = {
+            name: state[name].detach().cpu()
+            for name in trainable_names
+            if name in state
+        }
+        missing = sorted(set(trainable_names).difference(trainable_state))
+        if missing:
+            raise RuntimeError("Trainable checkpoint is missing model state keys: {}".format(missing[:20]))
+
+        checkpoint_name = str(self.cfg.SOLVER.TRAINABLE_FINAL_CHECKPOINT_NAME).strip()
+        if not checkpoint_name or os.path.basename(checkpoint_name) != checkpoint_name:
+            raise ValueError("SOLVER.TRAINABLE_FINAL_CHECKPOINT_NAME must be a file name without directories.")
+        checkpoint_path = os.path.join(str(self.cfg.OUTPUT_DIR), checkpoint_name)
+        os.makedirs(str(self.cfg.OUTPUT_DIR), exist_ok=True)
+        torch.save(
+            {
+                "format": "vpt_trainable_v1",
+                "model_state": trainable_state,
+                "trainable_parameter_names": trainable_names,
+                "seed": int(self.cfg.SEED) if self.cfg.SEED is not None else None,
+                "cell_id": str(self.cfg.SOLVER.STAGE2_CHECKPOINT_CELL_ID),
+                "protocol_mode": str(self.cfg.DATA.XLSA.PROTOCOL_MODE),
+                "total_epoch": int(total_epoch),
+                "config": str(self.cfg),
+            },
+            checkpoint_path,
+        )
+        logger.info(
+            "Saved trainable-only final checkpoint: %s tensors=%d parameters=%d",
+            checkpoint_path,
+            len(trainable_state),
+            sum(int(t.numel()) for t in trainable_state.values()),
+        )
+
     def train_classifier(self, train_loader, val_loader, test_seen_loader, test_unseen_loader):
         if val_loader is not None:
             return self._train_classifier_dev(train_loader, val_loader, test_seen_loader, test_unseen_loader)

@@ -80,6 +80,32 @@ class ViT(nn.Module):
         """
         return self._runtime_prompt_distribution_stats
 
+    def get_runtime_classifier_stats(self):
+        if self.r_similarity_head is None:
+            return None
+        fields = {
+            "visual_input": "_loss_last_visual_input",
+            "visual_repr": "_loss_last_visual_repr",
+            "semantic_input": "_loss_last_semantic_input",
+            "semantic_repr": "_loss_last_semantic_repr",
+        }
+        stats = {
+            name: getattr(self.r_similarity_head, attribute, None)
+            for name, attribute in fields.items()
+        }
+        return stats if all(torch.is_tensor(value) for value in stats.values()) else None
+
+    def set_runtime_prompt_distribution_override(self, mu, logvar, eps=None):
+        transformer = self.enc.transformer
+        if not hasattr(transformer, "set_runtime_prompt_distribution_override"):
+            raise RuntimeError("Current backbone does not support external prompt distributions.")
+        transformer.set_runtime_prompt_distribution_override(mu, logvar, eps=eps)
+
+    def clear_runtime_prompt_distribution_override(self):
+        transformer = self.enc.transformer
+        if hasattr(transformer, "clear_runtime_prompt_distribution_override"):
+            transformer.clear_runtime_prompt_distribution_override()
+
     def build_backbone(self, prompt_cfg, cfg, adapter_cfg, load_pretrain, vis):
 
         self.enc, self.feat_dim = build_vit_sup_models(

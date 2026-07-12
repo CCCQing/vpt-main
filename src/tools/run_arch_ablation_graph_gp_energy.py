@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run the minimum Stage-1 Graph-GP x Attention Mediation experiment.
+"""Run the valid Graph-GP x semantic-token x Attention Mediation experiment.
 
-The default design is C00/C10/C01/C11/A00 across seeds 17/29/43, for 15
-training runs. All cells share the same instance-aware dynamic distributor;
-only Graph-GP, Attention Mediation, and the A00 semantic-token anchor differ.
+The default design is C00/C10/C01/C11/A00/A10 across seeds 17/29/43, for 18
+training runs. Attention Mediation is nested under semantic tokens, so the two
+semantic-off/AM-on cells are intentionally undefined.
 """
 
 from __future__ import annotations
@@ -54,11 +54,13 @@ SUMMARY_METRICS = (
     "gzsl_h_best",
 )
 PAIRED_EFFECTS = {
+    "graph_gp_no_semantic": ("A10", "A00"),
     "graph_gp_no_am": ("C10", "C00"),
     "graph_gp_with_am": ("C11", "C01"),
     "am_no_graph_gp": ("C01", "C00"),
     "am_with_graph_gp": ("C11", "C10"),
     "semantic_token_only": ("C00", "A00"),
+    "semantic_with_graph_gp": ("C10", "A10"),
     "semantic_am_package": ("C01", "A00"),
 }
 
@@ -266,6 +268,15 @@ def _cell_specs() -> List[Dict[str, Any]]:
             "core_2x2": False,
             "purpose": "Distributor anchor without semantic tokens, Graph-GP, or AM.",
         },
+        {
+            "cell_id": "A10",
+            "cell_name": "a10_gp1_am0_sem0",
+            "graph_gp": True,
+            "attention_mediation": False,
+            "semantic_tokens": False,
+            "core_2x2": False,
+            "purpose": "Distributor + Graph-GP without semantic tokens or AM.",
+        },
     ]
 
 
@@ -292,7 +303,7 @@ def _select_cell_specs(raw_cells: Sequence[str]) -> List[Dict[str, Any]]:
         spec = by_key.get(item.lower())
         if spec is None:
             raise ValueError(
-                f"Unknown cell '{item}'. Valid values: C00,C10,C01,C11,A00; 1-5; or cell names."
+                f"Unknown cell '{item}'. Valid values: C00,C10,C01,C11,A00,A10; 1-6; or cell names."
             )
         cell_id = str(spec["cell_id"])
         if cell_id not in seen:
@@ -351,6 +362,8 @@ def _build_trials(
                 _attention_mediation_overrides(attention_mediation),
                 {
                     "SEED": int(seed),
+                    "SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT": True,
+                    "SOLVER.STAGE2_CHECKPOINT_CELL_ID": cell_id,
                     "OUTPUT_DIR": str(output_dir),
                 },
             )
@@ -498,6 +511,30 @@ def _paired_effect_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any
                         values["C10"] - values["C00"]
                     )
             effects.append(interaction)
+
+        graph_semantic_required = {
+            cell_id: by_seed_cell.get((seed, cell_id))
+            for cell_id in ("A00", "A10", "C00", "C10")
+        }
+        if all(row is not None for row in graph_semantic_required.values()):
+            interaction = {
+                "effect": "graph_gp_semantic_interaction_no_am",
+                "seed": int(seed),
+                "lhs_cell": "(C10-C00)",
+                "rhs_cell": "(A10-A00)",
+            }
+            for metric in SUMMARY_METRICS:
+                values = {
+                    cell_id: _metric_value(row, metric)
+                    for cell_id, row in graph_semantic_required.items()
+                }
+                if all(value is not None for value in values.values()):
+                    interaction[f"{metric}_delta"] = (
+                        values["C10"] - values["C00"]
+                    ) - (
+                        values["A10"] - values["A00"]
+                    )
+            effects.append(interaction)
     return effects
 
 
@@ -568,7 +605,7 @@ def _write_commands(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Stage-1 C00/C10/C01/C11/A00 across three seeds (15 runs by default)."
+        description="Run valid C00/C10/C01/C11/A00/A10 cells across three seeds (18 runs by default)."
     )
     parser.add_argument("--repo-root", default=str(ROOT))
     parser.add_argument("--python-bin", default="")
@@ -580,7 +617,7 @@ def parse_args() -> argparse.Namespace:
         dest="cells",
         nargs="+",
         default=[],
-        help="Cell ids/names separated by commas or spaces. Default: C00,C10,C01,C11,A00.",
+        help="Cell ids/names separated by commas or spaces. Default: C00,C10,C01,C11,A00,A10.",
     )
     parser.add_argument(
         "--seeds",

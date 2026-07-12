@@ -670,6 +670,7 @@ class PromptedTransformer(Transformer):
         self._shape_debug_incorporate_logged = False
         self._last_prompt_path_info = {}
         self._last_prompt_distribution_stats = None
+        self._runtime_prompt_distribution_override = None
 
         if prompt_init is not None:
             raise ValueError("Static prompt initialization has been removed; prompt_init must be None.")
@@ -817,6 +818,19 @@ class PromptedTransformer(Transformer):
         """
         if self.prompt_init_provider is None:
             raise ValueError("prompt_init_provider is required for INIT_SOURCE='distributor_mean'.")
+        if self._runtime_prompt_distribution_override is not None:
+            override = self._runtime_prompt_distribution_override
+            self._runtime_prompt_distribution_override = None
+            mu = override["mu"].to(device=x_base.device, dtype=x_base.dtype)
+            logvar = override["logvar"].to(device=x_base.device, dtype=x_base.dtype)
+            eps = override.get("eps")
+            if torch.is_tensor(eps):
+                eps = eps.to(device=x_base.device, dtype=x_base.dtype)
+            if mu.shape[0] != raw_image.shape[0]:
+                raise ValueError(
+                    f"External prompt batch {mu.shape[0]} does not match image batch {raw_image.shape[0]}."
+                )
+            return self.prompt_init_provider.prompt_from_distribution(mu, logvar, eps=eps)
         vit_image_tokens = x_base[:, 1:, :]
         vit_cls = None
         if str(self.prompt_init_provider.source) == "vit_cls_prepass":
@@ -830,6 +844,19 @@ class PromptedTransformer(Transformer):
         if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
             raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
         return provider_out
+
+    def set_runtime_prompt_distribution_override(
+        self,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+        eps: Optional[torch.Tensor] = None,
+    ) -> None:
+        if self.prompt_init_source != "distributor_mean":
+            raise ValueError("External prompt distribution requires INIT_SOURCE='distributor_mean'.")
+        self._runtime_prompt_distribution_override = {"mu": mu, "logvar": logvar, "eps": eps}
+
+    def clear_runtime_prompt_distribution_override(self) -> None:
+        self._runtime_prompt_distribution_override = None
 
     def incorporate_prompt(self, x, semantics=None):
         """构造输入层主序列，并在需要时注入输入 prompt。
