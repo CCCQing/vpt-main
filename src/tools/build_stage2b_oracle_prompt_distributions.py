@@ -180,17 +180,60 @@ def _macro_accuracy(predictions: np.ndarray, targets: np.ndarray, class_ids: Seq
     return float(np.mean(values))
 
 
+def _heldout_classification_metrics(
+    logits: np.ndarray,
+    targets: np.ndarray,
+    class_ids: Sequence[int],
+    seen_class_ids: Sequence[int],
+    unseen_class_ids: Sequence[int],
+) -> Dict[str, float]:
+    class_array = np.asarray(list(class_ids), dtype=np.int64)
+    seen_array = np.asarray(list(seen_class_ids), dtype=np.int64)
+    unseen_array = np.asarray(list(unseen_class_ids), dtype=np.int64)
+    if set(seen_array.tolist()).intersection(unseen_array.tolist()):
+        raise ValueError("Seen and unseen class ids must be disjoint.")
+    if set(seen_array.tolist()).union(unseen_array.tolist()) != set(class_array.tolist()):
+        raise ValueError("Seen and unseen class ids must partition all classifier classes.")
+    column_by_class = {int(class_id): index for index, class_id in enumerate(class_array)}
+    unseen_columns = np.asarray(
+        [column_by_class[int(class_id)] for class_id in unseen_array], dtype=np.int64
+    )
+    predictions = class_array[np.asarray(logits).argmax(axis=1)]
+    seen_mask = np.isin(targets, seen_array)
+    unseen_mask = np.isin(targets, unseen_array)
+    if not seen_mask.any() or not unseen_mask.any():
+        raise ValueError("Held-out evaluation must contain both seen and unseen samples.")
+    seen_accuracy = _macro_accuracy(predictions[seen_mask], targets[seen_mask], seen_array)
+    unseen_accuracy = _macro_accuracy(predictions[unseen_mask], targets[unseen_mask], unseen_array)
+    harmonic = (
+        0.0
+        if seen_accuracy + unseen_accuracy <= 0.0
+        else 2.0 * seen_accuracy * unseen_accuracy / (seen_accuracy + unseen_accuracy)
+    )
+    unseen_logits = np.asarray(logits)[unseen_mask][:, unseen_columns]
+    zsl_predictions = unseen_array[unseen_logits.argmax(axis=1)]
+    zsl_unseen = _macro_accuracy(zsl_predictions, targets[unseen_mask], unseen_array)
+    return {
+        "heldout_gzsl_seen": float(seen_accuracy),
+        "heldout_gzsl_unseen": float(unseen_accuracy),
+        "heldout_gzsl_h": float(harmonic),
+        "heldout_zsl_unseen": float(zsl_unseen),
+    }
+
+
 def _evaluate(
     model,
     loader,
     class_ids: torch.Tensor,
+    seen_class_ids: Sequence[int],
+    unseen_class_ids: Sequence[int],
     oracle_mu: torch.Tensor,
     oracle_logvar: torch.Tensor,
     device: torch.device,
     use_oracle: bool,
 ) -> Tuple[Dict[str, float], np.ndarray, np.ndarray]:
     labels_all: List[np.ndarray] = []
-    predictions_all: List[np.ndarray] = []
+    logits_all: List[np.ndarray] = []
     visual_sum = torch.zeros(
         class_ids.numel(), oracle_mu.shape[1], device=device, dtype=torch.float64
     )
@@ -215,20 +258,23 @@ def _evaluate(
             visual = classifier["visual_repr"]
             semantic = classifier["semantic_repr"].index_select(0, labels)
             paired_cosine.append(F.cosine_similarity(visual, semantic, dim=-1).detach().cpu())
-            predictions = class_ids.index_select(0, logits.argmax(dim=1))
             labels_all.append(labels.detach().cpu().numpy())
-            predictions_all.append(predictions.detach().cpu().numpy())
+            logits_all.append(logits.detach().cpu().numpy())
             ones = torch.ones(labels.shape[0], device=device, dtype=torch.float64)
             count.index_add_(0, labels, ones)
             visual_sum.index_add_(0, labels, visual.double())
             logit_sum.index_add_(0, labels, logits.double())
     labels_np = np.concatenate(labels_all)
-    predictions_np = np.concatenate(predictions_all)
+    logits_np = np.concatenate(logits_all)
     class_list = [int(x) for x in class_ids.detach().cpu().tolist()]
-    metrics = {
-        "macro_accuracy": _macro_accuracy(predictions_np, labels_np, class_list),
-        "paired_visual_semantic_cosine": float(torch.cat(paired_cosine).mean().item()),
-    }
+    metrics = _heldout_classification_metrics(
+        logits_np,
+        labels_np,
+        class_list,
+        seen_class_ids,
+        unseen_class_ids,
+    )
+    metrics["paired_visual_semantic_cosine"] = float(torch.cat(paired_cosine).mean().item())
     visual_centers = (visual_sum / count[:, None]).cpu().numpy().astype(np.float32)
     logit_profiles = (logit_sum / count[:, None]).cpu().numpy().astype(np.float32)
     return metrics, visual_centers, logit_profiles
@@ -332,10 +378,26 @@ def build_oracle(args: argparse.Namespace) -> None:
         )
 
     original_metrics, _, _ = _evaluate(
-        model, eval_loader, class_ids, oracle_mu, oracle_logvar, runtime_device, use_oracle=False
+        model,
+        eval_loader,
+        class_ids,
+        dataset.seen_classes,
+        dataset.unseen_classes,
+        oracle_mu,
+        oracle_logvar,
+        runtime_device,
+        use_oracle=False,
     )
     oracle_metrics, visual_centers, logit_profiles = _evaluate(
-        model, eval_loader, class_ids, oracle_mu, oracle_logvar, runtime_device, use_oracle=True
+        model,
+        eval_loader,
+        class_ids,
+        dataset.seen_classes,
+        dataset.unseen_classes,
+        oracle_mu,
+        oracle_logvar,
+        runtime_device,
+        use_oracle=True,
     )
     metadata = {
         "format": "stage2b_oracle_prompt_distributions_v1",
