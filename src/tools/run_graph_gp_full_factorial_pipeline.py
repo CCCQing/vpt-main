@@ -22,11 +22,16 @@ from src.tools.run_arch_ablation_graph_gp_energy import _cell_specs  # noqa: E40
 
 CELLS = ("A00", "A10", "C00", "C10", "C01", "C11")
 STAGE2B_GROUPS = (
-    "B0_image_only",
-    "B1_attribute_ridge",
-    "B2_graph_gp",
-    "B3_shuffled_graph_gp",
-    "B4_oracle_bank",
+    "D0_image_posterior",
+    "D0_empirical_replace_oracle",
+    "D0_empirical_fusion_oracle",
+    "D1_moment_replace_oracle",
+    "D1_moment_fusion_oracle",
+    "D2_task_replace_oracle",
+    "D2_task_fusion_oracle",
+    "D2_graph_gp_deployable",
+    "D2_shuffled_graph_deployable",
+    "D3_ce_only_oracle_reference",
 )
 DEFAULT_SEEDS = (17, 29, 43)
 DEFAULT_GRAPH_BUNDLE = (
@@ -98,8 +103,12 @@ def _stage2b_oracle_path(out_root: Path, seed: int) -> Path:
     return out_root / "stage2b" / "oracles" / f"seed_{seed}.npz"
 
 
+def _stage2b_healthy_path(out_root: Path, seed: int) -> Path:
+    return out_root / "stage2b" / "healthy_banks" / f"seed_{seed}.npz"
+
+
 def _stage2b_result_dir(out_root: Path, seed: int) -> Path:
-    return out_root / "stage2b" / "results" / f"seed_{seed}"
+    return out_root / "stage2b" / "healthy_results" / f"seed_{seed}"
 
 
 def _job_specs(out_root: Path, seeds: Sequence[int]) -> List[Dict[str, Any]]:
@@ -375,38 +384,158 @@ def _stage2b_oracle(args: argparse.Namespace, seeds: Sequence[int], gpu_groups: 
         raise RuntimeError(f"Stage-2B oracle coverage is incomplete: {missing}")
 
 
-def _stage2b_evaluate_command(args: argparse.Namespace, seed: int, checkpoint: Path) -> List[str]:
+def _stage2b_healthy_command(args: argparse.Namespace, seed: int, checkpoint: Path) -> List[str]:
     return [
         args.python_bin,
-        str(ROOT / "src" / "tools" / "evaluate_stage2b_prior_intervention.py"),
+        str(ROOT / "src" / "tools" / "build_stage2b_healthy_prompt_distributions.py"),
         "--config-file",
         str(args.config_file),
         "--seed",
         str(seed),
         "--checkpoint",
         str(checkpoint),
-        "--oracle",
-        str(_stage2b_oracle_path(args.out_root, seed)),
+        "--posterior-cache",
+        str(_cache_path(args.out_root, "A00", seed)),
         "--graph-bundle",
         str(args.graph_bundle),
+        "--graph-key",
+        str(args.stage2b_graph_key),
+        "--output",
+        str(_stage2b_healthy_path(args.out_root, seed)),
+        "--num-workers",
+        str(args.export_num_workers),
+        "--epochs",
+        str(args.stage2b_healthy_epochs),
+        "--lr",
+        str(args.stage2b_healthy_lr),
+        "--generator-hidden-dim",
+        str(args.stage2b_generator_hidden_dim),
+        "--classes-per-batch",
+        str(args.stage2b_classes_per_batch),
+        "--samples-per-class",
+        str(args.stage2b_samples_per_class),
+        "--moment-samples",
+        str(args.stage2b_moment_samples),
+        "--ce-weight",
+        str(args.stage2b_ce_weight),
+        "--mean-weight",
+        str(args.stage2b_mean_weight),
+        "--variance-weight",
+        str(args.stage2b_variance_weight),
+        "--semantic-weight",
+        str(args.stage2b_semantic_weight),
+        "--prompt-visual-weight",
+        str(args.stage2b_prompt_visual_weight),
+        "--prompt-semantic-weight",
+        str(args.stage2b_prompt_semantic_weight),
+        "--anchor-weight",
+        str(args.stage2b_anchor_weight),
+        "--graph-weight",
+        str(args.stage2b_graph_weight),
+        "--mu-delta-scale",
+        str(args.stage2b_mu_delta_scale),
+        "--logvar-delta-scale",
+        str(args.stage2b_logvar_delta_scale),
+        "--prior-ridge",
+        str(args.stage2b_prior_ridge),
+        "--gp-var-weight",
+        str(args.stage2b_gp_var_weight),
+        "--support-var-weight",
+        str(args.stage2b_support_var_weight),
+        "--pseudo-folds",
+        str(args.num_folds),
+    ]
+
+
+def _stage2b_healthy(args: argparse.Namespace, seeds: Sequence[int], gpu_groups: Sequence[str]) -> None:
+    missing_caches = [
+        str(_cache_path(args.out_root, "A00", int(seed)))
+        for seed in seeds
+        if not _cache_path(args.out_root, "A00", int(seed)).is_file()
+    ]
+    if missing_caches:
+        raise RuntimeError(f"Stage-2B healthy-bank A00 caches are incomplete: {missing_caches}")
+    pending = [
+        int(seed)
+        for seed in seeds
+        if args.no_resume
+        or not all(
+            path.is_file()
+            for path in (
+                _stage2b_healthy_path(args.out_root, int(seed)),
+                _stage2b_healthy_path(args.out_root, int(seed)).with_suffix(".json"),
+                _stage2b_healthy_path(args.out_root, int(seed)).with_suffix(".pth"),
+                _stage2b_healthy_path(args.out_root, int(seed)).with_name(
+                    _stage2b_healthy_path(args.out_root, int(seed)).stem + "_pseudo_unseen.csv"
+                ),
+                _stage2b_healthy_path(args.out_root, int(seed)).with_name(
+                    _stage2b_healthy_path(args.out_root, int(seed)).stem + "_history.csv"
+                ),
+            )
+        )
+    ]
+
+    def run_one(seed: int, env: Mapping[str, str]) -> None:
+        checkpoint = _checkpoint_path(_stage1_result_root(args.out_root), "A00", seed)
+        _run_command(
+            _stage2b_healthy_command(args, seed, checkpoint),
+            args.out_root / "logs" / "stage2b_healthy" / f"seed_{seed}.log",
+            env=env,
+        )
+
+    _run_gpu_seed_jobs(args, pending, gpu_groups, run_one)
+    missing = [
+        str(_stage2b_healthy_path(args.out_root, seed))
+        for seed in seeds
+        if not _stage2b_healthy_path(args.out_root, seed).is_file()
+    ]
+    if missing:
+        raise RuntimeError(f"Stage-2B healthy-bank coverage is incomplete: {missing}")
+
+
+def _stage2b_evaluate_command(args: argparse.Namespace, seed: int, checkpoint: Path) -> List[str]:
+    return [
+        args.python_bin,
+        str(ROOT / "src" / "tools" / "evaluate_stage2b_healthy_intervention.py"),
+        "--config-file",
+        str(args.config_file),
+        "--seed",
+        str(seed),
+        "--checkpoint",
+        str(checkpoint),
+        "--healthy-bank",
+        str(_stage2b_healthy_path(args.out_root, seed)),
+        "--oracle",
+        str(_stage2b_oracle_path(args.out_root, seed)),
         "--output-dir",
         str(_stage2b_result_dir(args.out_root, seed)),
         "--batch-size",
         str(args.stage2b_batch_size),
         "--num-workers",
         str(args.export_num_workers),
-        "--prior-ridge",
-        str(args.stage2b_prior_ridge),
         "--fusion-alpha",
         str(args.stage2b_fusion_alpha),
         "--energy-beta",
         str(args.stage2b_energy_beta),
         "--candidate-temperature",
         str(args.stage2b_candidate_temperature),
+        "--candidate-topk",
+        str(args.stage2b_candidate_topk),
     ]
 
 
 def _stage2b_evaluate(args: argparse.Namespace, seeds: Sequence[int], gpu_groups: Sequence[str]) -> None:
+    missing_inputs = [
+        str(path)
+        for seed in seeds
+        for path in (
+            _stage2b_healthy_path(args.out_root, int(seed)),
+            _stage2b_oracle_path(args.out_root, int(seed)),
+        )
+        if not path.is_file()
+    ]
+    if missing_inputs:
+        raise RuntimeError(f"Stage-2B evaluation inputs are incomplete: {missing_inputs}")
     pending = [
         int(seed)
         for seed in seeds
@@ -437,22 +566,34 @@ def _stage2b_evaluate(args: argparse.Namespace, seeds: Sequence[int], gpu_groups
 
 def _stage2b_summarize(args: argparse.Namespace, seeds: Sequence[int]) -> None:
     inputs = [str(_stage2b_result_dir(args.out_root, seed) / "group_results.csv") for seed in seeds]
+    pseudo_inputs = [
+        str(
+            _stage2b_healthy_path(args.out_root, seed).with_name(
+                _stage2b_healthy_path(args.out_root, seed).stem + "_pseudo_unseen.csv"
+            )
+        )
+        for seed in seeds
+    ]
     command = [
         args.python_bin,
-        str(ROOT / "src" / "tools" / "summarize_stage2b_prior_intervention.py"),
+        str(ROOT / "src" / "tools" / "summarize_stage2b_healthy_intervention.py"),
         "--inputs",
         *inputs,
+        "--pseudo-inputs",
+        *pseudo_inputs,
         "--output-dir",
-        str(args.out_root / "summaries" / "stage2b"),
+        str(args.out_root / "summaries" / "stage2b_healthy"),
         "--expected-seeds",
         ",".join(str(seed) for seed in seeds),
+        "--expected-folds",
+        str(args.num_folds),
     ]
     _run_command(command, args.out_root / "logs" / "summarize_stage2b.log")
 
 
 def _write_plan(args: argparse.Namespace, jobs: Sequence[Mapping[str, Any]], seeds: Sequence[int]) -> None:
     payload = {
-        "format": "graph_gp_full_factorial_plan_v2",
+        "format": "graph_gp_full_factorial_plan_v3",
         "stage": args.stage,
         "cells": list(CELLS),
         "seeds": list(seeds),
@@ -460,6 +601,7 @@ def _write_plan(args: argparse.Namespace, jobs: Sequence[Mapping[str, Any]], see
         "export_jobs": len(jobs),
         "stage2_fold_method_rows": len(jobs) * args.num_folds * (10 + args.shuffle_count),
         "stage2b_oracle_jobs": len(seeds),
+        "stage2b_healthy_jobs": len(seeds),
         "stage2b_groups": list(STAGE2B_GROUPS),
         "stage2b_group_seed_conditions": len(STAGE2B_GROUPS) * len(seeds),
         "stage2b_jobs": [
@@ -469,6 +611,8 @@ def _write_plan(args: argparse.Namespace, jobs: Sequence[Mapping[str, Any]], see
                     _stage1_result_root(args.out_root) / _cell_names()["A00"] / f"seed_{seed}"
                 ),
                 "oracle": str(_stage2b_oracle_path(args.out_root, int(seed))),
+                "posterior_cache": str(_cache_path(args.out_root, "A00", int(seed))),
+                "healthy_bank": str(_stage2b_healthy_path(args.out_root, int(seed))),
                 "result_dir": str(_stage2b_result_dir(args.out_root, int(seed))),
             }
             for seed in seeds
@@ -495,7 +639,7 @@ def _write_plan(args: argparse.Namespace, jobs: Sequence[Mapping[str, Any]], see
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Stage-2A factorial diagnostics followed by Stage-2B prior intervention.")
+    parser = argparse.ArgumentParser(description="Run Stage-2A diagnostics and Stage-2B healthy-distribution interventions.")
     parser.add_argument(
         "--stage",
         choices=(
@@ -505,6 +649,7 @@ def parse_args() -> argparse.Namespace:
             "evaluate",
             "summarize",
             "stage2b_oracle",
+            "stage2b_healthy",
             "stage2b_evaluate",
             "stage2b_summarize",
         ),
@@ -531,10 +676,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2b-oracle-lr", type=float, default=1e-2)
     parser.add_argument("--stage2b-align-weight", type=float, default=1.0)
     parser.add_argument("--stage2b-anchor-weight", type=float, default=0.1)
+    parser.add_argument("--stage2b-healthy-epochs", type=int, default=10)
+    parser.add_argument("--stage2b-healthy-lr", type=float, default=1e-3)
+    parser.add_argument("--stage2b-generator-hidden-dim", type=int, default=256)
+    parser.add_argument("--stage2b-classes-per-batch", type=int, default=8)
+    parser.add_argument("--stage2b-samples-per-class", type=int, default=4)
+    parser.add_argument("--stage2b-moment-samples", type=int, default=1)
+    parser.add_argument("--stage2b-ce-weight", type=float, default=1.0)
+    parser.add_argument("--stage2b-mean-weight", type=float, default=1.0)
+    parser.add_argument("--stage2b-variance-weight", type=float, default=0.1)
+    parser.add_argument("--stage2b-semantic-weight", type=float, default=1.0)
+    parser.add_argument("--stage2b-prompt-visual-weight", type=float, default=0.1)
+    parser.add_argument("--stage2b-prompt-semantic-weight", type=float, default=0.1)
+    parser.add_argument("--stage2b-graph-weight", type=float, default=0.1)
+    parser.add_argument("--stage2b-mu-delta-scale", type=float, default=1.0)
+    parser.add_argument("--stage2b-logvar-delta-scale", type=float, default=1.0)
+    parser.add_argument("--stage2b-gp-var-weight", type=float, default=1.0)
+    parser.add_argument("--stage2b-support-var-weight", type=float, default=1.0)
+    parser.add_argument("--stage2b-graph-key", default="method1_diff")
     parser.add_argument("--stage2b-prior-ridge", type=float, default=1e-3)
     parser.add_argument("--stage2b-fusion-alpha", type=float, default=1.0)
     parser.add_argument("--stage2b-energy-beta", type=float, default=1.0)
     parser.add_argument("--stage2b-candidate-temperature", type=float, default=1.0)
+    parser.add_argument("--stage2b-candidate-topk", type=int, default=0)
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -545,7 +709,7 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"--repo-root must resolve to {ROOT}")
     if not args.config_file.is_file():
         parser.error(f"Config file does not exist: {args.config_file}")
-    if args.stage in {"all", "evaluate", "stage2b_evaluate"} and not args.graph_bundle.is_file():
+    if args.stage in {"all", "evaluate", "stage2b_healthy"} and not args.graph_bundle.is_file():
         parser.error(f"Graph bundle does not exist: {args.graph_bundle}")
     if min(
         args.max_workers,
@@ -557,6 +721,12 @@ def parse_args() -> argparse.Namespace:
         args.stage2b_batch_size,
         args.stage2b_oracle_epochs,
         args.stage2b_oracle_lr,
+        args.stage2b_healthy_epochs,
+        args.stage2b_healthy_lr,
+        args.stage2b_generator_hidden_dim,
+        args.stage2b_classes_per_batch,
+        args.stage2b_samples_per_class,
+        args.stage2b_moment_samples,
         args.stage2b_prior_ridge,
         args.stage2b_fusion_alpha,
         args.stage2b_candidate_temperature,
@@ -564,7 +734,24 @@ def parse_args() -> argparse.Namespace:
         parser.error("Worker/batch/fold/shuffle/top-k values must be positive.")
     if not 0.0 < args.stage2b_build_ratio < 1.0:
         parser.error("--stage2b-build-ratio must be in (0,1).")
-    if min(args.stage2b_align_weight, args.stage2b_anchor_weight, args.stage2b_energy_beta) < 0.0:
+    if args.stage2b_candidate_topk < 0:
+        parser.error("--stage2b-candidate-topk must be non-negative.")
+    if min(
+        args.stage2b_align_weight,
+        args.stage2b_anchor_weight,
+        args.stage2b_energy_beta,
+        args.stage2b_ce_weight,
+        args.stage2b_mean_weight,
+        args.stage2b_variance_weight,
+        args.stage2b_semantic_weight,
+        args.stage2b_prompt_visual_weight,
+        args.stage2b_prompt_semantic_weight,
+        args.stage2b_graph_weight,
+        args.stage2b_mu_delta_scale,
+        args.stage2b_logvar_delta_scale,
+        args.stage2b_gp_var_weight,
+        args.stage2b_support_var_weight,
+    ) < 0.0:
         parser.error("Stage-2B weights must be non-negative.")
     return args
 
@@ -586,6 +773,7 @@ def main() -> None:
             "evaluate",
             "summarize",
             "stage2b_oracle",
+            "stage2b_healthy",
             "stage2b_evaluate",
             "stage2b_summarize",
         )
@@ -604,6 +792,8 @@ def main() -> None:
             _summarize(args, jobs, seeds)
         elif stage == "stage2b_oracle":
             _stage2b_oracle(args, seeds, gpu_groups)
+        elif stage == "stage2b_healthy":
+            _stage2b_healthy(args, seeds, gpu_groups)
         elif stage == "stage2b_evaluate":
             _stage2b_evaluate(args, seeds, gpu_groups)
         else:
