@@ -12,8 +12,11 @@ from src.configs.config import get_cfg
 from src.data import loader as data_loader
 from src.engine.evaluator import Evaluator
 from src.engine.trainer import Trainer
-from src.models.build_model import build_model
+from src.models.build_model import build_model, log_model_info
 from src.utils.file_io import PathManager
+from src.utils.dataset_manifest import write_xlsa_dataset_manifest
+from src.utils.run_artifacts import write_resolved_config, write_trainable_parameter_manifest
+from src.utils.reproducibility import seed_streams
 
 from launch import default_argument_parser, logging_train_setup
 warnings.filterwarnings("ignore")
@@ -124,11 +127,22 @@ def train(cfg, args):
     if cfg.SEED is not None:
         torch.manual_seed(cfg.SEED)
         np.random.seed(cfg.SEED)
-        random.seed(0)
+        random.seed(cfg.SEED)
 
     # setup training env including loggers
     logging_train_setup(args, cfg)
     logger = logging.get_logger("visual_prompt")
+    streams = seed_streams(cfg.SEED)
+    logger.info(
+        "[reproducibility] master_seed=%s classifier_init_seed=%s prompt_init_seed=%s data_order_seed=%s",
+        str(cfg.SEED),
+        str(streams["classifier_init"]),
+        str(streams["prompt_init"]),
+        str(streams["data_order"]),
+    )
+    resolved_config_path = write_resolved_config(cfg)
+    if resolved_config_path is not None:
+        logger.info("Wrote complete resolved config: %s", resolved_config_path)
     logger.info(
         "XLSA protocol mode=%s eval_mode=%s",
         str(cfg.DATA.XLSA.PROTOCOL_MODE),
@@ -136,6 +150,17 @@ def train(cfg, args):
     )
 
     train_loader, val_loader, test_seen_loader, test_unseen_loader = get_loaders(cfg, logger)
+    manifest_path = write_xlsa_dataset_manifest(
+        cfg,
+        {
+            "train": train_loader.dataset if train_loader is not None else None,
+            "val_unseen": val_loader.dataset if val_loader is not None else None,
+            "test_seen": test_seen_loader.dataset if test_seen_loader is not None else None,
+            "test_unseen": test_unseen_loader.dataset if test_unseen_loader is not None else None,
+        },
+    )
+    if manifest_path is not None:
+        logger.info("Wrote XLSA dataset manifest: %s", manifest_path)
 
     logger.info("Constructing models...")
     model, cur_device = build_model(cfg)
@@ -147,6 +172,10 @@ def train(cfg, args):
         raise ValueError("R-similarity head enabled but no class_attributes provided by dataset")
     if hasattr(model, "attach_r_similarity_head"):
         model.attach_r_similarity_head(class_attr)
+    trainable_manifest_path = write_trainable_parameter_manifest(cfg, model)
+    if trainable_manifest_path is not None:
+        logger.info("Wrote effective trainable-parameter manifest: %s", trainable_manifest_path)
+    log_model_info(model, verbose=False, label="Effective model after classifier head attachment")
 
     # ------------------------------------
     train_dataset = train_loader.dataset
@@ -187,13 +216,6 @@ def train(cfg, args):
         trainer.train_classifier(train_loader, val_loader, test_seen_loader, test_unseen_loader)
     else:
         print("No train loader presented. Exit")
-
-    # -------------------------------------
-    if cfg.SOLVER.TOTAL_EPOCH == 0:
-        if test_seen_loader is not None and str(cfg.SOLVER.EVAL_MODE).lower() == "gzsl":
-            trainer.eval_classifier(test_seen_loader, "test_seen")
-        if test_unseen_loader is not None:
-            trainer.eval_classifier(test_unseen_loader, "test_unseen")
 
 def main(args):
     """main function to call from workflow."""

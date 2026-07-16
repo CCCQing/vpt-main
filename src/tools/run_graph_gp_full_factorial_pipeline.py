@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.run_arch_ablation_graph_gp_energy import _cell_specs  # noqa: E402
+from src.monitoring.writer import stage2_metadata, write_stage2_json  # noqa: E402
 
 
 CELLS = ("A00", "A10", "C00", "C10", "C01", "C11")
@@ -634,7 +635,7 @@ def _write_plan(args: argparse.Namespace, jobs: Sequence[Mapping[str, Any]], see
     }
     args.out_root.mkdir(parents=True, exist_ok=True)
     path = args.out_root / "pipeline_plan.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_stage2_json(path, payload, stage2_metadata("graph_gp_full_factorial_pipeline"))
     print(f"wrote {path}", flush=True)
 
 

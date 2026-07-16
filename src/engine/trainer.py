@@ -39,6 +39,7 @@ import os
 import numpy as np
 import math
 import ast
+from contextlib import nullcontext
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -53,6 +54,42 @@ from ..solver.losses import build_loss
 from ..utils import logging
 from ..utils import distributed as du
 from ..utils.train_utils import AverageMeter, gpu_mem_usage
+from ..monitoring import (
+    DiagnosticManager,
+    MonitorManager,
+    NumericalGuard,
+    OptimizerSanity,
+    PromptParameterTracker,
+)
+from ..monitoring.fields import GPP_MONITOR_ALIAS_ITEMS
+from ..monitoring.adapters import (
+    auxiliary_loss_metrics,
+    affinity_metrics,
+    attention_mediation_metrics,
+    graph_prob_prior_metrics,
+    prompt_distribution_metrics,
+    semantic_token_metrics,
+    train_debug_metrics,
+)
+from ..monitoring.eval_metrics import (
+    classification_metrics,
+    representation_geometry_metrics,
+    semantic_visual_graph_metrics,
+    visual_semantic_alignment_metrics,
+)
+from ..monitoring.module_effect import (
+    attention_mediation_gamma_zero_intervention,
+    checkpoint_sha256,
+    paired_module_effect_metrics,
+    prompt_zero_intervention,
+)
+from ..monitoring.probe import (
+    FixedProbeDataset,
+    affinity_health_metrics,
+    attention_flow_metrics,
+    build_probe_manifest,
+)
+from ..data.transforms import get_transforms
 
 from ..utils.vis_pipeline import (
     as_long_path,
@@ -141,8 +178,8 @@ class Trainer():
             else None
         )
 
-        # 涓€涓负鐪熷嵆use_affinity
-        self.use_affinity = cfg.MODEL.AFFINITY.ENABLE or self.affinity_aux_needed
+        self.affinity_monitor_requested = bool(cfg.MONITOR.ENABLE) and bool(cfg.MONITOR.AFFINITY.ENABLE)
+        self.use_affinity = cfg.MODEL.AFFINITY.ENABLE or self.affinity_aux_needed or self.affinity_monitor_requested
         if self.use_affinity:
             self.affinity_cfg = {
                 "prompt_length": cfg.MODEL.PROMPT.NUM_TOKENS,
@@ -211,7 +248,43 @@ class Trainer():
         self._trace_iter = -1
         self._trace_stage = "init"
         self._trace_global_step = 0
+        self._graph_prob_prior_forward = 0
+        self.graph_prob_prior_loss_active = (
+            bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE)
+            and float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT) > 0.0
+        )
         self._trace_rank = int(cfg.DIST_RANK)
+        is_monitor_writer = du.get_rank() == 0
+        self.monitor_manager = MonitorManager(cfg, is_writer=is_monitor_writer)
+        self.diagnostic_manager = DiagnosticManager(
+            cfg,
+            self.monitor_manager,
+            is_writer=is_monitor_writer,
+        )
+        guarded_modules = (("model", self._model_ref(self.model)), ("cls_criterion", self.cls_criterion))
+        self.numerical_guard = NumericalGuard(guarded_modules)
+        self.optimizer_sanity = OptimizerSanity(guarded_modules, self.optimizer)
+        self.prompt_parameter_tracker = PromptParameterTracker(self._model_ref(self.model))
+        self._optimizer_sanity_first_step_done = False
+        self._optimizer_sanity_payload = {
+            "initialization": self.optimizer_sanity.initialization_report(),
+            "first_step": None,
+        }
+        if self.monitor_manager.monitor_groups["optimizer_sanity"]["effective"]:
+            self.monitor_manager.write_evidence("optimizer_sanity.json", self._optimizer_sanity_payload)
+            self.monitor_manager.record_event(
+                "optimizer_sanity",
+                self._optimizer_sanity_payload["initialization"],
+            )
+        self._probe_manifests = {}
+        self._final_trainable_checkpoint_path = None
+        self.monitor_manager.record_event(
+            "monitor_initialized",
+            {
+                "protocol_mode": str(cfg.DATA.XLSA.PROTOCOL_MODE),
+                "task_type": str(self.evaluator.task_type),
+            },
+        )
 
         diag_cfg = cfg.SOLVER.DIAG
         self.diag_shuffle_raw_targets = diag_cfg.SHUFFLE_RAW_TARGETS
@@ -392,7 +465,14 @@ class Trainer():
             raise ValueError("test_unseen is only valid under final_zsl/final_gzsl, got '{}'".format(protocol_mode))
         raise ValueError("Unsupported eval split '{}' for metric-key resolution".format(prefix))
 
-    def _update_gzsl_record_metrics(self, epoch: int, test_unseen_loader, seen_metrics, unseen_metrics):
+    def _update_gzsl_record_metrics(
+        self,
+        epoch: int,
+        test_seen_loader,
+        test_unseen_loader,
+        seen_metrics,
+        unseen_metrics,
+    ):
         if not isinstance(seen_metrics, dict) or not isinstance(unseen_metrics, dict):
             return
         seen_val = seen_metrics.get("gzsl_seen", None)
@@ -416,11 +496,35 @@ class Trainer():
             "gzsl_seen": seen_val,
             "gzsl_unseen": unseen_val,
             "gzsl_h": curr_h,
+        }
+        selection_debug = {
             "best_gzsl_seen_recorded": float(self.best_gzsl_seen_recorded),
             "best_gzsl_unseen_recorded": float(self.best_gzsl_unseen_recorded),
-            "gzsl_h_recorded": recorded_h,
+            "historical_independent_best_upper_bound": recorded_h,
         }
         self.evaluator.update_result("classification", {eval_name: combined})
+        self.evaluator.update_result("checkpoint_selection_debug", {eval_name: selection_debug})
+        self.monitor_manager.set_context(
+            stage="eval",
+            epoch=int(epoch + 1),
+            global_step=int(self._trace_global_step),
+            graph_prob_prior_forward=int(self._graph_prob_prior_forward),
+        )
+        self.monitor_manager.record_epoch(
+            "test_gzsl",
+            "classification",
+            combined,
+            reducer="dataset",
+            n=len(test_seen_loader.dataset) + len(test_unseen_loader.dataset),
+        )
+        self.monitor_manager.record_epoch(
+            "test_gzsl",
+            "checkpoint_selection_debug",
+            selection_debug,
+            reducer="history",
+            n=1,
+        )
+        self.diagnostic_manager.record_calibration(int(epoch + 1))
         logger.info(
             "[gzsl-record] epoch=%d gzsl_seen=%.4f gzsl_unseen=%.4f gzsl_h=%.4f "
             "best_seen_recorded=%.4f best_unseen_recorded=%.4f gzsl_h_recorded=%.4f",
@@ -753,129 +857,7 @@ class Trainer():
         stats = getattr(self.cls_criterion, "_last_loss_stats", None)
         if not isinstance(stats, dict):
             return ""
-        keys = [
-            ("gEnt", "graph_prob_prior_monitor_tau_graph_neighbor_entropy_norm_mean"),
-            ("gTop1", "graph_prob_prior_monitor_tau_graph_neighbor_top1_mean"),
-            ("gTop5", "graph_prob_prior_monitor_tau_graph_neighbor_top5_mass_mean"),
-            ("gHub", "graph_prob_prior_monitor_neighbor_hubness_gini"),
-            ("gMean", "graph_prob_prior_monitor_graph_offdiag_mean"),
-            ("gStd", "graph_prob_prior_monitor_graph_offdiag_std"),
-            ("gQ95", "graph_prob_prior_monitor_graph_offdiag_q95"),
-            ("g09", "graph_prob_prior_monitor_graph_pairs_gt_0_9_undirected"),
-            ("g08", "graph_prob_prior_monitor_graph_pairs_gt_0_8_undirected"),
-            ("gSelf", "graph_prob_prior_monitor_neighbor_self_mass_mean"),
-            ("gMutual", "graph_prob_prior_monitor_neighbor_mutual_top5_ratio"),
-            ("tLogQ50", "graph_prob_prior_monitor_tau_acc_topk_logits_q50"),
-            ("tSemEnt", "graph_prob_prior_monitor_tau_acc_target_sem_entropy_norm_mean"),
-            ("tSemTop1", "graph_prob_prior_monitor_tau_acc_target_sem_top1_mean"),
-            ("tSemTrue", "graph_prob_prior_monitor_tau_acc_target_sem_true_mean"),
-            ("tEnt", "graph_prob_prior_monitor_tau_acc_target_entropy_norm_mean"),
-            ("tTop1", "graph_prob_prior_monitor_tau_acc_target_top1_mean"),
-            ("tTop5", "graph_prob_prior_monitor_tau_acc_target_top5_mass_mean"),
-            ("tTrue", "graph_prob_prior_monitor_tau_acc_target_true_mean"),
-            ("lEnt", "graph_prob_prior_monitor_tau_latent_entropy_norm_mean"),
-            ("lTop1", "graph_prob_prior_monitor_tau_latent_top1_mean"),
-            ("lTop5", "graph_prob_prior_monitor_tau_latent_top5_mass_mean"),
-            ("lTrue", "graph_prob_prior_monitor_tau_latent_true_mean"),
-            ("klQ50", "graph_prob_prior_monitor_tau_latent_distance_q50"),
-            ("klQ95", "graph_prob_prior_monitor_tau_latent_distance_q95"),
-            ("rank1", "graph_prob_prior_monitor_posterior_true_rank_top1"),
-            ("rank5", "graph_prob_prior_monitor_posterior_true_rank_top5"),
-            ("rank10", "graph_prob_prior_monitor_posterior_true_rank_top10"),
-            ("rankQ50", "graph_prob_prior_monitor_posterior_true_rank_q50"),
-            ("klTrueQ50", "graph_prob_prior_monitor_posterior_kl_true_q50"),
-            ("klWrongQ50", "graph_prob_prior_monitor_posterior_kl_nearest_wrong_q50"),
-            ("klMargin", "graph_prob_prior_monitor_posterior_kl_margin_mean"),
-            ("marginPos", "graph_prob_prior_monitor_posterior_kl_margin_positive_ratio"),
-            ("pMuMean", "graph_prob_prior_monitor_prior_mu_norm_mean"),
-            ("pMuQ95", "graph_prob_prior_monitor_prior_mu_norm_q95"),
-            ("pVarMean", "graph_prob_prior_monitor_prior_var_mean"),
-            ("pVarQ95", "graph_prob_prior_monitor_prior_var_q95"),
-            ("pDistQ50", "graph_prob_prior_monitor_prior_pair_mu_dist_q50"),
-            ("pDistQ95", "graph_prob_prior_monitor_prior_pair_mu_dist_q95"),
-            ("pCosMean", "graph_prob_prior_monitor_prior_pair_cosine_mean"),
-            ("pCosQ95", "graph_prob_prior_monitor_prior_pair_cosine_q95"),
-            ("pCos09", "graph_prob_prior_monitor_prior_pair_cosine_pairs_gt_0_9"),
-            ("pCollapse", "graph_prob_prior_monitor_prior_center_collapse_score"),
-            ("pSymQ50", "graph_prob_prior_monitor_prior_symkl_q50"),
-            ("pSymQ95", "graph_prob_prior_monitor_prior_symkl_q95"),
-            ("pSymMin", "graph_prob_prior_monitor_prior_symkl_min_offdiag"),
-            ("pOv", "graph_prob_prior_monitor_prior_overlap_risk_rate"),
-            ("pRank", "graph_prob_prior_monitor_prior_effective_rank"),
-            ("pEnt", "graph_prob_prior_monitor_tau_prior_entropy_norm_mean"),
-            ("rAttrMean", "graph_prob_prior_monitor_residual_attr_norm_mean"),
-            ("rAttrQ95", "graph_prob_prior_monitor_residual_attr_norm_q95"),
-            ("aCosMean", "graph_prob_prior_monitor_anchor_pair_cosine_mean"),
-            ("aCosQ95", "graph_prob_prior_monitor_anchor_pair_cosine_q95"),
-            ("aCos09", "graph_prob_prior_monitor_anchor_pairs_gt_0_9"),
-            ("paCosMean", "graph_prob_prior_monitor_prior_anchor_cos_mean"),
-            ("paCosQ50", "graph_prob_prior_monitor_prior_anchor_cos_q50"),
-            ("dNormMean", "graph_prob_prior_monitor_prior_delta_norm_mean"),
-            ("dNormQ95", "graph_prob_prior_monitor_prior_delta_norm_q95"),
-            ("dRatioMean", "graph_prob_prior_monitor_prior_delta_to_anchor_ratio_mean"),
-            ("dRatioQ95", "graph_prob_prior_monitor_prior_delta_to_anchor_ratio_q95"),
-            ("ctxCosMean", "graph_prob_prior_monitor_context_anchor_cos_mean"),
-            ("gPriorSp", "graph_prob_prior_monitor_graph_pos_prior_relation_spearman"),
-            ("hardCosQ95", "graph_prob_prior_monitor_hardneg_prior_cos_q95"),
-            ("hardV", "graph_prob_prior_monitor_hardneg_violate_rate"),
-            ("neiPres", "graph_prob_prior_monitor_true_neighbor_preservation_mean"),
-            ("seenMu", "graph_prob_prior_monitor_prior_seen_mu_norm_mean"),
-            ("unseenMu", "graph_prob_prior_monitor_prior_unseen_mu_norm_mean"),
-            ("ssDist", "graph_prob_prior_monitor_prior_seen_seen_dist_mean"),
-            ("uuDist", "graph_prob_prior_monitor_prior_unseen_unseen_dist_mean"),
-            ("suDist", "graph_prob_prior_monitor_prior_seen_unseen_dist_mean"),
-            ("unNearSeen", "graph_prob_prior_monitor_unseen_nearest_seen_distance_mean"),
-            ("unNearRatio", "graph_prob_prior_monitor_unseen_nearest_seen_ratio_mean"),
-            ("gpKRank", "graph_prob_prior_monitor_graph_gp_kernel_effective_rank"),
-            ("gpKCond", "graph_prob_prior_monitor_graph_gp_kernel_condition"),
-            ("gpSysCond", "graph_prob_prior_monitor_graph_gp_system_condition"),
-            ("gpRowEnt", "graph_prob_prior_monitor_graph_gp_kernel_row_entropy_norm_mean"),
-            ("gpKus5", "graph_prob_prior_monitor_graph_gp_k_us_support_top5_mass_mean"),
-            ("gpSmooth", "graph_prob_prior_monitor_graph_gp_smoothing_strength_mean"),
-            ("gpMRank", "graph_prob_prior_monitor_graph_gp_mstar_effective_rank"),
-            ("gpSp", "graph_prob_prior_monitor_graph_gp_mstar_graph_prior_spearman"),
-            ("gpEce", "graph_prob_prior_graph_gp_energy_ce"),
-            ("gpEacc", "graph_prob_prior_graph_gp_energy_acc"),
-            ("gpEmar", "graph_prob_prior_graph_gp_energy_margin_mean"),
-            ("gpPUloss", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_energy_loss"),
-            ("gpPUacc", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_acc"),
-            ("gpSupAcc", "graph_prob_prior_monitor_graph_gp_support_seen_acc"),
-            ("gpGap", "graph_prob_prior_monitor_graph_gp_support_pseudo_acc_gap"),
-            ("gpPUCos", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_center_cos_mean"),
-            ("gpPUMse", "graph_prob_prior_monitor_graph_gp_pseudo_unseen_center_mse_mean"),
-            ("gpBias", "graph_prob_prior_monitor_graph_gp_seen_unseen_logit_bias_mean"),
-            ("mmdK", "graph_prob_prior_monitor_mmd_kernel_mean"),
-            ("mmdKStd", "graph_prob_prior_monitor_mmd_kernel_std"),
-            ("mmdLow", "graph_prob_prior_monitor_mmd_kernel_saturation_low_ratio"),
-            ("mmdHigh", "graph_prob_prior_monitor_mmd_kernel_saturation_high_ratio"),
-            ("mmdD50", "graph_prob_prior_monitor_mmd_pair_dist_q50"),
-            ("mmdD95", "graph_prob_prior_monitor_mmd_pair_dist_q95"),
-            ("agg1", "graph_prob_prior_monitor_agg_single_sample_class_ratio"),
-            ("facCov", "graph_prob_prior_monitor_factorized_cross_cov_fro"),
-            ("facRatio", "graph_prob_prior_monitor_factorized_semantic_variation_norm_ratio"),
-            ("facSemRank", "graph_prob_prior_monitor_factorized_semantic_batch_effective_rank"),
-            ("facVarRank", "graph_prob_prior_monitor_factorized_variation_batch_effective_rank"),
-            ("facClass", "graph_prob_prior_monitor_factorized_variation_class_ratio"),
-            ("gzsl", "graph_prob_prior_monitor_prior_gzsl_unseen_to_seen_bias_risk_mean"),
-            ("gGzsl", "graph_prob_prior_monitor_graph_gzsl_unseen_to_seen_bias_risk_mean"),
-            ("fhG", "graph_prob_prior_monitor_false_high_graph_relation_still_gt_0_9_count"),
-            ("fhP", "graph_prob_prior_monitor_false_high_prior_relation_still_gt_0_9_count"),
-            ("wLoss", "graph_prob_prior_monitor_loss_weighted_graph_prob_prior_loss"),
-            ("wRatio", "graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio"),
-            ("muS", "graph_prob_prior_monitor_learnable_prior_mu_scale_value"),
-            ("dS", "graph_prob_prior_monitor_learnable_prior_delta_scale_value"),
-            ("tauG", "graph_prob_prior_monitor_learnable_tau_graph_value"),
-            ("tauL", "graph_prob_prior_monitor_learnable_tau_latent_value"),
-            ("gTauD", "graph_prob_prior_monitor_learnable_geom_tau_dist_value"),
-            ("gBound", "graph_prob_prior_monitor_learnable_geom_bound_weight_value"),
-            ("ordM", "graph_prob_prior_monitor_learnable_geom_ord_margin_scale_value"),
-            ("ordO", "graph_prob_prior_monitor_learnable_geom_ord_non_overlap_weight_value"),
-            ("gPrior", "graph_prob_prior_monitor_grad_prior_head_norm"),
-            ("gAnchor", "graph_prob_prior_monitor_grad_anchor_head_norm"),
-            ("gDelta", "graph_prob_prior_monitor_grad_delta_head_norm"),
-            ("gScalar", "graph_prob_prior_monitor_grad_learnable_scalar_norm"),
-            ("gFinite", "graph_prob_prior_monitor_grad_finite_ratio"),
-        ]
+        keys = GPP_MONITOR_ALIAS_ITEMS
         parts = []
         for label, key in keys:
             value = stats.get(key)
@@ -984,6 +966,53 @@ class Trainer():
             loss_stats = self.cls_criterion._last_loss_stats
             if isinstance(loss_stats, dict) and len(loss_stats) > 0:
                 self._last_train_debug.update(loss_stats)
+
+    def _record_train_step_monitors(self, train_loss):
+        epoch = int(self._trace_epoch + 1) if self._trace_epoch >= 0 else None
+        self.monitor_manager.set_context(
+            stage="train",
+            epoch=epoch,
+            global_step=int(self._trace_global_step),
+            graph_prob_prior_forward=int(self._graph_prob_prior_forward),
+        )
+        loss_stats = getattr(self.cls_criterion, "_last_loss_stats", None)
+        if self.monitor_manager.should_sample_step("graph_prob_prior"):
+            self.monitor_manager.record_step(
+                "graph_prob_prior",
+                graph_prob_prior_metrics(loss_stats),
+            )
+        if not self.monitor_manager.should_sample_step("train"):
+            return
+        loss_value = float(train_loss.detach().item()) if torch.is_tensor(train_loss) else float(train_loss)
+        self.monitor_manager.record_step(
+            "train",
+            {
+                "loss": loss_value,
+                "lr": float(self.optimizer.param_groups[0]["lr"]) if self.optimizer.param_groups else None,
+            },
+        )
+        self.monitor_manager.record_step("train_debug", train_debug_metrics(self._last_train_debug))
+        model_ref = self._model_ref(self.model)
+        self.monitor_manager.record_step(
+            "prompt_distribution",
+            prompt_distribution_metrics(model_ref.get_runtime_prompt_distribution_stats()),
+        )
+        self.monitor_manager.record_step(
+            "semantic_token_health",
+            semantic_token_metrics(model_ref.get_runtime_semantic_state()),
+        )
+        self.monitor_manager.record_step(
+            "attention_mediation",
+            attention_mediation_metrics(model_ref.get_runtime_attention_mediation_stats()),
+        )
+        self.monitor_manager.record_step(
+            "affinity_summary",
+            affinity_metrics(model_ref.get_runtime_affinities()),
+        )
+        self.monitor_manager.record_step(
+            "auxiliary_loss_health",
+            auxiliary_loss_metrics(loss_stats),
+        )
 
     ##=========================== 4. affinity helpers=========================
     @staticmethod
@@ -1981,7 +2010,10 @@ class Trainer():
             # 不再通过外部写 r_similarity_head._runtime_targets 暂存状态。
             runtime_targets = effective_targets.detach() if is_train else None
 
-            if self.use_affinity:
+            use_affinity_for_batch = self.use_affinity and (
+                bool(is_train) or bool(self.cfg.MODEL.AFFINITY.ENABLE) or self.affinity_aux_needed
+            )
+            if use_affinity_for_batch:
                 self._last_attn_weights = None
                 if self.affinity_vis:
                     outputs, attn_weights, affinities = self.model.forward_with_affinity(
@@ -2129,6 +2161,18 @@ class Trainer():
                 loss_outputs, loss_targets, loss_weights, kwargs=loss_kwargs)
 
             # ========== 4. NaN / inf 防御==========
+            numerical_failure = self.numerical_guard.check_forward(loss, debug_logits)
+            if numerical_failure is not None:
+                self.monitor_manager.set_context(
+                    stage=str(self._trace_stage),
+                    epoch=int(self._trace_epoch + 1) if self._trace_epoch >= 0 else None,
+                    global_step=int(self._trace_global_step),
+                    graph_prob_prior_forward=int(self._graph_prob_prior_forward),
+                )
+                self.monitor_manager.record_event("numerical_guard", numerical_failure)
+                raise FloatingPointError(
+                    "numerical_guard rejected forward: {}".format(numerical_failure["failures"][:8])
+                )
             if loss == float('inf'):
                 raise FloatingPointError("encountered infinite loss during forward_one_batch")
             elif torch.isnan(loss).any():
@@ -2200,9 +2244,25 @@ class Trainer():
             self.optimizer.zero_grad()
             loss.backward()
             self._sync_cls_criterion_grads()
-            if bool(self.cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE):
+            numerical_failure = self.numerical_guard.check_gradients()
+            if numerical_failure is not None:
+                self.monitor_manager.set_context(
+                    stage="train",
+                    epoch=int(self._trace_epoch + 1) if self._trace_epoch >= 0 else None,
+                    global_step=int(self._trace_global_step),
+                    graph_prob_prior_forward=int(self._graph_prob_prior_forward),
+                )
+                self.monitor_manager.record_event("numerical_guard", numerical_failure)
+                raise FloatingPointError(
+                    "numerical_guard rejected backward: {}".format(numerical_failure["failures"][:8])
+                )
+            if (
+                self.graph_prob_prior_loss_active
+                and bool(self.cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE)
+            ):
                 monitor_every = max(1, int(self.cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N))
-                if int(self._trace_global_step) % monitor_every == 0:
+                graph_prob_prior_forward = int(self._graph_prob_prior_forward) + 1
+                if graph_prob_prior_forward % monitor_every == 0:
                     from ..solver.graph_prob_prior_monitors import graph_prob_prior_grad_monitor
 
                     loss_stats = getattr(self.cls_criterion, "_last_loss_stats", None)
@@ -2220,6 +2280,42 @@ class Trainer():
                 self._log_grad_norms_once(refs)
                 before_norms = self._capture_param_norms(refs)
             self.optimizer.step()
+            numerical_failure = self.numerical_guard.check_parameters()
+            if numerical_failure is not None:
+                self.monitor_manager.set_context(
+                    stage="train",
+                    epoch=int(self._trace_epoch + 1) if self._trace_epoch >= 0 else None,
+                    global_step=int(self._trace_global_step),
+                    graph_prob_prior_forward=int(self._graph_prob_prior_forward),
+                )
+                self.monitor_manager.record_event("numerical_guard", numerical_failure)
+                raise FloatingPointError(
+                    "numerical_guard rejected optimizer step: {}".format(numerical_failure["failures"][:8])
+                )
+            if not self._optimizer_sanity_first_step_done:
+                self._optimizer_sanity_first_step_done = True
+                self._optimizer_sanity_payload["first_step"] = self.optimizer_sanity.first_step_report()
+                self.monitor_manager.set_context(
+                    stage="train",
+                    epoch=int(self._trace_epoch + 1) if self._trace_epoch >= 0 else None,
+                    global_step=int(self._trace_global_step),
+                    graph_prob_prior_forward=int(self._graph_prob_prior_forward),
+                )
+                self.monitor_manager.write_evidence("optimizer_sanity.json", self._optimizer_sanity_payload)
+                self.monitor_manager.record_event(
+                    "optimizer_sanity",
+                    self._optimizer_sanity_payload["first_step"],
+                )
+                self.monitor_manager.record_event(
+                    "numerical_guard",
+                    {
+                        "phase": "first_backward_optimizer_step",
+                        "loss_is_finite": True,
+                        "logits_are_finite": True,
+                        "grads_are_finite": True,
+                        "params_are_finite_after_step": True,
+                    },
+                )
             if self.debug_grad_norm and refs is not None:
                 after_norms = self._capture_param_norms(refs)
                 self._log_update_once(before_norms, after_norms)
@@ -2256,6 +2352,9 @@ class Trainer():
             )
 
             losses.update(train_loss.item(), X.shape[0])
+            if self.graph_prob_prior_loss_active:
+                self._graph_prob_prior_forward += 1
+            self._record_train_step_monitors(train_loss)
             batch_time.update(time.time() - end)
             end = time.time()
 
@@ -2290,9 +2389,653 @@ class Trainer():
             float(batch_time.avg),
             float(data_time.avg),
         )
+        self.monitor_manager.set_context(
+            stage="train",
+            epoch=int(epoch + 1),
+            global_step=int(self._trace_global_step),
+            graph_prob_prior_forward=int(self._graph_prob_prior_forward),
+        )
+        self.monitor_manager.record_epoch(
+            "train",
+            "train_epoch",
+            {
+                "loss": float(losses.avg),
+                "batch_time_sec": float(batch_time.avg),
+                "data_time_sec": float(data_time.avg),
+                "lr": float(self.optimizer.param_groups[0]["lr"]) if self.optimizer.param_groups else None,
+            },
+            reducer="mean",
+            n=int(len(train_loader.dataset)),
+        )
+        self.monitor_manager.record_epoch(
+            "train",
+            "prompt_parameter_health",
+            self.prompt_parameter_tracker.metrics(),
+            reducer="last",
+            n=1,
+        )
 
         if self.scheduler is not None:
             self.scheduler.step()
+
+    @staticmethod
+    def _merge_probe_layer_tensors(batch_layers):
+        if not batch_layers:
+            return []
+        layer_count = max(len(item) for item in batch_layers)
+        merged = []
+        for layer_index in range(layer_count):
+            tensors = []
+            for layers in batch_layers:
+                if layer_index < len(layers) and torch.is_tensor(layers[layer_index]):
+                    tensors.append(layers[layer_index].detach().cpu())
+            merged.append(torch.cat(tensors, dim=0) if tensors else None)
+        return merged
+
+    @staticmethod
+    def _merge_probe_affinities(batch_affinities):
+        if not batch_affinities:
+            return []
+        layer_count = max(len(item) for item in batch_affinities)
+        merged = []
+        for layer_index in range(layer_count):
+            keys = set()
+            for layers in batch_affinities:
+                if layer_index < len(layers) and isinstance(layers[layer_index], dict):
+                    keys.update(layers[layer_index].keys())
+            layer = {}
+            for key in sorted(keys):
+                tensors = []
+                for layers in batch_affinities:
+                    if layer_index >= len(layers) or not isinstance(layers[layer_index], dict):
+                        continue
+                    value = layers[layer_index].get(key)
+                    if torch.is_tensor(value):
+                        tensors.append(value.detach().cpu())
+                if tensors:
+                    layer[key] = torch.cat(tensors, dim=0)
+            merged.append(layer)
+        return merged
+
+    @torch.no_grad()
+    def _execute_fixed_probe_condition(
+        self,
+        probe_loader,
+        source_dataset,
+        candidate_class_ids,
+        *,
+        affinity_forward=False,
+    ):
+        model_ref = self._model_ref(self.model)
+        candidate_class_ids = [int(item) for item in candidate_class_ids]
+        global_to_local = {global_id: local_id for local_id, global_id in enumerate(candidate_class_ids)}
+        logits_rows = []
+        target_local_rows = []
+        target_global_rows = []
+        sample_ids = []
+        visual_rows = []
+        semantic_prototypes = None
+        token_rows = []
+        attention_batches = []
+        affinity_batches = []
+        prompt_length = int(self.cfg.MODEL.PROMPT.NUM_TOKENS) if bool(self.cfg.MODEL.PROMPT.ENABLE) else 0
+        semantic_length = (
+            int(self.cfg.MODEL.SEMANTIC_TOKENS.NUM_TOKENS)
+            if bool(self.cfg.MODEL.SEMANTIC_TOKENS.ENABLE)
+            else 0
+        )
+        affinity_cfg = {
+            "prompt_length": prompt_length,
+            "semantic_length": semantic_length,
+            "detach": True,
+            "block_s_to_cls": bool(self.cfg.MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS),
+        }
+        for input_data in probe_loader:
+            inputs, targets_global, attributes = self.get_input(input_data)
+            inputs = inputs.to(self.device, non_blocking=True)
+            targets_global = targets_global.to(self.device, non_blocking=True)
+            semantics = self._prepare_semantics_for_stage(
+                attributes,
+                source_dataset,
+                batch_size=int(inputs.shape[0]),
+                is_train=False,
+            )
+            if affinity_forward:
+                use_attention = bool(self.cfg.MONITOR.PROBE.ATTENTION_ENABLE)
+                output = model_ref.forward_with_affinity(
+                    inputs,
+                    affinity_cfg,
+                    semantics=semantics,
+                    vis=use_attention,
+                    class_ids=candidate_class_ids,
+                    runtime_targets=None,
+                )
+                if use_attention:
+                    logits, attention_layers, affinities = output
+                    attention_batches.append(list(attention_layers or []))
+                else:
+                    logits, affinities = output
+                affinity_batches.append(list(affinities or []))
+                tokens = model_ref.get_runtime_token_sequence()
+                if torch.is_tensor(tokens):
+                    token_rows.append(tokens.detach().cpu())
+            else:
+                logits = model_ref(
+                    inputs,
+                    semantics=semantics,
+                    class_ids=candidate_class_ids,
+                    runtime_targets=None,
+                )
+            stats = model_ref.get_runtime_classifier_stats()
+            if isinstance(stats, dict):
+                visual = stats.get("visual_repr")
+                semantic = stats.get("semantic_repr")
+                if torch.is_tensor(visual):
+                    visual_rows.append(visual.detach().cpu())
+                if semantic_prototypes is None and torch.is_tensor(semantic):
+                    semantic_prototypes = semantic.detach().cpu()
+            logits_rows.append(logits.detach().cpu())
+            target_global_list = [int(item) for item in targets_global.detach().cpu().tolist()]
+            target_global_rows.extend(target_global_list)
+            target_local_rows.extend([global_to_local[item] for item in target_global_list])
+            batch_ids = input_data.get("sample_id", [])
+            if isinstance(batch_ids, str):
+                batch_ids = [batch_ids]
+            sample_ids.extend([str(item) for item in list(batch_ids)])
+        return {
+            "logits": torch.cat(logits_rows, dim=0).numpy() if logits_rows else np.empty((0, len(candidate_class_ids))),
+            "targets_local": np.asarray(target_local_rows, dtype=np.int64),
+            "targets_global": np.asarray(target_global_rows, dtype=np.int64),
+            "sample_ids": np.asarray(sample_ids),
+            "visual_features": torch.cat(visual_rows, dim=0).numpy() if visual_rows else None,
+            "semantic_prototypes": semantic_prototypes.numpy() if semantic_prototypes is not None else None,
+            "token_sequence": torch.cat(token_rows, dim=0).numpy() if token_rows else None,
+            "attention_layers": self._merge_probe_layer_tensors(attention_batches),
+            "affinities": self._merge_probe_affinities(affinity_batches),
+            "candidate_class_ids": np.asarray(candidate_class_ids, dtype=np.int64),
+            "prompt_length": prompt_length,
+            "semantic_length": semantic_length,
+        }
+
+    def _probe_metric_rows(self, metrics, *, checkpoint_id, probe_id, split, domain, entity_type="split", entity_id="all"):
+        return [
+            {
+                "run_id": self.monitor_manager.run_id,
+                "session_id": self.monitor_manager.session_id,
+                "checkpoint_id": str(checkpoint_id),
+                "probe_id": str(probe_id),
+                "split": str(split),
+                "domain": str(domain),
+                "entity_type": str(entity_type),
+                "entity_id": str(entity_id),
+                "metric": str(name),
+                "value": float(value),
+            }
+            for name, value in sorted(metrics.items())
+            if isinstance(value, (int, float, np.integer, np.floating)) and math.isfinite(float(value))
+        ]
+
+    @staticmethod
+    def _true_margin_numpy(logits, targets):
+        logits = np.asarray(logits, dtype=np.float64)
+        targets = np.asarray(targets, dtype=np.int64)
+        true = logits[np.arange(targets.size), targets]
+        other = logits.copy()
+        other[np.arange(targets.size), targets] = -np.inf
+        return true - other.max(axis=1)
+
+    def _record_probe_module_effect(
+        self,
+        *,
+        checkpoint_id,
+        checkpoint_manifest,
+        split,
+        manifest,
+        normal,
+        intervention_name,
+        intervention,
+        seen_global_ids,
+    ):
+        pair_id = f"{checkpoint_id}:{manifest['probe_id']}:{intervention_name}"
+        effect = paired_module_effect_metrics(
+            normal["logits"],
+            intervention["logits"],
+            normal["targets_local"],
+            normal["candidate_class_ids"],
+            seen_global_ids,
+            normal_features=normal.get("visual_features"),
+            intervention_features=intervention.get("visual_features"),
+        )
+        arrays_path = self.diagnostic_manager.record_module_effect_artifact(
+            f"module_effect/{checkpoint_id}/{split}_{intervention_name}.npz",
+            effect["arrays"],
+            is_array=True,
+        )
+        sample_rows = []
+        normal_margin = self._true_margin_numpy(normal["logits"], normal["targets_local"])
+        changed_margin = self._true_margin_numpy(intervention["logits"], intervention["targets_local"])
+        for index, sample_id in enumerate(normal["sample_ids"].tolist()):
+            sample_rows.append({
+                "pair_id": pair_id,
+                "sample_id": str(sample_id),
+                "condition": "normal",
+                "target_local": int(normal["targets_local"][index]),
+                "target_global": int(normal["targets_global"][index]),
+                "prediction": int(np.argmax(normal["logits"][index])),
+                "true_class_margin": float(normal_margin[index]),
+                "logits": normal["logits"][index].tolist(),
+            })
+            sample_rows.append({
+                "pair_id": pair_id,
+                "sample_id": str(sample_id),
+                "condition": str(intervention_name),
+                "target_local": int(intervention["targets_local"][index]),
+                "target_global": int(intervention["targets_global"][index]),
+                "prediction": int(np.argmax(intervention["logits"][index])),
+                "true_class_margin": float(changed_margin[index]),
+                "logits": intervention["logits"][index].tolist(),
+            })
+        results_path = self.diagnostic_manager.record_module_effect_jsonl(
+            f"module_effect/{checkpoint_id}/{split}_{intervention_name}.jsonl",
+            sample_rows,
+        )
+        self.diagnostic_manager.record_module_effect_artifact(
+            f"module_effect/{checkpoint_id}/{split}_{intervention_name}_summary.json",
+            {
+                "pair_id": pair_id,
+                "checkpoint": checkpoint_manifest,
+                "probe_id": manifest["probe_id"],
+                "probe_manifest_sha256": manifest["manifest_sha256"],
+                "condition": str(intervention_name),
+                "runtime_overrides": {"intervention": str(intervention_name)},
+                "model_eval": True,
+                "torch_no_grad": True,
+                "dtype": str(next(self._model_ref(self.model).parameters()).dtype),
+                "device": str(self.device),
+                "intervention_seed": int(self.cfg.MONITOR.PROBE.SELECTION_SEED),
+                "shared_randomness_id": manifest["manifest_sha256"],
+                "comparison_tolerance": float(self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL),
+                "summary": effect["summary"],
+                "per_class": effect["per_class"],
+                "arrays_path": str(arrays_path),
+                "results_path": str(results_path),
+            },
+        )
+
+    def _run_fixed_probes(self, train_loader, test_seen_loader, test_unseen_loader, *, checkpoint_epoch):
+        if not self.diagnostic_manager.enabled or not bool(self.cfg.MONITOR.PROBE.ENABLE):
+            return
+        if du.get_rank() != 0:
+            return
+        model_ref = self._model_ref(self.model)
+        was_training = bool(model_ref.training)
+        model_ref.eval()
+        checkpoint_id = f"final_epoch_{int(checkpoint_epoch):04d}"
+        checkpoint_manifest = {
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_epoch": int(checkpoint_epoch),
+            "checkpoint_global_step": int(self._trace_global_step),
+            "checkpoint_selection_rule": "predeclared_final_epoch",
+            "source_run_id": self.monitor_manager.run_id,
+            "source_session_id": self.monitor_manager.session_id,
+            "checkpoint_path": self._final_trainable_checkpoint_path,
+            "checkpoint_sha256": (
+                checkpoint_sha256(self._final_trainable_checkpoint_path)
+                if self._final_trainable_checkpoint_path and os.path.isfile(self._final_trainable_checkpoint_path)
+                else None
+            ),
+        }
+        split_sources = {
+            "probe_train_seen": train_loader.dataset if train_loader is not None else None,
+            "probe_test_seen": test_seen_loader.dataset if test_seen_loader is not None else None,
+            "probe_test_unseen": test_unseen_loader.dataset if test_unseen_loader is not None else None,
+        }
+        combined_manifest = {
+            "format": "baseline_fixed_probe_collection_v1",
+            "run_id": self.monitor_manager.run_id,
+            "session_id": self.monitor_manager.session_id,
+            "checkpoint": checkpoint_manifest,
+            "probes": {},
+        }
+        normal_results = {}
+        all_rows = []
+        deterministic_transform = get_transforms("test_seen", self.cfg.DATA.CROPSIZE)
+        for split, dataset in split_sources.items():
+            if dataset is None:
+                continue
+            if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "final_gzsl":
+                candidate_class_ids = list(dataset.seen_classes) + list(dataset.unseen_classes)
+            else:
+                candidate_class_ids = list(dataset.eval_local_classes)
+            manifest = build_probe_manifest(
+                dataset,
+                split=split,
+                per_class=int(self.cfg.MONITOR.PROBE.PER_CLASS),
+                max_samples=int(self.cfg.MONITOR.PROBE.MAX_SAMPLES),
+                selection_seed=int(self.cfg.MONITOR.PROBE.SELECTION_SEED),
+                candidate_class_ids=candidate_class_ids,
+            )
+            combined_manifest["probes"][split] = manifest
+            self._probe_manifests[split] = manifest
+            self.diagnostic_manager.record_probe_artifact(f"probe_manifests/{split}.json", manifest)
+            probe_dataset = FixedProbeDataset(dataset, manifest, deterministic_transform)
+            probe_loader = torch.utils.data.DataLoader(
+                probe_dataset,
+                batch_size=max(1, int(self.cfg.MONITOR.PROBE.BATCH_SIZE)),
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+                drop_last=False,
+            )
+            normal = self._execute_fixed_probe_condition(
+                probe_loader,
+                dataset,
+                candidate_class_ids,
+                affinity_forward=False,
+            )
+            normal_results[split] = normal
+            geometry = representation_geometry_metrics(normal.get("visual_features"), normal["targets_local"])
+            alignment = visual_semantic_alignment_metrics(
+                normal.get("visual_features"),
+                normal.get("semantic_prototypes"),
+                normal["targets_local"],
+            )
+            semantic_visual_graph = semantic_visual_graph_metrics(
+                normal.get("visual_features"),
+                normal.get("semantic_prototypes"),
+                normal["targets_local"],
+                logits=normal["logits"],
+                neighbor_k=int(self.cfg.MONITOR.SEMANTIC_GRAPH_REFERENCE.NEIGHBOR_K),
+            )
+            all_rows.extend(self._probe_metric_rows(
+                geometry,
+                checkpoint_id=checkpoint_id,
+                probe_id=manifest["probe_id"],
+                split=split,
+                domain="representation_geometry",
+            ))
+            all_rows.extend(self._probe_metric_rows(
+                alignment,
+                checkpoint_id=checkpoint_id,
+                probe_id=manifest["probe_id"],
+                split=split,
+                domain="visual_semantic_alignment",
+            ))
+            all_rows.extend(self._probe_metric_rows(
+                semantic_visual_graph,
+                checkpoint_id=checkpoint_id,
+                probe_id=manifest["probe_id"],
+                split=split,
+                domain="semantic_graph_reference",
+                entity_type="graph",
+                entity_id="visual_consistency",
+            ))
+            vector_payload = {
+                "sample_ids": normal["sample_ids"],
+                "targets_local": normal["targets_local"],
+                "targets_global": normal["targets_global"],
+                "candidate_class_ids": normal["candidate_class_ids"],
+                "logits": normal["logits"],
+            }
+            if normal.get("visual_features") is not None:
+                vector_payload["visual_features"] = normal["visual_features"]
+            if normal.get("semantic_prototypes") is not None:
+                vector_payload["semantic_prototypes"] = normal["semantic_prototypes"]
+            self.diagnostic_manager.record_probe_artifact(
+                f"probe_vectors/representation/{checkpoint_id}_{split}.npz",
+                vector_payload,
+                is_array=True,
+            )
+
+            if bool(self.cfg.MONITOR.PROBE.AFFINITY_ENABLE):
+                affinity_result = self._execute_fixed_probe_condition(
+                    probe_loader,
+                    dataset,
+                    candidate_class_ids,
+                    affinity_forward=True,
+                )
+                normal_logits = np.asarray(normal["logits"])
+                affinity_logits = np.asarray(affinity_result["logits"])
+                normal_margin = self._true_margin_numpy(normal_logits, normal["targets_local"])
+                affinity_margin = self._true_margin_numpy(affinity_logits, normal["targets_local"])
+                equivalence = {
+                    "logit_max_abs_diff": float(np.max(np.abs(normal_logits - affinity_logits))),
+                    "true_margin_abs_diff": float(np.max(np.abs(normal_margin - affinity_margin))),
+                    "prediction_flip_rate": float((normal_logits.argmax(axis=1) != affinity_logits.argmax(axis=1)).mean()),
+                }
+                equivalence["affinity_forward_equivalence_pass"] = float(
+                    equivalence["logit_max_abs_diff"] <= float(self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL)
+                )
+                selected_layers = {int(item) for item in self.cfg.MONITOR.PROBE.LAYERS}
+                attention_layers = [
+                    value for index, value in enumerate(affinity_result["attention_layers"])
+                    if value is not None and (not selected_layers or index in selected_layers)
+                ]
+                affinity_layers = [
+                    value for index, value in enumerate(affinity_result["affinities"])
+                    if value and (not selected_layers or index in selected_layers)
+                ]
+                attention = attention_flow_metrics(
+                    attention_layers,
+                    prompt_length=int(affinity_result["prompt_length"]),
+                    semantic_length=int(affinity_result["semantic_length"]),
+                    affinity_layers=affinity_layers,
+                    predictions=affinity_logits.argmax(axis=1),
+                    targets=normal["targets_local"],
+                )
+                affinity_health = affinity_health_metrics(
+                    affinity_layers,
+                    temperature=float(self.cfg.MONITOR.PROBE.AFFINITY_TEMPERATURE),
+                    saturation_threshold=float(self.cfg.MONITOR.PROBE.AFFINITY_SATURATION_THRESHOLD),
+                )
+                all_rows.extend(self._probe_metric_rows(
+                    equivalence,
+                    checkpoint_id=checkpoint_id,
+                    probe_id=manifest["probe_id"],
+                    split=split,
+                    domain="affinity_forward_equivalence",
+                ))
+                all_rows.extend(self._probe_metric_rows(
+                    attention,
+                    checkpoint_id=checkpoint_id,
+                    probe_id=manifest["probe_id"],
+                    split=split,
+                    domain="attention_flow_reference",
+                ))
+                for metric_name, value in sorted(affinity_health.items()):
+                    relation, _, metric = metric_name.partition(".")
+                    all_rows.extend(self._probe_metric_rows(
+                        {metric or relation: value},
+                        checkpoint_id=checkpoint_id,
+                        probe_id=manifest["probe_id"],
+                        split=split,
+                        domain="affinity_health",
+                        entity_type="relation",
+                        entity_id=relation if metric else "global",
+                    ))
+                token_sequence = affinity_result.get("token_sequence")
+                if token_sequence is not None:
+                    normal_results[split]["token_sequence"] = token_sequence
+                    prompt_length = int(affinity_result["prompt_length"])
+                    semantic_length = int(affinity_result["semantic_length"])
+                    patch_start = 1 + prompt_length
+                    patch_end = int(token_sequence.shape[1]) - semantic_length
+                    token_views = {
+                        "cls": token_sequence[:, 0, :],
+                        "pooled_patch": token_sequence[:, patch_start:patch_end, :].mean(axis=1),
+                    }
+                    if prompt_length > 0:
+                        token_views["contextualized_prompt"] = token_sequence[:, 1:patch_start, :].mean(axis=1)
+                    if semantic_length > 0:
+                        token_views["semantic_token"] = token_sequence[:, patch_end:, :].mean(axis=1)
+                    for entity_id, values in token_views.items():
+                        token_geometry = representation_geometry_metrics(values, normal["targets_local"])
+                        all_rows.extend(self._probe_metric_rows(
+                            token_geometry,
+                            checkpoint_id=checkpoint_id,
+                            probe_id=manifest["probe_id"],
+                            split=split,
+                            domain="representation_geometry",
+                            entity_type="representation",
+                            entity_id=entity_id,
+                        ))
+                    if prompt_length > 0:
+                        prompt_output = token_views["contextualized_prompt"]
+                        cls_output = token_views["cls"]
+                        patch_output = token_views["pooled_patch"]
+                        prompt_norm = np.linalg.norm(prompt_output, axis=1)
+                        prompt_normalized = prompt_output / np.maximum(prompt_norm[:, None], 1e-12)
+                        cls_normalized = cls_output / np.maximum(np.linalg.norm(cls_output, axis=1, keepdims=True), 1e-12)
+                        patch_normalized = patch_output / np.maximum(np.linalg.norm(patch_output, axis=1, keepdims=True), 1e-12)
+                        prompt_response = {
+                            "contextualized_prompt_instance_variance": float(np.var(prompt_output, axis=0).mean()),
+                            "prompt_cls_cosine": float(np.sum(prompt_normalized * cls_normalized, axis=1).mean()),
+                            "prompt_patch_cosine": float(np.sum(prompt_normalized * patch_normalized, axis=1).mean()),
+                            "contextualized_prompt_norm": float(prompt_norm.mean()),
+                        }
+                        normal_results[split]["prompt_response"] = prompt_response
+                        all_rows.extend(self._probe_metric_rows(
+                            prompt_response,
+                            checkpoint_id=checkpoint_id,
+                            probe_id=manifest["probe_id"],
+                            split=split,
+                            domain="prompt_parameter_health",
+                            entity_type="representation",
+                            entity_id="contextualized_prompt",
+                        ))
+                    token_payload = {
+                        "sample_ids": affinity_result["sample_ids"],
+                        "token_sequence": token_sequence,
+                    }
+                    self.diagnostic_manager.record_probe_artifact(
+                        f"probe_vectors/token_sequence/{checkpoint_id}_{split}.npz",
+                        token_payload,
+                        is_array=True,
+                    )
+
+            if bool(self.cfg.MONITOR.MODULE_EFFECT.ENABLE):
+                interventions = []
+                if bool(self.cfg.MONITOR.MODULE_EFFECT.PROMPT_ZERO) and self.prompt_parameter_tracker.active:
+                    interventions.append(("prompt_zeroed", prompt_zero_intervention(model_ref)))
+                if (
+                    bool(self.cfg.MONITOR.MODULE_EFFECT.ATTENTION_MEDIATION_GAMMA_ZERO)
+                    and bool(self.cfg.MODEL.ATTENTION_MEDIATION.ENABLE)
+                ):
+                    interventions.append(("attention_mediation_gamma_zero", attention_mediation_gamma_zero_intervention(model_ref)))
+                for intervention_name, context in interventions:
+                    with context:
+                        changed = self._execute_fixed_probe_condition(
+                            probe_loader,
+                            dataset,
+                            candidate_class_ids,
+                            affinity_forward=False,
+                        )
+                    self._record_probe_module_effect(
+                        checkpoint_id=checkpoint_id,
+                        checkpoint_manifest=checkpoint_manifest,
+                        split=split,
+                        manifest=manifest,
+                        normal=normal,
+                        intervention_name=intervention_name,
+                        intervention=changed,
+                        seen_global_ids=dataset.seen_classes,
+                    )
+
+        self.diagnostic_manager.record_probe_artifact("probe_manifest.json", combined_manifest)
+        if bool(self.cfg.MONITOR.MODULE_EFFECT.ENABLE):
+            configured_conditions = []
+            if bool(self.cfg.MONITOR.MODULE_EFFECT.PROMPT_ZERO) and self.prompt_parameter_tracker.active:
+                configured_conditions.append("prompt_zeroed")
+            if (
+                bool(self.cfg.MONITOR.MODULE_EFFECT.ATTENTION_MEDIATION_GAMMA_ZERO)
+                and bool(self.cfg.MODEL.ATTENTION_MEDIATION.ENABLE)
+            ):
+                configured_conditions.append("attention_mediation_gamma_zero")
+            self.diagnostic_manager.record_module_effect_artifact(
+                "module_effect_manifest.json",
+                {
+                    "format": "baseline_module_effect_v1",
+                    "checkpoint": checkpoint_manifest,
+                    "probe_manifest_path": "probe_manifest.json",
+                    "probe_manifest_sha256_by_split": {
+                        split: manifest["manifest_sha256"]
+                        for split, manifest in combined_manifest["probes"].items()
+                    },
+                    "conditions": ["normal"] + configured_conditions,
+                    "model_eval": True,
+                    "torch_no_grad": True,
+                    "intervention_seed": int(self.cfg.MONITOR.PROBE.SELECTION_SEED),
+                    "comparison_tolerance": float(self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL),
+                },
+            )
+        self.diagnostic_manager.append_probe_metrics(all_rows)
+        if "probe_test_seen" in normal_results and "probe_test_unseen" in normal_results:
+            seen_result = normal_results["probe_test_seen"]
+            unseen_result = normal_results["probe_test_unseen"]
+            seen_alignment = visual_semantic_alignment_metrics(
+                seen_result.get("visual_features"), seen_result.get("semantic_prototypes"), seen_result["targets_local"]
+            )
+            unseen_alignment = visual_semantic_alignment_metrics(
+                unseen_result.get("visual_features"), unseen_result.get("semantic_prototypes"), unseen_result["targets_local"]
+            )
+            transfer = {
+                f"{key}_transfer_gap": float(seen_alignment[key] - unseen_alignment[key])
+                for key in sorted(set(seen_alignment).intersection(unseen_alignment))
+            }
+            combined_visual_graph = semantic_visual_graph_metrics(
+                np.concatenate([seen_result["visual_features"], unseen_result["visual_features"]], axis=0)
+                if seen_result.get("visual_features") is not None and unseen_result.get("visual_features") is not None
+                else None,
+                seen_result.get("semantic_prototypes"),
+                np.concatenate([seen_result["targets_local"], unseen_result["targets_local"]], axis=0),
+                logits=np.concatenate([seen_result["logits"], unseen_result["logits"]], axis=0),
+                neighbor_k=int(self.cfg.MONITOR.SEMANTIC_GRAPH_REFERENCE.NEIGHBOR_K),
+            )
+            transfer.update({f"combined_{name}": value for name, value in combined_visual_graph.items()})
+            seen_prompt = seen_result.get("prompt_response", {})
+            unseen_prompt = unseen_result.get("prompt_response", {})
+            if "contextualized_prompt_norm" in seen_prompt and "contextualized_prompt_norm" in unseen_prompt:
+                transfer["prompt_seen_unseen_response_gap"] = float(
+                    seen_prompt["contextualized_prompt_norm"] - unseen_prompt["contextualized_prompt_norm"]
+                )
+            all_transfer_rows = self._probe_metric_rows(
+                transfer,
+                checkpoint_id=checkpoint_id,
+                probe_id="paired_test_seen_unseen",
+                split="test_seen_vs_test_unseen",
+                domain="visual_semantic_alignment",
+                entity_type="cross_split",
+                entity_id="seen_minus_unseen",
+            )
+            self.diagnostic_manager.append_probe_metrics(all_transfer_rows)
+        if "probe_train_seen" in normal_results and "probe_test_seen" in normal_results:
+            train_result = normal_results["probe_train_seen"]
+            test_result = normal_results["probe_test_seen"]
+            train_metric = classification_metrics(train_result["logits"], train_result["targets_local"])
+            test_metric = classification_metrics(test_result["logits"], test_result["targets_local"])
+            gap_rows = self._probe_metric_rows(
+                {
+                    "train_joint_to_test_seen_gap": float(train_metric["per_class"] - test_metric["per_class"]),
+                },
+                checkpoint_id=checkpoint_id,
+                probe_id="paired_train_test_seen",
+                split="train_seen_vs_test_seen",
+                domain="prediction_health",
+                entity_type="cross_split",
+                entity_id="train_minus_test_seen",
+            )
+            self.diagnostic_manager.append_probe_metrics(gap_rows)
+        self.diagnostic_manager.record_probe_artifact(
+            "probe_runtime_summary.json",
+            {
+                "status": "completed",
+                "checkpoint": checkpoint_manifest,
+                "probe_count": int(len(combined_manifest["probes"])),
+                "metric_row_count": int(len(all_rows)),
+            },
+        )
+        if was_training:
+            model_ref.train()
 
     def _train_classifier_dev(self, train_loader, val_loader, test_seen_loader, test_unseen_loader):
         total_epoch = self.cfg.SOLVER.TOTAL_EPOCH
@@ -2357,7 +3100,7 @@ class Trainer():
                 unseen_metrics = None
 
             if str(self.evaluator.task_type).lower() == "gzsl":
-                self._update_gzsl_record_metrics(epoch, test_unseen_loader, seen_metrics, unseen_metrics)
+                self._update_gzsl_record_metrics(epoch, test_seen_loader, test_unseen_loader, seen_metrics, unseen_metrics)
 
             if improved:
                 best_metric = curr_acc
@@ -2387,6 +3130,22 @@ class Trainer():
         data_time = AverageMeter('Data', ':6.3f')
         self.cls_weights = train_loader.dataset.get_class_weights(self.cfg.DATA.CLASS_WEIGHTS_TYPE)
 
+        if total_epoch == 0:
+            self.model.eval()
+            self.evaluator.update_iteration(0)
+            seen_metrics = (
+                self.eval_classifier(test_seen_loader, "test_seen")
+                if test_seen_loader is not None and str(self.evaluator.task_type).lower() == "gzsl"
+                else None
+            )
+            unseen_metrics = (
+                self.eval_classifier(test_unseen_loader, "test_unseen")
+                if test_unseen_loader is not None
+                else None
+            )
+            if str(self.evaluator.task_type).lower() == "gzsl":
+                self._update_gzsl_record_metrics(-1, test_seen_loader, test_unseen_loader, seen_metrics, unseen_metrics)
+
         for epoch in range(total_epoch):
             self._run_train_epoch(epoch, total_epoch, total_data, train_loader, log_interval, losses, batch_time, data_time)
 
@@ -2409,10 +3168,20 @@ class Trainer():
                 unseen_metrics = None
 
             if str(self.evaluator.task_type).lower() == "gzsl":
-                self._update_gzsl_record_metrics(epoch, test_unseen_loader, seen_metrics, unseen_metrics)
+                self._update_gzsl_record_metrics(epoch, test_seen_loader, test_unseen_loader, seen_metrics, unseen_metrics)
 
         if bool(self.cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT):
-            self._save_trainable_final_checkpoint(total_epoch)
+            self._final_trainable_checkpoint_path = self._save_trainable_final_checkpoint(total_epoch)
+        if bool(self.cfg.MONITOR.MODULE_EFFECT.ENABLE) and not self._final_trainable_checkpoint_path:
+            raise ValueError(
+                "MONITOR.MODULE_EFFECT.ENABLE requires SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT=True"
+            )
+        self._run_fixed_probes(
+            train_loader,
+            test_seen_loader,
+            test_unseen_loader,
+            checkpoint_epoch=total_epoch,
+        )
 
     def _save_trainable_final_checkpoint(self, total_epoch):
         model_ref = self._model_ref(self.model)
@@ -2451,11 +3220,34 @@ class Trainer():
             len(trainable_state),
             sum(int(t.numel()) for t in trainable_state.values()),
         )
+        return checkpoint_path
 
     def train_classifier(self, train_loader, val_loader, test_seen_loader, test_unseen_loader):
-        if val_loader is not None:
-            return self._train_classifier_dev(train_loader, val_loader, test_seen_loader, test_unseen_loader)
-        return self._train_classifier_final(train_loader, test_seen_loader, test_unseen_loader)
+        completed = False
+        try:
+            self.diagnostic_manager.record_static_semantic_graph(train_loader.dataset)
+            if val_loader is not None:
+                result = self._train_classifier_dev(
+                    train_loader,
+                    val_loader,
+                    test_seen_loader,
+                    test_unseen_loader,
+                )
+            else:
+                result = self._train_classifier_final(
+                    train_loader,
+                    test_seen_loader,
+                    test_unseen_loader,
+                )
+            completed = True
+            return result
+        finally:
+            self.diagnostic_manager.finalize(
+                status="completed" if completed else "interrupted"
+            )
+            self.monitor_manager.finalize(
+                status="completed" if completed else "interrupted"
+            )
 
     @torch.no_grad()
     def eval_classifier(self, data_loader, prefix):
@@ -2483,6 +3275,22 @@ class Trainer():
         metric_key = self._resolve_eval_metric_key(dataset, prefix)
         test_name = prefix + "_" + data_loader.dataset.name
         total = len(data_loader)
+        eval_epoch = int(self._trace_epoch + 1) if self._trace_epoch >= 0 else 0
+        self.monitor_manager.set_context(
+            stage=f"eval_{prefix}",
+            epoch=eval_epoch,
+            global_step=int(self._trace_global_step),
+            graph_prob_prior_forward=int(self._graph_prob_prior_forward),
+        )
+        self.monitor_manager.record_event(
+            "protocol_access",
+            {
+                "protocol_mode": str(dataset.protocol_mode),
+                "split": str(prefix),
+                "purpose": "epoch_diagnostic_evaluation",
+                "used_for_model_selection": bool(str(dataset.protocol_mode).lower() == "dev"),
+            },
+        )
 
         eval_class_ids, eval_map = self._dataset_space_meta(dataset, use_eval_space=True)
         eval_map = eval_map.to(dtype=torch.long)
@@ -2490,6 +3298,9 @@ class Trainer():
         # initialize features and target
         total_logits = []
         total_targets = []
+        total_global_targets = []
+        total_sample_ids = []
+        total_visual_features = []
         model_ref = self._model_ref(self.model)
         model_ref.clear_runtime_state()
         if self._vis_split_enabled(prefix):
@@ -2499,7 +3310,6 @@ class Trainer():
         for idx, input_data in enumerate(data_loader):
             self._trace_stage = f"eval_{prefix}"
             self._trace_iter = int(idx)
-            self._trace_global_step += 1
             end = time.time()
             X, targets, attributes = self.get_input(input_data)
 
@@ -2542,6 +3352,15 @@ class Trainer():
                 )
 
             total_targets.extend(list(targets_eval_local.detach().cpu().numpy()))
+            total_global_targets.extend(list(targets.detach().cpu().numpy()))
+            batch_sample_ids = input_data.get("sample_id") if isinstance(input_data, dict) else None
+            if batch_sample_ids is None:
+                batch_sample_ids = [f"{prefix}:{idx}:{item}" for item in range(int(targets.shape[0]))]
+            elif isinstance(batch_sample_ids, str):
+                batch_sample_ids = [batch_sample_ids]
+            elif torch.is_tensor(batch_sample_ids):
+                batch_sample_ids = batch_sample_ids.detach().cpu().tolist()
+            total_sample_ids.extend([str(item) for item in list(batch_sample_ids)])
 
             # 提取 logits
             logits = outputs
@@ -2551,6 +3370,11 @@ class Trainer():
                 logits = outputs["logits"]
 
             total_logits.append(logits)
+            classifier_stats = model_ref.get_runtime_classifier_stats()
+            if isinstance(classifier_stats, dict):
+                visual_repr = classifier_stats.get("visual_repr")
+                if torch.is_tensor(visual_repr) and int(visual_repr.shape[0]) == int(targets.shape[0]):
+                    total_visual_features.append(visual_repr.detach().cpu())
 
             # visualization：当前 split 若启用，就积累 trend 并保存若干样本图
             if self._vis_split_enabled(prefix):
@@ -2591,6 +3415,8 @@ class Trainer():
         raw_metrics = self.evaluator.classify(joint_logits, total_targets)
         metrics = {
             "top1": raw_metrics["top1"],
+            "top5": raw_metrics["top5"],
+            "nll": raw_metrics["nll"],
             metric_key: raw_metrics["per_class"],
         }
         log_results = {k: np.around(v * 100, decimals=2) for k, v in metrics.items()}
@@ -2604,4 +3430,32 @@ class Trainer():
             float(log_results[metric_key]),
         )
         self.evaluator.log_and_update(log_results, metrics, test_name)
+        self.monitor_manager.set_context(
+            stage="eval",
+            epoch=eval_epoch,
+            global_step=int(self._trace_global_step),
+            graph_prob_prior_forward=int(self._graph_prob_prior_forward),
+        )
+        self.monitor_manager.record_epoch(
+            str(prefix),
+            "classification",
+            metrics,
+            reducer="dataset",
+            n=len(dataset),
+        )
+        visual_features = None
+        if total_visual_features:
+            candidate_visual = torch.cat(total_visual_features, dim=0)
+            if int(candidate_visual.shape[0]) == int(joint_logits.shape[0]):
+                visual_features = candidate_visual.numpy()
+        self.diagnostic_manager.record_eval(
+            epoch=eval_epoch,
+            split=str(prefix),
+            scores=joint_logits,
+            targets_local=np.asarray(total_targets, dtype=np.int64),
+            targets_global=np.asarray(total_global_targets, dtype=np.int64),
+            sample_ids=total_sample_ids,
+            dataset=dataset,
+            visual_features=visual_features,
+        )
         return metrics

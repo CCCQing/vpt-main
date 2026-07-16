@@ -5,11 +5,18 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import math
 import statistics
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
+
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.monitoring.writer import stage2_metadata, write_stage2_json, write_stage2_table  # noqa: E402
 
 
 GROUPS = (
@@ -34,16 +41,7 @@ def _read(path: Path) -> List[Dict[str, str]]:
 
 
 def _write(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    keys: List[str] = []
-    for row in rows:
-        for key in row:
-            if key not in keys:
-                keys.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
+    write_stage2_table(path, rows, stage2_metadata("stage2B_prior_intervention_summary"))
 
 
 def _number(row: Mapping[str, Any], key: str) -> float:
@@ -122,8 +120,10 @@ def summarize(args: argparse.Namespace) -> None:
         "seeds": seeds,
         "comparisons": COMPARISONS,
     }
-    (args.output_dir / "summary.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    write_stage2_json(
+        args.output_dir / "summary.json",
+        metadata,
+        stage2_metadata("stage2B_prior_intervention_summary"),
     )
     print(f"wrote {args.output_dir / 'group_summary.csv'}", flush=True)
 

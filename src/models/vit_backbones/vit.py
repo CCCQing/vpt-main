@@ -91,6 +91,7 @@ class Attention(nn.Module):
         self.softmax = Softmax(dim=-1)
         self.debug_shapes = False
         self._shape_debug_forward_proj_logged = False
+        self._last_mediation_stats = None
 
     def transpose_for_scores(self, x):
         """将张量从 [B, N, D] 变形为 [B, h, N, d_k] 以便做多头注意力。"""
@@ -654,6 +655,20 @@ class Attention(nn.Module):
             # mediation 先构造 dropout 前的 modified_probs；这里让原始主路径和 mediated 分支
             # 共享同一份 attention dropout mask，然后再分别计算主路径 context 与 mediated delta。
             modified_probs = mediation.pop("modified_probs")
+            original_probs_monitor = attention_probs.detach().float()
+            modified_probs_monitor = modified_probs.detach().float()
+            midpoint = 0.5 * (original_probs_monitor + modified_probs_monitor)
+            original_kl = (
+                original_probs_monitor
+                * (original_probs_monitor.clamp_min(1e-12).log() - modified_probs_monitor.clamp_min(1e-12).log())
+            ).sum(dim=-1)
+            js = 0.5 * (
+                original_probs_monitor
+                * (original_probs_monitor.clamp_min(1e-12).log() - midpoint.clamp_min(1e-12).log())
+            ).sum(dim=-1) + 0.5 * (
+                modified_probs_monitor
+                * (modified_probs_monitor.clamp_min(1e-12).log() - midpoint.clamp_min(1e-12).log())
+            ).sum(dim=-1)
             attention_probs, modified_probs = self._apply_shared_attention_dropout(attention_probs, modified_probs)
 
             delta_probs = modified_probs - attention_probs
@@ -661,6 +676,26 @@ class Attention(nn.Module):
             mediated_context = torch.matmul(modified_probs, value_layer)
             mediation["delta_attention_output"] = self._context_to_attention_output(delta_context, include_bias=False)
             mediation["mediated_attention_output"] = self._context_to_attention_output(mediated_context, include_bias=True)
+            with torch.no_grad():
+                delta_output = mediation["delta_attention_output"].detach().float()
+                mediation["monitor_stats"] = {
+                    "delta_prob_abs_mean": float(delta_probs.detach().float().abs().mean().item()),
+                    "delta_prob_l2": float(delta_probs.detach().float().pow(2).mean().sqrt().item()),
+                    "delta_output_abs_mean": float(delta_output.abs().mean().item()),
+                    "delta_output_l2": float(delta_output.pow(2).mean().sqrt().item()),
+                    "attention_kl": float(original_kl.mean().item()),
+                    "attention_js": float(js.mean().item()),
+                    "activation_sample_ratio": float(
+                        (delta_probs.detach().float().abs().reshape(delta_probs.shape[0], -1).sum(dim=1) > 1e-12)
+                        .float().mean().item()
+                    ),
+                }
+                base_context = torch.matmul(attention_probs.detach(), value_layer.detach()).float()
+                delta_context_value = delta_context.detach().float()
+                mediation["monitor_stats"]["delta_output_to_base_ratio"] = float(
+                    delta_context_value.norm(dim=-1).mean().item()
+                    / max(float(base_context.norm(dim=-1).mean().item()), 1e-12)
+                )
         else:
             attention_probs = self.attn_dropout(attention_probs)
 
@@ -767,12 +802,27 @@ class Attention(nn.Module):
         q_prompt = q_base[:, :, prompt_slice, :]
         q_patch = q_base[:, :, patch_slice, :]
         q_semantic = q_base[:, :, semantic_slice, :]
+        q_cls = q_base[:, :, :1, :]
         k_prompt = k_base[:, :, prompt_slice, :]
         k_patch = k_base[:, :, patch_slice, :]
         k_semantic = k_base[:, :, semantic_slice, :]
         scale = 1.0 / math.sqrt(self.attention_head_size)
 
         monitors = {}
+        attention_probs = torch.softmax(torch.matmul(q_base, k_base.transpose(-1, -2)) * scale, dim=-1)
+        monitors["AcKv_attn"] = attention_probs[:, :, :1, patch_slice]
+        if prompt_length > 0:
+            monitors["AcKp_attn"] = attention_probs[:, :, :1, prompt_slice]
+            monitors["ApKv_attn"] = attention_probs[:, :, prompt_slice, patch_slice]
+            monitors["AvKp_attn"] = attention_probs[:, :, patch_slice, prompt_slice]
+            monitors["ApKc_attn"] = attention_probs[:, :, prompt_slice, :1]
+        if semantic_length > 0:
+            monitors["AcKs_attn"] = attention_probs[:, :, :1, semantic_slice]
+            monitors["AsKv_attn"] = attention_probs[:, :, semantic_slice, patch_slice]
+            monitors["AvKs_attn"] = attention_probs[:, :, patch_slice, semantic_slice]
+            if prompt_length > 0:
+                monitors["AsKp_attn"] = attention_probs[:, :, semantic_slice, prompt_slice]
+                monitors["ApKs_attn"] = attention_probs[:, :, prompt_slice, semantic_slice]
         if q_prompt.numel() > 0 and q_patch.numel() > 0:
             qpqv_raw = torch.matmul(q_prompt, q_patch.transpose(-1, -2)) * scale
             monitors["QpQv_raw"] = qpqv_raw
@@ -788,6 +838,16 @@ class Attention(nn.Module):
             monitors["QpKv_raw"] = qpkv_raw
             monitors["QpKv_vis"] = self._minmax_normalize_lastdim(qpkv_raw)
 
+        if q_patch.numel() > 0 and k_prompt.numel() > 0:
+            qvkp_raw = torch.matmul(q_patch, k_prompt.transpose(-1, -2)) * scale
+            monitors["QvKp_raw"] = qvkp_raw
+            monitors["QvKp_vis"] = self._minmax_normalize_lastdim(qvkp_raw)
+
+        if q_cls.numel() > 0 and k_prompt.numel() > 0:
+            qckp_raw = torch.matmul(q_cls, k_prompt.transpose(-1, -2)) * scale
+            monitors["QcKp_raw"] = qckp_raw
+            monitors["QcKp_vis"] = self._minmax_normalize_lastdim(qckp_raw)
+
         if q_semantic.numel() > 0 and k_patch.numel() > 0:
             qskv_raw = torch.matmul(q_semantic, k_patch.transpose(-1, -2)) * scale
             monitors["QsKv_raw"] = qskv_raw
@@ -797,6 +857,11 @@ class Attention(nn.Module):
             qvks_raw = torch.matmul(q_patch, k_semantic.transpose(-1, -2)) * scale
             monitors["QvKs_raw"] = qvks_raw
             monitors["QvKs_vis"] = self._minmax_normalize_lastdim(qvks_raw)
+
+        if q_cls.numel() > 0 and k_semantic.numel() > 0:
+            qcks_raw = torch.matmul(q_cls, k_semantic.transpose(-1, -2)) * scale
+            monitors["QcKs_raw"] = qcks_raw
+            monitors["QcKs_vis"] = self._minmax_normalize_lastdim(qcks_raw)
 
         if q_semantic.numel() > 0 and k_prompt.numel() > 0:
             qskp_raw = torch.matmul(q_semantic, k_prompt.transpose(-1, -2)) * scale
@@ -901,6 +966,30 @@ class Block(nn.Module):
         self.ffn = Mlp(config)                  # 段2的两层 MLP（D→H→D，通常 H≈4D），完成通道内的非线性变换
         self.attn = Attention(config, vis)      # 段1的多头自注意力
         self.debug_shapes = False
+        self._last_attention_mediation_stats = None
+
+    def _cache_attention_mediation_stats(self, mediation, config, layer_idx):
+        if mediation is None:
+            self._last_attention_mediation_stats = None
+            return
+        stats = dict(mediation.get("monitor_stats", {}))
+        if config:
+            ref = mediation["delta_attention_output"]
+            prompt_gamma = self._attention_mediation_gamma(config, "prompt_gamma", layer_idx, ref).detach()
+            semantic_gamma = self._attention_mediation_gamma(config, "semantic_gamma", layer_idx, ref).detach()
+            stats["prompt_gamma"] = float(prompt_gamma.item())
+            stats["semantic_gamma"] = float(semantic_gamma.item())
+            delta = ref.detach().float()
+            prompt_slice = mediation["prompt_slice"]
+            semantic_slice = mediation["semantic_slice"]
+            prompt_delta = delta[:, prompt_slice, :]
+            semantic_delta = delta[:, semantic_slice, :]
+            if prompt_delta.numel() > 0:
+                stats["prompt_writeback_l2"] = float((prompt_gamma.float() * prompt_delta).pow(2).mean().sqrt().item())
+            if semantic_delta.numel() > 0:
+                stats["semantic_writeback_l2"] = float((semantic_gamma.float() * semantic_delta).pow(2).mean().sqrt().item())
+        stats["layer"] = int(layer_idx)
+        self._last_attention_mediation_stats = stats
 
     @staticmethod
     def _attention_mediation_gamma(config: Dict[str, Any], name: str, layer_idx: int, ref: torch.Tensor) -> torch.Tensor:
@@ -1010,6 +1099,7 @@ class Block(nn.Module):
             raise ValueError("ATTENTION_MEDIATION.EXECUTION_MODE must be attention_parallel or block_parallel.")
         if mediation is not None and mlp_policy not in {"enter_mlp", "skip_mlp"}:
             raise ValueError("ATTENTION_MEDIATION.MLP_POLICY must be enter_mlp or skip_mlp.")
+        self._cache_attention_mediation_stats(mediation, attention_mediation_config, layer_idx)
         if mediation is not None and execution_mode == "block_parallel":
             if mlp_policy != "enter_mlp":
                 raise ValueError("ATTENTION_MEDIATION block_parallel requires MLP_POLICY='enter_mlp'.")
@@ -1104,6 +1194,7 @@ class Block(nn.Module):
             raise ValueError("ATTENTION_MEDIATION.EXECUTION_MODE must be attention_parallel or block_parallel.")
         if mediation is not None and mlp_policy not in {"enter_mlp", "skip_mlp"}:
             raise ValueError("ATTENTION_MEDIATION.MLP_POLICY must be enter_mlp or skip_mlp.")
+        self._cache_attention_mediation_stats(mediation, attention_mediation_config, layer_idx)
         if mediation is not None and execution_mode == "block_parallel":
             if mlp_policy != "enter_mlp":
                 raise ValueError("ATTENTION_MEDIATION block_parallel requires MLP_POLICY='enter_mlp'.")
@@ -1208,6 +1299,7 @@ class Encoder(nn.Module):
         self.vis = vis
         self.layer = nn.ModuleList()    # 保存有序的多层子模块
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6) # 在所有 block 之后再做一次 LayerNorm
+        self._last_attention_mediation_stats = []
         for _ in range(config.transformer["num_layers"]):
             layer = Block(config, vis)  # 每层都是同结构的 Transformer Block（内部是 LN→MHSA→残差；LN→MLP→残差）
             self.layer.append(copy.deepcopy(layer))
@@ -1223,6 +1315,7 @@ class Encoder(nn.Module):
     ):
         """常规前向：返回编码结果与（可选）各层注意力权重。"""
         attn_weights = []
+        self._last_attention_mediation_stats = []
         for layer_idx, layer_block in enumerate(self.layer):
             # attention_mediation_config 在所有层共享，layer_idx 用于取当前层独立的 gamma gate。
             hidden_states, weights, semantics = layer_block(hidden_states, semantics,
@@ -1230,6 +1323,8 @@ class Encoder(nn.Module):
                     attention_mediation_config, layer_idx)  # hidden_states为(B, 1+N, D)D 为 hidden_size
             if self.vis:
                 attn_weights.append(weights)    # 把每层的 weights 保存到列表里否则返回空列表
+            if layer_block._last_attention_mediation_stats is not None:
+                self._last_attention_mediation_stats.append(dict(layer_block._last_attention_mediation_stats))
         encoded = self.encoder_norm(hidden_states)  # 对最后一层输出再做一次 LayerNorm，得到 encoded
         return encoded, attn_weights
 
@@ -1265,6 +1360,7 @@ class Encoder(nn.Module):
         """
         attn_weights = []
         affinities = []
+        self._last_attention_mediation_stats = []
         for layer_idx, layer_block in enumerate(self.layer):
             # forward_with_affinity 同时服务训练损失/可视化，因此 mediation 的插入点必须和常规 forward 一致。
             hidden_states, weights, affinity, semantics = layer_block.forward_with_affinity(
@@ -1278,6 +1374,8 @@ class Encoder(nn.Module):
             if self.vis:
                 attn_weights.append(weights)
             affinities.append(affinity)
+            if layer_block._last_attention_mediation_stats is not None:
+                self._last_attention_mediation_stats.append(dict(layer_block._last_attention_mediation_stats))
         encoded = self.encoder_norm(hidden_states)
         return encoded, attn_weights, affinities
 
@@ -1319,12 +1417,14 @@ class Transformer(nn.Module):
         self.encoder = Encoder(config, vis)
         self._last_semantic_token_state = None
         self._last_prompt_path_info = {}
+        self._last_token_sequence = None
 
     def forward(self, input_ids, semantics: torch.Tensor = None):
         """标准前向：返回编码后的序列与注意力权重。"""
         embedding_output = self.embeddings(input_ids)
 
         encoded, attn_weights = self.encoder(embedding_output, semantics)
+        self._last_token_sequence = encoded
         return encoded, attn_weights
 
 
@@ -1346,6 +1446,7 @@ class Transformer(nn.Module):
         """
         embedding_output = self.embeddings(input_ids)
         encoded, attn_weights, affinities = self.encoder.forward_with_affinity(embedding_output, affinity_config, semantics)
+        self._last_token_sequence = encoded
         return encoded, attn_weights, affinities
 
     def forward_cls_layerwise(self, input_ids):

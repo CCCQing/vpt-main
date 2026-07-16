@@ -34,6 +34,7 @@ from scipy import ndimage
 
 from ..vit_backbones.vit import CONFIGS, Transformer, VisionTransformer, np2th
 from ...utils import logging
+from ...utils.reproducibility import make_torch_generator
 
 logger = logging.get_logger("visual_prompt")
 
@@ -601,7 +602,16 @@ class PromptedTransformer(Transformer):
     3. 轻量语义交互分支在 backbone 中的逐层接入
     """
 
-    def __init__(self, prompt_config, config, img_size, vis, prompt_init=None, prompt_init_provider=None):
+    def __init__(
+        self,
+        prompt_config,
+        config,
+        img_size,
+        vis,
+        prompt_init=None,
+        prompt_init_provider=None,
+        prompt_init_seed=None,
+    ):
 
         self.semantic_tokens_cfg = prompt_config.SEMANTIC_TOKENS
         self.semantic_tokens_enable = bool(self.semantic_tokens_cfg.ENABLE)
@@ -657,6 +667,8 @@ class PromptedTransformer(Transformer):
         self.prompt_dropout = Dropout(self.prompt_config.DROPOUT)
 
         self.prompt_init_provider = prompt_init_provider
+        self.prompt_init_seed = None if prompt_init_seed is None else int(prompt_init_seed)
+        prompt_init_generator = make_torch_generator(self.prompt_init_seed)
         self.prompt_proj = nn.Identity()
         self.prompt_embeddings = None
         self.deep_prompt_embeddings = None
@@ -670,6 +682,7 @@ class PromptedTransformer(Transformer):
         self._shape_debug_incorporate_logged = False
         self._last_prompt_path_info = {}
         self._last_prompt_distribution_stats = None
+        self._last_attention_mediation_stats = []
         self._runtime_prompt_distribution_override = None
 
         if prompt_init is not None:
@@ -708,17 +721,17 @@ class PromptedTransformer(Transformer):
                 prompt_dim = config.hidden_size
                 val = math.sqrt(6.0 / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
                 self.prompt_embeddings = nn.Parameter(torch.zeros(1, num_tokens, prompt_dim))
-                nn.init.uniform_(self.prompt_embeddings.data, -val, val)
+                self.prompt_embeddings.data.uniform_(-val, val, generator=prompt_init_generator)
         elif self.prompt_enable and self.prompt_backend == "vpt_deep":
             prompt_dim = config.hidden_size
             val = math.sqrt(6.0 / float(3 * reduce(mul, patch_size, 1) + prompt_dim))
             if self.prompt_init_source == "learned":
                 self.prompt_embeddings = nn.Parameter(torch.zeros(1, num_tokens, prompt_dim))
-                nn.init.uniform_(self.prompt_embeddings.data, -val, val)
+                self.prompt_embeddings.data.uniform_(-val, val, generator=prompt_init_generator)
             if self.prompt_config.DEEP:
                 total_d_layer = config.transformer["num_layers"] - 1
                 self.deep_prompt_embeddings = nn.Parameter(torch.zeros(total_d_layer, num_tokens, prompt_dim))
-                nn.init.uniform_(self.deep_prompt_embeddings.data, -val, val)
+                self.deep_prompt_embeddings.data.uniform_(-val, val, generator=prompt_init_generator)
 
         if self.attention_mediation_enable:
             # attention mediation 是“当前 block 内”的注意力修正，因此每一层 ViT block 都有独立 gamma。
@@ -1204,7 +1217,13 @@ class PromptedTransformer(Transformer):
                 attention_mediation_config,
             )
 
+        self._last_attention_mediation_stats = [
+            dict(block._last_attention_mediation_stats)
+            for block in self.encoder.layer
+            if block._last_attention_mediation_stats is not None
+        ]
         self._finalize_semantic_token_state(encoded)
+        self._last_token_sequence = encoded
         return encoded, attn_weights
 
     def forward_with_affinity(self, x, affinity_config, semantics=None):
@@ -1239,14 +1258,30 @@ class PromptedTransformer(Transformer):
                 attention_mediation_config,
             )
 
+        self._last_attention_mediation_stats = [
+            dict(block._last_attention_mediation_stats)
+            for block in self.encoder.layer
+            if block._last_attention_mediation_stats is not None
+        ]
         self._finalize_semantic_token_state(encoded)
+        self._last_token_sequence = encoded
         return encoded, attn_weights, affinities
 
 class PromptedVisionTransformer(VisionTransformer):
     """
     Replace the original VisionTransformer's internal transformer backbone with PromptedTransformer
     """
-    def __init__(self, prompt_cfg, model_type,img_size=224, num_classes=21843, vis=False, prompt_init=None, prompt_init_provider=None):
+    def __init__(
+        self,
+        prompt_cfg,
+        model_type,
+        img_size=224,
+        num_classes=21843,
+        vis=False,
+        prompt_init=None,
+        prompt_init_provider=None,
+        prompt_init_seed=None,
+    ):
         super(PromptedVisionTransformer, self).__init__(model_type, img_size, num_classes, vis)
 
         if prompt_cfg is None:
@@ -1254,7 +1289,15 @@ class PromptedVisionTransformer(VisionTransformer):
         self.prompt_cfg = prompt_cfg
 
         vit_cfg = CONFIGS[model_type]
-        self.transformer = PromptedTransformer(prompt_cfg, vit_cfg, img_size, vis, prompt_init=prompt_init, prompt_init_provider=prompt_init_provider,)
+        self.transformer = PromptedTransformer(
+            prompt_cfg,
+            vit_cfg,
+            img_size,
+            vis,
+            prompt_init=prompt_init,
+            prompt_init_provider=prompt_init_provider,
+            prompt_init_seed=prompt_init_seed,
+        )
 
     def forward(self, x, vis=False, semantics=None):
         x, attn_weights = self.transformer(x, semantics)

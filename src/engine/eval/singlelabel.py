@@ -5,6 +5,8 @@
 import numpy as np
 from sklearn.metrics import accuracy_score
 
+from ...monitoring.eval_metrics import classification_metrics
+
 
 def accuracy(y_probs, y_true):
     y_preds = np.argmax(y_probs, axis=1)
@@ -32,6 +34,10 @@ def compute_per_class_top1(scores: np.ndarray, targets: np.ndarray) -> float:
     if not accs:
         return 0.0
     return float(np.mean(accs))
+
+
+def compute_classification_metrics(scores: np.ndarray, targets: np.ndarray):
+    return classification_metrics(scores, targets)
 
 
 def harmonic_mean(a: float, b: float) -> float:

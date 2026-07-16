@@ -103,6 +103,7 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
         self.unseen_classes = None
         self.seen_classnames = None
         self.unseen_classnames = None
+        self.all_classnames = None
 
         self.protocol_mode = None
         self.split_source_keys = []
@@ -292,6 +293,7 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
         if len(all_class_names) < num_classes:
             raise ValueError("allclasses_names length {} is smaller than num_classes {}".format(
                     len(all_class_names), num_classes))
+        self.all_classnames = [str(name) for name in all_class_names[:num_classes]]
         self.seen_classnames = [all_class_names[i] for i in self.seen_classes]
         self.unseen_classnames = [all_class_names[i] for i in self.unseen_classes]
 
@@ -368,7 +370,13 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
             label = int(labels_all[int(idx)])
             if label < 0 or label >= num_classes:
                 raise ValueError("Label {} out of range for NUMBER_CLASSES {}".format(label, num_classes))
-            self._imdb.append({"im_path": abs_path, "class": label})
+            sample_id = "{}:{}:{}".format(self._split, int(idx), str(rel_path).replace("\\", "/"))
+            self._imdb.append({
+                "im_path": abs_path,
+                "class": label,
+                "source_index": int(idx),
+                "sample_id": sample_id,
+            })
 
         if missing_files:
             raise FileNotFoundError(
@@ -437,6 +445,10 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
             "image": image,
             "label": label,
             "attribute": self.class_attributes[label],
+            "sample_id": str(record["sample_id"]),
+            "sample_index": int(index),
+            "source_index": int(record["source_index"]),
+            "image_path": str(record["im_path"]),
         }
 
     def __len__(self):

@@ -30,6 +30,7 @@ from src.tools.evaluate_graph_gp_center_transfer import (  # noqa: E402
 )
 from src.tools.export_prompt_posterior_cache import _load_trainable_checkpoint, _setup_cfg  # noqa: E402
 from src.utils import logging  # noqa: E402
+from src.monitoring.writer import stage2_metadata, write_stage2_json, write_stage2_table  # noqa: E402
 
 
 GROUP_SPECS = (
@@ -47,17 +48,8 @@ GROUP_SPECS = (
 GROUPS = tuple(spec[0] for spec in GROUP_SPECS)
 
 
-def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    keys: List[str] = []
-    for row in rows:
-        for key in row:
-            if key not in keys:
-                keys.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], metadata: Mapping[str, Any] = None) -> None:
+    write_stage2_table(path, rows, metadata or stage2_metadata("stage2B_eval"))
 
 
 def _load_healthy(path: Path, seed: int) -> Dict[str, Any]:
@@ -620,7 +612,8 @@ def evaluate(args: argparse.Namespace) -> None:
             args.eps,
         ))
         rows.append(row)
-    _write_csv(args.output_dir / "group_results.csv", rows)
+    output_metadata = stage2_metadata("stage2B_eval", seed=args.seed)
+    _write_csv(args.output_dir / "group_results.csv", rows, output_metadata)
     np.savez_compressed(
         str(args.output_dir / "prior_banks.npz"),
         **{f"{key}_mu": values[0].astype(np.float32) for key, values in bank_arrays.items()},
@@ -655,9 +648,7 @@ def evaluate(args: argparse.Namespace) -> None:
             for group, mode, bank_key in active_specs
         },
     }
-    (args.output_dir / "results.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    write_stage2_json(args.output_dir / "results.json", metadata, output_metadata)
     print(f"wrote {args.output_dir / 'group_results.csv'}", flush=True)
 
 

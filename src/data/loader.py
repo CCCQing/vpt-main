@@ -7,6 +7,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data.sampler import RandomSampler
 
 from ..utils import logging
+from ..utils.reproducibility import derive_seed, make_torch_generator
 from .datasets.xlsa_dataset import CUB200Dataset, AWA2Dataset, SUNAttributeDataset
 
 logger = logging.get_logger("visual_prompt")
@@ -29,6 +30,15 @@ def _construct_loader(cfg, split, batch_size, shuffle, drop_last):
 
     dataset = _DATASET_CATALOG[dataset_name](cfg, split)
     sampler = DistributedSampler(dataset) if cfg.NUM_GPUS > 1 else None
+    data_order_seed = derive_seed(cfg.SEED, "data_order")
+    loader_generator = make_torch_generator(data_order_seed) if shuffle else None
+    if shuffle:
+        logger.info(
+            "[reproducibility] data_order split=%s seed=%s workers=%d",
+            split,
+            str(data_order_seed),
+            int(cfg.DATA.NUM_WORKERS),
+        )
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
@@ -37,6 +47,7 @@ def _construct_loader(cfg, split, batch_size, shuffle, drop_last):
         num_workers=cfg.DATA.NUM_WORKERS,
         pin_memory=cfg.DATA.PIN_MEMORY,
         drop_last=drop_last,
+        generator=loader_generator,
     )
 
 

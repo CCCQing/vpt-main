@@ -2401,8 +2401,10 @@ class GraphProbPriorLossComputer(torch.nn.Module):
                 )
 
         prior_cfg = self.cfg.MODEL.GRAPH_PROB_PRIOR
-        self._monitor_step += 1
-        monitor_active = self.monitor_enable and (self._monitor_step % self.monitor_every_n == 0)
+        monitor_active = False
+        if bool(is_train):
+            self._monitor_step += 1
+            monitor_active = self.monitor_enable and (self._monitor_step % self.monitor_every_n == 0)
 
         # 统一构造语义图输入：
         #   bank:   [C,768] 类别语义原型；graph_gp_conditioned 下为 None；

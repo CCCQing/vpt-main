@@ -8,11 +8,19 @@ import csv
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.stats import spearmanr
+
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.monitoring.writer import stage2_metadata, write_stage2_json, write_stage2_table  # noqa: E402
 
 
 METRIC_KEYS = (
@@ -59,19 +67,8 @@ ALIGNMENT_METRIC_KEYS = (
 )
 
 
-def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    keys: List[str] = []
-    seen = set()
-    for row in rows:
-        for key in row:
-            if key not in seen:
-                seen.add(key)
-                keys.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], metadata: Mapping[str, Any] = None) -> None:
+    write_stage2_table(path, rows, metadata or stage2_metadata("stage2A"))
 
 
 def _json_safe(value: Any):
@@ -89,9 +86,8 @@ def _json_safe(value: Any):
     return value
 
 
-def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+def _write_json(path: Path, payload: Mapping[str, Any], metadata: Mapping[str, Any] = None) -> None:
+    write_stage2_json(path, payload, metadata or stage2_metadata("stage2A"))
 
 
 def _load_cache(path: Path) -> Dict[str, Any]:
@@ -921,11 +917,16 @@ def evaluate(args: argparse.Namespace) -> None:
         print(f"[stage2] completed fold {fold_index + 1}/{len(manifest['query_folds'])}", flush=True)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    _write_csv(args.output_dir / "fold_results.csv", fold_rows)
-    _write_csv(args.output_dir / "query_class_results.csv", class_rows)
-    _write_csv(args.output_dir / "class_center_stats.csv", class_center_rows)
-    _write_csv(args.output_dir / "support_class_stats.csv", support_class_rows)
-    _write_csv(args.output_dir / "cross_space_alignment.csv", alignment_rows)
+    output_metadata = stage2_metadata(
+        "stage2A",
+        seed=model_seed,
+        cell_id=str(cache["metadata"].get("cell_id", "")) or None,
+    )
+    _write_csv(args.output_dir / "fold_results.csv", fold_rows, output_metadata)
+    _write_csv(args.output_dir / "query_class_results.csv", class_rows, output_metadata)
+    _write_csv(args.output_dir / "class_center_stats.csv", class_center_rows, output_metadata)
+    _write_csv(args.output_dir / "support_class_stats.csv", support_class_rows, output_metadata)
+    _write_csv(args.output_dir / "cross_space_alignment.csv", alignment_rows, output_metadata)
     metadata = {
         "format": "graph_gp_stage2_results_v1",
         "cache": str(args.cache),
@@ -954,6 +955,7 @@ def evaluate(args: argparse.Namespace) -> None:
     _write_json(
         args.output_dir / "results.json",
         {"metadata": metadata, "fold_rows": fold_rows, "alignment_rows": alignment_rows},
+        output_metadata,
     )
     print(f"wrote {args.output_dir / 'fold_results.csv'}", flush=True)
     print(f"wrote {args.output_dir / 'query_class_results.csv'}", flush=True)

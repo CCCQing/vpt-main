@@ -69,6 +69,8 @@ def _classify_group(name: str) -> str:
             "classifier",
             "logit_scale",
             "sim_head",
+            "r_similarity_head",
+            "prototype_proj",
             "vs_projection",
         ]
     ) or lower.startswith("head"):
@@ -126,6 +128,11 @@ def log_trainable_parameters(
 
     total_params = sum(v["total_numel"] for v in stats.values())
     trainable_params = sum(v["train_numel"] for v in stats.values())
+    trainable_tensors = [
+        "{} shape={} numel={}".format(name, list(param.shape), int(param.numel()))
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    ]
     sorted_groups = sorted(stats.items(), key=lambda item: item[1]["train_numel"], reverse=True)
     nonzero_groups = [
         (group_name, group_stats)
@@ -140,6 +147,12 @@ def log_trainable_parameters(
         summary_parts.append(f"{group_name}={trainable} ({pct_all:.2f}% all)")
     if summary_parts:
         logger.info("[visual_prompt]: trainable modules: %s", ", ".join(summary_parts))
+    logger.info(
+        "[visual_prompt]: effective trainable tensors=%d parameters=%d: %s",
+        len(trainable_tensors),
+        trainable_params,
+        "; ".join(trainable_tensors) if trainable_tensors else "<none>",
+    )
 
     if stats["backbone_pretrained"]["train_numel"] > 0:
         logger.warning(

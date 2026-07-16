@@ -8,8 +8,16 @@ import csv
 import json
 import math
 import statistics
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
+
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.monitoring.writer import stage2_metadata, write_stage2_json, write_stage2_table  # noqa: E402
 
 
 GROUPS = (
@@ -56,17 +64,8 @@ def _read(path: Path) -> List[Dict[str, str]]:
         return [dict(row) for row in csv.DictReader(handle)]
 
 
-def _write(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    keys: List[str] = []
-    for row in rows:
-        for key in row:
-            if key not in keys:
-                keys.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
+def _write(path: Path, rows: Sequence[Mapping[str, Any]], metadata: Mapping[str, Any] = None) -> None:
+    write_stage2_table(path, rows, metadata or stage2_metadata("stage2B_summary"))
 
 
 def _number(row: Mapping[str, Any], key: str) -> float:
@@ -217,14 +216,15 @@ def summarize(args: argparse.Namespace) -> None:
                 summary[f"{metric}_std"] = std
             pseudo_pair_summary.append(summary)
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    _write(args.output_dir / "group_seed_results.csv", rows)
-    _write(args.output_dir / "group_summary.csv", group_rows)
-    _write(args.output_dir / "paired_effects_by_seed.csv", pair_rows)
-    _write(args.output_dir / "paired_effect_summary.csv", pair_summary)
-    _write(args.output_dir / "pseudo_unseen_rows.csv", pseudo_rows)
-    _write(args.output_dir / "pseudo_unseen_summary.csv", pseudo_summary)
-    _write(args.output_dir / "pseudo_unseen_paired_effects.csv", pseudo_pair_rows)
-    _write(args.output_dir / "pseudo_unseen_paired_summary.csv", pseudo_pair_summary)
+    output_metadata = stage2_metadata("stage2B_summary")
+    _write(args.output_dir / "group_seed_results.csv", rows, output_metadata)
+    _write(args.output_dir / "group_summary.csv", group_rows, output_metadata)
+    _write(args.output_dir / "paired_effects_by_seed.csv", pair_rows, output_metadata)
+    _write(args.output_dir / "paired_effect_summary.csv", pair_summary, output_metadata)
+    _write(args.output_dir / "pseudo_unseen_rows.csv", pseudo_rows, output_metadata)
+    _write(args.output_dir / "pseudo_unseen_summary.csv", pseudo_summary, output_metadata)
+    _write(args.output_dir / "pseudo_unseen_paired_effects.csv", pseudo_pair_rows, output_metadata)
+    _write(args.output_dir / "pseudo_unseen_paired_summary.csv", pseudo_pair_summary, output_metadata)
     metadata = {
         "format": "stage2b_healthy_intervention_summary_v1",
         "groups": list(GROUPS),
@@ -235,9 +235,7 @@ def summarize(args: argparse.Namespace) -> None:
         "pseudo_comparisons": PSEUDO_COMPARISONS,
         "expected_folds": int(args.expected_folds),
     }
-    (args.output_dir / "summary.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    write_stage2_json(args.output_dir / "summary.json", metadata, output_metadata)
     print(f"wrote {args.output_dir / 'group_summary.csv'}", flush=True)
 
 

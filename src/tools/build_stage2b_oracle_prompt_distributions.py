@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import random
@@ -24,6 +23,7 @@ if str(ROOT) not in sys.path:
 from src.data.datasets.xlsa_dataset import CUB200Dataset  # noqa: E402
 from src.data.transforms import get_transforms  # noqa: E402
 from src.models.build_model import build_model  # noqa: E402
+from src.monitoring.writer import stage2_metadata, write_stage2_json, write_stage2_table  # noqa: E402
 from src.tools.export_prompt_posterior_cache import (  # noqa: E402
     _load_trainable_checkpoint,
     _setup_cfg,
@@ -400,6 +400,7 @@ def build_oracle(args: argparse.Namespace) -> None:
         use_oracle=True,
     )
     metadata = {
+        **stage2_metadata("stage2B_oracle_prompt_distribution", seed=int(args.seed)),
         "format": "stage2b_oracle_prompt_distributions_v1",
         "seed": int(args.seed),
         "checkpoint": str(args.checkpoint),
@@ -432,13 +433,12 @@ def build_oracle(args: argparse.Namespace) -> None:
         metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=False)),
         split_manifest_json=np.asarray(json.dumps(split_manifest, ensure_ascii=False)),
     )
-    args.output.with_suffix(".json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    write_stage2_json(args.output.with_suffix(".json"), metadata, {})
+    write_stage2_table(
+        args.output.with_name(args.output.stem + "_history.csv"),
+        history,
+        stage2_metadata("stage2B_oracle_prompt_distribution", seed=int(args.seed)),
     )
-    with args.output.with_name(args.output.stem + "_history.csv").open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(history[0]))
-        writer.writeheader()
-        writer.writerows(history)
     print(f"wrote {args.output}", flush=True)
 
 

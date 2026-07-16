@@ -19,7 +19,6 @@ def build_model(cfg):
 
     vis = bool(cfg.MODEL.AFFINITY.VIS or cfg.SOLVER.VIS.ENABLE)
     model = _MODEL_TYPES[cfg.MODEL.TYPE](cfg, vis=vis)
-    log_model_info(model, verbose=False)
 
     model, device = load_model_to_device(model, cfg)
     logger.info(f"Device used for model: {device}")
@@ -27,7 +26,7 @@ def build_model(cfg):
 
 
 
-def log_model_info(model, verbose=False):
+def log_model_info(model, verbose=False, label="Model"):
     if verbose:
         logger.info(f"Classification Model:\n{model}")
 
@@ -35,7 +34,8 @@ def log_model_info(model, verbose=False):
     model_grad_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     logger.info(
-        "Model params: total=%d trainable=%d",
+        "%s params: total=%d trainable=%d",
+        label,
         model_total_params,
         model_grad_params,
     )

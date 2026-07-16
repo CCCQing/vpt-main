@@ -36,6 +36,7 @@ def build_vit_sup_models(
     vis=False,
     prompt_init=None,
     prompt_init_provider=None,
+    prompt_init_seed=None,
 ):
     """Construct a supervised ViT backbone and load the matching `.npz` checkpoint."""
 
@@ -107,6 +108,7 @@ def build_vit_sup_models(
             vis=vis,
             prompt_init=prompt_init,
             prompt_init_provider=prompt_provider,
+            prompt_init_seed=prompt_init_seed,
         )
     elif adapter_cfg is not None:
         model = ADPT_VisionTransformer(model_type, crop_size, num_classes=-1, adapter_cfg=adapter_cfg)

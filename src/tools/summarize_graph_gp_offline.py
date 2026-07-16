@@ -5,11 +5,18 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
 import math
 import statistics
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
+
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.monitoring.writer import stage2_metadata, write_stage2_json, write_stage2_table  # noqa: E402
 
 
 METRICS = (
@@ -32,33 +39,11 @@ def _read_csv(path: Path) -> List[Dict[str, str]]:
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    keys: List[str] = []
-    seen = set()
-    for row in rows:
-        for key in row:
-            if key not in seen:
-                seen.add(key)
-                keys.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def _json_safe(value: Any):
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    return value
+    write_stage2_table(path, rows, stage2_metadata("stage2A_graph_gp_summary"))
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_stage2_json(path, payload, stage2_metadata("stage2A_graph_gp_summary"))
 
 
 def _number(row: Mapping[str, Any], key: str) -> float:

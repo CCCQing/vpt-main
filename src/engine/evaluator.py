@@ -75,9 +75,7 @@ class Evaluator:
         scores = np.asarray(probs)
         targets_np = np.asarray(targets, dtype=np.int64)
 
-        top1 = singlelabel.compute_top1(scores, targets_np)["top1"]
-        per_class = singlelabel.compute_per_class_top1(scores, targets_np)
-        return {"top1": top1, "per_class": per_class}
+        return singlelabel.compute_classification_metrics(scores, targets_np)
 
     def log_and_update(self, log_results, save_results, eval_name):
         self.update_result("classification", {eval_name: save_results})

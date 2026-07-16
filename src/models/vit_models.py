@@ -11,6 +11,7 @@ from ..utils import logging
 logger = logging.get_logger("visual_prompt")
 from .classifiers import RSimilarityClassifier, RSimilarityClassifierV2, VSPCNBaselineClassifier
 from ..utils.param_logging import log_trainable_parameters
+from ..utils.reproducibility import derive_seed, isolated_torch_cpu_seed
 
 
 class ViT(nn.Module):
@@ -58,6 +59,7 @@ class ViT(nn.Module):
         self._runtime_affinities = None
         self._runtime_semantic_state = None
         self._runtime_prompt_distribution_stats = None
+        self._runtime_attention_mediation_stats = None
 
     def get_runtime_semantic_state(self):
         """返回最近一次 forward 产生的 semantic runtime state。"""
@@ -79,6 +81,10 @@ class ViT(nn.Module):
         都从这里读取 mu/logvar，避免把 label 传进 distributor.forward。
         """
         return self._runtime_prompt_distribution_stats
+
+    def get_runtime_attention_mediation_stats(self):
+        """Return detached scalar summaries from the latest attention-mediation forward."""
+        return self._runtime_attention_mediation_stats
 
     def get_runtime_classifier_stats(self):
         if self.r_similarity_head is None:
@@ -116,6 +122,7 @@ class ViT(nn.Module):
             adapter_cfg=adapter_cfg,
             load_pretrain=load_pretrain,
             vis=vis,
+            prompt_init_seed=derive_seed(cfg.SEED, "prompt_init"),
         )
         trainable_keys = []
         if cfg.MODEL.PROMPT.ENABLE:
@@ -167,9 +174,6 @@ class ViT(nn.Module):
                 p.requires_grad = False
 
         # 鍙€夛細鎵撳嵃鍙缁冨弬鏁扮粺璁★紝渚夸簬纭鍐荤粨绛栫暐鏄惁绗﹀悎棰勬湡
-        if self.cfg.MODEL.LOG_TRAINABLE or self.cfg.SOLVER.DBG_TRAINABLE:
-            self._log_trainable_parameters()
-
     def _log_trainable_parameters(self):
         log_trainable_parameters(self, logger, max_examples_per_group=10)
 
@@ -201,11 +205,16 @@ class ViT(nn.Module):
         else:
             raise ValueError(f"Unsupported MODEL.CLASSIFIER='{self.cfg.MODEL.CLASSIFIER}'")
 
-        self.r_similarity_head = head_cls(
-            class_attributes,
-            hidden_size=self.feat_dim,
-            cfg=self.cfg,
-        ).to(device)
+        classifier_init_seed = derive_seed(self.cfg.SEED, "classifier_init")
+        with isolated_torch_cpu_seed(classifier_init_seed):
+            head = head_cls(
+                class_attributes,
+                hidden_size=self.feat_dim,
+                cfg=self.cfg,
+            )
+        self.r_similarity_head = head.to(device)
+        if self.cfg.MODEL.LOG_TRAINABLE or self.cfg.SOLVER.DBG_TRAINABLE:
+            self._log_trainable_parameters()
 
     def forward(self, x, return_feature=False, semantics=None, class_ids=None, runtime_targets=None):
 
@@ -230,7 +239,8 @@ class ViT(nn.Module):
         transformer = self.enc.transformer
         self._runtime_semantic_state = transformer._last_semantic_token_state
         # 缓存 prompt distributor stats，供 loss 侧读取；分类头仍只接收最终 CLS feature。
-        self._runtime_prompt_distribution_stats = transformer._last_prompt_distribution_stats
+        self._runtime_prompt_distribution_stats = getattr(transformer, "_last_prompt_distribution_stats", None)
+        self._runtime_attention_mediation_stats = getattr(transformer, "_last_attention_mediation_stats", None)
         x = self.r_similarity_head(
             x,
             class_ids=class_ids,
@@ -292,11 +302,13 @@ class ViT(nn.Module):
             raise ValueError("r_similarity_head must be attached before ViT.forward_with_affinity is used.")
 
         transformer = self.enc.transformer
-        self._runtime_token_sequence = feats.detach() if torch.is_tensor(feats) else None
+        token_sequence = getattr(transformer, "_last_token_sequence", None)
+        self._runtime_token_sequence = token_sequence.detach() if torch.is_tensor(token_sequence) else None
         self._runtime_affinities = affinities
         self._runtime_semantic_state = transformer._last_semantic_token_state
         # forward_with_affinity 路径同样缓存 stats，保证启用 affinity aux 时 KL/graph loss 仍可用。
-        self._runtime_prompt_distribution_stats = transformer._last_prompt_distribution_stats
+        self._runtime_prompt_distribution_stats = getattr(transformer, "_last_prompt_distribution_stats", None)
+        self._runtime_attention_mediation_stats = getattr(transformer, "_last_attention_mediation_stats", None)
 
         # 涓?forward 瀵归綈锛歟nc 杈撳嚭鍙兘鏄?[B, 1+N, D] 鎴?[B, D]锛屽彇 CLS 鍚庢帴澶撮儴
         feats = feats[:, 0] if feats.dim() == 3 else feats

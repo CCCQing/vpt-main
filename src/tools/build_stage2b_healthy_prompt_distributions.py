@@ -35,24 +35,14 @@ from src.tools.export_prompt_posterior_cache import (  # noqa: E402
     _setup_cfg,
 )
 from src.utils import logging  # noqa: E402
+from src.monitoring.writer import stage2_metadata, write_stage2_json, write_stage2_table  # noqa: E402
 
 
 VARIANTS = ("D0_empirical", "D1_moment", "D2_task")
 
 
-def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    if not rows:
-        return
-    keys: List[str] = []
-    for row in rows:
-        for key in row:
-            if key not in keys:
-                keys.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], metadata: Mapping[str, Any] = None) -> None:
+    write_stage2_table(path, rows, metadata or stage2_metadata("stage2B_build"))
 
 
 def _clean_kernel(matrix: np.ndarray, eps: float) -> np.ndarray:
@@ -896,8 +886,9 @@ def build(args: argparse.Namespace) -> None:
         args.logvar_max,
         args.eps,
     )
-    _write_csv(args.output.with_name(args.output.stem + "_pseudo_unseen.csv"), pseudo_rows)
-    _write_csv(args.output.with_name(args.output.stem + "_history.csv"), d1_history + d2_history)
+    output_metadata = stage2_metadata("stage2B_build", seed=args.seed)
+    _write_csv(args.output.with_name(args.output.stem + "_pseudo_unseen.csv"), pseudo_rows, output_metadata)
+    _write_csv(args.output.with_name(args.output.stem + "_history.csv"), d1_history + d2_history, output_metadata)
     torch.save(
         {
             "format": "stage2b_healthy_generator_state_v1",
@@ -953,9 +944,7 @@ def build(args: argparse.Namespace) -> None:
         seen_class_counts=stats["count"].cpu().numpy().astype(np.float32),
         metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=False)),
     )
-    args.output.with_suffix(".json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    write_stage2_json(args.output.with_suffix(".json"), metadata, output_metadata)
     print(f"wrote {args.output}", flush=True)
 
 
