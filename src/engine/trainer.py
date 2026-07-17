@@ -2802,35 +2802,32 @@ class Trainer():
                 affinity_logits = np.asarray(affinity_result["logits"])
                 normal_margin = self._true_margin_numpy(normal_logits, normal["targets_local"])
                 affinity_margin = self._true_margin_numpy(affinity_logits, normal["targets_local"])
+                logit_atol = float(self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL)
+                margin_atol = float(self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_MARGIN_ATOL)
                 equivalence = {
                     "logit_max_abs_diff": float(np.max(np.abs(normal_logits - affinity_logits))),
                     "true_margin_abs_diff": float(np.max(np.abs(normal_margin - affinity_margin))),
                     "prediction_flip_rate": float((normal_logits.argmax(axis=1) != affinity_logits.argmax(axis=1)).mean()),
                 }
-                equivalence["affinity_forward_equivalence_pass"] = float(
-                    equivalence["logit_max_abs_diff"] <= float(self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL)
+                equivalence_pass = bool(
+                    equivalence["logit_max_abs_diff"] <= logit_atol
+                    and equivalence["true_margin_abs_diff"] <= margin_atol
+                    and equivalence["prediction_flip_rate"] == 0.0
                 )
-                selected_layers = {int(item) for item in self.cfg.MONITOR.PROBE.LAYERS}
-                attention_layers = [
-                    value for index, value in enumerate(affinity_result["attention_layers"])
-                    if value is not None and (not selected_layers or index in selected_layers)
-                ]
-                affinity_layers = [
-                    value for index, value in enumerate(affinity_result["affinities"])
-                    if value and (not selected_layers or index in selected_layers)
-                ]
-                attention = attention_flow_metrics(
-                    attention_layers,
-                    prompt_length=int(affinity_result["prompt_length"]),
-                    semantic_length=int(affinity_result["semantic_length"]),
-                    affinity_layers=affinity_layers,
-                    predictions=affinity_logits.argmax(axis=1),
-                    targets=normal["targets_local"],
-                )
-                affinity_health = affinity_health_metrics(
-                    affinity_layers,
-                    temperature=float(self.cfg.MONITOR.PROBE.AFFINITY_TEMPERATURE),
-                    saturation_threshold=float(self.cfg.MONITOR.PROBE.AFFINITY_SATURATION_THRESHOLD),
+                equivalence["affinity_forward_equivalence_pass"] = float(equivalence_pass)
+                self.diagnostic_manager.record_probe_artifact(
+                    f"probe_equivalence/{checkpoint_id}_{split}.json",
+                    {
+                        "format": "affinity_forward_equivalence_v1",
+                        "checkpoint_id": checkpoint_id,
+                        "probe_id": manifest["probe_id"],
+                        "split": split,
+                        "logit_atol": logit_atol,
+                        "margin_atol": margin_atol,
+                        "required_prediction_flip_rate": 0.0,
+                        "metrics": equivalence,
+                        "valid": equivalence_pass,
+                    },
                 )
                 all_rows.extend(self._probe_metric_rows(
                     equivalence,
@@ -2839,26 +2836,58 @@ class Trainer():
                     split=split,
                     domain="affinity_forward_equivalence",
                 ))
-                all_rows.extend(self._probe_metric_rows(
-                    attention,
-                    checkpoint_id=checkpoint_id,
-                    probe_id=manifest["probe_id"],
-                    split=split,
-                    domain="attention_flow_reference",
-                ))
-                for metric_name, value in sorted(affinity_health.items()):
-                    relation, _, metric = metric_name.partition(".")
+                if equivalence_pass:
+                    selected_layers = {int(item) for item in self.cfg.MONITOR.PROBE.LAYERS}
+                    attention_layers = [
+                        value for index, value in enumerate(affinity_result["attention_layers"])
+                        if value is not None and (not selected_layers or index in selected_layers)
+                    ]
+                    affinity_layers = [
+                        value for index, value in enumerate(affinity_result["affinities"])
+                        if value and (not selected_layers or index in selected_layers)
+                    ]
+                    attention = attention_flow_metrics(
+                        attention_layers,
+                        prompt_length=int(affinity_result["prompt_length"]),
+                        semantic_length=int(affinity_result["semantic_length"]),
+                        affinity_layers=affinity_layers,
+                        predictions=affinity_logits.argmax(axis=1),
+                        targets=normal["targets_local"],
+                    )
+                    affinity_health = affinity_health_metrics(
+                        affinity_layers,
+                        temperature=float(self.cfg.MONITOR.PROBE.AFFINITY_TEMPERATURE),
+                        saturation_threshold=float(self.cfg.MONITOR.PROBE.AFFINITY_SATURATION_THRESHOLD),
+                    )
                     all_rows.extend(self._probe_metric_rows(
-                        {metric or relation: value},
+                        attention,
                         checkpoint_id=checkpoint_id,
                         probe_id=manifest["probe_id"],
                         split=split,
-                        domain="affinity_health",
-                        entity_type="relation",
-                        entity_id=relation if metric else "global",
+                        domain="attention_flow_reference",
                     ))
+                    for metric_name, value in sorted(affinity_health.items()):
+                        relation, _, metric = metric_name.partition(".")
+                        all_rows.extend(self._probe_metric_rows(
+                            {metric or relation: value},
+                            checkpoint_id=checkpoint_id,
+                            probe_id=manifest["probe_id"],
+                            split=split,
+                            domain="affinity_health",
+                            entity_type="relation",
+                            entity_id=relation if metric else "global",
+                        ))
+                else:
+                    logger.warning(
+                        "[fixed-probe] affinity diagnostics skipped for split=%s because forward equivalence failed "
+                        "(logit=%.3e, margin=%.3e, flip_rate=%.3e)",
+                        split,
+                        equivalence["logit_max_abs_diff"],
+                        equivalence["true_margin_abs_diff"],
+                        equivalence["prediction_flip_rate"],
+                    )
                 token_sequence = affinity_result.get("token_sequence")
-                if token_sequence is not None:
+                if equivalence_pass and token_sequence is not None:
                     normal_results[split]["token_sequence"] = token_sequence
                     prompt_length = int(affinity_result["prompt_length"])
                     semantic_length = int(affinity_result["semantic_length"])
@@ -2969,7 +2998,11 @@ class Trainer():
                     "model_eval": True,
                     "torch_no_grad": True,
                     "intervention_seed": int(self.cfg.MONITOR.PROBE.SELECTION_SEED),
-                    "comparison_tolerance": float(self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL),
+                    "comparison_tolerance": {
+                        "logit_atol": float(self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL),
+                        "margin_atol": float(self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_MARGIN_ATOL),
+                        "prediction_flip_rate": 0.0,
+                    },
                 },
             )
         self.diagnostic_manager.append_probe_metrics(all_rows)

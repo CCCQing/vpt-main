@@ -34,6 +34,7 @@ from src.monitoring.eval_metrics import (
     visual_semantic_alignment_metrics,
 )
 from src.monitoring.module_effect import paired_module_effect_metrics
+from src.monitoring.probe import build_probe_manifest
 
 
 class SyntheticDataset:
@@ -51,6 +52,18 @@ class SyntheticDataset:
         ],
         dtype=torch.float32,
     )
+
+
+class SyntheticProbeDataset:
+    seen_classes = [0, 1]
+    _imdb = [
+        {"class": 0, "sample_id": "c0-a", "im_path": "c0-a.jpg"},
+        {"class": 0, "sample_id": "c0-b", "im_path": "c0-b.jpg"},
+        {"class": 1, "sample_id": "c1-a", "im_path": "c1-a.jpg"},
+        {"class": 1, "sample_id": "c1-b", "im_path": "c1-b.jpg"},
+        {"class": 2, "sample_id": "c2-a", "im_path": "c2-a.jpg"},
+        {"class": 2, "sample_id": "c2-b", "im_path": "c2-b.jpg"},
+    ]
 
 
 def main():
@@ -83,6 +96,31 @@ def main():
         [0, 1],
     )
     assert "prediction_flip_rate" in effect["summary"]
+    full_probe_manifest = build_probe_manifest(
+        SyntheticProbeDataset(),
+        split="synthetic",
+        per_class=1,
+        max_samples=3,
+        selection_seed=17,
+        candidate_class_ids=[0, 1, 2, 3],
+    )
+    assert full_probe_manifest["candidate_class_ids_absent_from_split"] == [3]
+    assert full_probe_manifest["available_probe_class_count"] == 3
+    assert full_probe_manifest["selected_class_count"] == 3
+    assert full_probe_manifest["class_coverage_ratio_of_available"] == 1.0
+    assert full_probe_manifest["per_class_quota_satisfied"]
+    capped_probe_manifest = build_probe_manifest(
+        SyntheticProbeDataset(),
+        split="synthetic",
+        per_class=2,
+        max_samples=4,
+        selection_seed=17,
+        candidate_class_ids=[0, 1, 2, 3],
+    )
+    assert capped_probe_manifest["pre_cap_sample_count"] == 6
+    assert capped_probe_manifest["selected_sample_count"] == 4
+    assert capped_probe_manifest["max_samples_truncated"]
+    assert not capped_probe_manifest["per_class_quota_satisfied"]
 
     model = torch.nn.Linear(5, 4)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)

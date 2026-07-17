@@ -27,22 +27,37 @@ def build_probe_manifest(
     candidate_class_ids: Sequence[int],
 ) -> Dict[str, Any]:
     by_class: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    candidate_class_set = {int(class_id) for class_id in candidate_class_ids}
     for dataset_index, record in enumerate(dataset._imdb):
+        class_id = int(record["class"])
+        if class_id not in candidate_class_set:
+            continue
         sample_id = str(record.get("sample_id", f"{split}:{dataset_index}"))
         digest = hashlib.sha256(f"{int(selection_seed)}|{sample_id}".encode("utf-8")).hexdigest()
-        by_class[int(record["class"])].append({
+        by_class[class_id].append({
             "dataset_index": int(dataset_index),
             "sample_id": sample_id,
             "image_path": str(record["im_path"]),
-            "global_label": int(record["class"]),
+            "global_label": class_id,
             "selection_hash": digest,
         })
-    selected = []
+    available_class_ids = sorted(by_class)
+    pre_cap_selected = []
     for class_id in sorted(by_class):
         rows = sorted(by_class[class_id], key=lambda row: (row["selection_hash"], row["sample_id"]))
-        selected.extend(rows[: max(1, int(per_class))])
-    selected = sorted(selected, key=lambda row: (row["selection_hash"], row["sample_id"]))[: max(1, int(max_samples))]
+        pre_cap_selected.extend(rows[: max(1, int(per_class))])
+    selected = sorted(pre_cap_selected, key=lambda row: (row["selection_hash"], row["sample_id"]))[: max(1, int(max_samples))]
     selected = sorted(selected, key=lambda row: (row["global_label"], row["sample_id"]))
+    selected_support = {class_id: 0 for class_id in available_class_ids}
+    for row in selected:
+        selected_support[int(row["global_label"])] += 1
+    selected_class_ids = [class_id for class_id in available_class_ids if selected_support[class_id] > 0]
+    missing_available_class_ids = [class_id for class_id in available_class_ids if selected_support[class_id] == 0]
+    per_class_quota = max(1, int(per_class))
+    quota_shortfall_class_ids = [
+        class_id for class_id in available_class_ids
+        if selected_support[class_id] < min(per_class_quota, len(by_class[class_id]))
+    ]
     seen_set = {int(item) for item in getattr(dataset, "seen_classes", [])}
     rows = []
     for order, row in enumerate(selected):
@@ -59,6 +74,22 @@ def build_probe_manifest(
         "per_class": int(per_class),
         "max_samples": int(max_samples),
         "candidate_class_ids": [int(item) for item in candidate_class_ids],
+        "candidate_class_count": int(len(candidate_class_set)),
+        "candidate_class_ids_absent_from_split": sorted(candidate_class_set.difference(available_class_ids)),
+        "available_probe_class_ids": available_class_ids,
+        "available_probe_class_count": int(len(available_class_ids)),
+        "selected_class_ids": selected_class_ids,
+        "selected_class_count": int(len(selected_class_ids)),
+        "class_coverage_ratio_of_available": (
+            float(len(selected_class_ids) / len(available_class_ids)) if available_class_ids else 1.0
+        ),
+        "missing_available_class_ids": missing_available_class_ids,
+        "per_class_support": {str(class_id): int(selected_support[class_id]) for class_id in available_class_ids},
+        "per_class_quota_satisfied": bool(not quota_shortfall_class_ids),
+        "per_class_quota_shortfall_class_ids": quota_shortfall_class_ids,
+        "pre_cap_sample_count": int(len(pre_cap_selected)),
+        "selected_sample_count": int(len(rows)),
+        "max_samples_truncated": bool(len(selected) < len(pre_cap_selected)),
         "input_transform": "Resize->CenterCrop->ToTensor->Normalize",
         "samples": rows,
     }

@@ -47,12 +47,12 @@ class DiagnosticManager:
         self.finalized = False
         self.eval_cache: Dict[Tuple[int, str], Dict[str, Any]] = {}
         self.runtime = {
-            "static_semantic_graph": self._new_state("one_time"),
-            "prediction_health": self._new_state("eval_runtime"),
-            "class_error": self._new_state("eval_artifact"),
-            "calibration_profile": self._new_state("offline_from_eval_cache"),
+            "static_semantic_graph": self._new_state("one_time_evidence"),
+            "prediction_health": self._new_state("eval_diagnostics"),
+            "class_error": self._new_state("eval_diagnostics"),
+            "calibration_profile": self._new_state("eval_diagnostics"),
             "fixed_probe": self._new_state("fixed_probe"),
-            "module_effect": self._new_state("offline_paired"),
+            "module_effect": self._new_state("paired_intervention"),
         }
         if self.enabled:
             self._prepare_root()
@@ -115,12 +115,18 @@ class DiagnosticManager:
             "started_at": self.started_at,
             "protocol_mode": str(self.cfg.DATA.XLSA.PROTOCOL_MODE),
             "execution_contracts": {
-                "static_semantic_graph": {"kind": "one_time", "intrusive": False},
-                "prediction_health": {"kind": "eval_runtime", "intrusive": False, "extra_forward": False},
-                "class_error": {"kind": "eval_artifact", "intrusive": False, "extra_forward": False},
-                "calibration_profile": {"kind": "offline_from_eval_cache", "intrusive": False, "extra_forward": False},
+                "static_semantic_graph": {"kind": "one_time_evidence", "intrusive": False},
+                "prediction_health": {"kind": "eval_diagnostics", "intrusive": False, "extra_forward": False},
+                "class_error": {"kind": "eval_diagnostics", "intrusive": False, "extra_forward": False},
+                "calibration_profile": {"kind": "eval_diagnostics", "intrusive": False, "extra_forward": False},
                 "fixed_probe": {"kind": "fixed_probe", "intrusive": False, "requires_probe_manifest": True},
-                "module_effect": {"kind": "offline_paired", "intrusive": True, "requires_probe_manifest": True},
+                "module_effect": {
+                    "kind": "paired_intervention",
+                    "intrusive": True,
+                    "requires_probe_manifest": True,
+                    "same_checkpoint": True,
+                    "same_probe_manifest": True,
+                },
             },
             "resolved_switches": {
                 "save_eval_cache": bool(self.cfg.MONITOR.DIAGNOSTICS.SAVE_EVAL_CACHE),

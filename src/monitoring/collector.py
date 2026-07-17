@@ -229,13 +229,14 @@ class MonitorManager:
                     "enabled": bool(cfg.SOLVER.VIS.ENABLE),
                     "output_dir": "visualization",
                 },
-                "offline_diagnostics": {"managed_by_runtime": False},
+                "eval_diagnostics": {"managed_by_runtime": False, "output_dir": "diagnostics"},
+                "cross_run_aggregation": {"managed_by_runtime": False, "output_dir": "external summary"},
                 "fixed_probe": {
                     "enabled": bool(cfg.MONITOR.PROBE.ENABLE),
                     "managed_by_runtime": False,
                     "output_dir": "diagnostics",
                 },
-                "module_effect": {
+                "paired_intervention": {
                     "enabled": bool(cfg.MONITOR.MODULE_EFFECT.ENABLE),
                     "managed_by_runtime": False,
                     "output_dir": "diagnostics",
