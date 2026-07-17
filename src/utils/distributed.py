@@ -99,8 +99,8 @@ def scaled_all_reduce(cfg, tensors):
     """Performs the scaled all_reduce operation on the provided tensors.
 
     The input tensors are modified in-place. Currently supports only the sum
-    reduction operator. The reduced values are scaled by the inverse size of
-    the process group (equivalent to cfg.NUM_GPUS).
+    reduction operator. The reduced values are scaled by the inverse actual
+    process-group size.
     """
     # Queue the reductions
     reductions = []
@@ -111,8 +111,9 @@ def scaled_all_reduce(cfg, tensors):
     for reduction in reductions:
         reduction.wait()
     # Scale the results
+    world_size = get_world_size()
     for tensor in tensors:
-        tensor.mul_(1.0 / cfg.NUM_GPUS / cfg.NUM_SHARDS)
+        tensor.mul_(1.0 / world_size)
     return tensors
 
 

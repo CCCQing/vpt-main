@@ -12,11 +12,17 @@ from src.configs.config import get_cfg
 from src.data import loader as data_loader
 from src.engine.evaluator import Evaluator
 from src.engine.trainer import Trainer
-from src.models.build_model import build_model, log_model_info
+from src.models.build_model import build_model, log_model_info, wrap_distributed_model
 from src.utils.file_io import PathManager
 from src.utils.dataset_manifest import write_xlsa_dataset_manifest
-from src.utils.run_artifacts import write_resolved_config, write_trainable_parameter_manifest
-from src.utils.reproducibility import seed_streams
+from src.utils.run_artifacts import (
+    collect_distributed_runtime_checks,
+    write_reproducibility_manifest,
+    write_resolved_config,
+    write_trainable_parameter_manifest,
+)
+from src.utils.reproducibility import apply_rank_runtime_seed, seed_streams
+from src.utils import distributed as du
 
 from launch import default_argument_parser, logging_train_setup
 warnings.filterwarnings("ignore")
@@ -175,7 +181,8 @@ def train(cfg, args):
     trainable_manifest_path = write_trainable_parameter_manifest(cfg, model)
     if trainable_manifest_path is not None:
         logger.info("Wrote effective trainable-parameter manifest: %s", trainable_manifest_path)
-    log_model_info(model, verbose=False, label="Effective model after classifier head attachment")
+    log_model_info(model, verbose=False, label="Effective model before DDP wrapping")
+    model = wrap_distributed_model(model, cfg)
 
     # ------------------------------------
     train_dataset = train_loader.dataset
@@ -210,6 +217,41 @@ def train(cfg, args):
 
     # ------------------------------------
     trainer = Trainer(cfg, model, evaluator, cur_device)
+    runtime_seed = apply_rank_runtime_seed(cfg.SEED, du.get_rank())
+    distributed_checks = collect_distributed_runtime_checks(
+        model,
+        trainer.cls_criterion,
+        train_loader,
+        runtime_seed,
+    )
+    if bool(distributed_checks.get("enabled")):
+        ddp_failures = []
+        if not bool(distributed_checks["initial_parameter_fingerprint"]["all_ranks_equal"]):
+            ddp_failures.append("initial model/loss parameters differ across ranks")
+        if not bool(distributed_checks["rank_runtime_seeds_unique"]):
+            ddp_failures.append("rank runtime seeds are not unique")
+        if not bool(distributed_checks["train_sampler_partition_configured"]):
+            ddp_failures.append("DistributedSampler rank/replica/seed configuration is invalid")
+        if ddp_failures:
+            raise RuntimeError("DDP reproducibility gate failed: {}".format("; ".join(ddp_failures)))
+    reproducibility_manifest_path = write_reproducibility_manifest(
+        cfg,
+        {
+            "train": train_loader,
+            "val_unseen": val_loader,
+            "test_seen": test_seen_loader,
+            "test_unseen": test_unseen_loader,
+        },
+        distributed_checks=distributed_checks,
+    )
+    if reproducibility_manifest_path is not None:
+        logger.info("Wrote reproducibility manifest: %s", reproducibility_manifest_path)
+    logger.info(
+        "[reproducibility] rank_runtime_seed=%s rank=%d world_size=%d",
+        str(runtime_seed),
+        du.get_rank(),
+        du.get_world_size(),
+    )
 
     # -----------------------------------
     if train_loader:

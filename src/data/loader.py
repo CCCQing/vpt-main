@@ -7,6 +7,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data.sampler import RandomSampler
 
 from ..utils import logging
+from ..utils import distributed as du
 from ..utils.reproducibility import derive_seed, make_torch_generator
 from .datasets.xlsa_dataset import CUB200Dataset, AWA2Dataset, SUNAttributeDataset
 
@@ -29,15 +30,38 @@ def _construct_loader(cfg, split, batch_size, shuffle, drop_last):
         raise ValueError("Dataset '{}' not supported".format(dataset_name))
 
     dataset = _DATASET_CATALOG[dataset_name](cfg, split)
-    sampler = DistributedSampler(dataset) if cfg.NUM_GPUS > 1 else None
+    world_size = du.get_world_size()
+    rank = du.get_rank()
     data_order_seed = derive_seed(cfg.SEED, "data_order")
+    sampler = None
+    if world_size > 1 and shuffle:
+        if data_order_seed is None:
+            raise ValueError("Distributed training requires cfg.SEED so DistributedSampler has a stable seed.")
+        if len(dataset) % world_size != 0:
+            raise ValueError(
+                "Training dataset size={} must be divisible by actual world_size={} so DDP ranks "
+                "can use non-overlapping, complete sample partitions without padding or omission.".format(
+                    len(dataset), world_size
+                )
+            )
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=int(data_order_seed),
+            drop_last=bool(drop_last),
+        )
     loader_generator = make_torch_generator(data_order_seed) if shuffle else None
     if shuffle:
         logger.info(
-            "[reproducibility] data_order split=%s seed=%s workers=%d",
+            "[reproducibility] data_order split=%s seed=%s workers=%d rank=%d world_size=%d sampler=%s",
             split,
             str(data_order_seed),
             int(cfg.DATA.NUM_WORKERS),
+            rank,
+            world_size,
+            sampler.__class__.__name__ if sampler is not None else "RandomSampler",
         )
     return torch.utils.data.DataLoader(
         dataset,
@@ -51,33 +75,43 @@ def _construct_loader(cfg, split, batch_size, shuffle, drop_last):
     )
 
 
+def _per_rank_batch_size(cfg):
+    """Interpret DATA.BATCH_SIZE as a global batch size in single- and multi-node runs."""
+    world_size = du.get_world_size()
+    global_batch_size = int(cfg.DATA.BATCH_SIZE)
+    if global_batch_size < world_size or global_batch_size % world_size != 0:
+        raise ValueError(
+            "DATA.BATCH_SIZE={} must be a positive multiple of actual world_size={} "
+            "because DATA.BATCH_SIZE is the global batch size.".format(global_batch_size, world_size)
+        )
+    return global_batch_size // world_size
+
+
 def construct_train_loader(cfg):
     """Build the `train` loader."""
-    drop_last = bool(cfg.NUM_GPUS > 1)
     return _construct_loader(
         cfg=cfg,
         split="train",
-        batch_size=int(cfg.DATA.BATCH_SIZE / cfg.NUM_GPUS),
+        batch_size=_per_rank_batch_size(cfg),
         shuffle=True,
-        drop_last=drop_last,
+        drop_last=False,
     )
 
 
 def construct_trainval_loader(cfg):
     """Build the `trainval` loader."""
-    drop_last = bool(cfg.NUM_GPUS > 1)
     return _construct_loader(
         cfg=cfg,
         split="trainval",
-        batch_size=int(cfg.DATA.BATCH_SIZE / cfg.NUM_GPUS),
+        batch_size=_per_rank_batch_size(cfg),
         shuffle=True,
-        drop_last=drop_last,
+        drop_last=False,
     )
 
 
 def construct_val_loader(cfg, batch_size=None):
     """Build the `val_unseen` loader."""
-    bs = int(cfg.DATA.BATCH_SIZE / cfg.NUM_GPUS) if batch_size is None else batch_size
+    bs = _per_rank_batch_size(cfg) if batch_size is None else batch_size
     return _construct_loader(
         cfg=cfg,
         split="val_unseen",
@@ -92,7 +126,7 @@ def construct_test_seen_loader(cfg):
     return _construct_loader(
         cfg=cfg,
         split="test_seen",
-        batch_size=int(cfg.DATA.BATCH_SIZE / cfg.NUM_GPUS),
+        batch_size=_per_rank_batch_size(cfg),
         shuffle=False,
         drop_last=False,
     )
@@ -103,7 +137,7 @@ def construct_test_unseen_loader(cfg):
     return _construct_loader(
         cfg=cfg,
         split="test_unseen",
-        batch_size=int(cfg.DATA.BATCH_SIZE / cfg.NUM_GPUS),
+        batch_size=_per_rank_batch_size(cfg),
         shuffle=False,
         drop_last=False,
     )

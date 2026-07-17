@@ -18,6 +18,13 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("config_file")
     parser.add_argument("--build-model", action="store_true")
+    parser.add_argument(
+        "--compare-config",
+        action="append",
+        default=[],
+        metavar="CONFIG",
+        help="Additional A-series config to compare for shared initialization and data-order streams.",
+    )
     args, opts = parser.parse_known_args()
     args.opts = opts
     return args
@@ -96,6 +103,19 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         failures.append("MODEL.R_SIMILARITY.ENABLE must remain true until the current training entry is refactored")
     if cfg.SEED is None:
         failures.append("SEED must be set for the A-series reproducibility protocol")
+    if int(cfg.NUM_GPUS) != 1:
+        failures.append("NUM_GPUS must be 1 for the current A-series single-GPU contract")
+    if int(cfg.NUM_SHARDS) != 1:
+        failures.append("NUM_SHARDS must be 1 for the current A-series single-GPU contract")
+    if int(cfg.DATA.NUM_WORKERS) != 0:
+        failures.append("DATA.NUM_WORKERS must be 0 for the current A-series single-GPU contract")
+    if bool(cfg.CUDNN_BENCHMARK):
+        failures.append("CUDNN_BENCHMARK must be false for the current A-series single-GPU contract")
+    streams = seed_streams(cfg.SEED)
+    if any(streams[name] is None for name in ("classifier_init", "prompt_init", "data_order")):
+        failures.append("classifier_init, prompt_init, and data_order streams must all be derived")
+    elif len(set(streams.values())) != len(streams):
+        failures.append("classifier_init, prompt_init, and data_order streams must be distinct")
     return stage, failures
 
 
@@ -145,10 +165,60 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
     return failures, trainable
 
 
+def cross_config_stream_checks(configs) -> List[str]:
+    """Check the A-series random streams that must stay aligned across stages."""
+    failures = []
+    records = [
+        {
+            "path": path,
+            "stage": resolved_stage(cfg),
+            "streams": seed_streams(cfg.SEED),
+        }
+        for path, cfg in configs
+    ]
+    for stream_name in ("classifier_init", "data_order"):
+        values = {record["streams"][stream_name] for record in records}
+        if len(values) != 1:
+            failures.append(
+                "{} must match across compared A-series configs: {}".format(
+                    stream_name,
+                    ", ".join(
+                        "{}={}".format(Path(record["path"]).name, record["streams"][stream_name])
+                        for record in records
+                    ),
+                )
+            )
+    prompt_records = [record for record in records if record["stage"] in {"B1", "B2"}]
+    if len(prompt_records) >= 2:
+        prompt_values = {record["streams"]["prompt_init"] for record in prompt_records}
+        if len(prompt_values) != 1:
+            failures.append(
+                "prompt_init must match across compared B1/B2 configs: {}".format(
+                    ", ".join(
+                        "{}={}".format(Path(record["path"]).name, record["streams"]["prompt_init"])
+                        for record in prompt_records
+                    ),
+                )
+            )
+    return failures
+
+
 def main():
     args = parse_args()
     cfg = load_cfg(args.config_file, args.opts)
     stage, failures = static_checks(cfg)
+    compared_configs = [(args.config_file, cfg)]
+    for config_file in args.compare_config:
+        compared_cfg = load_cfg(config_file, [])
+        compared_stage, compared_failures = static_checks(compared_cfg)
+        failures.extend(
+            "{}: {}".format(Path(config_file).name, failure)
+            for failure in compared_failures
+        )
+        compared_configs.append((config_file, compared_cfg))
+        print("compared baseline stage: {} ({})".format(compared_stage, config_file))
+    if len(compared_configs) > 1:
+        failures.extend(cross_config_stream_checks(compared_configs))
     trainable = []
     if not failures and args.build_model:
         model_failures, trainable = constructed_model_checks(cfg, stage)

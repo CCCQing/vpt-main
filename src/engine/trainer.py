@@ -253,7 +253,7 @@ class Trainer():
             bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE)
             and float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT) > 0.0
         )
-        self._trace_rank = int(cfg.DIST_RANK)
+        self._trace_rank = int(du.get_rank())
         is_monitor_writer = du.get_rank() == 0
         self.monitor_manager = MonitorManager(cfg, is_writer=is_monitor_writer)
         self.diagnostic_manager = DiagnosticManager(
@@ -2328,6 +2328,10 @@ class Trainer():
         batch_time.reset()
         data_time.reset()
 
+        sampler = getattr(train_loader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(int(epoch))
+
         lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
         logger.info("Training {} / {} epoch, with learning rate {}".format(epoch + 1, effective_total_epoch, lr))
 
@@ -3170,18 +3174,23 @@ class Trainer():
             if str(self.evaluator.task_type).lower() == "gzsl":
                 self._update_gzsl_record_metrics(epoch, test_seen_loader, test_unseen_loader, seen_metrics, unseen_metrics)
 
-        if bool(self.cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT):
-            self._final_trainable_checkpoint_path = self._save_trainable_final_checkpoint(total_epoch)
-        if bool(self.cfg.MONITOR.MODULE_EFFECT.ENABLE) and not self._final_trainable_checkpoint_path:
+        if bool(self.cfg.MONITOR.MODULE_EFFECT.ENABLE) and not bool(
+            self.cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT
+        ):
             raise ValueError(
                 "MONITOR.MODULE_EFFECT.ENABLE requires SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT=True"
             )
-        self._run_fixed_probes(
-            train_loader,
-            test_seen_loader,
-            test_unseen_loader,
-            checkpoint_epoch=total_epoch,
-        )
+        if du.get_rank() == 0:
+            if bool(self.cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT):
+                self._final_trainable_checkpoint_path = self._save_trainable_final_checkpoint(total_epoch)
+            self._run_fixed_probes(
+                train_loader,
+                test_seen_loader,
+                test_unseen_loader,
+                checkpoint_epoch=total_epoch,
+            )
+        if du.get_world_size() > 1:
+            torch.distributed.barrier()
 
     def _save_trainable_final_checkpoint(self, total_epoch):
         model_ref = self._model_ref(self.model)

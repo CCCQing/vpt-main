@@ -5,6 +5,7 @@ import torch
 
 from .vit_models import ViT
 from ..utils import logging
+from ..utils import distributed as du
 
 logger = logging.get_logger("visual_prompt")
 
@@ -54,13 +55,31 @@ def load_model_to_device(model, cfg):
 
     if torch.cuda.is_available():
         model = model.cuda(device=cur_device)
-        if cfg.NUM_GPUS > 1:
-            model = torch.nn.parallel.DistributedDataParallel(
-                module=model,
-                device_ids=[cur_device],
-                output_device=cur_device,
-                find_unused_parameters=True,
-            )
     else:
         model = model.to(cur_device)
     return model, cur_device
+
+
+def wrap_distributed_model(model, cfg):
+    """Wrap a fully assembled model in DDP when a process group is active."""
+    world_size = du.get_world_size()
+    if world_size <= 1:
+        return model
+    if not torch.cuda.is_available():
+        raise RuntimeError("DistributedDataParallel training requires CUDA in the current codepath.")
+    if hasattr(model, "module"):
+        raise ValueError("Model is already wrapped in DistributedDataParallel.")
+
+    cur_device = torch.cuda.current_device()
+    logger.info(
+        "Wrapping complete model in DDP: rank=%d world_size=%d device=%d",
+        du.get_rank(),
+        world_size,
+        cur_device,
+    )
+    return torch.nn.parallel.DistributedDataParallel(
+        module=model,
+        device_ids=[cur_device],
+        output_device=cur_device,
+        find_unused_parameters=True,
+    )

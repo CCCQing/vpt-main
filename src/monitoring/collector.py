@@ -181,6 +181,11 @@ class MonitorManager:
             },
             "cell_id": str(cfg.SOLVER.STAGE2_CHECKPOINT_CELL_ID) or None,
             "seed": int(cfg.SEED) if cfg.SEED is not None else None,
+            "reproducibility": {
+                "manifest": "reproducibility_manifest.json",
+                "schema_version": "reproducibility_v1",
+                "master_seed": int(cfg.SEED) if cfg.SEED is not None else None,
+            },
             "git": git_identity,
             "artifacts": {
                 "epoch_csv": "metrics_epoch.csv" if self.write_epoch_csv else None,

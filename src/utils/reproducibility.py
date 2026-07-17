@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import hashlib
+import random
 from contextlib import contextmanager
 from typing import Dict, Iterator, Optional
 
+import numpy as np
 import torch
 
 
@@ -23,6 +25,24 @@ def seed_streams(master_seed: Optional[int]) -> Dict[str, Optional[int]]:
         name: derive_seed(master_seed, name)
         for name in _STREAM_NAMES
     }
+
+
+def rank_runtime_seed(master_seed: Optional[int], rank: int) -> Optional[int]:
+    """Return the deterministic training-time seed for one distributed rank."""
+    return derive_seed(master_seed, "rank_runtime:{}".format(int(rank)))
+
+
+def apply_rank_runtime_seed(master_seed: Optional[int], rank: int) -> Optional[int]:
+    """Seed runtime stochasticity after shared model initialization is complete."""
+    seed = rank_runtime_seed(master_seed, rank)
+    if seed is None:
+        return None
+    random.seed(int(seed))
+    np.random.seed(int(seed) % (1 << 32))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    return seed
 
 
 def make_torch_generator(seed: Optional[int]) -> Optional[torch.Generator]:
