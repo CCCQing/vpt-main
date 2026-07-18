@@ -16,6 +16,7 @@ This directory is the isolated configuration and audit record for the clean VPT-
 | A-10 | `diagnostics/` in every run output | Eval cache, per-class errors, calibration, fixed probes, and paired module effects |
 | A-11 | `src/tools/validate_baseline_monitoring.py` | Synthetic monitoring and output-policy regression gate |
 | A-12 | `src/tools/summarize_baseline_monitoring.py` | Offline multi-seed mean/CI and paired-delta summary |
+| A-13 | `src/tools/run_A_series.py` | Two-card launcher for A0/A1/A2 across the requested seeds |
 
 The A series is deliberately restricted to the same attribute-prototype semantic matcher and seen-class cross-entropy. It is not a result claim and does not replace the separate protocol, split, evaluator, or best-validation-checkpoint work.
 
@@ -44,3 +45,11 @@ C:\Users\84291\.conda\envs\prompt\python.exe src\tools\validate_baseline_monitor
 The A configs keep training-time affinity monitoring disabled. Attention and affinity references run only on the deterministic final fixed probe; the probe records a strict normal/affinity-forward logits equivalence check. A1/A2 additionally run a paired prompt-zero intervention against the same final checkpoint and sample manifest. A0 records the module-effect manifest with no active prompt intervention.
 
 Future baseline work stays in this directory and uses the next top-level letter only after the A series has been frozen.
+
+On a two-GPU Linux server, preview all nine jobs before training:
+
+```bash
+python src/tools/run_A_series.py --gpu-groups '0;1' --max-workers 2 --dry-run
+```
+
+The launcher runs one single-GPU experiment per worker, keeps two experiments active in parallel, and uses `monitor_runtime_summary.json` to skip only tasks that are already complete.
