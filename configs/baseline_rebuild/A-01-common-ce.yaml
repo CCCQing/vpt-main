@@ -10,7 +10,7 @@ DATA:
   FEATURE: "sup_vitb16_224"
   CROPSIZE: 224
   BATCH_SIZE: 32
-  NUM_WORKERS: 0
+  NUM_WORKERS: 4
   PIN_MEMORY: true
   XLSA:
     ENABLED: true

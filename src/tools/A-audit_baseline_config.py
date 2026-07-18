@@ -107,8 +107,8 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         failures.append("NUM_GPUS must be 1 for the current A-series single-GPU contract")
     if int(cfg.NUM_SHARDS) != 1:
         failures.append("NUM_SHARDS must be 1 for the current A-series single-GPU contract")
-    if int(cfg.DATA.NUM_WORKERS) != 0:
-        failures.append("DATA.NUM_WORKERS must be 0 for the current A-series single-GPU contract")
+    if int(cfg.DATA.NUM_WORKERS) != 4:
+        failures.append("DATA.NUM_WORKERS must be 4 for the current A-series deterministic multi-worker loader")
     if bool(cfg.CUDNN_BENCHMARK):
         failures.append("CUDNN_BENCHMARK must be false for the current A-series single-GPU contract")
     streams = seed_streams(cfg.SEED)

@@ -53,6 +53,12 @@ def make_torch_generator(seed: Optional[int]) -> Optional[torch.Generator]:
     return generator
 
 
+def seed_data_worker(worker_id: int) -> None:
+    worker_seed = int(torch.initial_seed() % (1 << 32))
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
 @contextmanager
 def isolated_torch_cpu_seed(seed: Optional[int]) -> Iterator[None]:
     if seed is None:

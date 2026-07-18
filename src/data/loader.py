@@ -8,7 +8,7 @@ from torch.utils.data.sampler import RandomSampler
 
 from ..utils import logging
 from ..utils import distributed as du
-from ..utils.reproducibility import derive_seed, make_torch_generator
+from ..utils.reproducibility import derive_seed, make_torch_generator, seed_data_worker
 from .datasets.xlsa_dataset import CUB200Dataset, AWA2Dataset, SUNAttributeDataset
 
 logger = logging.get_logger("visual_prompt")
@@ -52,16 +52,17 @@ def _construct_loader(cfg, split, batch_size, shuffle, drop_last):
             seed=int(data_order_seed),
             drop_last=bool(drop_last),
         )
-    loader_generator = make_torch_generator(data_order_seed) if shuffle else None
+    loader_generator = make_torch_generator(data_order_seed)
     if shuffle:
         logger.info(
-            "[reproducibility] data_order split=%s seed=%s workers=%d rank=%d world_size=%d sampler=%s",
+            "[reproducibility] data_order split=%s seed=%s workers=%d rank=%d world_size=%d sampler=%s worker_init=%s",
             split,
             str(data_order_seed),
             int(cfg.DATA.NUM_WORKERS),
             rank,
             world_size,
             sampler.__class__.__name__ if sampler is not None else "RandomSampler",
+            "seed_data_worker" if int(cfg.DATA.NUM_WORKERS) > 0 else "none",
         )
     return torch.utils.data.DataLoader(
         dataset,
@@ -72,6 +73,7 @@ def _construct_loader(cfg, split, batch_size, shuffle, drop_last):
         pin_memory=cfg.DATA.PIN_MEMORY,
         drop_last=drop_last,
         generator=loader_generator,
+        worker_init_fn=seed_data_worker if int(cfg.DATA.NUM_WORKERS) > 0 else None,
     )
 
 
