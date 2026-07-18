@@ -1,0 +1,9 @@
+_BASE_: "A-01-common-ce.yaml"
+OUTPUT_DIR: "output/baseline_rebuild/A-04-A2-vpt-deep-ce"
+
+MODEL:
+  PROMPT:
+    ENABLE: true
+    BACKEND: "vpt_deep"
+    INIT_SOURCE: "learned"
+    DEEP: true

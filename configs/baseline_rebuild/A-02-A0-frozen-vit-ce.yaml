@@ -1,0 +1,9 @@
+_BASE_: "A-01-common-ce.yaml"
+OUTPUT_DIR: "output/baseline_rebuild/A-02-A0-frozen-vit-ce"
+
+MODEL:
+  PROMPT:
+    ENABLE: false
+    BACKEND: "dynamic"
+    INIT_SOURCE: "learned"
+    DEEP: false
