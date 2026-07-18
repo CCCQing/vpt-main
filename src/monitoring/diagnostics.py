@@ -316,7 +316,6 @@ class DiagnosticManager:
                 "gamma_grid": profile["gamma_grid"],
                 "seen_at_gamma": profile["seen_at_gamma"],
                 "unseen_at_gamma": profile["unseen_at_gamma"],
-                "h_at_gamma": profile["h_at_gamma"],
             },
             position,
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import sys
 import tempfile
 import json
@@ -79,13 +80,102 @@ def main():
     semantic = SyntheticDataset.class_attributes.numpy()
 
     assert set(classification_metrics(seen_scores, seen_targets)) == {"top1", "top5", "nll", "per_class"}
-    assert prediction_health_metrics(seen_scores, seen_targets, [0, 1, 2, 3], [0, 1])
-    assert class_error_metrics(seen_scores, seen_targets, [0, 1, 2, 3])["arrays"]["per_class_accuracy"].shape == (4,)
-    assert calibration_profile_metrics(
+    prediction_fields = {
+        "seen_unseen_logit_margin_mean",
+        "seen_probability_mass_mean",
+        "wrong_domain_prediction_rate",
+        "true_class_margin_mean",
+        "true_class_rank_mean",
+        "entropy_mean",
+        "confidence_incorrect",
+    }
+    assert set(prediction_health_metrics(seen_scores, seen_targets, [0, 1, 2, 3], [0, 1])) == prediction_fields
+    assert set(prediction_health_metrics(unseen_scores, unseen_targets, [0, 1, 2, 3], [0, 1])) == prediction_fields
+    class_error = class_error_metrics(
+        seen_scores,
+        seen_targets,
+        [0, 1, 2, 3],
+        class_names=SyntheticDataset.all_classnames,
+        class_attributes=semantic,
+    )
+    assert set(class_error["summary"]) == {"bottom_k_class_mean", "max_prediction_share"}
+    assert set(class_error["arrays"]) == {
+        "candidate_global_ids",
+        "per_class_accuracy",
+        "class_support",
+        "class_true_margin",
+        "predicted_class_frequency",
+    }
+    assert class_error["arrays"]["per_class_accuracy"].shape == (4,)
+    assert len(class_error["top_confusion_pairs"]) <= 10
+    for pair in class_error["top_confusion_pairs"]:
+        assert "true_local_id" not in pair and "pred_local_id" not in pair
+    calibration_profile = calibration_profile_metrics(
         seen_scores, seen_targets, unseen_scores, unseen_targets, [0, 1, 2, 3], [0, 1], [-1.0, 0.0, 1.0]
-    )["summary"]["raw_h"] >= 0.0
+    )
+    assert set(calibration_profile["summary"]) == {
+        "ausuc",
+        "raw_to_oracle_gain",
+        "oracle_peak_gamma",
+    }
+    assert set(calibration_profile) == {
+        "summary",
+        "gamma_grid",
+        "seen_at_gamma",
+        "unseen_at_gamma",
+    }
+    assert calibration_profile["summary"]["raw_to_oracle_gain"] >= 0.0
     assert representation_geometry_metrics(visual_seen, seen_targets)
-    assert visual_semantic_alignment_metrics(visual_seen, semantic, seen_targets)
+    alignment_fields = {
+        "true_prototype_similarity",
+        "hard_negative_similarity",
+        "semantic_margin",
+        "true_prototype_rank",
+        "prototype_recall_at_k",
+        "class_center_prototype_cosine",
+        "visual_semantic_structure_spearman",
+        "neighbor_preservation_at_k",
+        "visual_interclass_distance_mean",
+        "visual_interclass_distance_std",
+        "semantic_interclass_distance_mean",
+        "semantic_interclass_distance_std",
+        "visual_semantic_distance_spearman",
+        "semantic_ambiguity_rate",
+    }
+    assert set(visual_semantic_alignment_metrics(visual_seen, semantic, seen_targets)) == alignment_fields
+    neighbor_visual = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.9, 0.1, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    neighbor_semantic = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.9, 0.1, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    neighbor_alignment = visual_semantic_alignment_metrics(
+        neighbor_visual,
+        neighbor_semantic,
+        np.arange(4, dtype=np.int64),
+        recall_k=1,
+    )
+    assert neighbor_alignment["neighbor_preservation_at_k"] < 1.0
+    expected_visual_distances = np.linalg.norm(
+        neighbor_visual[:, None, :] - neighbor_visual[None, :, :], axis=-1
+    )[np.triu_indices(4, k=1)]
+    assert np.isclose(
+        neighbor_alignment["visual_interclass_distance_mean"],
+        expected_visual_distances.mean(),
+    )
+    assert np.isfinite(neighbor_alignment["visual_semantic_distance_spearman"])
     assert semantic_graph_reference_metrics(semantic, [0, 1], [2, 3])
     assert semantic_visual_graph_metrics(visual_seen, semantic, seen_targets, logits=seen_scores)
     effect = paired_module_effect_metrics(
@@ -152,6 +242,14 @@ def main():
         cfg.MONITOR.PROBE.ENABLE = False
         cfg.MONITOR.MODULE_EFFECT.ENABLE = False
         manager = MonitorManager(cfg, is_writer=True)
+        running_summary = json.loads(
+            (Path(temp_dir) / "monitor_runtime_summary.json").read_text(encoding="utf-8")
+        )
+        assert running_summary["status"] == "running"
+        assert running_summary["finalized_at"] is None
+        assert running_summary["seed"] == cfg.SEED
+        assert "sampling" in running_summary
+        assert not (Path(temp_dir) / "monitor_manifest.json").exists()
         diagnostics = DiagnosticManager(cfg, manager, is_writer=True)
         dataset = SyntheticDataset()
         diagnostics.record_static_semantic_graph(dataset)
@@ -183,10 +281,26 @@ def main():
         except ValueError:
             cadence_failed = True
         assert cadence_failed
+        manager.record_epoch(
+            "train",
+            "train_epoch",
+            {
+                "loss": 1.0,
+                "lr": 0.01,
+                "batch_time_sec": 0.2,
+                "data_time_sec": 0.05,
+            },
+            reducer={
+                "loss": "sample_mean",
+                "lr": "last",
+                "batch_time_sec": "mean",
+                "data_time_sec": "mean",
+            },
+            n=4,
+        )
         diagnostics.finalize(status="completed")
         manager.finalize(status="completed")
         required = (
-            "monitor_manifest.json",
             "metrics_epoch.csv",
             "metrics_events.jsonl",
             "monitor_runtime_summary.json",
@@ -197,6 +311,19 @@ def main():
         )
         for relative in required:
             assert (Path(temp_dir) / relative).exists(), relative
+        with (Path(temp_dir) / "metrics_epoch.csv").open("r", encoding="utf-8", newline="") as handle:
+            epoch_rows = list(csv.DictReader(handle))
+        train_epoch_reducers = {
+            row["metric"]: row["reducer"]
+            for row in epoch_rows
+            if row["namespace"] == "train_epoch"
+        }
+        assert train_epoch_reducers == {
+            "loss": "sample_mean",
+            "lr": "last",
+            "batch_time_sec": "mean",
+            "data_time_sec": "mean",
+        }
 
         original_session_id = manager.session_id
         collision_failed = False

@@ -69,7 +69,6 @@ def _latest_probe_mechanisms(run_dir: Path) -> Dict[str, float]:
 
 
 def load_run(method: str, run_dir: Path) -> Dict[str, Any]:
-    manifest_path = run_dir / "monitor_manifest.json"
     runtime_path = run_dir / "monitor_runtime_summary.json"
     epoch_path = run_dir / "metrics_epoch.csv"
     row: Dict[str, Any] = {
@@ -79,13 +78,12 @@ def load_run(method: str, run_dir: Path) -> Dict[str, Any]:
         "status": "missing",
         "failed": True,
     }
-    if not manifest_path.exists() or not runtime_path.exists() or not epoch_path.exists():
+    if not runtime_path.exists() or not epoch_path.exists():
         return row
-    manifest = _read_json(manifest_path)
     runtime = _read_json(runtime_path)
-    row["seed"] = manifest.get("seed")
-    row["run_id"] = manifest.get("run_id")
-    row["session_id"] = manifest.get("session", {}).get("id")
+    row["seed"] = runtime.get("seed")
+    row["run_id"] = runtime.get("run_id")
+    row["session_id"] = runtime.get("session_id")
     row["status"] = str(runtime.get("status", "unknown"))
     row["failed"] = row["status"] != "completed"
     epochs = _classification_by_epoch(epoch_path)
@@ -109,7 +107,7 @@ def load_run(method: str, run_dir: Path) -> Dict[str, Any]:
     row["diagnostic_peak_epoch"] = int(peak_epoch)
     row["diagnostic_peak_h"] = float(peak_values["gzsl_h"])
     calibration = _latest_calibration(run_dir)
-    for name in ("ausuc", "oracle_peak_gamma", "oracle_peak_h", "raw_to_oracle_gain"):
+    for name in ("ausuc", "raw_to_oracle_gain", "oracle_peak_gamma"):
         if name in calibration:
             row[name] = calibration[name]
     row["mechanisms"] = _latest_probe_mechanisms(run_dir)
@@ -156,7 +154,15 @@ def main():
         by_method[str(row["method"])].append(row)
     method_rows = []
     method_payload = {}
-    metric_names = ("gzsl_seen", "gzsl_unseen", "gzsl_h", "ausuc", "diagnostic_peak_epoch", "oracle_peak_gamma")
+    metric_names = (
+        "gzsl_seen",
+        "gzsl_unseen",
+        "gzsl_h",
+        "ausuc",
+        "raw_to_oracle_gain",
+        "diagnostic_peak_epoch",
+        "oracle_peak_gamma",
+    )
     for method, rows in sorted(by_method.items()):
         summary = {
             name: _summary([row[name] for row in rows if _float(row.get(name)) is not None])

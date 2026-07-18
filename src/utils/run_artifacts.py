@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import hashlib
 import json
 import os
 from datetime import datetime, timezone
@@ -8,13 +7,10 @@ from typing import Dict, Mapping, Optional
 
 import torch
 import torch.distributed as dist
+from torch.utils.data import SequentialSampler
 
 from .distributed import get_rank, get_world_size
 from .reproducibility import seed_streams
-
-
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _atomic_write_text(path: str, text: str) -> None:
@@ -56,16 +52,13 @@ def write_trainable_parameter_manifest(cfg, model) -> Optional[str]:
     ]
     total_parameters = int(sum(parameter.numel() for parameter in model_ref.parameters()))
     trainable_parameters = int(sum(item["numel"] for item in tensors))
-    resolved_config = cfg.dump()
     payload = {
-        "schema_version": "trainable_parameter_manifest_v1",
+        "schema_version": "trainable_parameter_manifest_v2",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "model_class": "{}.{}".format(model_ref.__class__.__module__, model_ref.__class__.__name__),
         "classifier": str(cfg.MODEL.CLASSIFIER),
-        "resolved_config_sha256": _sha256_text(resolved_config),
         "total_parameters": total_parameters,
         "trainable_parameter_count": trainable_parameters,
-        "trainable_tensor_count": len(tensors),
         "trainable_tensors": tensors,
     }
     path = os.path.join(str(cfg.OUTPUT_DIR), "trainable_parameters.json")
@@ -73,20 +66,16 @@ def write_trainable_parameter_manifest(cfg, model) -> Optional[str]:
     return path
 
 
-def _loader_record(loader) -> Optional[Dict[str, object]]:
+def _loader_record(loader, include_batch_size: bool = False) -> Optional[Dict[str, object]]:
     if loader is None:
         return None
     sampler = getattr(loader, "sampler", None)
     record = {
         "sampler": sampler.__class__.__name__ if sampler is not None else None,
-        "batch_size": int(loader.batch_size) if loader.batch_size is not None else None,
-        "num_workers": int(loader.num_workers),
         "drop_last": bool(loader.drop_last),
-        "dataset_size": int(len(loader.dataset)),
     }
-    for name in ("num_replicas", "rank", "seed"):
-        if sampler is not None and hasattr(sampler, name):
-            record[name] = int(getattr(sampler, name))
+    if include_batch_size:
+        record["batch_size"] = int(loader.batch_size) if loader.batch_size is not None else None
     return record
 
 
@@ -128,11 +117,12 @@ def collect_distributed_runtime_checks(
     cls_criterion,
     train_loader,
     rank_runtime_seed: Optional[int],
+    evaluation_loaders: Optional[Mapping[str, object]] = None,
 ) -> Dict[str, object]:
     """Collect small DDP correctness checks collectively on every rank."""
     world_size = get_world_size()
     if world_size <= 1:
-        return {"enabled": False}
+        return {}
 
     fingerprint = _module_fingerprint({"model": model, "cls_criterion": cls_criterion})
     device = next((parameter.device for parameter in model.parameters()), torch.device("cpu"))
@@ -181,23 +171,36 @@ def collect_distributed_runtime_checks(
         and not bool(train_loader.drop_last)
     )
 
+    active_evaluation_loaders = [
+        loader
+        for loader in (evaluation_loaders or {}).values()
+        if loader is not None
+    ]
+    local_evaluation_loaders_full_dataset = bool(active_evaluation_loaders) and all(
+        isinstance(getattr(loader, "sampler", None), SequentialSampler)
+        and not bool(loader.drop_last)
+        and int(len(loader.sampler)) == int(len(loader.dataset))
+        for loader in active_evaluation_loaders
+    )
+    evaluation_check_tensor = torch.tensor(
+        [int(local_evaluation_loaders_full_dataset)],
+        dtype=torch.long,
+        device=device,
+    )
+    gathered_evaluation_checks = _all_gather_tensor(evaluation_check_tensor)
+
     return {
-        "enabled": True,
-        "initial_parameter_fingerprint": {
-            "parameter_count": int(first_fingerprint[0].item()),
-            "sum": float(first_fingerprint[1].item()),
-            "square_sum": float(first_fingerprint[2].item()),
-            "abs_max": float(first_fingerprint[3].item()),
-            "all_ranks_equal": bool(fingerprints_match),
-        },
+        "initial_parameters_equal": bool(fingerprints_match),
         "rank_runtime_seeds_unique": len(set(runtime_seeds)) == world_size,
-        "train_sampler_partition_configured": bool(
+        "train_sampler_partition_valid": bool(
             sampler_ranks == list(range(world_size))
             and all(value == world_size for value in sampler_replicas)
             and len(set(sampler_seeds)) == 1
             and complete_partition
         ),
-        "evaluation_loader_mode": "full_dataset_on_each_rank",
+        "evaluation_loaders_full_dataset": all(
+            bool(int(item.item())) for item in gathered_evaluation_checks
+        ),
     }
 
 
@@ -212,23 +215,30 @@ def write_reproducibility_manifest(
 
     world_size = get_world_size()
     distributed_initialized = bool(dist.is_available() and dist.is_initialized())
+    distributed_record = {"world_size": int(world_size)}
+    if world_size > 1:
+        distributed_record["backend"] = str(dist.get_backend()) if distributed_initialized else None
+
+    active_loaders = [loader for loader in loaders.values() if loader is not None]
+    loader_record = {
+        "num_workers": int(active_loaders[0].num_workers) if active_loaders else None,
+    }
+    loader_record.update(
+        {
+            str(name): _loader_record(loader, include_batch_size=str(name) == "train")
+            for name, loader in loaders.items()
+        }
+    )
     payload = {
-        "schema_version": "reproducibility_v1",
+        "schema_version": "reproducibility_v2",
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "execution_mode": "ddp" if world_size > 1 else "single_gpu",
         "master_seed": int(cfg.SEED) if cfg.SEED is not None else None,
         "shared_streams": seed_streams(cfg.SEED),
-        "distributed": {
-            "backend": str(dist.get_backend()) if distributed_initialized else None,
-            "world_size": int(world_size),
-            "rank": int(get_rank()),
-        },
-        "loaders": {name: _loader_record(loader) for name, loader in loaders.items()},
-        "determinism": {
-            "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
-        },
+        "distributed": distributed_record,
+        "loaders": loader_record,
     }
-    if distributed_checks is not None:
+    if distributed_checks:
         payload["distributed_checks"] = dict(distributed_checks)
 
     path = os.path.join(str(cfg.OUTPUT_DIR), "reproducibility_manifest.json")

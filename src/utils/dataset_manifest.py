@@ -3,7 +3,6 @@
 import hashlib
 import json
 import os
-from datetime import datetime, timezone
 from typing import Dict, Mapping, Optional
 
 import torch
@@ -11,7 +10,7 @@ import torch
 from .distributed import get_rank
 
 
-MANIFEST_SCHEMA_VERSION = "xlsa_dataset_manifest_v1"
+MANIFEST_SCHEMA_VERSION = "xlsa_dataset_manifest_v2"
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -33,11 +32,7 @@ def _file_record(path: str) -> Dict[str, object]:
     absolute_path = os.path.abspath(path)
     if not os.path.isfile(absolute_path):
         raise FileNotFoundError("Manifest source file does not exist: {}".format(absolute_path))
-    return {
-        "path": absolute_path,
-        "size_bytes": int(os.path.getsize(absolute_path)),
-        "sha256": _sha256_file(absolute_path),
-    }
+    return {"sha256": _sha256_file(absolute_path)}
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:
@@ -71,26 +66,18 @@ def _int_list(values) -> list:
 
 def _dataset_record(dataset) -> Dict[str, object]:
     class_attributes = getattr(dataset, "class_attributes", None)
-    all_classnames = getattr(dataset, "all_classnames", None)
     if class_attributes is None:
         raise ValueError("Dataset manifest requires class_attributes.")
-    if all_classnames is None or len(all_classnames) != int(dataset.num_classes):
-        raise ValueError("Dataset manifest requires complete all_classnames in global-ID order.")
     return {
         "dataset_name": str(dataset.name),
         "protocol_mode": str(dataset.protocol_mode),
         "split": str(dataset.split_name),
-        "split_source_keys": [str(key) for key in dataset.split_source_keys],
-        "image_root": os.path.abspath(dataset.get_imagedir()),
         "image_count": int(len(dataset)),
         "image_records_sha256": _image_records_sha256(dataset),
-        "split_class_ids": _int_list(dataset.split_classes),
-        "local_class_ids": _int_list(dataset.local_classes),
         "eval_local_class_ids": _int_list(dataset.eval_local_classes),
         "seen_class_ids": _int_list(dataset.seen_classes),
         "unseen_class_ids": _int_list(dataset.unseen_classes),
         "class_attributes": {
-            "dtype": str(class_attributes.dtype),
             "shape": [int(x) for x in class_attributes.shape],
             "sha256": _tensor_sha256(class_attributes),
         },
@@ -113,17 +100,6 @@ def _assert_shared_global_space(dataset_records: Mapping[str, Dict[str, object]]
             reference = key
         elif key != reference:
             raise ValueError("Datasets in one run do not share the same global class/attribute protocol.")
-
-
-def _global_class_mapping(dataset) -> list:
-    return [
-        {
-            "global_id": int(class_id),
-            "class_name": str(dataset.all_classnames[class_id]),
-            "attribute_row": int(class_id),
-        }
-        for class_id in range(int(dataset.num_classes))
-    ]
 
 
 def _atomic_json_dump(path: str, payload: Dict[str, object]) -> None:
@@ -153,17 +129,12 @@ def write_xlsa_dataset_manifest(cfg, datasets: Mapping[str, Optional[object]]) -
         for role, dataset in active_datasets.items()
     }
     _assert_shared_global_space(records)
-    reference_dataset = next(iter(active_datasets.values()))
-    config_text = cfg.dump()
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "resolved_config_sha256": _sha256_bytes(config_text.encode("utf-8")),
         "source_files": {
             "res101_mat": _file_record(str(cfg.DATA.XLSA.RES101_PATH)),
             "att_splits_mat": _file_record(str(cfg.DATA.XLSA.SPLIT_PATH)),
         },
-        "global_class_mapping": _global_class_mapping(reference_dataset),
         "datasets": records,
     }
     manifest_path = os.path.join(str(cfg.OUTPUT_DIR), "dataset_manifest.json")

@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional
 from uuid import uuid4
 
-from .fields import field_catalog_manifest
 from .registry import MONITOR_SPECS, get_monitor_spec, resolve_monitor_groups
 from .schema import EPOCH_CSV_FIELDS, MonitorContext, SCHEMA_VERSION
 from .writer import json_safe, write_json
@@ -18,7 +17,6 @@ from .writer import json_safe, write_json
 
 class MonitorManager:
     _ARTIFACT_FILENAMES = (
-        "monitor_manifest.json",
         "metrics_epoch.csv",
         "metrics_step.jsonl",
         "metrics_events.jsonl",
@@ -46,15 +44,18 @@ class MonitorManager:
         self.finalized = False
         self.monitor_groups = resolve_monitor_groups(cfg)
         self.runtime_groups = self._new_runtime_groups()
+        self.cell_id = str(cfg.SOLVER.STAGE2_CHECKPOINT_CELL_ID) or None
+        self.seed = int(cfg.SEED) if cfg.SEED is not None else None
+        self.git_identity = self._collect_git_identity() if self.enabled else None
         if self.enabled:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             self._prepare_output_artifacts()
-            self._write_manifest(cfg)
+            self._write_runtime_summary("running")
         self.context = MonitorContext(
             run_id=self.run_id,
             session_id=self.session_id,
-            cell_id=str(cfg.SOLVER.STAGE2_CHECKPOINT_CELL_ID) or None,
-            seed=int(cfg.SEED) if cfg.SEED is not None else None,
+            cell_id=self.cell_id,
+            seed=self.seed,
             stage="init",
             epoch=None,
             global_step=None,
@@ -99,33 +100,30 @@ class MonitorManager:
         self._resume_existing_session(paths)
 
     def _resume_existing_session(self, paths: Mapping[str, Path]) -> None:
-        manifest_path = paths["monitor_manifest.json"]
-        if not manifest_path.is_file():
+        summary_path = paths["monitor_runtime_summary.json"]
+        if not summary_path.is_file():
             raise FileNotFoundError(
-                "MONITOR.OUTPUT_POLICY=resume requires an existing monitor_manifest.json."
+                "MONITOR.OUTPUT_POLICY=resume requires an existing monitor_runtime_summary.json."
             )
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Cannot resume monitoring session from {manifest_path}.") from exc
-        if int(manifest.get("schema_version", -1)) != SCHEMA_VERSION:
+            raise RuntimeError(f"Cannot resume monitoring session from {summary_path}.") from exc
+        if int(summary.get("schema_version", -1)) != SCHEMA_VERSION:
             raise RuntimeError(
                 "Cannot resume a monitoring artifact with a different schema version. "
                 "Use a new OUTPUT_DIR or MONITOR.OUTPUT_POLICY=overwrite."
             )
-        if str(manifest.get("run_id", "")) != self.run_id:
-            raise RuntimeError("Monitoring manifest run_id does not match the current OUTPUT_DIR.")
-        session = manifest.get("session", {})
-        session_id = str(session.get("id", "")).strip()
+        if str(summary.get("run_id", "")) != self.run_id:
+            raise RuntimeError("Monitoring runtime summary run_id does not match the current OUTPUT_DIR.")
+        session_id = str(summary.get("session_id", "")).strip()
         if not session_id:
-            raise RuntimeError("Monitoring manifest has no session id and cannot be resumed safely.")
+            raise RuntimeError("Monitoring runtime summary has no session id and cannot be resumed safely.")
         self.session_id = session_id
-        self.started_at = str(session.get("started_at", self.started_at))
+        self.started_at = str(summary.get("started_at", self.started_at))
         self.resumed_at = self._utc_now()
         self.resumed = True
-        summary_path = paths["monitor_runtime_summary.json"]
-        if summary_path.is_file():
-            self._restore_runtime_groups(summary_path)
+        self._restore_runtime_groups(summary_path)
 
     def _restore_runtime_groups(self, path: Path) -> None:
         try:
@@ -148,7 +146,8 @@ class MonitorManager:
             state["first_observed"] = old.get("first_observed")
             state["last_observed"] = old.get("last_observed")
 
-    def _write_manifest(self, cfg: Any) -> None:
+    @staticmethod
+    def _collect_git_identity() -> Dict[str, Any]:
         repository_root = Path(__file__).resolve().parents[2]
         git_identity = {"commit": None, "dirty": None, "root": str(repository_root)}
         try:
@@ -169,81 +168,7 @@ class MonitorManager:
             git_identity.update({"commit": commit or None, "dirty": bool(status.strip())})
         except (OSError, subprocess.SubprocessError):
             pass
-        payload = {
-            "schema_version": SCHEMA_VERSION,
-            "run_id": self.run_id,
-            "session": {
-                "id": self.session_id,
-                "started_at": self.started_at,
-                "resumed": self.resumed,
-                "resumed_at": self.resumed_at,
-                "output_policy": self.output_policy,
-            },
-            "cell_id": str(cfg.SOLVER.STAGE2_CHECKPOINT_CELL_ID) or None,
-            "seed": int(cfg.SEED) if cfg.SEED is not None else None,
-            "reproducibility": {
-                "manifest": "reproducibility_manifest.json",
-                "schema_version": "reproducibility_v1",
-                "master_seed": int(cfg.SEED) if cfg.SEED is not None else None,
-            },
-            "git": git_identity,
-            "artifacts": {
-                "epoch_csv": "metrics_epoch.csv" if self.write_epoch_csv else None,
-                "step_jsonl": "metrics_step.jsonl" if self.write_step_jsonl else None,
-                "events_jsonl": "metrics_events.jsonl" if self.write_events_jsonl else None,
-                "runtime_summary": "monitor_runtime_summary.json",
-            },
-            "sampling": {
-                "global_step_every_n": self.step_every_n,
-                "graph_prob_prior_forward_every_n": self.graph_prob_prior_every_n,
-            },
-            "resolved_switches": {
-                "monitor": {
-                    "enabled": bool(cfg.MONITOR.ENABLE),
-                    "prompt_enabled": bool(cfg.MONITOR.PROMPT.ENABLE),
-                    "attention_mediation_enabled": bool(cfg.MONITOR.ATTENTION_MEDIATION.ENABLE),
-                    "affinity_summary_enabled": bool(cfg.MONITOR.AFFINITY.ENABLE),
-                },
-                "graph_prob_prior": {
-                    "enabled": bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE),
-                    "monitor_enabled": bool(cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE),
-                    "monitor_every_n": int(cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N),
-                    "effective_rank_enabled": bool(cfg.MODEL.GRAPH_PROB_PRIOR.MONITOR_EFFECTIVE_RANK),
-                },
-                "affinity": {
-                    "enabled": bool(cfg.MODEL.AFFINITY.ENABLE),
-                    "detach": bool(cfg.MODEL.AFFINITY.DETACH),
-                    "visualization_enabled": bool(cfg.MODEL.AFFINITY.VIS),
-                },
-                "attention_mediation": {
-                    "enabled": bool(cfg.MODEL.ATTENTION_MEDIATION.ENABLE),
-                    "source": str(cfg.MODEL.ATTENTION_MEDIATION.SOURCE),
-                    "execution_mode": str(cfg.MODEL.ATTENTION_MEDIATION.EXECUTION_MODE),
-                },
-            },
-            "monitor_groups": self.monitor_groups,
-            "field_catalog": field_catalog_manifest(),
-            "diagnostic_subsystems": {
-                "runtime_structured": {"enabled": bool(cfg.MONITOR.ENABLE), "output_dir": "."},
-                "visualization": {
-                    "enabled": bool(cfg.SOLVER.VIS.ENABLE),
-                    "output_dir": "visualization",
-                },
-                "eval_diagnostics": {"managed_by_runtime": False, "output_dir": "diagnostics"},
-                "cross_run_aggregation": {"managed_by_runtime": False, "output_dir": "external summary"},
-                "fixed_probe": {
-                    "enabled": bool(cfg.MONITOR.PROBE.ENABLE),
-                    "managed_by_runtime": False,
-                    "output_dir": "diagnostics",
-                },
-                "paired_intervention": {
-                    "enabled": bool(cfg.MONITOR.MODULE_EFFECT.ENABLE),
-                    "managed_by_runtime": False,
-                    "output_dir": "diagnostics",
-                },
-            },
-        }
-        write_json(self.output_dir / "monitor_manifest.json", payload)
+        return git_identity
 
     def write_evidence(self, filename: str, payload: Mapping[str, Any]) -> Optional[Path]:
         if not self.enabled:
@@ -355,7 +280,7 @@ class MonitorManager:
         namespace: str,
         metrics: Mapping[str, Any],
         *,
-        reducer: str = "last",
+        reducer: Any = "last",
         n: int = 1,
     ) -> None:
         if (not self.write_epoch_csv) or (not self._is_recordable(namespace, "epoch")):
@@ -363,13 +288,14 @@ class MonitorManager:
         rows = []
         clean = {metric: value for metric, value in json_safe(metrics).items() if value is not None}
         for metric, value in clean.items():
+            metric_reducer = reducer.get(metric, "last") if isinstance(reducer, Mapping) else reducer
             rows.append({
                 **self._base(),
                 "split": str(split),
                 "namespace": str(namespace),
                 "metric": str(metric),
                 "value": value,
-                "reducer": str(reducer),
+                "reducer": str(metric_reducer),
                 "n": int(n),
             })
         if not rows:
@@ -400,19 +326,31 @@ class MonitorManager:
             "schema_version": SCHEMA_VERSION,
             "run_id": self.run_id,
             "session_id": self.session_id,
+            "cell_id": self.cell_id,
+            "seed": self.seed,
             "started_at": self.started_at,
+            "resumed": self.resumed,
             "resumed_at": self.resumed_at,
-            "finalized_at": self._utc_now(),
+            "finalized_at": None if str(status) == "running" else self._utc_now(),
             "status": str(status),
+            "output_policy": self.output_policy,
+            "git": self.git_identity,
+            "sampling": {
+                "global_step_every_n": self.step_every_n,
+                "graph_prob_prior_forward_every_n": self.graph_prob_prior_every_n,
+            },
             "groups": groups,
         }
+
+    def _write_runtime_summary(self, status: str) -> None:
+        write_json(
+            self.output_dir / "monitor_runtime_summary.json",
+            self._runtime_summary_payload(status),
+        )
 
     def finalize(self, *, status: str) -> None:
         if (not self.enabled) or self.finalized:
             return
         self.record_event("monitor_finalized", {"status": str(status)})
-        write_json(
-            self.output_dir / "monitor_runtime_summary.json",
-            self._runtime_summary_payload(status),
-        )
+        self._write_runtime_summary(status)
         self.finalized = True

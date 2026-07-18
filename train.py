@@ -223,15 +223,22 @@ def train(cfg, args):
         trainer.cls_criterion,
         train_loader,
         runtime_seed,
+        {
+            "val_unseen": val_loader,
+            "test_seen": test_seen_loader,
+            "test_unseen": test_unseen_loader,
+        },
     )
-    if bool(distributed_checks.get("enabled")):
+    if distributed_checks:
         ddp_failures = []
-        if not bool(distributed_checks["initial_parameter_fingerprint"]["all_ranks_equal"]):
+        if not bool(distributed_checks["initial_parameters_equal"]):
             ddp_failures.append("initial model/loss parameters differ across ranks")
         if not bool(distributed_checks["rank_runtime_seeds_unique"]):
             ddp_failures.append("rank runtime seeds are not unique")
-        if not bool(distributed_checks["train_sampler_partition_configured"]):
+        if not bool(distributed_checks["train_sampler_partition_valid"]):
             ddp_failures.append("DistributedSampler rank/replica/seed configuration is invalid")
+        if not bool(distributed_checks["evaluation_loaders_full_dataset"]):
+            ddp_failures.append("evaluation loaders do not cover the full dataset on every rank")
         if ddp_failures:
             raise RuntimeError("DDP reproducibility gate failed: {}".format("; ".join(ddp_failures)))
     reproducibility_manifest_path = write_reproducibility_manifest(

@@ -44,11 +44,11 @@ def load_cfg(config_file: str, opts: List[str]):
 def resolved_stage(cfg) -> str:
     prompt = cfg.MODEL.PROMPT
     if not bool(prompt.ENABLE):
-        return "B0"
+        return "A0"
     if str(prompt.BACKEND).lower() == "dynamic" and not bool(prompt.DEEP):
-        return "B1"
+        return "A1"
     if str(prompt.BACKEND).lower() == "vpt_deep" and bool(prompt.DEEP):
-        return "B2"
+        return "A2"
     return "invalid"
 
 
@@ -94,7 +94,7 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
             failures.append(f"{name}: expected {target!r}, got {actual!r}")
 
     if stage == "invalid":
-        failures.append("prompt configuration is not one of B0/B1/B2")
+        failures.append("prompt configuration is not one of A0/A1/A2")
     if int(cfg.MODEL.PROMPT.NUM_TOKENS) != 5:
         failures.append("MODEL.PROMPT.NUM_TOKENS must be 5 for the initial A-series protocol")
     if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
@@ -141,16 +141,16 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
 
     prompt_names = [name for name in trainable if "prompt_embeddings" in name]
     deep_names = [name for name in trainable if "deep_prompt_embeddings" in name]
-    if stage == "B0" and prompt_names:
-        failures.append("B0 unexpectedly has trainable prompt parameters")
-    if stage == "B1" and (not prompt_names or deep_names):
-        failures.append("B1 must train input prompt embeddings only")
-    if stage == "B2" and (not prompt_names or not deep_names):
-        failures.append("B2 must train both input and deep prompt embeddings")
+    if stage == "A0" and prompt_names:
+        failures.append("A0 unexpectedly has trainable prompt parameters")
+    if stage == "A1" and (not prompt_names or deep_names):
+        failures.append("A1 must train input prompt embeddings only")
+    if stage == "A2" and (not prompt_names or not deep_names):
+        failures.append("A2 must train both input and deep prompt embeddings")
     allowed_prefixes = {
-        "B0": ("r_similarity_head.prototype_proj.",),
-        "B1": ("enc.transformer.prompt_embeddings", "r_similarity_head.prototype_proj."),
-        "B2": (
+        "A0": ("r_similarity_head.prototype_proj.",),
+        "A1": ("enc.transformer.prompt_embeddings", "r_similarity_head.prototype_proj."),
+        "A2": (
             "enc.transformer.prompt_embeddings",
             "enc.transformer.deep_prompt_embeddings",
             "r_similarity_head.prototype_proj.",
@@ -188,12 +188,12 @@ def cross_config_stream_checks(configs) -> List[str]:
                     ),
                 )
             )
-    prompt_records = [record for record in records if record["stage"] in {"B1", "B2"}]
+    prompt_records = [record for record in records if record["stage"] in {"A1", "A2"}]
     if len(prompt_records) >= 2:
         prompt_values = {record["streams"]["prompt_init"] for record in prompt_records}
         if len(prompt_values) != 1:
             failures.append(
-                "prompt_init must match across compared B1/B2 configs: {}".format(
+                "prompt_init must match across compared A1/A2 configs: {}".format(
                     ", ".join(
                         "{}={}".format(Path(record["path"]).name, record["streams"]["prompt_init"])
                         for record in prompt_records

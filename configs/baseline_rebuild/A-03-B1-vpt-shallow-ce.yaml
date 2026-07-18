@@ -1,9 +1,0 @@
-_BASE_: "A-01-common-ce.yaml"
-OUTPUT_DIR: "output/baseline_rebuild/A-03-B1-vpt-shallow-ce"
-
-MODEL:
-  PROMPT:
-    ENABLE: true
-    BACKEND: "dynamic"
-    INIT_SOURCE: "learned"
-    DEEP: false

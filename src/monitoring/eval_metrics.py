@@ -35,6 +35,16 @@ def _normalize_rows(values: np.ndarray) -> np.ndarray:
     return values / np.maximum(np.linalg.norm(values, axis=1, keepdims=True), 1e-12)
 
 
+def _pairwise_euclidean_upper(values: np.ndarray) -> np.ndarray:
+    matrix = np.asarray(values, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[0] < 2:
+        return np.asarray([], dtype=np.float64)
+    squared_norm = np.square(matrix).sum(axis=1)
+    squared_distance = squared_norm[:, None] + squared_norm[None, :] - 2.0 * (matrix @ matrix.T)
+    upper = np.triu_indices(matrix.shape[0], k=1)
+    return np.sqrt(np.maximum(squared_distance[upper], 0.0))
+
+
 def _per_class_accuracy(predictions: np.ndarray, targets: np.ndarray, class_ids: Iterable[int]) -> float:
     values = []
     for class_id in class_ids:
@@ -147,19 +157,11 @@ def prediction_health_metrics(
 
     return {
         "seen_unseen_logit_margin_mean": float((seen_max - unseen_max).mean()),
-        "seen_unseen_logit_margin_std": float((seen_max - unseen_max).std()),
         "seen_probability_mass_mean": float(probabilities[:, seen_columns].sum(axis=1).mean()),
-        "unseen_probability_mass_mean": float(probabilities[:, unseen_columns].sum(axis=1).mean()),
-        "unseen_to_seen_error_rate": mean_or_zero(predicted_seen[~target_seen].astype(np.float64)),
-        "seen_to_unseen_error_rate": mean_or_zero((~predicted_seen[target_seen]).astype(np.float64)),
-        "predicted_seen_rate": float(predicted_seen.mean()),
+        "wrong_domain_prediction_rate": float((predicted_seen != target_seen).mean()),
         "true_class_margin_mean": float(true_margin.mean()),
-        "true_class_margin_std": float(true_margin.std()),
         "true_class_rank_mean": float(true_rank.mean()),
-        "true_class_rank_top1": float((true_rank <= 1).mean()),
-        "true_class_rank_top5": float((true_rank <= min(5, score_matrix.shape[1])).mean()),
         "entropy_mean": float(entropy.mean()),
-        "confidence_correct": mean_or_zero(confidence[correct]),
         "confidence_incorrect": mean_or_zero(confidence[~correct]),
     }
 
@@ -171,14 +173,13 @@ def class_error_metrics(
     *,
     class_names: Optional[Sequence[str]] = None,
     class_attributes: Optional[Any] = None,
-    top_confusions: int = 20,
+    top_confusions: int = 10,
 ) -> Dict[str, Any]:
     score_matrix = _as_scores(scores)
     target_ids = _as_targets(targets, score_matrix.shape[0], score_matrix.shape[1])
     candidate = np.asarray(candidate_global_ids, dtype=np.int64).reshape(-1)
     if candidate.size != score_matrix.shape[1]:
         raise ValueError("candidate_global_ids length does not match score columns")
-    probabilities = _softmax(score_matrix)
     predictions = score_matrix.argmax(axis=1)
     true_scores = score_matrix[np.arange(target_ids.size), target_ids]
     competitor = score_matrix.copy()
@@ -190,12 +191,10 @@ def class_error_metrics(
     correct_count = np.bincount(target_ids[predictions == target_ids], minlength=class_count).astype(np.int64)
     predicted_frequency = np.bincount(predictions, minlength=class_count).astype(np.int64)
     accuracy = np.divide(correct_count, support, out=np.full(class_count, np.nan), where=support > 0)
-    confidence = np.full(class_count, np.nan, dtype=np.float64)
     margin = np.full(class_count, np.nan, dtype=np.float64)
     for class_id in range(class_count):
         mask = target_ids == class_id
         if mask.any():
-            confidence[class_id] = float(probabilities[mask, class_id].mean())
             margin[class_id] = float(margins[mask].mean())
 
     confusion_counts: Dict[Tuple[int, int], int] = {}
@@ -213,8 +212,6 @@ def class_error_metrics(
     confusions = []
     for (true_id, pred_id), count in sorted(confusion_counts.items(), key=lambda item: (-item[1], item[0]))[: max(0, int(top_confusions))]:
         row = {
-            "true_local_id": true_id,
-            "pred_local_id": pred_id,
             "true_global_id": int(candidate[true_id]),
             "pred_global_id": int(candidate[pred_id]),
             "count": int(count),
@@ -231,22 +228,14 @@ def class_error_metrics(
     sortable_accuracy = accuracy.copy()
     sortable_accuracy[~np.isfinite(sortable_accuracy)] = np.inf
     worst_local = np.argsort(sortable_accuracy)[:bottom_count]
-    total_errors = int(wrong.sum())
-    worst_errors = int(np.maximum(support[worst_local] - correct_count[worst_local], 0).sum())
     summary = {
-        "prediction_frequency_gini": _gini_nonnegative(predicted_frequency),
         "max_prediction_share": float((predicted_frequency.max() if predicted_frequency.size else 0) / max(1, predicted_frequency.sum())),
         "bottom_k_class_mean": float(np.nanmean(accuracy[worst_local])) if worst_local.size else 0.0,
-        "error_concentration_ratio": float(worst_errors / max(1, total_errors)),
-        "class_count_observed": int((support > 0).sum()),
-        "top_confusion_pair_count": int(confusions[0]["count"]) if confusions else 0,
     }
     arrays = {
         "candidate_global_ids": candidate,
         "per_class_accuracy": accuracy,
         "class_support": support,
-        "class_correct_count": correct_count,
-        "class_mean_confidence": confidence,
         "class_true_margin": margin,
         "predicted_class_frequency": predicted_frequency,
     }
@@ -301,16 +290,9 @@ def calibration_profile_metrics(
     raw_index = int(np.argmin(np.abs(gamma)))
     order = np.argsort(seen_values)
     ausuc = float(abs(np.trapz(unseen_values[order], seen_values[order]))) if gamma.size > 1 else 0.0
-    near_peak = gamma[h_values >= 0.95 * float(h_values[peak_index])]
-    width = float(near_peak.max() - near_peak.min()) if near_peak.size else 0.0
     summary = {
-        "raw_seen": float(seen_values[raw_index]),
-        "raw_unseen": float(unseen_values[raw_index]),
-        "raw_h": float(h_values[raw_index]),
         "oracle_peak_gamma": float(gamma[peak_index]),
-        "oracle_peak_h": float(h_values[peak_index]),
         "ausuc": ausuc,
-        "oracle_95pct_width": width,
         "raw_to_oracle_gain": float(h_values[peak_index] - h_values[raw_index]),
     }
     return {
@@ -318,7 +300,6 @@ def calibration_profile_metrics(
         "gamma_grid": gamma,
         "seen_at_gamma": seen_values,
         "unseen_at_gamma": unseen_values,
-        "h_at_gamma": h_values,
     }
 
 
@@ -402,6 +383,9 @@ def visual_semantic_alignment_metrics(
     visual_centers = np.asarray(visual_centers, dtype=np.float64)
     aligned_semantics = np.asarray(aligned_semantics, dtype=np.float64)
     center_cosine = np.sum(_normalize_rows(visual_centers) * _normalize_rows(aligned_semantics), axis=1)
+    visual_interclass_distance = _pairwise_euclidean_upper(visual_centers)
+    semantic_interclass_distance = _pairwise_euclidean_upper(aligned_semantics)
+    distance_structure = spearman_correlation(visual_interclass_distance, semantic_interclass_distance)
     if class_ids.size > 1:
         visual_relation = _normalize_rows(visual_centers) @ _normalize_rows(visual_centers).T
         semantic_relation = _normalize_rows(aligned_semantics) @ _normalize_rows(aligned_semantics).T
@@ -410,11 +394,11 @@ def visual_semantic_alignment_metrics(
         neighbor_k = min(k, class_ids.size - 1)
         overlap = []
         for row in range(class_ids.size):
-            v_order = np.argsort(-visual_relation[row])
-            s_order = np.argsort(-semantic_relation[row])
-            v_neigh = {int(item) for item in v_order if int(item) != row}
+            v_order = np.argsort(-visual_relation[row], kind="mergesort")
+            s_order = np.argsort(-semantic_relation[row], kind="mergesort")
+            v_neigh = [int(item) for item in v_order if int(item) != row][:neighbor_k]
             s_neigh = [int(item) for item in s_order if int(item) != row][:neighbor_k]
-            overlap.append(len(v_neigh.intersection(s_neigh)) / max(1, neighbor_k))
+            overlap.append(len(set(v_neigh).intersection(s_neigh)) / max(1, neighbor_k))
         neighbor_preservation = float(np.mean(overlap))
     else:
         structure = 0.0
@@ -428,6 +412,11 @@ def visual_semantic_alignment_metrics(
         "class_center_prototype_cosine": float(center_cosine.mean()) if center_cosine.size else 0.0,
         "visual_semantic_structure_spearman": structure,
         "neighbor_preservation_at_k": neighbor_preservation,
+        "visual_interclass_distance_mean": float(visual_interclass_distance.mean()) if visual_interclass_distance.size else 0.0,
+        "visual_interclass_distance_std": float(visual_interclass_distance.std()) if visual_interclass_distance.size else 0.0,
+        "semantic_interclass_distance_mean": float(semantic_interclass_distance.mean()) if semantic_interclass_distance.size else 0.0,
+        "semantic_interclass_distance_std": float(semantic_interclass_distance.std()) if semantic_interclass_distance.size else 0.0,
+        "visual_semantic_distance_spearman": distance_structure,
         "semantic_ambiguity_rate": float((margin < float(ambiguity_margin)).mean()),
     }
 

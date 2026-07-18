@@ -153,16 +153,24 @@ MONITOR_FIELD_CATALOG: Dict[str, Tuple[MetricFieldSpec, ...]] = {
         MetricFieldSpec("data_time_sec", "当前训练 epoch 的平均数据读取耗时", "seconds", "mean"),
     ),
     "train_debug": (
-        MetricFieldSpec("*", "Trainer 与分类损失暴露的标量调试项", "scalar", "sampled_batch"),
+        MetricFieldSpec("ce_logits_std", "当前采样 batch 的 CE logits 总体标准差", "logit", "sampled_batch", True),
+        MetricFieldSpec("ce_logits_abs_max", "当前采样 batch 的 CE logits 最大绝对值", "logit", "sampled_batch", True),
+        MetricFieldSpec("ce_entropy", "当前采样 batch 的 CE softmax 平均熵", "nat", "sampled_batch", True),
+        MetricFieldSpec("seen_only_top1", "当前采样 batch 在 seen-only 候选空间中的 top1", "ratio", "sampled_batch", True),
+        MetricFieldSpec("effective_logit_scale", "分类头可学习 logit scale 的当前有效值", "scale", "sampled_batch"),
+        MetricFieldSpec("ce_vs_raw_same_tensor", "CE logits 与模型 raw logits 是否为同一张量", "boolean", "one_time"),
+        MetricFieldSpec("raw_logits_std", "仅路径不一致时记录的 raw logits 总体标准差", "logit", "one_time_if_path_diff"),
+        MetricFieldSpec("raw_logits_abs_max", "仅路径不一致时记录的 raw logits 最大绝对值", "logit", "one_time_if_path_diff"),
+        MetricFieldSpec("raw_entropy", "仅路径不一致时记录的 raw softmax 平均熵", "nat", "one_time_if_path_diff"),
     ),
     "numerical_guard": (
         MetricFieldSpec("*", "首个成功 step 或非有限数值失败证据", "event", "on_event", True),
     ),
     "optimizer_sanity": (
-        MetricFieldSpec("*", "optimizer 参数归属、梯度和首次更新证据", "event", "one_time", True),
-    ),
-    "protocol_access": (
-        MetricFieldSpec("*", "评测 split 的访问时机和用途", "event", "on_access", True),
+        MetricFieldSpec("phase", "optimizer 审计阶段", "event", "one_time", True),
+        MetricFieldSpec("passed", "当前阶段最低检查是否通过", "boolean", "one_time", True),
+        MetricFieldSpec("issue_count", "当前阶段异常或警告项总数", "count", "one_time", True),
+        MetricFieldSpec("checks.*", "首个 step 的梯度、更新和冻结状态布尔检查", "boolean", "one_time"),
     ),
     "graph_prob_prior": (
         MetricFieldSpec("*", "GraphProbPrior loss stats 中所有有限标量", "scalar", "graph_prob_prior_forward"),
@@ -189,13 +197,22 @@ MONITOR_FIELD_CATALOG: Dict[str, Tuple[MetricFieldSpec, ...]] = {
         MetricFieldSpec("*", "Evaluator 在完整数据集上计算的分类指标", "metric", "dataset"),
     ),
     "prediction_health": (
-        MetricFieldSpec("*", "联合类别空间中的 seen bias、margin、rank、entropy 和 confidence", "metric", "dataset"),
+        MetricFieldSpec("seen_unseen_logit_margin_mean", "最强 seen 与最强 unseen logit 的平均差", "logit", "dataset", True),
+        MetricFieldSpec("seen_probability_mass_mean", "联合 softmax 中分配给 seen 类的平均概率质量", "probability", "dataset", True),
+        MetricFieldSpec("wrong_domain_prediction_rate", "预测类别落入错误 seen/unseen 域的样本比例", "ratio", "dataset", True),
+        MetricFieldSpec("true_class_margin_mean", "真实类别相对最强错误类别的平均 logit 余量", "logit", "dataset", True),
+        MetricFieldSpec("true_class_rank_mean", "真实类别在联合候选空间中的平均排名", "rank", "dataset", True),
+        MetricFieldSpec("entropy_mean", "联合 softmax 的平均熵", "nat", "dataset", True),
+        MetricFieldSpec("confidence_incorrect", "错误预测样本的平均最大 softmax 概率", "probability", "dataset", True),
     ),
     "class_error": (
-        MetricFieldSpec("*", "逐类错误 artifact 的标量摘要", "metric", "dataset"),
+        MetricFieldSpec("bottom_k_class_mean", "准确率最低 10% 已观测类别的平均准确率", "ratio", "dataset", True),
+        MetricFieldSpec("max_prediction_share", "预测次数最多类别占全部预测的比例", "ratio", "dataset", True),
     ),
     "calibration_profile": (
-        MetricFieldSpec("*", "固定 gamma 网格上的 final_gzsl 校准曲线摘要", "metric", "dataset"),
+        MetricFieldSpec("ausuc", "固定 gamma 网格上 Seen-Unseen 曲线的诊断面积", "area", "dataset", True),
+        MetricFieldSpec("raw_to_oracle_gain", "原始 H 到事后校准峰值 H 的差值", "ratio", "dataset", True),
+        MetricFieldSpec("oracle_peak_gamma", "final_gzsl 诊断曲线的事后峰值位置", "gamma", "dataset", True),
     ),
     "checkpoint_selection_debug": (
         MetricFieldSpec("historical_independent_best_upper_bound", "不同 epoch 独立最佳 S/U 拼接的诊断上界", "metric", "history", True),

@@ -231,8 +231,7 @@ class Trainer():
         self._named_param_cache = None
 
         self._last_train_debug = {}
-        self._last_ce_logits = None
-        self._last_raw_logits = None
+        self._train_debug_contract_pending = True
 
         # BEGIN SEMANTIC_ABLATION_EXPERIMENT
         semantic_cfg = cfg.MODEL.SEMANTIC_TOKENS
@@ -263,18 +262,27 @@ class Trainer():
         )
         guarded_modules = (("model", self._model_ref(self.model)), ("cls_criterion", self.cls_criterion))
         self.numerical_guard = NumericalGuard(guarded_modules)
-        self.optimizer_sanity = OptimizerSanity(guarded_modules, self.optimizer)
+        self._optimizer_sanity_enabled = bool(
+            self.monitor_manager.monitor_groups["optimizer_sanity"]["effective"]
+        )
+        self.optimizer_sanity = (
+            OptimizerSanity(guarded_modules, self.optimizer)
+            if self._optimizer_sanity_enabled
+            else None
+        )
         self.prompt_parameter_tracker = PromptParameterTracker(self._model_ref(self.model))
         self._optimizer_sanity_first_step_done = False
-        self._optimizer_sanity_payload = {
-            "initialization": self.optimizer_sanity.initialization_report(),
-            "first_step": None,
-        }
-        if self.monitor_manager.monitor_groups["optimizer_sanity"]["effective"]:
+        self._optimizer_sanity_payload = None
+        if self.optimizer_sanity is not None:
+            initialization_report = self.optimizer_sanity.initialization_report()
+            self._optimizer_sanity_payload = {
+                "initialization": initialization_report,
+                "first_step": None,
+            }
             self.monitor_manager.write_evidence("optimizer_sanity.json", self._optimizer_sanity_payload)
             self.monitor_manager.record_event(
                 "optimizer_sanity",
-                self._optimizer_sanity_payload["initialization"],
+                self.optimizer_sanity.event_summary(initialization_report),
             )
         self._probe_manifests = {}
         self._final_trainable_checkpoint_path = None
@@ -884,88 +892,56 @@ class Trainer():
             int(log_interval),
         )
 
-    @staticmethod
-    def _tensor_stats(t: torch.Tensor):
-        """
-        Return a dictionary of basic statistics of a tensor:
-            - shape
-            - mean
-            - std
-            - min
-            - max"""
-        if t is None or (not torch.is_tensor(t)):
-            return None
-        return {
-            "shape": tuple(t.shape),
-            "mean": float(t.mean().item()),
-            "std": float(t.std().item()),
-            "min": float(t.min().item()),
-            "max": float(t.max().item()),
-        }
-
     def _capture_train_debug(self, loss_outputs, raw_outputs, loss_targets):
-        """
-        记录“当前训练 batch”的关键调试信息。
-
-        这个函数不参与训练逻辑本身，它的职责是：
-        1. 从训练时真正用于算 loss 的输出中提取 logits（ce_logits）
-        2. 从模型原始输出中提取 logits（raw_logits）
-        3. 统计：
-            - logits 的形状/均值/方差/极值
-            - softmax 熵
-            - seen-only top1
-            - CE logits 与 raw logits 是否是同一份张量
-            - r_similarity_head 的一些评分统计
-            - 当前 loss 的辅助统计
-        4. 把这些信息放到 self._last_train_debug 里，
-           供训练日志、overfit debug、NaN debug 等地方复用"""
         ce_logits = self._extract_logits(loss_outputs)
         raw_logits = self._extract_logits(raw_outputs)
         if not torch.is_tensor(ce_logits):
+            self._last_train_debug = {}
             return
 
         with torch.no_grad():
-            self._last_ce_logits = ce_logits.detach()
-            self._last_raw_logits = raw_logits.detach() if torch.is_tensor(raw_logits) else None
-            ce_probs = torch.softmax(ce_logits.float(), dim=-1)
+            ce_value = ce_logits.detach().float()
+            ce_probs = torch.softmax(ce_value, dim=-1)
             ce_entropy = -(ce_probs * torch.log(ce_probs.clamp_min(1e-12))).sum(dim=-1).mean()
             top1 = (ce_logits.argmax(dim=1) == loss_targets).float().mean()
 
-            same_tensor = (
-                torch.is_tensor(raw_logits)
-                and ce_logits.data_ptr() == raw_logits.data_ptr()
-                and ce_logits.shape == raw_logits.shape
-            )
-
-            raw_entropy = None
-            if torch.is_tensor(raw_logits):
-                raw_probs = torch.softmax(raw_logits.float(), dim=-1)
-                raw_entropy = float(
-                    (-(raw_probs * torch.log(raw_probs.clamp_min(1e-12))).sum(dim=-1).mean()).item()
-                )
-
             self._last_train_debug = {
-                "ce_logits_stats": self._tensor_stats(ce_logits),
-                "raw_logits_stats": self._tensor_stats(raw_logits) if torch.is_tensor(raw_logits) else None,
+                "ce_logits_std": float(ce_value.std(unbiased=False).item()),
+                "ce_logits_abs_max": float(ce_value.abs().max().item()),
                 "ce_entropy": float(ce_entropy.item()),
-                "raw_entropy": raw_entropy,
-                "entropy_from_ce_logits": True,
-                "entropy_logits_is_ce_tensor": True,
-                "ce_vs_raw_same_tensor": bool(same_tensor),
                 "seen_only_top1": float(top1.item()),
-                "ce_classes": int(ce_logits.shape[-1]),
             }
             model_ref = self._model_ref(self.model)
             r_head = model_ref.r_similarity_head
             if r_head is not None:
-                fixed_scale = float(r_head.fixed_logit_scale)
-                self._last_train_debug["whether_fixed_logit_scale"] = bool(fixed_scale > 0)
-                scale_t = r_head._loss_last_logit_scale
-                if torch.is_tensor(scale_t):
+                learnable_scale = getattr(r_head, "logit_scale", None)
+                scale_t = getattr(r_head, "_loss_last_logit_scale", None)
+                if (
+                    torch.is_tensor(learnable_scale)
+                    and learnable_scale.requires_grad
+                    and torch.is_tensor(scale_t)
+                ):
                     self._last_train_debug["effective_logit_scale"] = float(scale_t.detach().mean().item())
-            loss_stats = self.cls_criterion._last_loss_stats
-            if isinstance(loss_stats, dict) and len(loss_stats) > 0:
-                self._last_train_debug.update(loss_stats)
+            if self._train_debug_contract_pending:
+                same_tensor = (
+                    torch.is_tensor(raw_logits)
+                    and ce_logits.shape == raw_logits.shape
+                    and ce_logits.data_ptr() == raw_logits.data_ptr()
+                )
+                self._last_train_debug["ce_vs_raw_same_tensor"] = bool(same_tensor)
+                if torch.is_tensor(raw_logits) and not same_tensor:
+                    raw_value = raw_logits.detach().float()
+                    raw_probs = torch.softmax(raw_value, dim=-1)
+                    raw_entropy = -(
+                        raw_probs * torch.log(raw_probs.clamp_min(1e-12))
+                    ).sum(dim=-1).mean()
+                    self._last_train_debug.update(
+                        {
+                            "raw_logits_std": float(raw_value.std(unbiased=False).item()),
+                            "raw_logits_abs_max": float(raw_value.abs().max().item()),
+                            "raw_entropy": float(raw_entropy.item()),
+                        }
+                    )
 
     def _record_train_step_monitors(self, train_loss):
         epoch = int(self._trace_epoch + 1) if self._trace_epoch >= 0 else None
@@ -991,7 +967,10 @@ class Trainer():
                 "lr": float(self.optimizer.param_groups[0]["lr"]) if self.optimizer.param_groups else None,
             },
         )
-        self.monitor_manager.record_step("train_debug", train_debug_metrics(self._last_train_debug))
+        train_debug = train_debug_metrics(self._last_train_debug)
+        self.monitor_manager.record_step("train_debug", train_debug)
+        if "ce_vs_raw_same_tensor" in train_debug:
+            self._train_debug_contract_pending = False
         model_ref = self._model_ref(self.model)
         self.monitor_manager.record_step(
             "prompt_distribution",
@@ -2292,9 +2271,10 @@ class Trainer():
                 raise FloatingPointError(
                     "numerical_guard rejected optimizer step: {}".format(numerical_failure["failures"][:8])
                 )
-            if not self._optimizer_sanity_first_step_done:
+            if self.optimizer_sanity is not None and not self._optimizer_sanity_first_step_done:
                 self._optimizer_sanity_first_step_done = True
-                self._optimizer_sanity_payload["first_step"] = self.optimizer_sanity.first_step_report()
+                first_step_report = self.optimizer_sanity.first_step_report()
+                self._optimizer_sanity_payload["first_step"] = first_step_report
                 self.monitor_manager.set_context(
                     stage="train",
                     epoch=int(self._trace_epoch + 1) if self._trace_epoch >= 0 else None,
@@ -2304,7 +2284,7 @@ class Trainer():
                 self.monitor_manager.write_evidence("optimizer_sanity.json", self._optimizer_sanity_payload)
                 self.monitor_manager.record_event(
                     "optimizer_sanity",
-                    self._optimizer_sanity_payload["first_step"],
+                    self.optimizer_sanity.event_summary(first_step_report),
                 )
                 self.monitor_manager.record_event(
                     "numerical_guard",
@@ -2321,6 +2301,36 @@ class Trainer():
                 self._log_update_once(before_norms, after_norms)
 
         return loss, outputs
+
+    def _aggregate_train_epoch_metrics(self, losses, batch_time, data_time):
+        loss_sum = float(losses.sum)
+        sample_count = int(losses.count)
+        batch_time_sec = float(batch_time.avg)
+        data_time_sec = float(data_time.avg)
+        if du.get_world_size() > 1:
+            loss_stats = torch.tensor(
+                [loss_sum, float(sample_count)],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            torch.distributed.all_reduce(loss_stats, op=torch.distributed.ReduceOp.SUM)
+            loss_sum = float(loss_stats[0].item())
+            sample_count = int(round(float(loss_stats[1].item())))
+            timing_stats = torch.tensor(
+                [batch_time_sec, data_time_sec],
+                dtype=torch.float64,
+                device=self.device,
+            )
+            torch.distributed.all_reduce(timing_stats, op=torch.distributed.ReduceOp.MAX)
+            batch_time_sec = float(timing_stats[0].item())
+            data_time_sec = float(timing_stats[1].item())
+        loss = loss_sum / sample_count if sample_count > 0 else 0.0
+        return {
+            "loss": float(loss),
+            "batch_time_sec": batch_time_sec,
+            "data_time_sec": data_time_sec,
+            "sample_count": sample_count,
+        }
 
     def _run_train_epoch(self, epoch, effective_total_epoch, total_data, train_loader, log_interval, losses, batch_time, data_time):
         # 只负责共享的单个训练 epoch
@@ -2385,13 +2395,14 @@ class Trainer():
                     + self._format_graph_prob_prior_monitor_log()
                 )
 
+        epoch_metrics = self._aggregate_train_epoch_metrics(losses, batch_time, data_time)
         logger.info(
             "Epoch %d/%d train: loss=%.4f batch=%.4fs data=%.2es",
             epoch + 1,
             effective_total_epoch,
-            float(losses.avg),
-            float(batch_time.avg),
-            float(data_time.avg),
+            epoch_metrics["loss"],
+            epoch_metrics["batch_time_sec"],
+            epoch_metrics["data_time_sec"],
         )
         self.monitor_manager.set_context(
             stage="train",
@@ -2403,13 +2414,18 @@ class Trainer():
             "train",
             "train_epoch",
             {
-                "loss": float(losses.avg),
-                "batch_time_sec": float(batch_time.avg),
-                "data_time_sec": float(data_time.avg),
+                "loss": epoch_metrics["loss"],
+                "batch_time_sec": epoch_metrics["batch_time_sec"],
+                "data_time_sec": epoch_metrics["data_time_sec"],
                 "lr": float(self.optimizer.param_groups[0]["lr"]) if self.optimizer.param_groups else None,
             },
-            reducer="mean",
-            n=int(len(train_loader.dataset)),
+            reducer={
+                "loss": "sample_mean",
+                "lr": "last",
+                "batch_time_sec": "mean",
+                "data_time_sec": "mean",
+            },
+            n=epoch_metrics["sample_count"],
         )
         self.monitor_manager.record_epoch(
             "train",
@@ -3324,16 +3340,6 @@ class Trainer():
             global_step=int(self._trace_global_step),
             graph_prob_prior_forward=int(self._graph_prob_prior_forward),
         )
-        self.monitor_manager.record_event(
-            "protocol_access",
-            {
-                "protocol_mode": str(dataset.protocol_mode),
-                "split": str(prefix),
-                "purpose": "epoch_diagnostic_evaluation",
-                "used_for_model_selection": bool(str(dataset.protocol_mode).lower() == "dev"),
-            },
-        )
-
         eval_class_ids, eval_map = self._dataset_space_meta(dataset, use_eval_space=True)
         eval_map = eval_map.to(dtype=torch.long)
 

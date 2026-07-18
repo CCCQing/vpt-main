@@ -5,9 +5,9 @@ This directory is the isolated configuration and audit record for the clean VPT-
 | ID | Artifact | Purpose |
 | --- | --- | --- |
 | A-01 | `A-01-common-ce.yaml` | Shared CUB final-GZSL protocol, semantic matcher, and CE-only loss boundary |
-| A-02 | `A-02-B0-frozen-vit-ce.yaml` | B0: frozen ViT with no visual prompt |
-| A-03 | `A-03-B1-vpt-shallow-ce.yaml` | B1: VPT-Shallow with learned input prompts |
-| A-04 | `A-04-B2-vpt-deep-ce.yaml` | B2: VPT-Deep with learned prompts at every layer |
+| A-02 | `A-02-A0-frozen-vit-ce.yaml` | A0: frozen ViT with no visual prompt |
+| A-03 | `A-03-A1-vpt-shallow-ce.yaml` | A1: VPT-Shallow with learned input prompts |
+| A-04 | `A-04-A2-vpt-deep-ce.yaml` | A2: VPT-Deep with learned prompts at every layer |
 | A-05 | `src/tools/A-audit_baseline_config.py` | Static and optional constructed-model cleanliness audit |
 | A-06 | `dataset_manifest.json` in every run output | Resolved split, global class mapping, attribute and source-file checksums |
 | A-07 | `resolved_config.yaml` in every run output | Complete merged configuration after base, local-path, and CLI overrides |
@@ -22,15 +22,15 @@ The A series is deliberately restricted to the same attribute-prototype semantic
 Run the static gate before training:
 
 ```powershell
-C:\Users\84291\.conda\envs\prompt\python.exe src\tools\A-audit_baseline_config.py configs\baseline_rebuild\A-02-B0-frozen-vit-ce.yaml
-C:\Users\84291\.conda\envs\prompt\python.exe src\tools\A-audit_baseline_config.py configs\baseline_rebuild\A-03-B1-vpt-shallow-ce.yaml
-C:\Users\84291\.conda\envs\prompt\python.exe src\tools\A-audit_baseline_config.py configs\baseline_rebuild\A-04-B2-vpt-deep-ce.yaml
+C:\Users\84291\.conda\envs\prompt\python.exe src\tools\A-audit_baseline_config.py configs\baseline_rebuild\A-02-A0-frozen-vit-ce.yaml
+C:\Users\84291\.conda\envs\prompt\python.exe src\tools\A-audit_baseline_config.py configs\baseline_rebuild\A-03-A1-vpt-shallow-ce.yaml
+C:\Users\84291\.conda\envs\prompt\python.exe src\tools\A-audit_baseline_config.py configs\baseline_rebuild\A-04-A2-vpt-deep-ce.yaml
 ```
 
 After the static gate passes, run the constructed-model gate once per configuration:
 
 ```powershell
-C:\Users\84291\.conda\envs\prompt\python.exe src\tools\A-audit_baseline_config.py configs\baseline_rebuild\A-02-B0-frozen-vit-ce.yaml --build-model
+C:\Users\84291\.conda\envs\prompt\python.exe src\tools\A-audit_baseline_config.py configs\baseline_rebuild\A-02-A0-frozen-vit-ce.yaml --build-model
 ```
 
 `--build-model` loads the configured ViT checkpoint and verifies trainable parameter names, so it is intentionally separate from the fast static gate.

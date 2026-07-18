@@ -109,13 +109,11 @@ class OptimizerSanity:
         optimizer_ids = []
         group_rows = []
         for group_index, group in enumerate(self.optimizer.param_groups):
-            names = []
             component_counts: Dict[str, int] = defaultdict(int)
             for parameter in group.get("params", []):
                 parameter_id = id(parameter)
                 optimizer_ids.append(parameter_id)
                 matched = id_to_names.get(parameter_id, ["<unknown>"])
-                names.extend(matched)
                 for name in matched:
                     component_counts[_component(name)] += 1
             group_rows.append({
@@ -124,7 +122,6 @@ class OptimizerSanity:
                 "weight_decay": float(group.get("weight_decay", 0.0)),
                 "parameter_count": int(len(group.get("params", []))),
                 "component_parameter_counts": dict(sorted(component_counts.items())),
-                "parameter_names": sorted(names),
             })
         optimizer_id_set = set(optimizer_ids)
         trainable = {name for name, parameter in self.parameters.items() if parameter.requires_grad}
@@ -136,21 +133,28 @@ class OptimizerSanity:
         duplicate_ids = sorted({parameter_id for parameter_id in optimizer_ids if optimizer_ids.count(parameter_id) > 1})
         duplicate_names = sorted({name for parameter_id in duplicate_ids for name in id_to_names.get(parameter_id, [])})
         component_counts: Dict[str, int] = defaultdict(int)
-        component_numel: Dict[str, int] = defaultdict(int)
         for name in sorted(trainable):
             component_counts[_component(name)] += 1
-            component_numel[_component(name)] += int(self.parameters[name].numel())
-        return {
-            "phase": "initialization",
-            "passed": not missing and not frozen_in_optimizer and not duplicate_names,
-            "trainable_parameter_tensor_count": int(len(trainable)),
-            "trainable_parameter_numel": int(sum(self.parameters[name].numel() for name in trainable)),
-            "trainable_component_tensor_counts": dict(sorted(component_counts.items())),
-            "trainable_component_numel": dict(sorted(component_numel.items())),
+        issue_names = {
             "missing_from_optimizer": missing,
             "frozen_in_optimizer": frozen_in_optimizer,
             "duplicate_optimizer_parameters": duplicate_names,
+        }
+        return {
+            "phase": "initialization",
+            "passed": not missing and not frozen_in_optimizer and not duplicate_names,
+            "trainable_component_tensor_counts": dict(sorted(component_counts.items())),
+            "optimizer_group_count": int(len(group_rows)),
             "optimizer_groups": group_rows,
+            "issue_counts": {
+                name: int(len(values))
+                for name, values in issue_names.items()
+            },
+            "issues": {
+                name: values
+                for name, values in issue_names.items()
+                if values
+            },
         }
 
     def first_step_report(self) -> Dict[str, Any]:
@@ -161,6 +165,7 @@ class OptimizerSanity:
         nonfinite_gradients = []
         unchanged_trainable = []
         changed_trainable = []
+        component_changed: Dict[str, int] = defaultdict(int)
         for name, parameter in self.parameters.items():
             if not parameter.requires_grad:
                 continue
@@ -181,6 +186,7 @@ class OptimizerSanity:
             delta = max(abs(after[key] - before[key]) for key in before)
             if delta > 1e-12:
                 changed_trainable.append(name)
+                component_changed[component] += 1
             else:
                 unchanged_trainable.append(name)
 
@@ -194,19 +200,55 @@ class OptimizerSanity:
                 "gradient_norm": float(component_grad_sq[component] ** 0.5),
                 "nonzero_gradient_tensor_count": int(component_nonzero[component]),
                 "trainable_tensor_count": int(component_total[component]),
+                "changed_parameter_count": int(component_changed[component]),
             }
             for component in sorted(component_total)
         }
-        return {
-            "phase": "first_backward_optimizer_step",
-            "passed": not nonfinite_gradients and not changed_frozen,
+        checks = {
+            "all_gradients_present": not missing_gradients,
+            "all_gradients_finite": not nonfinite_gradients,
+            "all_trainable_components_have_nonzero_gradient": all(
+                component_nonzero[component] > 0
+                for component in component_total
+            ),
+            "any_trainable_parameter_updated": bool(changed_trainable),
+            "all_frozen_parameters_unchanged": not changed_frozen,
+        }
+        issue_names = {
             "missing_gradients": sorted(missing_gradients),
             "nonfinite_gradients": sorted(nonfinite_gradients),
             "unchanged_trainable_parameters": sorted(unchanged_trainable),
-            "changed_trainable_parameter_count": int(len(changed_trainable)),
             "changed_frozen_parameters": sorted(changed_frozen),
-            "components": component_rows,
         }
+        return {
+            "phase": "first_backward_optimizer_step",
+            "passed": all(checks.values()),
+            "checks": checks,
+            "changed_trainable_parameter_count": int(len(changed_trainable)),
+            "components": component_rows,
+            "issue_counts": {
+                name: int(len(values))
+                for name, values in issue_names.items()
+            },
+            "issues": {
+                name: values
+                for name, values in issue_names.items()
+                if values
+            },
+        }
+
+    @staticmethod
+    def event_summary(report: Mapping[str, Any]) -> Dict[str, Any]:
+        issue_counts = report.get("issue_counts", {})
+        result = {
+            "phase": str(report.get("phase", "unknown")),
+            "passed": bool(report.get("passed", False)),
+            "issue_count": int(sum(int(value) for value in issue_counts.values())),
+        }
+        checks = report.get("checks")
+        if isinstance(checks, Mapping):
+            result["checks"] = {str(name): bool(value) for name, value in checks.items()}
+        return result
 
 
 class PromptParameterTracker:
