@@ -300,7 +300,7 @@ class PromptParameterTracker:
             cosine = normalized @ normalized.t()
             mask = ~torch.eye(cosine.shape[0], dtype=torch.bool, device=cosine.device)
             offdiag = cosine[mask]
-            centered = tokens - tokens.mean(dim=0, keepdim=True)
+            centered = (tokens - tokens.mean(dim=0, keepdim=True)).cpu()
             singular = (
                 torch.linalg.svdvals(centered)
                 if hasattr(torch.linalg, "svdvals")

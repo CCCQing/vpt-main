@@ -36,6 +36,7 @@ from src.monitoring.eval_metrics import (
 )
 from src.monitoring.module_effect import paired_module_effect_metrics
 from src.monitoring.probe import build_probe_manifest
+from src.monitoring.diagnostics import _compact_eval_scores
 
 
 class SyntheticDataset:
@@ -78,6 +79,19 @@ def main():
     visual_seen = rng.normal(size=(seen_targets.size, 5))
     visual_unseen = rng.normal(size=(unseen_targets.size, 5))
     semantic = SyntheticDataset.class_attributes.numpy()
+
+    compact_source = rng.normal(size=(6, 25)).astype(np.float32)
+    compact_targets = np.asarray([0, 4, 8, 12, 16, 24], dtype=np.int64)
+    compact_scores = _compact_eval_scores(compact_source, compact_targets, topk=20)
+    assert compact_scores["topk_scores"].shape == (6, 20)
+    assert compact_scores["topk_scores"].dtype == np.float32
+    assert compact_scores["topk_local_indices"].shape == (6, 20)
+    assert compact_scores["topk_local_indices"].dtype == np.int32
+    assert np.allclose(
+        compact_scores["true_class_scores"],
+        compact_source[np.arange(compact_source.shape[0]), compact_targets],
+    )
+    assert np.all(np.diff(compact_scores["topk_scores"], axis=1) <= 0)
 
     assert set(classification_metrics(seen_scores, seen_targets)) == {"top1", "top5", "nll", "per_class"}
     prediction_fields = {
@@ -237,6 +251,7 @@ def main():
         cfg = get_cfg()
         cfg.OUTPUT_DIR = temp_dir
         cfg.DATA.XLSA.PROTOCOL_MODE = "final_gzsl"
+        cfg.SOLVER.TOTAL_EPOCH = 2
         cfg.MONITOR.ENABLE = True
         cfg.MONITOR.OUTPUT_POLICY = "error_if_exists"
         cfg.MONITOR.PROBE.ENABLE = False
@@ -275,6 +290,31 @@ def main():
             visual_features=visual_unseen,
         )
         diagnostics.record_calibration(1)
+        with np.load(Path(temp_dir) / "diagnostics/eval_cache/epoch_0001/test_seen.npz") as compact_cache:
+            assert "scores" not in compact_cache.files
+            assert "visual_features" not in compact_cache.files
+            assert set(("topk_scores", "topk_local_indices", "true_class_scores")) <= set(compact_cache.files)
+            assert compact_cache["topk_scores"].dtype == np.float32
+            assert compact_cache["topk_local_indices"].dtype == np.int32
+            assert np.allclose(
+                compact_cache["true_class_scores"],
+                seen_scores[np.arange(seen_targets.size), seen_targets].astype(np.float32),
+            )
+        diagnostics.record_eval(
+            epoch=2,
+            split="test_seen",
+            scores=seen_scores,
+            targets_local=seen_targets,
+            targets_global=seen_targets,
+            sample_ids=[f"seen:{index}" for index in range(seen_targets.size)],
+            dataset=dataset,
+            visual_features=visual_seen,
+        )
+        with np.load(Path(temp_dir) / "diagnostics/eval_cache/epoch_0002/test_seen.npz") as final_cache:
+            assert "scores" in final_cache.files
+            assert final_cache["scores"].dtype == np.float32
+            assert "visual_features" in final_cache.files
+            assert "topk_scores" not in final_cache.files
         cadence_failed = False
         try:
             manager.record_epoch("train", "train", {"loss": 1.0})

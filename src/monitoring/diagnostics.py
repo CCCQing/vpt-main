@@ -34,6 +34,35 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _compact_eval_scores(
+    scores: np.ndarray,
+    targets_local: np.ndarray,
+    *,
+    topk: int = 20,
+) -> Dict[str, np.ndarray]:
+    if scores.ndim != 2:
+        raise ValueError(f"eval scores must be 2-D, got shape={scores.shape}")
+    if targets_local.ndim != 1 or targets_local.shape[0] != scores.shape[0]:
+        raise ValueError(
+            "targets_local must be a 1-D array aligned with eval score rows, "
+            f"got targets={targets_local.shape}, scores={scores.shape}"
+        )
+    if scores.shape[1] == 0:
+        raise ValueError("eval scores must contain at least one candidate class")
+    if np.any(targets_local < 0) or np.any(targets_local >= scores.shape[1]):
+        raise ValueError("targets_local contains an index outside the eval candidate space")
+
+    retained_k = min(int(topk), int(scores.shape[1]))
+    topk_local_indices = np.argsort(-scores, axis=1, kind="mergesort")[:, :retained_k]
+    topk_scores = np.take_along_axis(scores, topk_local_indices, axis=1)
+    true_class_scores = scores[np.arange(scores.shape[0]), targets_local]
+    return {
+        "topk_scores": topk_scores.astype(np.float32, copy=False),
+        "topk_local_indices": topk_local_indices.astype(np.int32, copy=False),
+        "true_class_scores": true_class_scores.astype(np.float32, copy=False),
+    }
+
+
 class DiagnosticManager:
     def __init__(self, cfg: Any, monitor_manager: Any, *, is_writer: bool = True) -> None:
         self.cfg = cfg
@@ -204,7 +233,8 @@ class DiagnosticManager:
     ) -> Dict[str, Dict[str, float]]:
         if not self.enabled:
             return {"prediction_health": {}, "class_error": {}}
-        score_matrix = _numpy(scores).astype(np.float64, copy=False)
+        stored_score_matrix = _numpy(scores).astype(np.float32, copy=False)
+        score_matrix = stored_score_matrix.astype(np.float64, copy=False)
         local_targets = _numpy(targets_local).astype(np.int64, copy=False)
         global_targets = _numpy(targets_global).astype(np.int64, copy=False)
         candidate = np.asarray(list(dataset.eval_local_classes), dtype=np.int64)
@@ -222,6 +252,12 @@ class DiagnosticManager:
         self.eval_cache[(int(epoch), str(split))] = cache
         if bool(self.cfg.MONITOR.DIAGNOSTICS.SAVE_EVAL_CACHE):
             arrays = {name: value for name, value in cache.items() if value is not None}
+            if int(epoch) == int(self.cfg.SOLVER.TOTAL_EPOCH):
+                arrays["scores"] = stored_score_matrix
+            else:
+                arrays.pop("scores", None)
+                arrays.pop("visual_features", None)
+                arrays.update(_compact_eval_scores(stored_score_matrix, local_targets, topk=20))
             self._write_npz_artifact(
                 "prediction_health",
                 f"eval_cache/epoch_{int(epoch):04d}/{split}.npz",

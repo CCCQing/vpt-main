@@ -2952,16 +2952,6 @@ class Trainer():
                             entity_type="representation",
                             entity_id="contextualized_prompt",
                         ))
-                    token_payload = {
-                        "sample_ids": affinity_result["sample_ids"],
-                        "token_sequence": token_sequence,
-                    }
-                    self.diagnostic_manager.record_probe_artifact(
-                        f"probe_vectors/token_sequence/{checkpoint_id}_{split}.npz",
-                        token_payload,
-                        is_array=True,
-                    )
-
             if bool(self.cfg.MONITOR.MODULE_EFFECT.ENABLE):
                 interventions = []
                 if bool(self.cfg.MONITOR.MODULE_EFFECT.PROMPT_ZERO) and self.prompt_parameter_tracker.active:
