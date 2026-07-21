@@ -57,25 +57,23 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
     failures = []
 
     expected = {
-        "MODEL.CLASSIFIER": (str(cfg.MODEL.CLASSIFIER).lower(), "vspcn_baseline"),
-        "SOLVER.MAIN_LOSS": (str(cfg.SOLVER.MAIN_LOSS).lower(), "vspcn"),
+        "MODEL.CLASSIFIER": (str(cfg.MODEL.CLASSIFIER).lower(), "r_similarity"),
+        "MODEL.R_SIMILARITY.SCORE_MODE": (str(cfg.MODEL.R_SIMILARITY.SCORE_MODE).lower(), "dot"),
+        "MODEL.R_SIMILARITY.LEARNABLE_SCALE": (bool(cfg.MODEL.R_SIMILARITY.LEARNABLE_SCALE), False),
+        "SOLVER.RSIM.ALIGN_MODE": (str(cfg.SOLVER.RSIM.ALIGN_MODE).lower(), "none"),
+        "SOLVER.RSIM.ALIGN_WEIGHT": (float(cfg.SOLVER.RSIM.ALIGN_WEIGHT), 0.0),
         "MODEL.PROMPT.INIT_SOURCE": (str(cfg.MODEL.PROMPT.INIT_SOURCE).lower(), "learned"),
         "MODEL.PROMPT.DISTRIBUTOR.ENABLE": (bool(cfg.MODEL.PROMPT.DISTRIBUTOR.ENABLE), False),
         "MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE": (bool(cfg.MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE), False),
         "MODEL.SEMANTIC_TOKENS.ENABLE": (bool(cfg.MODEL.SEMANTIC_TOKENS.ENABLE), False),
         "MODEL.AFFINITY.ENABLE": (bool(cfg.MODEL.AFFINITY.ENABLE), False),
         "MODEL.ATTENTION_MEDIATION.ENABLE": (bool(cfg.MODEL.ATTENTION_MEDIATION.ENABLE), False),
-        "MODEL.CONSISTENCY.ENABLE": (bool(cfg.MODEL.CONSISTENCY.ENABLE), False),
         "MODEL.GRAPH_PROB_PRIOR.ENABLE": (bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE), False),
         "MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT": (float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT), 0.0),
-        "SOLVER.LOSS_VSPCN_AR_WEIGHT": (float(cfg.SOLVER.LOSS_VSPCN_AR_WEIGHT), 0.0),
-        "SOLVER.LOSS_CM_WEIGHT": (float(cfg.SOLVER.LOSS_CM_WEIGHT), 0.0),
         "SOLVER.LOSS_SEM_MED_WEIGHT": (float(cfg.SOLVER.LOSS_SEM_MED_WEIGHT), 0.0),
         "SOLVER.LOSS_SPV_WEIGHT": (float(cfg.SOLVER.LOSS_SPV_WEIGHT), 0.0),
         "SOLVER.LOSS_ATTR_WEIGHT": (float(cfg.SOLVER.LOSS_ATTR_WEIGHT), 0.0),
         "SOLVER.LOSS_PROMPT_KL_WEIGHT": (float(cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT), 0.0),
-        "SOLVER.LOSS_AGR_RES_WEIGHT": (float(cfg.SOLVER.LOSS_AGR_RES_WEIGHT), 0.0),
-        "SOLVER.LOSS_CONS_WEIGHT": (float(cfg.SOLVER.LOSS_CONS_WEIGHT), 0.0),
         "SOLVER.VIS.ENABLE": (bool(cfg.SOLVER.VIS.ENABLE), False),
         "SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT": (bool(cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT), True),
         "MONITOR.ENABLE": (bool(cfg.MONITOR.ENABLE), True),
@@ -99,8 +97,6 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         failures.append("MODEL.PROMPT.NUM_TOKENS must be 5 for the initial A-series protocol")
     if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
         failures.append("DATA.XLSA.PROTOCOL_MODE must be 'final_gzsl' for the A-series")
-    if not bool(cfg.MODEL.R_SIMILARITY.ENABLE):
-        failures.append("MODEL.R_SIMILARITY.ENABLE must remain true until the current training entry is refactored")
     if cfg.SEED is None:
         failures.append("SEED must be set for the A-series reproducibility protocol")
     if int(cfg.NUM_GPUS) != 1:
@@ -131,7 +127,7 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
     failures = []
 
     if not any(name.startswith("r_similarity_head.prototype_proj") for name in trainable):
-        failures.append("VSPCN prototype projection is not trainable")
+        failures.append("R-similarity prototype projection is not trainable")
     if any("semantic_token" in name for name in trainable):
         failures.append("semantic-token parameters remain trainable")
     if any("attention_mediation" in name for name in trainable):
@@ -225,8 +221,8 @@ def main():
         failures.extend(model_failures)
 
     print(f"baseline stage: {stage}")
-    print("semantic matcher: VSPCN attribute projection plus CLS-prototype dot product")
-    print("main loss: CE only; VSPCN AR weight is zero")
+    print("semantic matcher: R-similarity attribute projection plus CLS-prototype dot product")
+    print("classification loss: CE only; RSIM alignment is disabled")
     streams = seed_streams(cfg.SEED)
     print(
         "random streams: master={} classifier_init={} prompt_init={} data_order={}".format(
@@ -236,7 +232,7 @@ def main():
             streams["data_order"],
         )
     )
-    print("compatibility exception: MODEL.R_SIMILARITY.ENABLE=true is required by train.py, but CLASSIFIER=vspcn_baseline selects VSPCNBaselineClassifier")
+    print("classifier route: r_similarity with SCORE_MODE=dot")
     print(f"constructed-model check: {'run' if args.build_model else 'not run'}")
     if trainable:
         print("trainable parameters: {}".format(", ".join(trainable)))

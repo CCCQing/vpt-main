@@ -42,15 +42,17 @@ def _affinity_source_active(cfg: Any) -> bool:
 
 
 def _auxiliary_loss_source_active(cfg: Any) -> bool:
+    main_alignment_weight = (
+        float(cfg.SOLVER.RSIM.ALIGN_WEIGHT)
+        if str(cfg.SOLVER.RSIM.ALIGN_MODE).lower() != "none"
+        else 0.0
+    )
     scalar_weights = (
-        cfg.SOLVER.LOSS_VSPCN_AR_WEIGHT,
-        cfg.SOLVER.LOSS_CM_WEIGHT,
+        main_alignment_weight,
         cfg.SOLVER.LOSS_SEM_MED_WEIGHT,
         cfg.SOLVER.LOSS_SPV_WEIGHT,
         cfg.SOLVER.LOSS_ATTR_WEIGHT,
         cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT,
-        cfg.SOLVER.LOSS_AGR_RES_WEIGHT,
-        cfg.SOLVER.LOSS_CONS_WEIGHT,
         cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT,
     )
     return any(float(value) > 0.0 for value in scalar_weights)

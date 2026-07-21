@@ -7,7 +7,6 @@ MODEL:
 SOLVER:
   SCHEDULER: "cosine"
   WARMUP_EPOCH: 5
-  MAIN_LOSS: "rsim"
   OPTIMIZER: "adamw"
   MOMENTUM: 0.9
   WEIGHT_DECAY: 0.0001

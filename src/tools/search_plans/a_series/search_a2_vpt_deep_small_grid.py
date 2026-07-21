@@ -33,12 +33,14 @@ class Job:
     base_lr: float
     total_epoch: int
     seed: int
+    score_mode: str
+    name: str
     output_root: Path
     log_path: Path
 
     @property
     def trial_name(self) -> str:
-        return self.output_root.name
+        return self.name
 
 
 def _parse_int_grid(raw: str, name: str) -> List[int]:
@@ -58,6 +60,16 @@ def _parse_float_grid(raw: str, name: str) -> List[float]:
         raise ValueError("{} must be a comma-separated numeric list.".format(name))
     if not values or len(set(values)) != len(values) or min(values) <= 0:
         raise ValueError("{} must contain unique positive values.".format(name))
+    return values
+
+
+def _parse_seed_grid(raw: str, name: str) -> List[int]:
+    try:
+        values = [int(item.strip()) for item in str(raw).split(",") if item.strip()]
+    except ValueError:
+        raise ValueError("{} must be a comma-separated integer list.".format(name))
+    if not values or len(set(values)) != len(values) or min(values) < 0:
+        raise ValueError("{} must contain unique non-negative integers.".format(name))
     return values
 
 
@@ -174,7 +186,9 @@ def _command(python_bin: str, config_file: Path, job: Job) -> List[str]:
         "DATA.XLSA.PROTOCOL_MODE",
         "final_gzsl",
         "MODEL.CLASSIFIER",
-        "vspcn_baseline",
+        "r_similarity",
+        "MODEL.R_SIMILARITY.SCORE_MODE",
+        job.score_mode,
         "MODEL.PROMPT.ENABLE",
         "True",
         "MODEL.PROMPT.BACKEND",
@@ -187,9 +201,9 @@ def _command(python_bin: str, config_file: Path, job: Job) -> List[str]:
         str(job.num_tokens),
         "MODEL.PROMPT.DISTRIBUTOR.ENABLE",
         "False",
-        "SOLVER.MAIN_LOSS",
-        "vspcn",
-        "SOLVER.LOSS_VSPCN_AR_WEIGHT",
+        "SOLVER.RSIM.ALIGN_MODE",
+        "none",
+        "SOLVER.RSIM.ALIGN_WEIGHT",
         "0.0",
         "SOLVER.BASE_LR",
         str(job.base_lr),
@@ -207,7 +221,9 @@ def _base_row(job: Job) -> Dict[str, object]:
         "base_lr": job.base_lr,
         "total_epoch": job.total_epoch,
         "weight_decay": FIXED_WEIGHT_DECAY,
-        "ar_weight": 0.0,
+        "score_mode": job.score_mode,
+        "align_mode": "none",
+        "align_weight": 0.0,
         "seed": job.seed,
         "status": "pending",
         "returncode": "",
@@ -290,7 +306,7 @@ def _sort_rows(rows: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
 def _write_summaries(out_root: Path, rows: Sequence[Dict[str, object]]) -> None:
     ordered = _sort_rows(rows)
     fieldnames = list(_base_row(
-        Job(0, 0, 0.0, 0, 0, Path("placeholder"), Path("placeholder"))
+        Job(0, 0, 0.0, 0, 0, "dot", "placeholder", Path("placeholder"), Path("placeholder"))
     ).keys())
     with (out_root / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
@@ -305,24 +321,37 @@ def _build_jobs(
     token_grid: Sequence[int],
     lr_grid: Sequence[float],
     epoch_grid: Sequence[int],
-    seed: int,
+    seeds: Sequence[int],
+    score_mode: str,
 ) -> List[Job]:
     jobs = []
-    for index, (num_tokens, base_lr, total_epoch) in enumerate(
-        product(token_grid, lr_grid, epoch_grid), start=1
-    ):
-        trial_name = _trial_name(index, num_tokens, base_lr, total_epoch)
-        jobs.append(
-            Job(
-                index=index,
-                num_tokens=int(num_tokens),
-                base_lr=float(base_lr),
-                total_epoch=int(total_epoch),
-                seed=int(seed),
-                output_root=out_root / trial_name,
-                log_path=out_root / "launcher_logs" / "{}.log".format(trial_name),
+    use_seed_subdirs = len(seeds) > 1
+    for seed in seeds:
+        for index, (num_tokens, base_lr, total_epoch) in enumerate(
+            product(token_grid, lr_grid, epoch_grid), start=1
+        ):
+            base_name = _trial_name(index, num_tokens, base_lr, total_epoch)
+            if use_seed_subdirs:
+                trial_name = "seed{}/{}".format(seed, base_name)
+                output_root = out_root / "seed{}".format(seed) / base_name
+                log_name = "seed{}_{}.log".format(seed, base_name)
+            else:
+                trial_name = base_name
+                output_root = out_root / base_name
+                log_name = "{}.log".format(base_name)
+            jobs.append(
+                Job(
+                    index=index,
+                    num_tokens=int(num_tokens),
+                    base_lr=float(base_lr),
+                    total_epoch=int(total_epoch),
+                    seed=int(seed),
+                    score_mode=str(score_mode),
+                    name=trial_name,
+                    output_root=output_root,
+                    log_path=out_root / "launcher_logs" / log_name,
+                )
             )
-        )
     return jobs
 
 
@@ -337,13 +366,21 @@ def _progress_trial(job: Job, trial_index: int) -> Dict[str, object]:
             "base_lr": float(job.base_lr),
             "total_epoch": int(job.total_epoch),
             "seed": int(job.seed),
+            "score_mode": str(job.score_mode),
         },
         "overrides": {
             "SOLVER.TOTAL_EPOCH": int(job.total_epoch),
             "MODEL.PROMPT.NUM_TOKENS": int(job.num_tokens),
+            "MODEL.R_SIMILARITY.SCORE_MODE": str(job.score_mode),
+            "SOLVER.RSIM.ALIGN_MODE": "none",
+            "SOLVER.RSIM.ALIGN_WEIGHT": 0.0,
         },
         "output_dir": str(job.output_root),
-        "identity_fields": {"base_lr": float(job.base_lr), "seed": int(job.seed)},
+        "identity_fields": {
+            "base_lr": float(job.base_lr),
+            "seed": int(job.seed),
+            "score_mode": str(job.score_mode),
+        },
         "eta_fields": {"num_tokens": int(job.num_tokens)},
         "eta_compatibility_keys": ["runner", "stage", "nproc", "total_epochs"],
     }
@@ -357,7 +394,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--num-tokens-grid", default="8,16,32")
     parser.add_argument("--lr-grid", default="6e-4,1e-3,1.4e-3")
     parser.add_argument("--epoch-grid", default="15,20,25")
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--score-mode", choices=("dot", "cosine"), default="dot")
+    parser.add_argument("--seed", type=int, default=0, help="Single-seed compatibility option.")
+    parser.add_argument(
+        "--seeds",
+        default=None,
+        help="Comma-separated seeds; overrides --seed and isolates outputs by seed.",
+    )
     parser.add_argument("--gpu-groups", default="0;1")
     parser.add_argument("--max-workers", type=int, default=2)
     parser.add_argument(
@@ -381,9 +424,10 @@ def main() -> None:
         lr_grid = _parse_float_grid(args.lr_grid, "--lr-grid")
         epoch_grid = _parse_int_grid(args.epoch_grid, "--epoch-grid")
         gpu_groups = _parse_gpu_groups(args.gpu_groups)
+        seeds = _parse_seed_grid(args.seeds, "--seeds") if args.seeds is not None else [args.seed]
     except ValueError as exc:
         raise SystemExit(str(exc))
-    if args.seed < 0:
+    if min(seeds) < 0:
         raise SystemExit("--seed must be non-negative.")
     if args.max_workers <= 0 or args.max_workers > len(gpu_groups):
         raise SystemExit("--max-workers must be positive and no larger than the GPU-group count.")
@@ -395,7 +439,7 @@ def main() -> None:
     if not config_file.is_file():
         raise SystemExit("Missing config file: {}".format(config_file))
     out_root = args.out_root.expanduser().resolve()
-    jobs = _build_jobs(out_root, token_grid, lr_grid, epoch_grid, args.seed)
+    jobs = _build_jobs(out_root, token_grid, lr_grid, epoch_grid, seeds, args.score_mode)
 
     pending = []
     existing_rows = []
@@ -422,8 +466,10 @@ def main() -> None:
         "lr_grid": lr_grid,
         "epoch_grid": epoch_grid,
         "weight_decay": FIXED_WEIGHT_DECAY,
-        "ar_weight": 0.0,
-        "seed": args.seed,
+        "score_mode": args.score_mode,
+        "align_mode": "none",
+        "align_weight": 0.0,
+        "seeds": seeds,
         "total_trials": len(jobs),
         "selection_metric": "gzsl_h_final",
         "gpu_groups": gpu_groups,

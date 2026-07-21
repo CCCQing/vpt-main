@@ -6,7 +6,7 @@ DATA:
     PROTOCOL_MODE: "final_gzsl"      #dev / final_zsl / final_gzsl
 MODEL:
   TYPE: "vit"
-  CLASSIFIER: "vspcn_baseline"
+  CLASSIFIER: "r_similarity"
   PROMPT:
     ENABLE: True
     BACKEND: "dynamic"             # dynamic / vpt_deep
@@ -55,22 +55,18 @@ MODEL:
     SEMANTIC_GAMMA_INIT: 0.0
 
   R_SIMILARITY:
-    ENABLE: True
-    USE_COSINE: True
+    SCORE_MODE: "dot"
+    LEARNABLE_SCALE: False
     LOGIT_SCALE_INIT: 10.0
-
-  CONSISTENCY:
-    ENABLE: False
-    PROJ: "linear"
-    DIST: "cosine"
 
 SOLVER:
   BASE_LR: 0.0006
   WEIGHT_DECAY: 0.00001
   WARMUP_EPOCH: 3
   TOTAL_EPOCH: 30
-  MAIN_LOSS: "vspcn"         # vspcn / rsim / rsim_v2
-  LOSS_VSPCN_AR_WEIGHT: 0.0005
+  RSIM:
+    ALIGN_MODE: "ar"
+    ALIGN_WEIGHT: 0.0005
   LOSS_SEM_MED_WEIGHT: 0.0
   LOSS_SPV_WEIGHT: 0.0
   SEM_MED:
@@ -86,8 +82,6 @@ SOLVER:
     NORM: "softmax"
     DETACH: "none"           # mediated / direct / none
     LAYERS: []
-  LOSS_CM_WEIGHT: 0.05
-  LOSS_CONS_WEIGHT: 0.00
   OPTIMIZER: "adamw"
   SCHEDULER: "cosine"
   BIAS_MULTIPLIER: 1.0

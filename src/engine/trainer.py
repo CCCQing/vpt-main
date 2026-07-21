@@ -622,7 +622,7 @@ class Trainer():
         1. normal head
         2. posterior mu / logvar
         3. prompt generator
-        4. r_similarity_head  visual / semantic proj
+        4. r_similarity_head prototype projection / logit scale
         5. semantic side branch """
         refs = {}
         refs["head.last_layer.weight"] = self._find_param_by_name_contains(
@@ -640,11 +640,8 @@ class Trainer():
         refs["prompt_generator"] = self._find_param_by_name_contains(
             ["prompt_init_provider.prompt_generator.mlp.3.weight", "prompt_init_provider.prompt_generator"]
         )
-        refs["r_head.visual_proj"] = self._find_param_by_name_contains(
-            ["r_similarity_head.visual_proj.weight", "r_similarity_head.visual_proj"]
-        )
-        refs["r_head.semantic_proj"] = self._find_param_by_name_contains(
-            ["r_similarity_head.semantic_proj.weight", "r_similarity_head.semantic_proj"]
+        refs["r_head.prototype_proj"] = self._find_param_by_name_contains(
+            ["r_similarity_head.prototype_proj.weight", "r_similarity_head.prototype_proj"]
         )
         refs["r_head.logit_scale"] = self._find_param_by_name_contains(
             ["r_similarity_head.logit_scale"]

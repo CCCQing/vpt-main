@@ -154,6 +154,15 @@ output/
 # local historical experiment scripts
 src/tools/historical_files/
 
+# local research notes and auxiliary scripts
+/cub_attribute_localization/
+/docs/
+/References/
+/ATTENTION_MEDIATION.ENABLE.txt
+/_tmp_current_monitor_system.txt
+/test8.py
+/test71.py
+
 # model checkpoints / eval artifacts
 *.pth
 *.pt

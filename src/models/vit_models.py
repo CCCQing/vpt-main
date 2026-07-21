@@ -9,7 +9,7 @@ import torch.nn as nn
 from .build_vit_backbone import (build_vit_sup_models)
 from ..utils import logging
 logger = logging.get_logger("visual_prompt")
-from .classifiers import RSimilarityClassifier, RSimilarityClassifierV2, VSPCNBaselineClassifier
+from .classifiers import RSimilarityClassifier
 from ..utils.param_logging import log_trainable_parameters
 from ..utils.reproducibility import derive_seed, isolated_torch_cpu_seed
 
@@ -22,10 +22,8 @@ class ViT(nn.Module):
         super(ViT, self).__init__()
         self.cfg = cfg
 
-        classifier_name = cfg.MODEL.CLASSIFIER.lower()
         use_plain_vit_backbone = (
-            classifier_name in {"vspcn_baseline", "r_similarity_v2"}
-            and (not cfg.MODEL.PROMPT.ENABLE)
+            (not cfg.MODEL.PROMPT.ENABLE)
             and (not cfg.MODEL.SEMANTIC_TOKENS.ENABLE)
         )
 
@@ -182,11 +180,8 @@ class ViT(nn.Module):
 
     def attach_r_similarity_head(self, class_attributes):
 
-        if not self.cfg.MODEL.R_SIMILARITY.ENABLE:
-            raise ValueError("Current prompt-only mainline requires MODEL.R_SIMILARITY.ENABLE=True")
-
         if class_attributes is None:
-            raise ValueError("class_attributes must be provided when R-similarity is enabled")
+            raise ValueError("class_attributes must be provided for r_similarity")
 
         if not isinstance(class_attributes, torch.Tensor):
             class_attributes = torch.from_numpy(class_attributes)
@@ -196,18 +191,12 @@ class ViT(nn.Module):
         device = next(self.parameters()).device
         class_attributes = class_attributes.to(device)
         classifier_name = self.cfg.MODEL.CLASSIFIER.lower()
-        if classifier_name == "r_similarity":
-            head_cls = RSimilarityClassifier
-        elif classifier_name == "r_similarity_v2":
-            head_cls = RSimilarityClassifierV2
-        elif classifier_name == "vspcn_baseline":
-            head_cls = VSPCNBaselineClassifier
-        else:
+        if classifier_name != "r_similarity":
             raise ValueError(f"Unsupported MODEL.CLASSIFIER='{self.cfg.MODEL.CLASSIFIER}'")
 
         classifier_init_seed = derive_seed(self.cfg.SEED, "classifier_init")
         with isolated_torch_cpu_seed(classifier_init_seed):
-            head = head_cls(
+            head = RSimilarityClassifier(
                 class_attributes,
                 hidden_size=self.feat_dim,
                 cfg=self.cfg,

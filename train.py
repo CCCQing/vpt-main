@@ -171,11 +171,9 @@ def train(cfg, args):
     logger.info("Constructing models...")
     model, cur_device = build_model(cfg)
 
-    if not cfg.MODEL.R_SIMILARITY.ENABLE:
-        raise ValueError("Current prompt-only XLSA mainline requires MODEL.R_SIMILARITY.ENABLE=True.")
     class_attr = train_loader.dataset.class_attributes
     if class_attr is None:
-        raise ValueError("R-similarity head enabled but no class_attributes provided by dataset")
+        raise ValueError("R-similarity head requires class_attributes from the dataset")
     if hasattr(model, "attach_r_similarity_head"):
         model.attach_r_similarity_head(class_attr)
     trainable_manifest_path = write_trainable_parameter_manifest(cfg, model)
