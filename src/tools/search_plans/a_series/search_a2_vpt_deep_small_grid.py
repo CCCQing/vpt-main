@@ -4,20 +4,24 @@ import argparse
 import csv
 import json
 import os
-import queue
 import re
 import shlex
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[4]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+
+
 DEFAULT_CONFIG = ROOT / "configs" / "baseline_rebuild" / "A-04-A2-vpt-deep-ce.yaml"
 FIXED_WEIGHT_DECAY = 1.0e-5
 
@@ -240,9 +244,9 @@ def _run_job(job: Job, python_bin: str, config_file: Path, gpu: str) -> Dict[str
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu
     env["PYTHONUNBUFFERED"] = "1"
+    env["VPT_SEARCH_PROGRESS_PATH"] = str((job.output_root / "progress.json").resolve())
     job.log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.time()
-    print("[start] {} gpu={} log={}".format(job.trial_name, gpu, job.log_path), flush=True)
     with job.log_path.open("w", encoding="utf-8") as handle:
         handle.write("CUDA_VISIBLE_DEVICES={}\n".format(gpu))
         handle.write(_format_command(command) + "\n\n")
@@ -271,16 +275,6 @@ def _run_job(job: Job, python_bin: str, config_file: Path, gpu: str) -> Dict[str
         row["status"] = "failed_missing_metrics"
     else:
         row["status"] = "completed"
-    print(
-        "[{}] {} gpu={} final_H={} duration_min={:.1f}".format(
-            row["status"],
-            job.trial_name,
-            gpu,
-            row.get("gzsl_h_final", ""),
-            float(row["duration_seconds"]) / 60.0,
-        ),
-        flush=True,
-    )
     return row
 
 
@@ -332,6 +326,29 @@ def _build_jobs(
     return jobs
 
 
+def _progress_trial(job: Job, trial_index: int) -> Dict[str, object]:
+    return {
+        "trial_index": int(trial_index),
+        "trial_name": str(job.trial_name),
+        "runner": "train",
+        "stage": "A2_grid",
+        "combo": {
+            "num_tokens": int(job.num_tokens),
+            "base_lr": float(job.base_lr),
+            "total_epoch": int(job.total_epoch),
+            "seed": int(job.seed),
+        },
+        "overrides": {
+            "SOLVER.TOTAL_EPOCH": int(job.total_epoch),
+            "MODEL.PROMPT.NUM_TOKENS": int(job.num_tokens),
+        },
+        "output_dir": str(job.output_root),
+        "identity_fields": {"base_lr": float(job.base_lr), "seed": int(job.seed)},
+        "eta_fields": {"num_tokens": int(job.num_tokens)},
+        "eta_compatibility_keys": ["runner", "stage", "nproc", "total_epochs"],
+    }
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Small final_gzsl grid around the historical VPT-Deep baseline."
@@ -350,6 +367,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--progress-interval", type=float, default=2.0)
+    parser.add_argument("--progress-width", type=int, default=120)
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -367,6 +387,10 @@ def main() -> None:
         raise SystemExit("--seed must be non-negative.")
     if args.max_workers <= 0 or args.max_workers > len(gpu_groups):
         raise SystemExit("--max-workers must be positive and no larger than the GPU-group count.")
+    if args.progress_interval <= 0.0:
+        raise SystemExit("--progress-interval must be positive.")
+    if args.progress_width < 80:
+        raise SystemExit("--progress-width must be at least 80.")
     config_file = args.config_file.expanduser().resolve()
     if not config_file.is_file():
         raise SystemExit("Missing config file: {}".format(config_file))
@@ -423,24 +447,23 @@ def main() -> None:
         print("All {} grid trials are already completed.".format(len(jobs)), flush=True)
         return
 
-    gpu_pool: "queue.Queue[str]" = queue.Queue()
-    active_gpus = gpu_groups[: min(args.max_workers, len(gpu_groups))]
-    for gpu in active_gpus:
-        gpu_pool.put(gpu)
-
-    def run_with_gpu(job: Job) -> Dict[str, object]:
-        gpu = gpu_pool.get()
-        try:
-            return _run_job(job, args.python_bin, config_file, gpu)
-        finally:
-            gpu_pool.put(gpu)
-
-    new_rows = []
-    with ThreadPoolExecutor(max_workers=len(active_gpus)) as executor:
-        futures = [executor.submit(run_with_gpu, job) for job in pending]
-        for future in as_completed(futures):
-            new_rows.append(future.result())
-            _write_summaries(out_root, existing_rows + new_rows)
+    all_trials = [_progress_trial(job, index) for index, job in enumerate(jobs)]
+    trial_by_job = {job: trial for job, trial in zip(jobs, all_trials)}
+    new_rows = run_parallel_trials(
+        all_trials=all_trials,
+        pending_items=pending,
+        pending_trials=[trial_by_job[job] for job in pending],
+        out_root=out_root,
+        gpu_groups=gpu_groups,
+        max_workers=args.max_workers,
+        initial_completed=len(existing_rows),
+        progress_interval=args.progress_interval,
+        progress_width=args.progress_width,
+        progress_enabled=not args.no_progress,
+        run_item=lambda job, gpu: _run_job(job, args.python_bin, config_file, gpu),
+        item_name=lambda job: str(job.trial_name),
+        on_result=lambda rows: _write_summaries(out_root, existing_rows + list(rows)),
+    )
 
     rows = existing_rows + new_rows
     _write_summaries(out_root, rows)

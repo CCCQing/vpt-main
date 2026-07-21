@@ -151,6 +151,9 @@ output/
 **/monitor/
 **/diagnose/
 
+# local historical experiment scripts
+src/tools/historical_files/
+
 # model checkpoints / eval artifacts
 *.pth
 *.pt

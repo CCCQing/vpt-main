@@ -1,5 +1,5 @@
 BASE_CONFIG_FILE: "configs/prompt/cub.yaml"
-DIAGNOSE_SCRIPT: "src/tools/diagnose_graph_prob_prior_temperatures.py"
+DIAGNOSE_SCRIPT: "src/tools/historical_files/graph_prob_prior_diagnostics/diagnose_graph_prob_prior_temperatures.py"
 TRAIN_SCRIPT: "train.py"
 RUNNER: "train"
 PYTHON_BIN: ""

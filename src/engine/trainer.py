@@ -54,6 +54,7 @@ from ..solver.losses import build_loss
 from ..utils import logging
 from ..utils import distributed as du
 from ..utils.train_utils import AverageMeter, gpu_mem_usage
+from ..utils.runtime_progress import TrainingProgressController
 from ..monitoring import (
     DiagnosticManager,
     MonitorManager,
@@ -248,6 +249,7 @@ class Trainer():
         self._trace_stage = "init"
         self._trace_global_step = 0
         self._graph_prob_prior_forward = 0
+        self._runtime_progress = TrainingProgressController(cfg, logger)
         self.graph_prob_prior_loss_active = (
             bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE)
             and float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT) > 0.0
@@ -2332,6 +2334,39 @@ class Trainer():
             "sample_count": sample_count,
         }
 
+    def _build_train_progress(self, epoch, effective_total_epoch, total_data, train_loader):
+        return self._runtime_progress.build_train_progress(
+            epoch,
+            effective_total_epoch,
+            total_data,
+            train_loader,
+        )
+
+    def _write_progress_state(self, force=False, **updates):
+        self._runtime_progress.write_state(force=force, **updates)
+
+    def _begin_progress_epoch(self, epoch, total_epochs, total_batches):
+        self._runtime_progress.begin_epoch(epoch, total_epochs, total_batches)
+
+    def _record_progress_batch(self, phase, epoch, total_epochs, batch, total_batches, batch_time_seconds):
+        self._runtime_progress.record_batch(
+            phase,
+            epoch,
+            total_epochs,
+            batch,
+            total_batches,
+            batch_time_seconds,
+        )
+
+    def _finish_progress_train_phase(self, epoch, total_epochs, total_batches):
+        self._runtime_progress.finish_train_phase(epoch, total_epochs, total_batches)
+
+    def _finish_progress_epoch(self, epoch, total_epochs):
+        self._runtime_progress.finish_epoch(epoch, total_epochs)
+
+    def _finalize_progress_state(self, status):
+        self._runtime_progress.finalize(status)
+
     def _run_train_epoch(self, epoch, effective_total_epoch, total_data, train_loader, log_interval, losses, batch_time, data_time):
         # 只负责共享的单个训练 epoch
         losses.reset()
@@ -2347,53 +2382,89 @@ class Trainer():
 
         self.model.train()
         end = time.time()
+        self._begin_progress_epoch(epoch, effective_total_epoch, total_data)
+        progress = self._build_train_progress(
+            epoch,
+            effective_total_epoch,
+            total_data,
+            train_loader,
+        )
+        iterator = progress if progress is not None else train_loader
+        world_size = max(1, int(du.get_world_size()))
 
-        for idx, input_data in enumerate(train_loader):
-            self._trace_stage = "train"
-            self._trace_epoch = int(epoch)
-            self._trace_iter = int(idx)
-            self._trace_global_step += 1
+        try:
+            for idx, input_data in enumerate(iterator):
+                self._trace_stage = "train"
+                self._trace_epoch = int(epoch)
+                self._trace_iter = int(idx)
+                self._trace_global_step += 1
 
-            X, targets, attributes = self.get_input(input_data)
-            data_time.update(time.time() - end)
+                X, targets, attributes = self.get_input(input_data)
+                data_time.update(time.time() - end)
 
-            train_loss, _ = self.forward_one_batch(
-                X,
-                targets,
-                True,
-                attributes=attributes,
-                dataset=train_loader.dataset,
-            )
-
-            losses.update(train_loss.item(), X.shape[0])
-            if self.graph_prob_prior_loss_active:
-                self._graph_prob_prior_forward += 1
-            self._record_train_step_monitors(train_loss)
-            batch_time.update(time.time() - end)
-            end = time.time()
-
-            if (idx + 1) % log_interval == 0:
-                seconds_per_batch = batch_time.val
-                eta = datetime.timedelta(
-                    seconds=int(
-                        seconds_per_batch * (total_data - idx - 1)
-                        + seconds_per_batch * total_data * (effective_total_epoch - epoch - 1)
-                    )
+                train_loss, _ = self.forward_one_batch(
+                    X,
+                    targets,
+                    True,
+                    attributes=attributes,
+                    dataset=train_loader.dataset,
                 )
-                logger.info(
-                    "\tTraining {}/{}. train loss: {:.4f},".format(
-                        idx + 1,
-                        total_data,
-                        train_loss
-                    )
-                    + "\t{:.4f} s / batch. (data: {:.2e}). ETA={}, ".format(
-                        seconds_per_batch,
-                        data_time.val,
-                        str(eta),
-                    )
-                    + "max mem: {:.1f} GB ".format(gpu_mem_usage())
-                    + self._format_graph_prob_prior_monitor_log()
+
+                losses.update(train_loss.item(), X.shape[0])
+                if self.graph_prob_prior_loss_active:
+                    self._graph_prob_prior_forward += 1
+                self._record_train_step_monitors(train_loss)
+                batch_time.update(time.time() - end)
+                end = time.time()
+                self._record_progress_batch(
+                    "train",
+                    epoch,
+                    effective_total_epoch,
+                    idx + 1,
+                    total_data,
+                    batch_time.val,
                 )
+
+                if progress is not None:
+                    loss_label = "loss" if world_size == 1 else "loss_r0"
+                    mem_label = "mem" if world_size == 1 else "mem_r0"
+                    progress.set_postfix_str(
+                        f"{loss_label}={train_loss.item():.4f}, "
+                        f"lr={lr:.2e}, {mem_label}={gpu_mem_usage():.1f}G",
+                        refresh=False,
+                    )
+
+                if (idx + 1) % log_interval == 0:
+                    seconds_per_batch = batch_time.val
+                    eta = datetime.timedelta(
+                        seconds=int(
+                            seconds_per_batch * (total_data - idx - 1)
+                            + seconds_per_batch * total_data * (effective_total_epoch - epoch - 1)
+                        )
+                    )
+                    if progress is not None:
+                        progress.clear()
+                    logger.info(
+                        "\tTraining {}/{}. train loss: {:.4f},".format(
+                            idx + 1,
+                            total_data,
+                            train_loss
+                        )
+                        + "\t{:.4f} s / batch. (data: {:.2e}). ETA={}, ".format(
+                            seconds_per_batch,
+                            data_time.val,
+                            str(eta),
+                        )
+                        + "max mem: {:.1f} GB ".format(gpu_mem_usage())
+                        + self._format_graph_prob_prior_monitor_log()
+                    )
+                    if progress is not None:
+                        progress.refresh()
+        finally:
+            if progress is not None:
+                progress.refresh()
+                progress.close()
+        self._finish_progress_train_phase(epoch, effective_total_epoch, total_data)
 
         epoch_metrics = self._aggregate_train_epoch_metrics(losses, batch_time, data_time)
         logger.info(
@@ -3117,6 +3188,7 @@ class Trainer():
                     sorted(list(metrics_this_epoch.keys())) if isinstance(metrics_this_epoch, dict) else [],
                 )
                 patience += 1
+                self._finish_progress_epoch(epoch, total_epoch)
                 if patience >= self.cfg.SOLVER.PATIENCE:
                     logger.info("No improvement. Breaking out of loop.")
                     break
@@ -3158,6 +3230,7 @@ class Trainer():
             else:
                 patience += 1
 
+            self._finish_progress_epoch(epoch, total_epoch)
             if patience >= self.cfg.SOLVER.PATIENCE:
                 logger.info("No improvement. Breaking out of loop.")
                 break
@@ -3212,6 +3285,7 @@ class Trainer():
 
             if str(self.evaluator.task_type).lower() == "gzsl":
                 self._update_gzsl_record_metrics(epoch, test_seen_loader, test_unseen_loader, seen_metrics, unseen_metrics)
+            self._finish_progress_epoch(epoch, total_epoch)
 
         if bool(self.cfg.MONITOR.MODULE_EFFECT.ENABLE) and not bool(
             self.cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT
@@ -3272,6 +3346,14 @@ class Trainer():
 
     def train_classifier(self, train_loader, val_loader, test_seen_loader, test_unseen_loader):
         completed = False
+        self._write_progress_state(
+            force=True,
+            status="running",
+            phase="initializing",
+            epoch=0,
+            completed_epochs=0,
+            total_epochs=int(self.cfg.SOLVER.TOTAL_EPOCH),
+        )
         try:
             self.diagnostic_manager.record_static_semantic_graph(train_loader.dataset)
             if val_loader is not None:
@@ -3290,6 +3372,7 @@ class Trainer():
             completed = True
             return result
         finally:
+            self._finalize_progress_state("completed" if completed else "interrupted")
             self.diagnostic_manager.finalize(
                 status="completed" if completed else "interrupted"
             )
@@ -3324,6 +3407,16 @@ class Trainer():
         test_name = prefix + "_" + data_loader.dataset.name
         total = len(data_loader)
         eval_epoch = int(self._trace_epoch + 1) if self._trace_epoch >= 0 else 0
+        self._write_progress_state(
+            force=True,
+            status="running",
+            phase=str(prefix),
+            epoch=eval_epoch,
+            completed_epochs=max(0, eval_epoch - 1),
+            total_epochs=int(self.cfg.SOLVER.TOTAL_EPOCH),
+            batch=0,
+            total_batches=int(total),
+        )
         self.monitor_manager.set_context(
             stage=f"eval_{prefix}",
             epoch=eval_epoch,
@@ -3365,6 +3458,14 @@ class Trainer():
             losses.update(loss, X.shape[0])
 
             batch_time.update(time.time() - end)
+            self._record_progress_batch(
+                str(prefix),
+                int(self._trace_epoch),
+                int(self.cfg.SOLVER.TOTAL_EPOCH),
+                idx + 1,
+                total,
+                batch_time.val,
+            )
 
             # periodic eval log
             if (idx + 1) % log_interval == 0:
@@ -3495,5 +3596,17 @@ class Trainer():
             sample_ids=total_sample_ids,
             dataset=dataset,
             visual_features=visual_features,
+        )
+        epoch_elapsed = self._runtime_progress.current_epoch_elapsed()
+        self._write_progress_state(
+            force=True,
+            status="running",
+            phase=f"{prefix}_complete",
+            epoch=eval_epoch,
+            completed_epochs=max(0, eval_epoch - 1),
+            total_epochs=int(self.cfg.SOLVER.TOTAL_EPOCH),
+            batch=int(total),
+            total_batches=int(total),
+            epoch_elapsed_seconds=float(epoch_elapsed),
         )
         return metrics

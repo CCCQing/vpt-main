@@ -7,13 +7,18 @@ import shlex
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[4]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+
+
 MODEL_CONFIGS = {
     "A0": ROOT / "configs" / "baseline_rebuild" / "A-02-A0-frozen-vit-ce.yaml",
     "A1": ROOT / "configs" / "baseline_rebuild" / "A-03-A1-vpt-shallow-ce.yaml",
@@ -158,12 +163,9 @@ def _run_job(job: Job, python_bin: str, gpu: str) -> Dict[str, object]:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu
     env["PYTHONUNBUFFERED"] = "1"
+    env["VPT_SEARCH_PROGRESS_PATH"] = str((job.output_root / "progress.json").resolve())
     job.log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.time()
-    print(
-        "[start] {} seed={} gpu={} log={}".format(job.model, job.seed, gpu, job.log_path),
-        flush=True,
-    )
     with job.log_path.open("w", encoding="utf-8") as handle:
         handle.write("CUDA_VISIBLE_DEVICES={}\n".format(gpu))
         handle.write(_format_command(command) + "\n\n")
@@ -185,12 +187,6 @@ def _run_job(job: Job, python_bin: str, gpu: str) -> Dict[str, object]:
         status = "failed_missing_completed_summary"
     else:
         status = "failed"
-    print(
-        "[{}] {} seed={} gpu={} returncode={} duration_min={:.1f}".format(
-            status, job.model, job.seed, gpu, process.returncode, duration / 60.0
-        ),
-        flush=True,
-    )
     return {
         "model": job.model,
         "seed": job.seed,
@@ -203,23 +199,48 @@ def _run_job(job: Job, python_bin: str, gpu: str) -> Dict[str, object]:
     }
 
 
+def _progress_trial(job: Job, trial_index: int) -> Dict[str, object]:
+    return {
+        "trial_index": int(trial_index),
+        "trial_name": "{}_seed{}".format(job.model, job.seed),
+        "runner": "train",
+        "stage": str(job.model),
+        "combo": {"model": str(job.model), "seed": int(job.seed)},
+        "overrides": {"SOLVER.TOTAL_EPOCH": 30},
+        "output_dir": str(job.output_root),
+        "identity_fields": {"config_file": str(job.config_file)},
+        "eta_fields": {"model": str(job.model)},
+        "eta_compatibility_keys": ["runner", "stage", "nproc", "total_epochs"],
+    }
+
+
 def _run_workers(
-    jobs: Sequence[Job], python_bin: str, gpu_groups: Sequence[str], max_workers: int
+    all_jobs: Sequence[Job],
+    pending_jobs: Sequence[Job],
+    python_bin: str,
+    gpu_groups: Sequence[str],
+    max_workers: int,
+    initial_completed: int,
+    progress_interval: float,
+    progress_width: int,
+    progress_enabled: bool,
 ) -> List[Dict[str, object]]:
-    worker_count = min(max_workers, len(gpu_groups), len(jobs))
-    assignments = [[] for _ in range(worker_count)]
-    for index, job in enumerate(jobs):
-        assignments[index % worker_count].append(job)
-
-    def run_worker(worker_index: int) -> List[Dict[str, object]]:
-        gpu = gpu_groups[worker_index]
-        return [_run_job(job, python_bin, gpu) for job in assignments[worker_index]]
-
-    results = []
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = [executor.submit(run_worker, index) for index in range(worker_count)]
-        for future in as_completed(futures):
-            results.extend(future.result())
+    all_trials = [_progress_trial(job, index) for index, job in enumerate(all_jobs)]
+    trial_by_job = {job: trial for job, trial in zip(all_jobs, all_trials)}
+    results = run_parallel_trials(
+        all_trials=all_trials,
+        pending_items=pending_jobs,
+        pending_trials=[trial_by_job[job] for job in pending_jobs],
+        out_root=Path(all_jobs[0].output_root).parents[1],
+        gpu_groups=gpu_groups,
+        max_workers=max_workers,
+        initial_completed=initial_completed,
+        progress_interval=progress_interval,
+        progress_width=progress_width,
+        progress_enabled=progress_enabled,
+        run_item=lambda job, gpu: _run_job(job, python_bin, gpu),
+        item_name=lambda job: "{} seed={} gpu-log={}".format(job.model, job.seed, job.log_path.name),
+    )
     return sorted(results, key=lambda item: (str(item["model"]), int(item["seed"])))
 
 
@@ -236,6 +257,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--progress-interval", type=float, default=2.0)
+    parser.add_argument("--progress-width", type=int, default=120)
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -252,6 +276,10 @@ def main() -> None:
         raise SystemExit("--max-workers must be positive.")
     if args.max_workers > len(gpu_groups):
         raise SystemExit("--max-workers must not exceed the number of --gpu-groups entries.")
+    if args.progress_interval <= 0.0:
+        raise SystemExit("--progress-interval must be positive.")
+    if args.progress_width < 80:
+        raise SystemExit("--progress-width must be at least 80.")
     missing = [str(MODEL_CONFIGS[model]) for model in models if not MODEL_CONFIGS[model].is_file()]
     if missing:
         raise SystemExit("Missing A-series config(s): {}".format(", ".join(missing)))
@@ -288,7 +316,17 @@ def main() -> None:
         print("All requested A-series tasks are already completed.", flush=True)
         return
 
-    results = _run_workers(pending, args.python_bin, gpu_groups, args.max_workers)
+    results = _run_workers(
+        jobs,
+        pending,
+        args.python_bin,
+        gpu_groups,
+        args.max_workers,
+        len(skipped),
+        args.progress_interval,
+        args.progress_width,
+        not args.no_progress,
+    )
     failed = [result for result in results if result["status"] != "completed"]
     print(
         "A-series finished: completed={} failed={} skipped={}.".format(

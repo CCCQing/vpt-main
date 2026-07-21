@@ -1,37 +1,42 @@
 #!/usr/bin/env python3
-"""Dispatch V5 semantic-relation GraphProbPrior temperature diagnostics.
-
-This script does not compute model losses by itself. It expands a YAML search
-space into many calls to diagnose_graph_prob_prior_temperatures.py, then merges
-the generated per-trial JSON summaries into one table.
-"""
+"""Define and run the GraphProbPrior parameter-search plan."""
 
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import itertools
 import json
-import os
 import re
-import socket
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence
 
 import numpy as np
 import yaml
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.monitoring.fields import GPP_MONITOR_ALIASES
-DEFAULT_GRID_CONFIG = "configs/graph_prob_prior/cub_v5_temperature_grid.yaml"
+from src.tools.parameter_search.search_scheduler import (
+    SearchScheduler,
+    build_run_command,
+    default_dist_backend,
+    mapping_to_opts,
+    parse_csv,
+    parse_gpu_groups,
+    patch_ddp_forward_missing_attrs,
+    pick_free_port,
+    validate_extra_opts,
+    validate_gpu_groups,
+    write_csv,
+    write_json,
+)
+
 GRAPH_PROB_PRIOR_MODES = [
     "graph_conditioned_semantic_prior",
     "class_aggregate_mmd",
@@ -54,56 +59,9 @@ MODE_ALIASES = {
 LEGACY_SEARCH_STAGES = ["temperature", "other"]
 
 
-def _default_dist_backend() -> str:
-    return "gloo" if os.name == "nt" else "nccl"
-
-
-def _pick_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _parse_gpu_groups(raw_groups: str, raw_gpus: str) -> List[str]:
-    if str(raw_groups).strip():
-        return [item.strip() for item in str(raw_groups).split(";") if item.strip()]
-    if str(raw_gpus).strip():
-        return _parse_csv(raw_gpus)
-    return [""]
-
-
-def _group_nproc(gpu_group: str, fallback_nproc: int) -> int:
-    if fallback_nproc > 0:
-        return int(fallback_nproc)
-    if not gpu_group:
-        return 1
-    return len([item for item in str(gpu_group).split(",") if item.strip()])
-
-
-def _patch_ddp_forward_missing_attrs() -> None:
-    import torch
-
-    ddp_cls = torch.nn.parallel.DistributedDataParallel
-    if getattr(ddp_cls, "_gpp_forward_missing_attrs", False):
-        return
-    original_getattr = ddp_cls.__getattr__
-
-    def forwarded_getattr(self, name):
-        try:
-            return original_getattr(self, name)
-        except AttributeError as exc:
-            module = original_getattr(self, "module")
-            if hasattr(module, name):
-                return getattr(module, name)
-            raise exc
-
-    ddp_cls.__getattr__ = forwarded_getattr
-    ddp_cls._gpp_forward_missing_attrs = True
-
-
 def _diagnose_with_ddp_attr_forward(argv: Sequence[str], _unused: Any = None) -> None:
-    _patch_ddp_forward_missing_attrs()
-    from src.tools import diagnose_graph_prob_prior_temperatures as diagnose
+    patch_ddp_forward_missing_attrs()
+    from src.tools.historical_files.graph_prob_prior_diagnostics import diagnose_graph_prob_prior_temperatures as diagnose
 
     old_argv = sys.argv
     try:
@@ -113,113 +71,10 @@ def _diagnose_with_ddp_attr_forward(argv: Sequence[str], _unused: Any = None) ->
         sys.argv = old_argv
 
 
-def _set_cli_opt(opts: Sequence[str], key: str, value: Any) -> List[str]:
-    updated = list(opts)
-    for idx, item in enumerate(updated):
-        if item == key:
-            if idx + 1 >= len(updated):
-                raise ValueError(f"Malformed CLI opts: key {key} has no value.")
-            updated[idx + 1] = str(value)
-            return updated
-    updated.extend([key, str(value)])
-    return updated
-
-
-def _rebuild_train_argv(train_args: Any, opts: Sequence[str]) -> List[str]:
-    argv: List[str] = []
-    if getattr(train_args, "config_file", ""):
-        argv.extend(["--config-file", str(train_args.config_file)])
-    if getattr(train_args, "train_type", ""):
-        argv.extend(["--train-type", str(train_args.train_type)])
-    argv.extend(list(opts))
-    return argv
-
-
-def _select_fixed_train_output(train_argv: Sequence[str], nproc: int) -> Dict[str, Any]:
-    import train as train_entry
-    from launch import default_argument_parser
-
-    train_args = default_argument_parser().parse_args(list(train_argv))
-    cfg = train_entry.get_cfg()
-    cfg.merge_from_file(train_args.config_file)
-    train_entry._merge_local_path_cfg_if_exists(cfg)
-    cfg.merge_from_list(train_args.opts)
-    train_entry._sync_xlsa_protocol(cfg)
-
-    base_output_dir = str(cfg.OUTPUT_DIR)
-    lr = cfg.SOLVER.BASE_LR
-    wd = cfg.SOLVER.WEIGHT_DECAY
-    output_folder = os.path.join(cfg.DATA.NAME, cfg.DATA.FEATURE, f"lr{lr}_wd{wd}")
-
-    # 网格搜索里每个 trial 的 OUTPUT_DIR 已经唯一；这里的 runN 只表示该 trial 下的第几次尝试。
-    # 如果上次 DDP 启动在 run1 中留下半截日志，继续选下一个空 runN，避免再次触发 train.py 的重复运行检查。
-    count = 1
-    while True:
-        fixed_output_dir = os.path.join(base_output_dir, output_folder, f"run{count}")
-        if not train_entry.PathManager.exists(fixed_output_dir):
-            train_entry.PathManager.mkdirs(fixed_output_dir)
-            break
-        count += 1
-        if count > 1000:
-            raise RuntimeError(f"Too many existing run directories under {base_output_dir}.")
-
-    opts = _set_cli_opt(train_args.opts, "OUTPUT_DIR", fixed_output_dir)
-    opts = _set_cli_opt(opts, "NUM_GPUS", int(nproc))
-    return {
-        "argv": _rebuild_train_argv(train_args, opts),
-        "output_dir": fixed_output_dir,
-        "nproc": int(nproc),
-    }
-
-
-def _train_with_ddp_attr_forward(payload: Any, _unused: Any = None) -> None:
-    _patch_ddp_forward_missing_attrs()
-    import train as train_entry
-    from launch import default_argument_parser
-    from src.utils.distributed import get_rank
-
-    old_argv = sys.argv
-    try:
-        if isinstance(payload, Mapping):
-            train_argv = list(payload["argv"])
-            fixed_output_dir = str(payload["output_dir"])
-            nproc = int(payload.get("nproc", 1))
-        else:
-            train_argv = list(payload)
-            fixed_output_dir = ""
-            nproc = 1
-
-        sys.argv = [str(ROOT / "train.py")] + list(train_argv)
-        train_args = default_argument_parser().parse_args(list(train_argv))
-
-        if not fixed_output_dir:
-            train_entry.main(train_args)
-            return
-
-        # DDP 子进程不能再调用 train.main()->setup()，否则每个进程都会竞争创建 run1。
-        # 这里复用 train.setup() 的配置合并流程，但直接使用父进程已经选好的 fixed_output_dir。
-        cfg = train_entry.get_cfg()
-        cfg.merge_from_file(train_args.config_file)
-        train_entry._merge_local_path_cfg_if_exists(cfg)
-        cfg.merge_from_list(train_args.opts)
-        train_entry._sync_xlsa_protocol(cfg)
-
-        node = os.environ.get("SLURMD_NODENAME")
-        if node:
-            cfg.DIST_INIT_PATH = f"tcp://{node}:12399"
-        cfg.OUTPUT_DIR = fixed_output_dir
-        cfg.NUM_GPUS = int(nproc)
-        cfg.DIST_RANK = int(get_rank())
-        cfg.freeze()
-        train_entry.train(cfg, train_args)
-    finally:
-        sys.argv = old_argv
-
-
 def _ddp_diagnose_main(argv: Sequence[str]) -> None:
-    parser = argparse.ArgumentParser("grid_search_graph_prob_prior_v5_temperatures ddp diagnose")
+    parser = argparse.ArgumentParser("GraphProbPrior search DDP diagnose")
     parser.add_argument("--nproc-per-node", type=int, required=True)
-    parser.add_argument("--dist-backend", default=_default_dist_backend(), choices=["nccl", "gloo"])
+    parser.add_argument("--dist-backend", default=default_dist_backend(), choices=["nccl", "gloo"])
     parser.add_argument("--dist-url", default="")
     known, diagnose_argv = parser.parse_known_args(list(argv))
     if known.nproc_per_node <= 1:
@@ -234,7 +89,7 @@ def _ddp_diagnose_main(argv: Sequence[str]) -> None:
 
     from src.utils import distributed as du
 
-    init_method = known.dist_url or "tcp://127.0.0.1:{}".format(_pick_free_port())
+    init_method = known.dist_url or "tcp://127.0.0.1:{}".format(pick_free_port())
     mp.spawn(
         du.run,
         nprocs=int(known.nproc_per_node),
@@ -246,43 +101,6 @@ def _ddp_diagnose_main(argv: Sequence[str]) -> None:
             1,
             str(known.dist_backend),
             list(diagnose_argv),
-            None,
-        ),
-        join=True,
-    )
-
-
-def _ddp_train_main(argv: Sequence[str]) -> None:
-    parser = argparse.ArgumentParser("grid_search_graph_prob_prior_v5_temperatures ddp train")
-    parser.add_argument("--nproc-per-node", type=int, required=True)
-    parser.add_argument("--dist-backend", default=_default_dist_backend(), choices=["nccl", "gloo"])
-    parser.add_argument("--dist-url", default="")
-    known, train_argv = parser.parse_known_args(list(argv))
-    if known.nproc_per_node <= 1:
-        raise ValueError("--nproc-per-node must be greater than 1 in DDP train mode.")
-    if not train_argv:
-        raise ValueError("Missing train.py arguments after DDP launcher options.")
-
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
-
-    import torch.multiprocessing as mp
-
-    from src.utils import distributed as du
-
-    train_payload = _select_fixed_train_output(train_argv, int(known.nproc_per_node))
-    init_method = known.dist_url or "tcp://127.0.0.1:{}".format(_pick_free_port())
-    mp.spawn(
-        du.run,
-        nprocs=int(known.nproc_per_node),
-        args=(
-            int(known.nproc_per_node),
-            _train_with_ddp_attr_forward,
-            init_method,
-            0,
-            1,
-            str(known.dist_backend),
-            train_payload,
             None,
         ),
         join=True,
@@ -305,34 +123,6 @@ def _as_list(value: Any) -> List[Any]:
     if isinstance(value, tuple):
         return list(value)
     return [value]
-
-
-def _parse_csv(raw: str) -> List[str]:
-    return [item.strip() for item in str(raw).split(",") if item.strip()]
-
-
-def _value_to_opt(value: Any) -> str:
-    if isinstance(value, bool):
-        return "True" if value else "False"
-    if value is None:
-        return "None"
-    return str(value)
-
-
-def _mapping_to_opts(mapping: Mapping[str, Any]) -> List[str]:
-    opts: List[str] = []
-    for key, value in mapping.items():
-        opts.extend([str(key), _value_to_opt(value)])
-    return opts
-
-
-def _validate_extra_opts(opts: Sequence[str]) -> List[str]:
-    opts = list(opts)
-    if opts and opts[0] == "--":
-        opts = opts[1:]
-    if len(opts) % 2 != 0:
-        raise ValueError("Extra opts must use KEY VALUE pairs.")
-    return opts
 
 
 def _sanitize(value: Any) -> str:
@@ -437,7 +227,7 @@ def _parse_stage_selection(raw_stage: str, stage_order: Sequence[str]) -> List[s
     if raw_stage.lower() == "all":
         return [str(stage).lower() for stage in stage_order]
 
-    wanted = [str(item).lower() for item in _parse_csv(raw_stage)]
+    wanted = [str(item).lower() for item in parse_csv(raw_stage)]
     if not wanted:
         raise ValueError("Stage selection cannot be empty.")
     valid = set(str(stage).lower() for stage in stage_order)
@@ -523,7 +313,7 @@ def _load_graph_methods(grid_cfg: Mapping[str, Any], selected: str) -> List[str]
     if not methods:
         raise ValueError("Grid config EXTERNAL_GRAPH.METHODS must list at least one graph key.")
     if selected and selected.lower() != "all":
-        wanted = _parse_csv(selected)
+        wanted = parse_csv(selected)
         missing = [item for item in wanted if item not in methods]
         if missing:
             raise ValueError(f"Unknown --graph-methods values {missing}; expected subset of {methods}.")
@@ -540,7 +330,7 @@ def _load_modes(grid_cfg: Mapping[str, Any], selected: str) -> List[str]:
     if bad:
         raise ValueError(f"Unsupported modes in config: {bad}")
     if selected and selected.lower() != "all":
-        wanted = _parse_csv(selected)
+        wanted = parse_csv(selected)
         missing = [item for item in wanted if item not in modes]
         if missing:
             raise ValueError(f"Unknown --modes values {missing}; expected subset of {modes}.")
@@ -647,7 +437,7 @@ def _build_trials(
                         "--config-file",
                         config_file,
                     ]
-                    cmd.extend(_mapping_to_opts(run_overrides))
+                    cmd.extend(mapping_to_opts(run_overrides))
                 else:
                     run_overrides = dict(overrides)
                     cmd = [
@@ -662,7 +452,7 @@ def _build_trials(
                     ]
                     if no_train_step:
                         cmd.append("--no-train-step")
-                    cmd.extend(_mapping_to_opts(run_overrides))
+                    cmd.extend(mapping_to_opts(run_overrides))
                 cmd.extend(extra_opts)
                 trials.append(
                     {
@@ -679,6 +469,15 @@ def _build_trials(
                         "cmd": cmd,
                         "repo_root": str(repo_root),
                         "runner": runner,
+                        "identity_fields": {
+                            "graph_method": graph_method,
+                            "mode": mode,
+                        },
+                        "eta_fields": {
+                            "graph_method": graph_method,
+                            "mode": mode,
+                        },
+                        "eta_compatibility_keys": ["runner", "mode"],
                     }
                 )
                 index += 1
@@ -1098,108 +897,10 @@ def _best_rows(rows: Sequence[Mapping[str, Any]], group_keys: Sequence[str]) -> 
     return sorted(best.values(), key=lambda row: tuple(str(row.get(k, "")) for k in group_keys))
 
 
-def _build_run_command(
-    trial: Mapping[str, Any],
-    python_bin: str,
-    gpu_group: str,
-    nproc_per_trial: int,
-    dist_backend: str,
-) -> tuple[List[str], int]:
-    nproc = _group_nproc(gpu_group, nproc_per_trial)
-    if nproc <= 1:
-        return list(trial["cmd"]), 1
-
-    child_cmd = list(trial["cmd"])
-    child_args = child_cmd[2:]
-    runner = str(trial.get("runner", "diagnose")).lower()
-    ddp_flag = "--ddp-train" if runner == "train" else "--ddp-diagnose"
-    return (
-        [
-            python_bin,
-            str(Path(__file__).resolve()),
-            ddp_flag,
-            "--nproc-per-node",
-            str(nproc),
-            "--dist-backend",
-            str(dist_backend),
-        ]
-        + child_args
-        + [
-            "NUM_GPUS",
-            str(nproc),
-        ],
-        nproc,
-    )
-
-
-def _run_trial(
-    trial: Mapping[str, Any],
-    gpu_id: str = "",
-    python_bin: str = sys.executable,
-    nproc_per_trial: int = 0,
-    dist_backend: str = "",
-    expected_batches: int = 0,
-    resume: bool = True,
-) -> Dict[str, Any]:
-    output_dir = Path(str(trial["output_dir"]))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
-    if gpu_id:
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    run_cmd, nproc = _build_run_command(
-        trial,
-        python_bin=python_bin,
-        gpu_group=gpu_id,
-        nproc_per_trial=int(nproc_per_trial),
-        dist_backend=dist_backend or _default_dist_backend(),
-    )
-    if resume and _trial_has_complete_output(trial, expected_batches=expected_batches):
-        return _flatten_result(
-            trial,
-            0,
-            gpu_id=gpu_id,
-            command=run_cmd,
-            num_gpus=nproc,
-            skipped_existing=True,
-        )
-    with Path(str(trial["stdout_path"])).open("w", encoding="utf-8", errors="replace") as stdout:
-        proc = subprocess.run(
-            run_cmd,
-            cwd=str(trial["repo_root"]),
-            env=env,
-            stdout=stdout,
-            stderr=subprocess.STDOUT,
-        )
-    return _flatten_result(trial, int(proc.returncode), gpu_id=gpu_id, command=run_cmd, num_gpus=nproc)
-
-
-def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    keys: List[str] = []
-    seen = set()
-    for row in rows:
-        for key in row.keys():
-            if key not in seen:
-                seen.add(key)
-                keys.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-
-def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Grid-dispatch GraphProbPrior V5 temperature diagnostics.")
+    parser = argparse.ArgumentParser(description="Run the GraphProbPrior parameter-search plan.")
     parser.add_argument("--repo-root", default=str(ROOT))
-    parser.add_argument("--grid-config", default=DEFAULT_GRID_CONFIG)
+    parser.add_argument("--grid-config", required=True)
     parser.add_argument("--python-bin", default="")
     parser.add_argument("--config-file", default="")
     parser.add_argument("--out-root", default="")
@@ -1224,8 +925,14 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="DDP process count for each trial. Default: GPU count in each --gpu-groups item; 0 keeps single-GPU behavior for --gpus.",
     )
-    parser.add_argument("--dist-backend", default=_default_dist_backend(), choices=["nccl", "gloo"])
+    parser.add_argument("--dist-backend", default=default_dist_backend(), choices=["nccl", "gloo"])
     parser.add_argument("--max-workers", type=int, default=1)
+    parser.add_argument(
+        "--eta-interval",
+        type=float,
+        default=30.0,
+        help="Seconds between task-level ETA updates; 0 disables periodic ETA output.",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Run only the first N expanded trials; 0 means all.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-resume", action="store_true", help="Rerun trials even when their diagnosis JSON already exists.")
@@ -1244,18 +951,23 @@ def main() -> None:
     grid_cfg = _read_yaml(grid_config)
 
     config_file = args.config_file or str(grid_cfg.get("BASE_CONFIG_FILE", "configs/prompt/cub.yaml"))
-    diagnose_script = str(grid_cfg.get("DIAGNOSE_SCRIPT", "src/tools/diagnose_graph_prob_prior_temperatures.py"))
+    diagnose_script = str(
+        grid_cfg.get(
+            "DIAGNOSE_SCRIPT",
+            "src/tools/historical_files/graph_prob_prior_diagnostics/diagnose_graph_prob_prior_temperatures.py",
+        )
+    )
     train_script = str(grid_cfg.get("TRAIN_SCRIPT", "train.py"))
     runner = str(grid_cfg.get("RUNNER", "diagnose")).lower()
     if runner not in {"diagnose", "train"}:
         raise ValueError(f"RUNNER must be 'diagnose' or 'train', got {runner}.")
     python_bin = str(args.python_bin or grid_cfg.get("PYTHON_BIN") or sys.executable)
-    out_root = Path(args.out_root or str(grid_cfg.get("OUTPUT_DIR", "output/gpp_v5_temperature_grid")))
+    out_root = Path(args.out_root or str(grid_cfg.get("OUTPUT_DIR", "output/graph_prob_prior_search")))
     if not out_root.is_absolute():
         out_root = repo_root / out_root
     max_batches = int(args.max_batches if args.max_batches is not None else int(grid_cfg.get("MAX_BATCHES", 111)))
     no_train_step = bool(grid_cfg.get("NO_TRAIN_STEP", False)) or bool(args.no_train_step)
-    extra_opts = _validate_extra_opts(args.opts)
+    extra_opts = validate_extra_opts(args.opts)
     stage_order = _configured_stage_names(grid_cfg)
     stage_groups = _configured_stage_groups(grid_cfg, stage_order)
     trial_order = str(grid_cfg.get("TRIAL_ORDER", "graph_mode_stage")).lower()
@@ -1266,16 +978,10 @@ def main() -> None:
     graph_methods = _load_graph_methods(grid_cfg, args.graph_methods)
     modes = _load_modes(grid_cfg, args.modes)
     graph_npz = _validate_external_graph_file(repo_root, grid_cfg, graph_methods)
-    gpu_groups = _parse_gpu_groups(args.gpu_groups, args.gpus)
-    if args.max_workers <= 0:
-        raise ValueError("--max-workers must be positive.")
-    if args.max_workers > len(gpu_groups):
-        raise ValueError("--max-workers must not exceed the number of GPU groups.")
-    for gpu_group in gpu_groups:
-        nproc = _group_nproc(gpu_group, int(args.nproc_per_trial))
-        visible_gpu_count = len([item for item in str(gpu_group).split(",") if item.strip()])
-        if gpu_group and nproc > 1 and nproc != visible_gpu_count:
-            raise ValueError("--nproc-per-trial must match each --gpu-groups item size when CUDA_VISIBLE_DEVICES is set.")
+    gpu_groups = parse_gpu_groups(args.gpu_groups, args.gpus)
+    validate_gpu_groups(gpu_groups, int(args.max_workers), int(args.nproc_per_trial))
+    if not np.isfinite(float(args.eta_interval)) or args.eta_interval < 0:
+        raise ValueError("--eta-interval must be finite and non-negative.")
 
     trials = _build_trials(
         repo_root=repo_root,
@@ -1302,16 +1008,36 @@ def main() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     stage_suffix = f"_{stage_label}"
     commands_path = out_root / f"commands{stage_suffix}.txt"
-    with commands_path.open("w", encoding="utf-8") as handle:
-        for trial in trials:
-            run_cmd, _ = _build_run_command(
-                trial,
-                python_bin=python_bin,
-                gpu_group=gpu_groups[0] if gpu_groups else "",
-                nproc_per_trial=int(args.nproc_per_trial),
-                dist_backend=str(args.dist_backend),
-            )
-            handle.write(subprocess.list2cmdline(run_cmd) + "\n")
+
+    def command_builder(trial: Mapping[str, Any], gpu_group: str):
+        return build_run_command(
+            trial,
+            python_bin=python_bin,
+            gpu_group=gpu_group,
+            nproc_per_trial=int(args.nproc_per_trial),
+            dist_backend=str(args.dist_backend),
+            ddp_launcher_path=str(Path(__file__).resolve()),
+            ddp_mode="--ddp-diagnose",
+        )
+
+    def complete_check(trial: Mapping[str, Any]) -> bool:
+        return _trial_has_complete_output(trial, expected_batches=max_batches)
+
+    scheduler = SearchScheduler(
+        trials=trials,
+        out_root=out_root,
+        gpu_groups=gpu_groups,
+        max_workers=int(args.max_workers),
+        nproc_per_trial=int(args.nproc_per_trial),
+        eta_interval=float(args.eta_interval),
+        command_builder=command_builder,
+        complete_check=complete_check,
+        result_flattener=_flatten_result,
+        resume_status=_resume_status,
+        resume=not bool(args.no_resume),
+        resume_debug=bool(args.resume_debug),
+    )
+    scheduler.write_commands(commands_path)
 
     search_space = {
         "grid_config": str(grid_config),
@@ -1337,6 +1063,18 @@ def main() -> None:
         "nproc_per_trial": int(args.nproc_per_trial),
         "dist_backend": str(args.dist_backend),
         "max_workers": int(args.max_workers),
+        "eta_interval_seconds": float(args.eta_interval),
+        "eta_estimator": {
+            "active_progress_weight": SearchScheduler.ACTIVE_PROGRESS_WEIGHT,
+            "historical_weight": SearchScheduler.HISTORICAL_WEIGHT,
+            "history_statistic": "median_with_interquartile_range",
+            "queue_model": "earliest_available_worker_simulation",
+        },
+        "runtime_state": {
+            "search_state": str(out_root / "search_state.json"),
+            "active_trial_progress": "<trial_output_dir>/progress.json",
+            "completed_progress_cleanup": True,
+        },
         "extra_opts": extra_opts,
         "mode_search_space": grid_cfg.get("MODE_SEARCH_SPACE", {}),
         "fixed_opts": grid_cfg.get("FIXED_OPTS", {}),
@@ -1351,174 +1089,32 @@ def main() -> None:
             ],
         },
     }
-    _write_json(out_root / "search_space.json", search_space)
+    write_json(out_root / "search_space.json", search_space)
 
-    if args.dry_run:
-        rows = []
-        for idx, trial in enumerate(trials):
-            gpu = gpu_groups[idx % len(gpu_groups)] if gpu_groups else ""
-            run_cmd, nproc = _build_run_command(
-                trial,
-                python_bin=python_bin,
-                gpu_group=gpu,
-                nproc_per_trial=int(args.nproc_per_trial),
-                dist_backend=str(args.dist_backend),
-            )
-            rows.append(_flatten_result(trial, returncode=-1, gpu_id=gpu, command=run_cmd, num_gpus=nproc))
-    elif args.max_workers == 1:
-        rows = []
-        for idx, trial in enumerate(trials):
-            gpu = gpu_groups[idx % len(gpu_groups)] if gpu_groups else ""
-            nproc = _group_nproc(gpu, int(args.nproc_per_trial))
-            run_cmd, run_nproc = _build_run_command(
-                trial,
-                python_bin=python_bin,
-                gpu_group=gpu,
-                nproc_per_trial=int(args.nproc_per_trial),
-                dist_backend=str(args.dist_backend),
-            )
-            existing = None if bool(args.no_resume) else _existing_trial_result(
-                trial,
-                gpu,
-                run_cmd,
-                run_nproc,
-                expected_batches=max_batches,
-            )
-            if existing is not None:
-                print(f"[{idx + 1}/{len(trials)}] skip existing {trial['trial_name']} gpu={gpu} nproc={run_nproc}", flush=True)
-                rows.append(existing)
-                continue
-            if bool(args.resume_debug) and not bool(args.no_resume):
-                print(f"[{idx + 1}/{len(trials)}] resume miss {trial['trial_name']}: {_resume_status(trial)}", flush=True)
-            print(f"[{idx + 1}/{len(trials)}] {trial['trial_name']} gpu={gpu} nproc={nproc}", flush=True)
-            rows.append(
-                _run_trial(
-                    trial,
-                    gpu_id=gpu,
-                    python_bin=python_bin,
-                    nproc_per_trial=int(args.nproc_per_trial),
-                    dist_backend=str(args.dist_backend),
-                    expected_batches=max_batches,
-                    resume=not bool(args.no_resume),
-                )
-            )
-    else:
-        rows = []
-        worker_count = int(args.max_workers)
-        worker_gpus = gpu_groups[:worker_count] if gpu_groups else [""] * worker_count
-
-        def _run_one_on_worker(
-            worker_idx: int,
-            gpu: str,
-            trial_idx: int,
-            trial: Mapping[str, Any],
-        ) -> Dict[str, Any]:
-            run_cmd, run_nproc = _build_run_command(
-                trial,
-                python_bin=python_bin,
-                gpu_group=gpu,
-                nproc_per_trial=int(args.nproc_per_trial),
-                dist_backend=str(args.dist_backend),
-            )
-            existing = None if bool(args.no_resume) else _existing_trial_result(
-                trial,
-                gpu,
-                run_cmd,
-                run_nproc,
-                expected_batches=max_batches,
-            )
-            if existing is not None:
-                print(
-                    f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
-                    f"skip existing {trial_idx + 1}/{len(trials)} {trial['trial_name']} nproc={run_nproc}",
-                    flush=True,
-                )
-                return existing
-            if bool(args.resume_debug) and not bool(args.no_resume):
-                print(
-                    f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
-                    f"resume miss {trial_idx + 1}/{len(trials)} {trial['trial_name']}: {_resume_status(trial)}",
-                    flush=True,
-                )
-            print(
-                f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
-                f"started {trial_idx + 1}/{len(trials)} {trial['trial_name']}",
-                flush=True,
-            )
-            result = _run_trial(
-                trial,
-                gpu_id=gpu,
-                python_bin=python_bin,
-                nproc_per_trial=int(args.nproc_per_trial),
-                dist_backend=str(args.dist_backend),
-                expected_batches=max_batches,
-                resume=not bool(args.no_resume),
-            )
-            print(
-                f"[worker {worker_idx + 1}/{worker_count} gpu={gpu}] "
-                f"finished {trial_idx + 1}/{len(trials)} {trial['trial_name']} "
-                f"returncode={result['returncode']}",
-                flush=True,
-            )
-            return result
-
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            pending_trial_idx = 0
-            future_to_worker: Dict[Any, int] = {}
-
-            def _submit_next(worker_idx: int) -> bool:
-                nonlocal pending_trial_idx
-                if pending_trial_idx >= len(trials):
-                    return False
-                trial_idx = pending_trial_idx
-                pending_trial_idx += 1
-                gpu = worker_gpus[worker_idx]
-                future = executor.submit(
-                    _run_one_on_worker,
-                    worker_idx,
-                    gpu,
-                    trial_idx,
-                    trials[trial_idx],
-                )
-                future_to_worker[future] = worker_idx
-                return True
-
-            for worker_idx in range(worker_count):
-                _submit_next(worker_idx)
-
-            finished = 0
-            while future_to_worker:
-                for future in as_completed(list(future_to_worker.keys())):
-                    worker_idx = future_to_worker.pop(future)
-                    rows.append(future.result())
-                    finished += 1
-                    print(f"[{finished}/{len(trials)}] collected worker result", flush=True)
-                    _submit_next(worker_idx)
-                    break
-        rows.sort(key=lambda row: int(row["trial_index"]))
+    rows = scheduler.dry_run() if args.dry_run else scheduler.run()
 
     ranked_rows = _rank_rows(rows)
     best_by_stage_graph_mode = _best_rows(ranked_rows, ["stage", "graph_method", "mode"])
     best_by_stage_mode = _best_rows(ranked_rows, ["stage", "mode"])
-    _write_csv(out_root / "summary.csv", ranked_rows)
-    _write_json(out_root / "summary.json", {"search_space": search_space, "rows": ranked_rows})
-    _write_csv(out_root / "ranked_summary.csv", ranked_rows)
-    _write_json(out_root / "ranked_summary.json", {"search_space": search_space, "rows": ranked_rows})
-    _write_csv(out_root / "best_by_stage_graph_mode.csv", best_by_stage_graph_mode)
-    _write_json(out_root / "best_by_stage_graph_mode.json", {"rows": best_by_stage_graph_mode})
-    _write_csv(out_root / "best_by_stage_mode.csv", best_by_stage_mode)
-    _write_json(out_root / "best_by_stage_mode.json", {"rows": best_by_stage_mode})
-    _write_csv(out_root / f"summary{stage_suffix}.csv", ranked_rows)
-    _write_json(out_root / f"summary{stage_suffix}.json", {"search_space": search_space, "rows": ranked_rows})
-    _write_csv(out_root / f"ranked_summary{stage_suffix}.csv", ranked_rows)
-    _write_json(out_root / f"ranked_summary{stage_suffix}.json", {"search_space": search_space, "rows": ranked_rows})
-    _write_csv(out_root / f"best_by_stage_graph_mode{stage_suffix}.csv", best_by_stage_graph_mode)
-    _write_json(out_root / f"best_by_stage_graph_mode{stage_suffix}.json", {"rows": best_by_stage_graph_mode})
-    _write_csv(out_root / f"best_by_stage_mode{stage_suffix}.csv", best_by_stage_mode)
-    _write_json(out_root / f"best_by_stage_mode{stage_suffix}.json", {"rows": best_by_stage_mode})
+    write_csv(out_root / "summary.csv", ranked_rows)
+    write_json(out_root / "summary.json", {"search_space": search_space, "rows": ranked_rows})
+    write_csv(out_root / "ranked_summary.csv", ranked_rows)
+    write_json(out_root / "ranked_summary.json", {"search_space": search_space, "rows": ranked_rows})
+    write_csv(out_root / "best_by_stage_graph_mode.csv", best_by_stage_graph_mode)
+    write_json(out_root / "best_by_stage_graph_mode.json", {"rows": best_by_stage_graph_mode})
+    write_csv(out_root / "best_by_stage_mode.csv", best_by_stage_mode)
+    write_json(out_root / "best_by_stage_mode.json", {"rows": best_by_stage_mode})
+    write_csv(out_root / f"summary{stage_suffix}.csv", ranked_rows)
+    write_json(out_root / f"summary{stage_suffix}.json", {"search_space": search_space, "rows": ranked_rows})
+    write_csv(out_root / f"ranked_summary{stage_suffix}.csv", ranked_rows)
+    write_json(out_root / f"ranked_summary{stage_suffix}.json", {"search_space": search_space, "rows": ranked_rows})
+    write_csv(out_root / f"best_by_stage_graph_mode{stage_suffix}.csv", best_by_stage_graph_mode)
+    write_json(out_root / f"best_by_stage_graph_mode{stage_suffix}.json", {"rows": best_by_stage_graph_mode})
+    write_csv(out_root / f"best_by_stage_mode{stage_suffix}.csv", best_by_stage_mode)
+    write_json(out_root / f"best_by_stage_mode{stage_suffix}.json", {"rows": best_by_stage_mode})
     failures = [row for row in rows if int(row.get("returncode", 0)) not in {0, -1}]
     if failures:
-        _write_json(out_root / "failures.json", {"failures": failures})
+        write_json(out_root / "failures.json", {"failures": failures})
         raise SystemExit(f"{len(failures)} trials failed; see {out_root / 'failures.json'}")
     print(f"wrote {out_root / 'summary.csv'}")
     print(f"wrote {out_root / 'summary.json'}")
@@ -1529,10 +1125,12 @@ def main() -> None:
     print(f"wrote {out_root / f'best_by_stage_graph_mode{stage_suffix}.csv'}")
 
 
-if __name__ == "__main__":
+def cli_main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--ddp-diagnose":
         _ddp_diagnose_main(sys.argv[2:])
-    elif len(sys.argv) > 1 and sys.argv[1] == "--ddp-train":
-        _ddp_train_main(sys.argv[2:])
     else:
         main()
+
+
+if __name__ == "__main__":
+    cli_main()
