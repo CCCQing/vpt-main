@@ -184,7 +184,7 @@ def _matrix_condition_number(x: torch.Tensor) -> float:
     """用奇异值估计条件数；只作为监测项，失败时返回 0。"""
     if not torch.is_tensor(x) or x.dim() != 2 or x.numel() == 0:
         return 0.0
-    values = x.detach().to(device="cpu", dtype=torch.float64)
+    values = x.detach().to(device="cpu", dtype=torch.float32)
     values = torch.where(torch.isfinite(values), values, torch.zeros_like(values))
     try:
         if hasattr(torch, "linalg") and hasattr(torch.linalg, "svdvals"):
@@ -743,7 +743,7 @@ def _effective_rank(x: torch.Tensor, center: bool = True) -> float:
     if values.numel() == 0:
         return 0.0
     # This rank metric is diagnostic only. CPU SVD avoids noisy CUDA MAGMA logs.
-    values = values.to(device="cpu", dtype=torch.float64)
+    values = values.to(device="cpu", dtype=torch.float32)
     values = torch.where(torch.isfinite(values), values, torch.zeros_like(values))
     if center:
         values = values - values.mean(dim=0, keepdim=True)

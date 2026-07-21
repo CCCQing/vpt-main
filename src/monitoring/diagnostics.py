@@ -234,7 +234,7 @@ class DiagnosticManager:
         if not self.enabled:
             return {"prediction_health": {}, "class_error": {}}
         stored_score_matrix = _numpy(scores).astype(np.float32, copy=False)
-        score_matrix = stored_score_matrix.astype(np.float64, copy=False)
+        score_matrix = stored_score_matrix
         local_targets = _numpy(targets_local).astype(np.int64, copy=False)
         global_targets = _numpy(targets_global).astype(np.int64, copy=False)
         candidate = np.asarray(list(dataset.eval_local_classes), dtype=np.int64)

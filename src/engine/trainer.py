@@ -86,8 +86,7 @@ from ..monitoring.module_effect import (
 )
 from ..monitoring.probe import (
     FixedProbeDataset,
-    affinity_health_metrics,
-    attention_flow_metrics,
+    ProbeAttentionAffinityAccumulator,
     build_probe_manifest,
 )
 from ..data.transforms import get_transforms
@@ -2312,7 +2311,7 @@ class Trainer():
         if du.get_world_size() > 1:
             loss_stats = torch.tensor(
                 [loss_sum, float(sample_count)],
-                dtype=torch.float64,
+                dtype=torch.float32,
                 device=self.device,
             )
             torch.distributed.all_reduce(loss_stats, op=torch.distributed.ReduceOp.SUM)
@@ -2320,7 +2319,7 @@ class Trainer():
             sample_count = int(round(float(loss_stats[1].item())))
             timing_stats = torch.tensor(
                 [batch_time_sec, data_time_sec],
-                dtype=torch.float64,
+                dtype=torch.float32,
                 device=self.device,
             )
             torch.distributed.all_reduce(timing_stats, op=torch.distributed.ReduceOp.MAX)
@@ -2509,45 +2508,6 @@ class Trainer():
         if self.scheduler is not None:
             self.scheduler.step()
 
-    @staticmethod
-    def _merge_probe_layer_tensors(batch_layers):
-        if not batch_layers:
-            return []
-        layer_count = max(len(item) for item in batch_layers)
-        merged = []
-        for layer_index in range(layer_count):
-            tensors = []
-            for layers in batch_layers:
-                if layer_index < len(layers) and torch.is_tensor(layers[layer_index]):
-                    tensors.append(layers[layer_index].detach().cpu())
-            merged.append(torch.cat(tensors, dim=0) if tensors else None)
-        return merged
-
-    @staticmethod
-    def _merge_probe_affinities(batch_affinities):
-        if not batch_affinities:
-            return []
-        layer_count = max(len(item) for item in batch_affinities)
-        merged = []
-        for layer_index in range(layer_count):
-            keys = set()
-            for layers in batch_affinities:
-                if layer_index < len(layers) and isinstance(layers[layer_index], dict):
-                    keys.update(layers[layer_index].keys())
-            layer = {}
-            for key in sorted(keys):
-                tensors = []
-                for layers in batch_affinities:
-                    if layer_index >= len(layers) or not isinstance(layers[layer_index], dict):
-                        continue
-                    value = layers[layer_index].get(key)
-                    if torch.is_tensor(value):
-                        tensors.append(value.detach().cpu())
-                if tensors:
-                    layer[key] = torch.cat(tensors, dim=0)
-            merged.append(layer)
-        return merged
-
     @torch.no_grad()
     def _execute_fixed_probe_condition(
         self,
@@ -2567,8 +2527,6 @@ class Trainer():
         visual_rows = []
         semantic_prototypes = None
         token_rows = []
-        attention_batches = []
-        affinity_batches = []
         prompt_length = int(self.cfg.MODEL.PROMPT.NUM_TOKENS) if bool(self.cfg.MODEL.PROMPT.ENABLE) else 0
         semantic_length = (
             int(self.cfg.MODEL.SEMANTIC_TOKENS.NUM_TOKENS)
@@ -2581,10 +2539,21 @@ class Trainer():
             "detach": True,
             "block_s_to_cls": bool(self.cfg.MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS),
         }
+        probe_metric_accumulator = None
+        if affinity_forward:
+            probe_metric_accumulator = ProbeAttentionAffinityAccumulator(
+                prompt_length=prompt_length,
+                semantic_length=semantic_length,
+                selected_layers=[int(item) for item in self.cfg.MONITOR.PROBE.LAYERS],
+                temperature=float(self.cfg.MONITOR.PROBE.AFFINITY_TEMPERATURE),
+                saturation_threshold=float(self.cfg.MONITOR.PROBE.AFFINITY_SATURATION_THRESHOLD),
+            )
         for input_data in probe_loader:
             inputs, targets_global, attributes = self.get_input(input_data)
             inputs = inputs.to(self.device, non_blocking=True)
             targets_global = targets_global.to(self.device, non_blocking=True)
+            target_global_list = [int(item) for item in targets_global.detach().cpu().tolist()]
+            target_local_list = [global_to_local[item] for item in target_global_list]
             semantics = self._prepare_semantics_for_stage(
                 attributes,
                 source_dataset,
@@ -2603,13 +2572,19 @@ class Trainer():
                 )
                 if use_attention:
                     logits, attention_layers, affinities = output
-                    attention_batches.append(list(attention_layers or []))
                 else:
                     logits, affinities = output
-                affinity_batches.append(list(affinities or []))
+                    attention_layers = []
+                probe_metric_accumulator.update(
+                    list(attention_layers or []),
+                    list(affinities or []),
+                    predictions=logits.detach().argmax(dim=1).cpu().tolist(),
+                    targets=target_local_list,
+                )
                 tokens = model_ref.get_runtime_token_sequence()
                 if torch.is_tensor(tokens):
                     token_rows.append(tokens.detach().cpu())
+                del output, attention_layers, affinities, tokens
             else:
                 logits = model_ref(
                     inputs,
@@ -2625,14 +2600,21 @@ class Trainer():
                     visual_rows.append(visual.detach().cpu())
                 if semantic_prototypes is None and torch.is_tensor(semantic):
                     semantic_prototypes = semantic.detach().cpu()
+            if affinity_forward:
+                model_ref.clear_runtime_state()
             logits_rows.append(logits.detach().cpu())
-            target_global_list = [int(item) for item in targets_global.detach().cpu().tolist()]
             target_global_rows.extend(target_global_list)
-            target_local_rows.extend([global_to_local[item] for item in target_global_list])
+            target_local_rows.extend(target_local_list)
             batch_ids = input_data.get("sample_id", [])
             if isinstance(batch_ids, str):
                 batch_ids = [batch_ids]
             sample_ids.extend([str(item) for item in list(batch_ids)])
+            del logits
+        probe_metrics = (
+            probe_metric_accumulator.finalize()
+            if probe_metric_accumulator is not None
+            else {"attention_flow": {}, "affinity_health": {}}
+        )
         return {
             "logits": torch.cat(logits_rows, dim=0).numpy() if logits_rows else np.empty((0, len(candidate_class_ids))),
             "targets_local": np.asarray(target_local_rows, dtype=np.int64),
@@ -2641,8 +2623,8 @@ class Trainer():
             "visual_features": torch.cat(visual_rows, dim=0).numpy() if visual_rows else None,
             "semantic_prototypes": semantic_prototypes.numpy() if semantic_prototypes is not None else None,
             "token_sequence": torch.cat(token_rows, dim=0).numpy() if token_rows else None,
-            "attention_layers": self._merge_probe_layer_tensors(attention_batches),
-            "affinities": self._merge_probe_affinities(affinity_batches),
+            "attention_flow_metrics": probe_metrics["attention_flow"],
+            "affinity_health_metrics": probe_metrics["affinity_health"],
             "candidate_class_ids": np.asarray(candidate_class_ids, dtype=np.int64),
             "prompt_length": prompt_length,
             "semantic_length": semantic_length,
@@ -2668,7 +2650,7 @@ class Trainer():
 
     @staticmethod
     def _true_margin_numpy(logits, targets):
-        logits = np.asarray(logits, dtype=np.float64)
+        logits = np.asarray(logits, dtype=np.float32)
         targets = np.asarray(targets, dtype=np.int64)
         true = logits[np.arange(targets.size), targets]
         other = logits.copy()
@@ -2924,28 +2906,8 @@ class Trainer():
                     domain="affinity_forward_equivalence",
                 ))
                 if equivalence_pass:
-                    selected_layers = {int(item) for item in self.cfg.MONITOR.PROBE.LAYERS}
-                    attention_layers = [
-                        value for index, value in enumerate(affinity_result["attention_layers"])
-                        if value is not None and (not selected_layers or index in selected_layers)
-                    ]
-                    affinity_layers = [
-                        value for index, value in enumerate(affinity_result["affinities"])
-                        if value and (not selected_layers or index in selected_layers)
-                    ]
-                    attention = attention_flow_metrics(
-                        attention_layers,
-                        prompt_length=int(affinity_result["prompt_length"]),
-                        semantic_length=int(affinity_result["semantic_length"]),
-                        affinity_layers=affinity_layers,
-                        predictions=affinity_logits.argmax(axis=1),
-                        targets=normal["targets_local"],
-                    )
-                    affinity_health = affinity_health_metrics(
-                        affinity_layers,
-                        temperature=float(self.cfg.MONITOR.PROBE.AFFINITY_TEMPERATURE),
-                        saturation_threshold=float(self.cfg.MONITOR.PROBE.AFFINITY_SATURATION_THRESHOLD),
-                    )
+                    attention = dict(affinity_result.get("attention_flow_metrics") or {})
+                    affinity_health = dict(affinity_result.get("affinity_health_metrics") or {})
                     all_rows.extend(self._probe_metric_rows(
                         attention,
                         checkpoint_id=checkpoint_id,

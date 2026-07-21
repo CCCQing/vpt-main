@@ -72,8 +72,8 @@ def paired_module_effect_metrics(
     normal_features: Optional[Any] = None,
     intervention_features: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    normal = np.asarray(normal_logits, dtype=np.float64)
-    changed = np.asarray(intervention_logits, dtype=np.float64)
+    normal = np.asarray(normal_logits, dtype=np.float32)
+    changed = np.asarray(intervention_logits, dtype=np.float32)
     target = np.asarray(targets, dtype=np.int64).reshape(-1)
     if normal.ndim != 2 or normal.shape != changed.shape or normal.shape[0] != target.size:
         raise ValueError("paired module-effect arrays have incompatible shapes")
@@ -97,7 +97,7 @@ def paired_module_effect_metrics(
 
     def bias_margin(values: np.ndarray) -> np.ndarray:
         if not seen_columns.any() or not unseen_columns.any():
-            return np.zeros(values.shape[0], dtype=np.float64)
+            return np.zeros(values.shape[0], dtype=np.float32)
         return values[:, seen_columns].max(axis=1) - values[:, unseen_columns].max(axis=1)
 
     normal_pred = normal.argmax(axis=1)
@@ -124,8 +124,8 @@ def paired_module_effect_metrics(
         "delta_entropy": float((changed_entropy - normal_entropy).mean()),
     }
     if normal_features is not None and intervention_features is not None:
-        left = np.asarray(normal_features, dtype=np.float64)
-        right = np.asarray(intervention_features, dtype=np.float64)
+        left = np.asarray(normal_features, dtype=np.float32)
+        right = np.asarray(intervention_features, dtype=np.float32)
         if left.shape == right.shape and left.ndim == 2 and left.shape[0] == target.size:
             denom = np.maximum(np.linalg.norm(left, axis=1) * np.linalg.norm(right, axis=1), 1e-12)
             summary["feature_cosine_before_after"] = float((np.sum(left * right, axis=1) / denom).mean())

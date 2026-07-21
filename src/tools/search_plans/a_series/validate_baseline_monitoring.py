@@ -35,7 +35,12 @@ from src.monitoring.eval_metrics import (
     visual_semantic_alignment_metrics,
 )
 from src.monitoring.module_effect import paired_module_effect_metrics
-from src.monitoring.probe import build_probe_manifest
+from src.monitoring.probe import (
+    ProbeAttentionAffinityAccumulator,
+    affinity_health_metrics,
+    attention_flow_metrics,
+    build_probe_manifest,
+)
 from src.monitoring.diagnostics import _compact_eval_scores
 
 
@@ -68,7 +73,161 @@ class SyntheticProbeDataset:
     ]
 
 
+def _merge_probe_batches(attention_batches, affinity_batches, selected_layers):
+    attention_layers = []
+    affinity_layers = []
+    for layer_index in selected_layers:
+        attention_layers.append(torch.cat(
+            [batch[layer_index] for batch in attention_batches],
+            dim=0,
+        ))
+        keys = sorted(set().union(*[
+            set(batch[layer_index]) for batch in affinity_batches
+        ]))
+        affinity_layers.append({
+            key: torch.cat(
+                [batch[layer_index][key] for batch in affinity_batches],
+                dim=0,
+            )
+            for key in keys
+        })
+    return attention_layers, affinity_layers
+
+
+def _assert_metric_maps_close(expected, actual, label):
+    assert set(actual) == set(expected), (
+        label,
+        sorted(set(expected) - set(actual)),
+        sorted(set(actual) - set(expected)),
+    )
+    for name, expected_value in expected.items():
+        assert np.isclose(
+            float(actual[name]),
+            float(expected_value),
+            rtol=2e-5,
+            atol=2e-6,
+        ), (label, name, expected_value, actual[name])
+
+
+def _validate_streaming_probe_metrics():
+    torch.manual_seed(17)
+    batch_sizes = [3, 2]
+    layer_count = 4
+    selected_layers = [0, 2, 3]
+    prompt_length = 2
+    semantic_length = 1
+    temperature = 0.7
+    saturation_threshold = 1.25
+    attention_batches = []
+    affinity_batches = []
+    prediction_batches = [[0, 1, 1], [2, 0]]
+    target_batches = [[0, 0, 1], [3, 0]]
+    accumulator = ProbeAttentionAffinityAccumulator(
+        prompt_length=prompt_length,
+        semantic_length=semantic_length,
+        selected_layers=selected_layers,
+        temperature=temperature,
+        saturation_threshold=saturation_threshold,
+    )
+    for batch_size, predictions, targets in zip(
+        batch_sizes,
+        prediction_batches,
+        target_batches,
+    ):
+        attention_layers = [
+            torch.softmax(torch.randn(batch_size, 3, 8, 8), dim=-1)
+            for _ in range(layer_count)
+        ]
+        affinity_layers = []
+        for _ in range(layer_count):
+            affinity_layers.append({
+                "QpKv_raw": torch.randn(batch_size, 3, 2, 4),
+                "QvKp_raw": torch.randn(batch_size, 3, 4, 2),
+                "AcKv_attn": torch.softmax(torch.randn(batch_size, 3, 1, 4), dim=-1),
+                "ApKv_attn": torch.softmax(torch.randn(batch_size, 3, 2, 4), dim=-1),
+                "AvKp_attn": torch.softmax(torch.randn(batch_size, 3, 4, 2), dim=-1),
+                "ApKc_attn": torch.softmax(torch.randn(batch_size, 3, 2, 1), dim=-1),
+            })
+        attention_batches.append(attention_layers)
+        affinity_batches.append(affinity_layers)
+        accumulator.update(
+            attention_layers,
+            affinity_layers,
+            predictions=predictions,
+            targets=targets,
+        )
+
+    attention_layers, affinity_layers = _merge_probe_batches(
+        attention_batches,
+        affinity_batches,
+        selected_layers,
+    )
+    predictions = np.concatenate([
+        np.asarray(batch, dtype=np.int64) for batch in prediction_batches
+    ])
+    targets = np.concatenate([
+        np.asarray(batch, dtype=np.int64) for batch in target_batches
+    ])
+    expected_attention = attention_flow_metrics(
+        attention_layers,
+        prompt_length=prompt_length,
+        semantic_length=semantic_length,
+        affinity_layers=affinity_layers,
+        predictions=predictions,
+        targets=targets,
+    )
+    expected_affinity = affinity_health_metrics(
+        affinity_layers,
+        temperature=temperature,
+        saturation_threshold=saturation_threshold,
+    )
+    streamed = accumulator.finalize()
+    _assert_metric_maps_close(
+        expected_attention,
+        streamed["attention_flow"],
+        "attention",
+    )
+    _assert_metric_maps_close(
+        expected_affinity,
+        streamed["affinity_health"],
+        "affinity",
+    )
+
+    fallback_accumulator = ProbeAttentionAffinityAccumulator(
+        prompt_length=prompt_length,
+        semantic_length=semantic_length,
+        selected_layers=selected_layers,
+        temperature=temperature,
+        saturation_threshold=saturation_threshold,
+    )
+    for affinity_batch, predictions_batch, targets_batch in zip(
+        affinity_batches,
+        prediction_batches,
+        target_batches,
+    ):
+        fallback_accumulator.update(
+            [],
+            affinity_batch,
+            predictions=predictions_batch,
+            targets=targets_batch,
+        )
+    expected_fallback = attention_flow_metrics(
+        [],
+        prompt_length=prompt_length,
+        semantic_length=semantic_length,
+        affinity_layers=affinity_layers,
+        predictions=predictions,
+        targets=targets,
+    )
+    _assert_metric_maps_close(
+        expected_fallback,
+        fallback_accumulator.finalize()["attention_flow"],
+        "attention_fallback",
+    )
+
+
 def main():
+    _validate_streaming_probe_metrics()
     rng = np.random.RandomState(7)
     seen_targets = np.asarray([0, 0, 1, 1, 0, 1], dtype=np.int64)
     unseen_targets = np.asarray([2, 2, 3, 3, 2, 3], dtype=np.int64)
@@ -121,6 +280,8 @@ def main():
         "predicted_class_frequency",
     }
     assert class_error["arrays"]["per_class_accuracy"].shape == (4,)
+    assert class_error["arrays"]["per_class_accuracy"].dtype == np.float32
+    assert class_error["arrays"]["class_true_margin"].dtype == np.float32
     assert len(class_error["top_confusion_pairs"]) <= 10
     for pair in class_error["top_confusion_pairs"]:
         assert "true_local_id" not in pair and "pred_local_id" not in pair
@@ -139,6 +300,9 @@ def main():
         "unseen_at_gamma",
     }
     assert calibration_profile["summary"]["raw_to_oracle_gain"] >= 0.0
+    assert calibration_profile["gamma_grid"].dtype == np.float32
+    assert calibration_profile["seen_at_gamma"].dtype == np.float32
+    assert calibration_profile["unseen_at_gamma"].dtype == np.float32
     assert representation_geometry_metrics(visual_seen, seen_targets)
     alignment_fields = {
         "true_prototype_similarity",
@@ -200,6 +364,9 @@ def main():
         [0, 1],
     )
     assert "prediction_flip_rate" in effect["summary"]
+    assert effect["arrays"]["normal_logits"].dtype == np.float32
+    assert effect["arrays"]["intervention_logits"].dtype == np.float32
+    assert effect["arrays"]["delta_true_margin"].dtype == np.float32
     full_probe_manifest = build_probe_manifest(
         SyntheticProbeDataset(),
         split="synthetic",

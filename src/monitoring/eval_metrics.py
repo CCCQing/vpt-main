@@ -7,7 +7,7 @@ import numpy as np
 
 
 def _as_scores(scores: Any) -> np.ndarray:
-    value = np.asarray(scores, dtype=np.float64)
+    value = np.asarray(scores, dtype=np.float32)
     if value.ndim != 2 or value.shape[0] == 0 or value.shape[1] == 0:
         raise ValueError("scores must be a non-empty [samples, classes] matrix")
     if not np.isfinite(value).all():
@@ -31,14 +31,14 @@ def _softmax(scores: np.ndarray) -> np.ndarray:
 
 
 def _normalize_rows(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float32)
     return values / np.maximum(np.linalg.norm(values, axis=1, keepdims=True), 1e-12)
 
 
 def _pairwise_euclidean_upper(values: np.ndarray) -> np.ndarray:
-    matrix = np.asarray(values, dtype=np.float64)
+    matrix = np.asarray(values, dtype=np.float32)
     if matrix.ndim != 2 or matrix.shape[0] < 2:
-        return np.asarray([], dtype=np.float64)
+        return np.asarray([], dtype=np.float32)
     squared_norm = np.square(matrix).sum(axis=1)
     squared_distance = squared_norm[:, None] + squared_norm[None, :] - 2.0 * (matrix @ matrix.T)
     upper = np.triu_indices(matrix.shape[0], k=1)
@@ -55,18 +55,18 @@ def _per_class_accuracy(predictions: np.ndarray, targets: np.ndarray, class_ids:
 
 
 def _gini_nonnegative(values: np.ndarray) -> float:
-    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
     values = values[np.isfinite(values)]
     if values.size == 0 or float(values.sum()) <= 0.0:
         return 0.0
     values = np.sort(np.maximum(values, 0.0))
     count = values.size
-    index = np.arange(1, count + 1, dtype=np.float64)
+    index = np.arange(1, count + 1, dtype=np.float32)
     return float((2.0 * np.sum(index * values) / (count * values.sum())) - (count + 1.0) / count)
 
 
 def _effective_rank(values: np.ndarray) -> Tuple[float, float]:
-    matrix = np.asarray(values, dtype=np.float64)
+    matrix = np.asarray(values, dtype=np.float32)
     if matrix.ndim != 2 or min(matrix.shape) == 0:
         return 0.0, 0.0
     singular = np.linalg.svd(matrix, full_matrices=False, compute_uv=False)
@@ -79,9 +79,9 @@ def _effective_rank(values: np.ndarray) -> Tuple[float, float]:
 
 
 def _rankdata(values: np.ndarray) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
     order = np.argsort(values, kind="mergesort")
-    ranks = np.empty(values.size, dtype=np.float64)
+    ranks = np.empty(values.size, dtype=np.float32)
     start = 0
     while start < values.size:
         end = start + 1
@@ -93,8 +93,8 @@ def _rankdata(values: np.ndarray) -> np.ndarray:
 
 
 def spearman_correlation(left: np.ndarray, right: np.ndarray) -> float:
-    left = np.asarray(left, dtype=np.float64).reshape(-1)
-    right = np.asarray(right, dtype=np.float64).reshape(-1)
+    left = np.asarray(left, dtype=np.float32).reshape(-1)
+    right = np.asarray(right, dtype=np.float32).reshape(-1)
     valid = np.isfinite(left) & np.isfinite(right)
     if int(valid.sum()) < 2:
         return 0.0
@@ -190,8 +190,13 @@ def class_error_metrics(
     support = np.bincount(target_ids, minlength=class_count).astype(np.int64)
     correct_count = np.bincount(target_ids[predictions == target_ids], minlength=class_count).astype(np.int64)
     predicted_frequency = np.bincount(predictions, minlength=class_count).astype(np.int64)
-    accuracy = np.divide(correct_count, support, out=np.full(class_count, np.nan), where=support > 0)
-    margin = np.full(class_count, np.nan, dtype=np.float64)
+    accuracy = np.divide(
+        correct_count,
+        support,
+        out=np.full(class_count, np.nan, dtype=np.float32),
+        where=support > 0,
+    )
+    margin = np.full(class_count, np.nan, dtype=np.float32)
     for class_id in range(class_count):
         mask = target_ids == class_id
         if mask.any():
@@ -204,7 +209,7 @@ def class_error_metrics(
         confusion_counts[key] = confusion_counts.get(key, 0) + 1
     attr_norm = None
     if class_attributes is not None:
-        attributes = np.asarray(class_attributes, dtype=np.float64)
+        attributes = np.asarray(class_attributes, dtype=np.float32)
         candidate_max = int(candidate.max()) if candidate.size else -1
         if attributes.ndim == 2 and candidate_max < attributes.shape[0]:
             attr_norm = _normalize_rows(attributes[candidate])
@@ -264,7 +269,7 @@ def calibration_profile_metrics(
     seen_columns = np.asarray([int(item) in seen_set for item in candidate], dtype=bool)
     seen_class_local = np.flatnonzero(seen_columns)
     unseen_class_local = np.flatnonzero(~seen_columns)
-    gamma = np.asarray(list(gamma_grid), dtype=np.float64).reshape(-1)
+    gamma = np.asarray(list(gamma_grid), dtype=np.float32).reshape(-1)
     if gamma.size == 0 or not np.isfinite(gamma).all():
         raise ValueError("gamma_grid must contain finite values")
 
@@ -283,9 +288,9 @@ def calibration_profile_metrics(
         unseen_curve.append(u)
         h_curve.append(h)
 
-    seen_values = np.asarray(seen_curve, dtype=np.float64)
-    unseen_values = np.asarray(unseen_curve, dtype=np.float64)
-    h_values = np.asarray(h_curve, dtype=np.float64)
+    seen_values = np.asarray(seen_curve, dtype=np.float32)
+    unseen_values = np.asarray(unseen_curve, dtype=np.float32)
+    h_values = np.asarray(h_curve, dtype=np.float32)
     peak_index = int(np.argmax(h_values))
     raw_index = int(np.argmin(np.abs(gamma)))
     order = np.argsort(seen_values)
@@ -304,7 +309,7 @@ def calibration_profile_metrics(
 
 
 def representation_geometry_metrics(features: Any, labels: Optional[Any] = None) -> Dict[str, float]:
-    matrix = np.asarray(features, dtype=np.float64)
+    matrix = np.asarray(features, dtype=np.float32)
     if matrix.ndim != 2 or matrix.shape[0] == 0:
         return {}
     finite = np.isfinite(matrix).all(axis=1)
@@ -315,7 +320,7 @@ def representation_geometry_metrics(features: Any, labels: Optional[Any] = None)
     normalized = _normalize_rows(matrix)
     sample = normalized[: min(512, normalized.shape[0])]
     pairwise = sample @ sample.T
-    offdiag = pairwise[~np.eye(pairwise.shape[0], dtype=bool)] if pairwise.shape[0] > 1 else np.asarray([], dtype=np.float64)
+    offdiag = pairwise[~np.eye(pairwise.shape[0], dtype=bool)] if pairwise.shape[0] > 1 else np.asarray([], dtype=np.float32)
     centered = matrix - matrix.mean(axis=0, keepdims=True)
     effective_rank, top_ratio = _effective_rank(centered)
     result = {
@@ -340,7 +345,7 @@ def representation_geometry_metrics(features: Any, labels: Optional[Any] = None)
         centers.append(center)
         within_sum += float(np.square(values - center).sum())
         within_count += int(values.size)
-    centers_matrix = np.asarray(centers, dtype=np.float64)
+    centers_matrix = np.asarray(centers, dtype=np.float32)
     overall = matrix.mean(axis=0)
     within = float(within_sum / max(1, within_count))
     between = float(np.square(centers_matrix - overall).sum(axis=1).mean()) if centers_matrix.size else 0.0
@@ -360,8 +365,8 @@ def visual_semantic_alignment_metrics(
     recall_k: int = 5,
     ambiguity_margin: float = 0.05,
 ) -> Dict[str, float]:
-    visual = np.asarray(visual_features, dtype=np.float64)
-    semantic = np.asarray(semantic_prototypes, dtype=np.float64)
+    visual = np.asarray(visual_features, dtype=np.float32)
+    semantic = np.asarray(semantic_prototypes, dtype=np.float32)
     if visual.ndim != 2 or semantic.ndim != 2 or visual.shape[1] != semantic.shape[1]:
         return {}
     target_ids = _as_targets(targets, visual.shape[0], semantic.shape[0])
@@ -380,8 +385,8 @@ def visual_semantic_alignment_metrics(
     for class_id in class_ids:
         visual_centers.append(visual[target_ids == class_id].mean(axis=0))
         aligned_semantics.append(semantic[int(class_id)])
-    visual_centers = np.asarray(visual_centers, dtype=np.float64)
-    aligned_semantics = np.asarray(aligned_semantics, dtype=np.float64)
+    visual_centers = np.asarray(visual_centers, dtype=np.float32)
+    aligned_semantics = np.asarray(aligned_semantics, dtype=np.float32)
     center_cosine = np.sum(_normalize_rows(visual_centers) * _normalize_rows(aligned_semantics), axis=1)
     visual_interclass_distance = _pairwise_euclidean_upper(visual_centers)
     semantic_interclass_distance = _pairwise_euclidean_upper(aligned_semantics)
@@ -430,7 +435,7 @@ def semantic_graph_reference_metrics(
     neighbor_k: int = 5,
     temperature: float = 1.0,
 ) -> Dict[str, float]:
-    attributes = np.asarray(class_attributes, dtype=np.float64)
+    attributes = np.asarray(class_attributes, dtype=np.float32)
     if attributes.ndim != 2 or attributes.shape[0] < 2:
         return {}
     relation = _normalize_rows(attributes) @ _normalize_rows(attributes).T
@@ -439,7 +444,7 @@ def semantic_graph_reference_metrics(
     adjacency = relation >= float(edge_threshold)
     adjacency = np.logical_or(adjacency, adjacency.T)
     np.fill_diagonal(adjacency, False)
-    degree = adjacency.sum(axis=1).astype(np.float64)
+    degree = adjacency.sum(axis=1).astype(np.float32)
 
     visited = np.zeros(count, dtype=bool)
     components = 0
@@ -520,15 +525,15 @@ def semantic_visual_graph_metrics(
     high_semantic_threshold: float = 0.8,
     low_visual_threshold: float = 0.2,
 ) -> Dict[str, float]:
-    visual = np.asarray(visual_features, dtype=np.float64)
-    semantic = np.asarray(semantic_prototypes, dtype=np.float64)
+    visual = np.asarray(visual_features, dtype=np.float32)
+    semantic = np.asarray(semantic_prototypes, dtype=np.float32)
     if visual.ndim != 2 or semantic.ndim != 2 or visual.shape[1] != semantic.shape[1]:
         return {}
     target_ids = _as_targets(targets, visual.shape[0], semantic.shape[0])
     observed = np.unique(target_ids)
     if observed.size < 2:
         return {}
-    centers = np.asarray([visual[target_ids == class_id].mean(axis=0) for class_id in observed], dtype=np.float64)
+    centers = np.asarray([visual[target_ids == class_id].mean(axis=0) for class_id in observed], dtype=np.float32)
     semantic_observed = semantic[observed]
     visual_relation = _normalize_rows(centers) @ _normalize_rows(centers).T
     semantic_relation = _normalize_rows(semantic_observed) @ _normalize_rows(semantic_observed).T
