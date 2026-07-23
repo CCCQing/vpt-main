@@ -1,21 +1,8 @@
 #!/usr/bin/env python3
-"""
-GraphProbPrior 温度/距离尺度监测工具。
+"""Graph-GP runtime statistics.
 
-这个文件只负责“把中间张量转成日志标量”，不参与 loss 计算，也不改变梯度。
-核心用途有两个：
-1. 短跑诊断脚本复用这里，统计一小段训练中各温度处理的真实数值范围；
-2. 日常训练开启 MONITOR_ENABLE 后，也复用这里把关键分布写进 loss stats。
-
-字段命名规则：
-- *_finite_ratio: 有限数值比例；小于 1 说明出现 inf/nan。
-- *_min/max/mean/std: 原始张量的基础统计。
-- *_q05/q50/q95: 原始张量 5%/50%/95% 分位数，比 min/max 更能反映典型范围。
-- *_entropy_mean: 概率分布每行熵的平均值；越小越尖，越大越平。
-- *_entropy_norm_mean: 熵除以 log(C) 后的归一化熵；接近 0 表示近似 one-hot，接近 1 表示近似均匀。
-- *_top1_mean: 每行最大概率的平均值；越大说明分布越集中在第一名。
-- *_top{k}_mass_mean: 每行 top-k 概率和的平均值；越大说明概率集中在少数类别。
-- *_true_mean: 每行真实类别位置的概率平均值；只在传入 true_index 时记录。
+This module converts detached intermediate tensors and gradients to log scalars.
+It does not participate in loss computation or alter gradients.
 """
 
 from __future__ import annotations
@@ -26,11 +13,9 @@ from typing import Dict, Iterable, List, Optional
 import torch
 import torch.nn.functional as F
 
-
 def _as_float(value: torch.Tensor) -> float:
     """把 0 维 tensor 安全转成 Python float，便于写入 json/csv/log。"""
     return float(value.detach().float().cpu().item())
-
 
 def _finite_flatten(x: torch.Tensor) -> torch.Tensor:
     """取出 tensor 中所有有限值并展平成一维；当前保留给后续扩展使用。"""
@@ -39,29 +24,8 @@ def _finite_flatten(x: torch.Tensor) -> torch.Tensor:
     values = x.detach().float().reshape(-1)
     return values[torch.isfinite(values)]
 
-
 def tensor_stats(prefix: str, x: torch.Tensor) -> Dict[str, float]:
-    """
-    统计任意实值张量的数值范围。
-
-    这个函数用于监测“温度处理之前”的原始量，例如：
-    - graph: 类别语义相似度矩阵；
-    - top_values: graph[y] top-k 后进入 TAU_ACC softmax 的 logits；
-    - distance: KL(q_i || p_c) 距离；
-    - sym_kl: prior-prior Gaussian 对称 KL；
-    - pair_dist: MMD 中 posterior/prior 样本两两平方距离；
-    - kernel: MMD 中 RBF kernel 值。
-
-    输出字段含义：
-    - {prefix}_finite_ratio: 有限值比例；如果小于 1，说明这个张量已经有数值异常。
-    - {prefix}_min / max: 极值；用于发现爆炸或异常离群点。
-    - {prefix}_mean / std: 均值和标准差；用于判断整体尺度。
-    - {prefix}_q05 / q50 / q95: 分位数；用于判断大多数值落在哪个范围。
-
-    读法：
-    - 如果 q95 - q05 很大，说明该位置 logits/距离跨度很大，softmax 温度可能需要更大；
-    - 如果 std 很小，说明该位置本身区分度弱，温度再小也可能只是在放大噪声。
-    """
+    """统计任意实值张量的有限比例、范围和分位数。"""
     if not torch.is_tensor(x):
         return {}
     values = x.detach().float().reshape(-1)
@@ -101,7 +65,6 @@ def tensor_stats(prefix: str, x: torch.Tensor) -> Dict[str, float]:
             }
         )
     return stats
-
 
 def probability_stats(
     prefix: str,
@@ -166,7 +129,6 @@ def probability_stats(
             stats[f"{prefix}_true_mean"] = _as_float(true_prob.mean())
     return stats
 
-
 def _membership_mask(values: torch.Tensor, members: torch.Tensor) -> torch.Tensor:
     """
     判断 values 中每个类别 id 是否属于 members。
@@ -178,7 +140,6 @@ def _membership_mask(values: torch.Tensor, members: torch.Tensor) -> torch.Tenso
         return torch.zeros_like(values, dtype=torch.bool)
     members = members.to(device=values.device, dtype=values.dtype)
     return (values[:, None] == members[None, :]).any(dim=1)
-
 
 def _matrix_condition_number(x: torch.Tensor) -> float:
     """用奇异值估计条件数；只作为监测项，失败时返回 0。"""
@@ -200,16 +161,13 @@ def _matrix_condition_number(x: torch.Tensor) -> float:
     min_s = singular[singular > 1e-12].min() if bool((singular > 1e-12).any().item()) else singular.new_tensor(1e-12)
     return _as_float(max_s / min_s.clamp_min(1e-12))
 
-
 def _row_probability_from_nonnegative(x: torch.Tensor) -> torch.Tensor:
     values = x.detach().float().clamp_min(0.0)
     return values / values.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
-
 def _abs_row_probability(x: torch.Tensor) -> torch.Tensor:
     values = x.detach().float().abs()
     return values / values.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
 
 def _batch_class_center_stats(
     prefix: str,
@@ -242,6 +200,125 @@ def _batch_class_center_stats(
     stats.update(tensor_stats(f"{prefix}_center_mse", center_mse))
     return stats
 
+def _offdiag_values(matrix: torch.Tensor) -> torch.Tensor:
+    """取方阵非对角线元素，用于统计类间关系而不让自相似对角线污染结果。"""
+    if not torch.is_tensor(matrix) or matrix.dim() != 2 or matrix.shape[0] != matrix.shape[1]:
+        return torch.empty(0)
+    n = int(matrix.shape[0])
+    mask = ~torch.eye(n, dtype=torch.bool, device=matrix.device)
+    return matrix.detach().float()[mask]
+
+def _row_entropy_stats(prefix: str, prob: torch.Tensor) -> Dict[str, float]:
+    """统计概率矩阵每行熵的分位数，判断分布是大锅饭还是过尖。"""
+    if not torch.is_tensor(prob) or prob.dim() != 2:
+        return {}
+    p = prob.detach().float().clamp_min(0.0)
+    p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    entropy = -(p * p.clamp_min(1e-12).log()).sum(dim=-1)
+    norm_entropy = entropy / math.log(max(int(p.shape[-1]), 2))
+    stats = tensor_stats(f"{prefix}_entropy_norm", norm_entropy)
+    stats[f"{prefix}_entropy_norm_mean"] = _as_float(norm_entropy.mean())
+    return stats
+
+def _gini(x: torch.Tensor) -> float:
+    """Gini 系数：越大表示 hubness 越集中在少数类别。"""
+    values = x.detach().float().reshape(-1)
+    finite = values[torch.isfinite(values)]
+    if finite.numel() == 0:
+        return 0.0
+    finite = finite.clamp_min(0.0).sort().values
+    total = finite.sum()
+    if float(total.item()) <= 0.0:
+        return 0.0
+    n = finite.numel()
+    index = torch.arange(1, n + 1, device=finite.device, dtype=finite.dtype)
+    return _as_float((2.0 * (index * finite).sum() / (float(n) * total)) - (float(n) + 1.0) / float(n))
+
+def _effective_rank(x: torch.Tensor, center: bool = True) -> float:
+    """
+    effective rank：看一组向量是否塌缩到低维子空间。
+    center=True 时先去掉整体均值，避免共同偏移影响 rank 判断。
+    """
+    if not torch.is_tensor(x) or x.dim() != 2:
+        return 0.0
+    values = x.detach()
+    if values.numel() == 0:
+        return 0.0
+    # This rank metric is diagnostic only. CPU SVD avoids noisy CUDA MAGMA logs.
+    values = values.to(device="cpu", dtype=torch.float32)
+    values = torch.where(torch.isfinite(values), values, torch.zeros_like(values))
+    if center:
+        values = values - values.mean(dim=0, keepdim=True)
+    try:
+        if hasattr(torch, "linalg") and hasattr(torch.linalg, "svdvals"):
+            singular = torch.linalg.svdvals(values)
+        else:
+            singular = torch.svd(values).S
+    except RuntimeError:
+        try:
+            gram = values.matmul(values.t()) if values.shape[0] <= values.shape[1] else values.t().matmul(values)
+            gram = 0.5 * (gram + gram.t())
+            if hasattr(torch, "linalg") and hasattr(torch.linalg, "eigvalsh"):
+                eigvals = torch.linalg.eigvalsh(gram)
+            else:
+                eigvals = torch.symeig(gram, eigenvectors=False).eigenvalues
+            singular = eigvals.clamp_min(0.0).sqrt()
+        except RuntimeError:
+            return 0.0
+    total = singular.sum()
+    if float(total.item()) <= 1e-12:
+        return 0.0
+    p = singular / total.clamp_min(1e-12)
+    entropy = -(p * p.clamp_min(1e-12).log()).sum()
+    return _as_float(entropy.exp())
+
+def _pairwise_symkl(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """计算所有类别 diagonal Gaussian prior 的两两对称 KL，返回 [C,C]。"""
+    mu = mu.detach().float()
+    logvar = logvar.detach().float()
+    var = logvar.exp()
+    inv_var = torch.exp(-logvar)
+    dim = int(mu.shape[1])
+    logvar_sum = logvar.sum(dim=-1)
+    log_term = logvar_sum[None, :] - logvar_sum[:, None]
+    var_term = var.matmul(inv_var.t())
+    mu_sq = mu.pow(2)
+    mu_sq_over_var = mu_sq.matmul(inv_var.t())
+    cross = mu.matmul((mu * inv_var).t())
+    self_quad = (mu_sq * inv_var).sum(dim=-1)
+    mean_term = mu_sq_over_var - 2.0 * cross + self_quad[None, :]
+    kl = 0.5 * (log_term + var_term + mean_term - float(dim))
+    return 0.5 * (kl + kl.t()).clamp_min(0.0)
+
+def _spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
+    """无 scipy 版本 Spearman：先转 rank，再算 Pearson。"""
+    if not torch.is_tensor(x) or not torch.is_tensor(y):
+        return 0.0
+    x = x.detach().float().reshape(-1)
+    y = y.detach().float().reshape(-1)
+    mask = torch.isfinite(x) & torch.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if x.numel() < 3:
+        return 0.0
+    rx = torch.argsort(torch.argsort(x)).float()
+    ry = torch.argsort(torch.argsort(y)).float()
+    rx = rx - rx.mean()
+    ry = ry - ry.mean()
+    denom = rx.norm() * ry.norm()
+    if float(denom.item()) <= 1e-12:
+        return 0.0
+    return _as_float(rx.dot(ry) / denom)
+
+def _index_tensor(ids, device: torch.device) -> torch.Tensor:
+    """把 list/tuple/numpy/tensor 形式的类别 id 统一成 long tensor。"""
+    if ids is None:
+        return torch.empty(0, dtype=torch.long, device=device)
+    if torch.is_tensor(ids):
+        out = ids.detach().to(device=device, dtype=torch.long).view(-1)
+    else:
+        out = torch.as_tensor(ids, device=device, dtype=torch.long).view(-1)
+    return out[out >= 0]
 
 def graph_gp_prototype_monitor(
     prior_mu: torch.Tensor,
@@ -488,339 +565,12 @@ def graph_gp_prototype_monitor(
 
     return stats
 
-
-def graph_neighbor_monitor(
-    graph: torch.Tensor,
-    tau_graph: float,
-    topk: int = 5,
-) -> Dict[str, float]:
-    """
-    监测 TAU_GRAPH 对 graph 邻居聚合权重的影响。
-
-    对应 GraphProbPrior 里的：
-        neighbor_weight = softmax(graph / TAU_GRAPH)
-        neighbor_bank = neighbor_weight @ bank
-
-    记录两类量：
-    1. graph_prob_prior_monitor_tau_graph_raw_*
-       graph 原始相似度矩阵的数值范围。
-    2. graph_prob_prior_monitor_tau_graph_neighbor_*
-       softmax 后的邻居权重分布。
-
-    读法：
-    - neighbor_entropy_norm 低、neighbor_top1 高：
-      每个类别主要从极少数邻居借信息，TAU_GRAPH 偏小或 graph 差距过大。
-    - neighbor_entropy_norm 高、neighbor_top1 低：
-      每个类别几乎平均借很多类的信息，TAU_GRAPH 偏大或 graph 差距太小。
-    """
-    stats = tensor_stats("graph_prob_prior_monitor_tau_graph_raw", graph)
-    neighbor_weight = F.softmax(graph / float(tau_graph), dim=-1)
-    stats.update(
-        probability_stats(
-            "graph_prob_prior_monitor_tau_graph_neighbor",
-            neighbor_weight,
-            topk=topk,
-        )
-    )
-    return stats
-
-
-def semantic_target_monitor(
-    graph: torch.Tensor,
-    targets_global: torch.Tensor,
-    tau_acc: float,
-    graph_topk: int,
-    target_mix_alpha: float,
-    num_classes: int,
-    eps: float,
-    topk: int = 5,
-) -> Dict[str, float]:
-    """
-    监测 TAU_ACC 和 TARGET_MIX_ALPHA 构造监督 target 的效果。
-
-    对应 GraphPriorInputBuilder.build_target() 的逻辑：
-        rows = graph[y]
-        masked = 只保留 TOPK 个语义近邻，其余置为 -inf
-        target_sem = softmax(masked / TAU_ACC)
-        target = (1 - TARGET_MIX_ALPHA) * onehot + TARGET_MIX_ALPHA * target_sem
-
-    记录三类量：
-    1. graph_prob_prior_monitor_tau_acc_topk_logits_*
-       进入 TAU_ACC softmax 的 top-k graph logits 的原始范围。
-    2. graph_prob_prior_monitor_tau_acc_target_sem_*
-       纯语义近邻 soft target 的分布形状。
-    3. graph_prob_prior_monitor_tau_acc_target_*
-       与 one-hot 混合后的最终监督 target 分布。
-
-    读法：
-    - target_sem_entropy_norm 低：
-      语义近邻 target 很尖，TAU_ACC 可能偏小。
-    - target_entropy_norm 明显低于 target_sem_entropy_norm：
-      TARGET_MIX_ALPHA 较小，one-hot 真类成分占主导。
-    - target_true_mean 越高：
-      最终监督 target 给真类的概率质量越大。
-    """
-    rows = graph.index_select(0, targets_global)
-    k = max(1, min(int(graph_topk), int(num_classes)))
-    top_values, top_idx = torch.topk(rows, k=k, dim=-1)
-    masked = rows.new_full(rows.shape, float("-inf"))
-    masked.scatter_(dim=-1, index=top_idx, src=top_values)
-    target_sem = F.softmax(masked / float(tau_acc), dim=-1)
-    onehot = F.one_hot(targets_global, num_classes=int(num_classes)).to(dtype=target_sem.dtype)
-    target = (1.0 - float(target_mix_alpha)) * onehot + float(target_mix_alpha) * target_sem
-    target = target.clamp_min(float(eps))
-    target = target / target.sum(dim=-1, keepdim=True).clamp_min(float(eps))
-
-    stats = tensor_stats("graph_prob_prior_monitor_tau_acc_topk_logits", top_values)
-    stats.update(
-        probability_stats(
-            "graph_prob_prior_monitor_tau_acc_target_sem",
-            target_sem,
-            true_index=targets_global,
-            topk=topk,
-        )
-    )
-    stats.update(
-        probability_stats(
-            "graph_prob_prior_monitor_tau_acc_target",
-            target,
-            true_index=targets_global,
-            topk=topk,
-        )
-    )
-    return stats
-
-
-def latent_matching_monitor(
-    distance: torch.Tensor,
-    latent_prob: torch.Tensor,
-    targets_global: Optional[torch.Tensor],
-    topk: int = 5,
-) -> Dict[str, float]:
-    """
-    监测 TAU_LATENT 对 all-class latent matching 的影响。
-
-    对应 _samplewise_latent_matching_loss()：
-        distance[i, c] = KL(q_i || p_c)
-        latent_prob[i] = softmax(-distance[i] / TAU_LATENT)
-
-    记录两类量：
-    1. graph_prob_prior_monitor_tau_latent_distance_*
-       样本 posterior 到所有类别 prior 的 KL 距离范围。
-    2. graph_prob_prior_monitor_tau_latent_*
-       softmax(-KL / TAU_LATENT) 后的类别分布。
-
-    读法：
-    - distance_q95 很大且 latent_entropy_norm 很低：
-      KL 距离跨度很大，TAU_LATENT 可能太小，分布接近 one-hot。
-    - distance_std 很小且 latent_entropy_norm 很高：
-      所有类距离差不多，latent matching 区分度弱。
-    - latent_true_mean 低：
-      样本 posterior 并没有把真类 prior 排到较高概率。
-    """
-    stats = tensor_stats("graph_prob_prior_monitor_tau_latent_distance", distance)
-    stats.update(
-        probability_stats(
-            "graph_prob_prior_monitor_tau_latent",
-            latent_prob,
-            true_index=targets_global,
-            topk=topk,
-        )
-    )
-    return stats
-
-
-def relation_monitor(sym_kl: torch.Tensor, pred_rel: torch.Tensor, topk: int = 5) -> Dict[str, float]:
-    """
-    监测 TAU_PRIOR 对 prior-prior 关系分布的影响。
-
-    对应 _relation_regularization()：
-        sym_kl[c, d] = 0.5 * (KL(P_c || P_d) + KL(P_d || P_c))
-        pred_rel[c] = softmax(-sym_kl[c] / TAU_PRIOR)
-
-    记录两类量：
-    1. graph_prob_prior_monitor_tau_prior_symkl_*
-       类别 prior Gaussian 两两对称 KL 的原始距离范围。
-    2. graph_prob_prior_monitor_tau_prior_*
-       用 TAU_PRIOR 转成的 prior 关系概率分布。
-
-    读法：
-    - symkl_q95 很大、tau_prior_entropy_norm 很低：
-      prior 关系分布过尖，TAU_PRIOR 可能偏小。
-    - symkl_std 很小、tau_prior_entropy_norm 高：
-      prior 之间距离差别小，relation regularization 难以提供结构区分。
-    """
-    stats = tensor_stats("graph_prob_prior_monitor_tau_prior_symkl", sym_kl)
-    stats.update(
-        probability_stats(
-            "graph_prob_prior_monitor_tau_prior",
-            pred_rel,
-            topk=topk,
-        )
-    )
-    return stats
-
-
-def mmd_monitor(pair_dist: torch.Tensor, kernel: torch.Tensor, sigma: Optional[float] = None) -> Dict[str, float]:
-    """
-    监测 MMD_SIGMA 对 RBF-MMD kernel 的影响。
-
-    对应 class_aggregate_mmd：
-        pair_dist = ||posterior_sample - prior_sample||^2
-        kernel = exp(-pair_dist / (2 * MMD_SIGMA^2))
-
-    记录两类量：
-    1. graph_prob_prior_monitor_mmd_pair_dist_*
-       posterior/prior latent 样本两两平方距离范围。
-    2. graph_prob_prior_monitor_mmd_kernel_*
-       RBF kernel 值范围。
-
-    读法：
-    - kernel_mean 接近 0：
-      sigma 相对距离太小，posterior/prior 样本几乎都被认为“不相似”，MMD 梯度可能弱或不稳定。
-    - kernel_mean 接近 1：
-      sigma 相对距离太大，样本几乎都被认为“很相似”，MMD 区分度弱。
-    - 理想情况通常是 kernel 有一定分散度，而不是全部挤在 0 或 1。
-    """
-    stats = tensor_stats("graph_prob_prior_monitor_mmd_pair_dist", pair_dist)
-    stats.update(tensor_stats("graph_prob_prior_monitor_mmd_kernel", kernel))
-    if torch.is_tensor(kernel):
-        kernel_flat = kernel.detach().float().reshape(-1)
-        finite = kernel_flat[torch.isfinite(kernel_flat)]
-        if finite.numel() > 0:
-            stats["graph_prob_prior_monitor_mmd_kernel_saturation_low_ratio"] = _as_float((finite < 1e-4).float().mean())
-            stats["graph_prob_prior_monitor_mmd_kernel_saturation_high_ratio"] = _as_float((finite > 0.99).float().mean())
-    if sigma is not None:
-        stats["graph_prob_prior_monitor_mmd_sigma"] = float(sigma)
-    return stats
-
-
-def _offdiag_values(matrix: torch.Tensor) -> torch.Tensor:
-    """取方阵非对角线元素，用于统计类间关系而不让自相似对角线污染结果。"""
-    if not torch.is_tensor(matrix) or matrix.dim() != 2 or matrix.shape[0] != matrix.shape[1]:
-        return torch.empty(0)
-    n = int(matrix.shape[0])
-    mask = ~torch.eye(n, dtype=torch.bool, device=matrix.device)
-    return matrix.detach().float()[mask]
-
-
-def _row_entropy_stats(prefix: str, prob: torch.Tensor) -> Dict[str, float]:
-    """统计概率矩阵每行熵的分位数，判断分布是大锅饭还是过尖。"""
-    if not torch.is_tensor(prob) or prob.dim() != 2:
-        return {}
-    p = prob.detach().float().clamp_min(0.0)
-    p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-    entropy = -(p * p.clamp_min(1e-12).log()).sum(dim=-1)
-    norm_entropy = entropy / math.log(max(int(p.shape[-1]), 2))
-    stats = tensor_stats(f"{prefix}_entropy_norm", norm_entropy)
-    stats[f"{prefix}_entropy_norm_mean"] = _as_float(norm_entropy.mean())
-    return stats
-
-
-def _gini(x: torch.Tensor) -> float:
-    """Gini 系数：越大表示 hubness 越集中在少数类别。"""
-    values = x.detach().float().reshape(-1)
-    finite = values[torch.isfinite(values)]
-    if finite.numel() == 0:
-        return 0.0
-    finite = finite.clamp_min(0.0).sort().values
-    total = finite.sum()
-    if float(total.item()) <= 0.0:
-        return 0.0
-    n = finite.numel()
-    index = torch.arange(1, n + 1, device=finite.device, dtype=finite.dtype)
-    return _as_float((2.0 * (index * finite).sum() / (float(n) * total)) - (float(n) + 1.0) / float(n))
-
-
-def _effective_rank(x: torch.Tensor, center: bool = True) -> float:
-    """
-    effective rank：看一组向量是否塌缩到低维子空间。
-    center=True 时先去掉整体均值，避免共同偏移影响 rank 判断。
-    """
-    if not torch.is_tensor(x) or x.dim() != 2:
-        return 0.0
-    values = x.detach()
-    if values.numel() == 0:
-        return 0.0
-    # This rank metric is diagnostic only. CPU SVD avoids noisy CUDA MAGMA logs.
-    values = values.to(device="cpu", dtype=torch.float32)
-    values = torch.where(torch.isfinite(values), values, torch.zeros_like(values))
-    if center:
-        values = values - values.mean(dim=0, keepdim=True)
-    try:
-        if hasattr(torch, "linalg") and hasattr(torch.linalg, "svdvals"):
-            singular = torch.linalg.svdvals(values)
-        else:
-            singular = torch.svd(values).S
-    except RuntimeError:
-        try:
-            gram = values.matmul(values.t()) if values.shape[0] <= values.shape[1] else values.t().matmul(values)
-            gram = 0.5 * (gram + gram.t())
-            if hasattr(torch, "linalg") and hasattr(torch.linalg, "eigvalsh"):
-                eigvals = torch.linalg.eigvalsh(gram)
-            else:
-                eigvals = torch.symeig(gram, eigenvectors=False).eigenvalues
-            singular = eigvals.clamp_min(0.0).sqrt()
-        except RuntimeError:
-            return 0.0
-    total = singular.sum()
-    if float(total.item()) <= 1e-12:
-        return 0.0
-    p = singular / total.clamp_min(1e-12)
-    entropy = -(p * p.clamp_min(1e-12).log()).sum()
-    return _as_float(entropy.exp())
-
-
-def _pairwise_symkl(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """计算所有类别 diagonal Gaussian prior 的两两对称 KL，返回 [C,C]。"""
-    mu = mu.detach().float()
-    logvar = logvar.detach().float()
-    var = logvar.exp()
-    inv_var = torch.exp(-logvar)
-    dim = int(mu.shape[1])
-    logvar_sum = logvar.sum(dim=-1)
-    log_term = logvar_sum[None, :] - logvar_sum[:, None]
-    var_term = var.matmul(inv_var.t())
-    mu_sq = mu.pow(2)
-    mu_sq_over_var = mu_sq.matmul(inv_var.t())
-    cross = mu.matmul((mu * inv_var).t())
-    self_quad = (mu_sq * inv_var).sum(dim=-1)
-    mean_term = mu_sq_over_var - 2.0 * cross + self_quad[None, :]
-    kl = 0.5 * (log_term + var_term + mean_term - float(dim))
-    return 0.5 * (kl + kl.t()).clamp_min(0.0)
-
-
-def _spearman_corr(x: torch.Tensor, y: torch.Tensor) -> float:
-    """无 scipy 版本 Spearman：先转 rank，再算 Pearson。"""
-    if not torch.is_tensor(x) or not torch.is_tensor(y):
-        return 0.0
-    x = x.detach().float().reshape(-1)
-    y = y.detach().float().reshape(-1)
-    mask = torch.isfinite(x) & torch.isfinite(y)
-    x = x[mask]
-    y = y[mask]
-    if x.numel() < 3:
-        return 0.0
-    rx = torch.argsort(torch.argsort(x)).float()
-    ry = torch.argsort(torch.argsort(y)).float()
-    rx = rx - rx.mean()
-    ry = ry - ry.mean()
-    denom = rx.norm() * ry.norm()
-    if float(denom.item()) <= 1e-12:
-        return 0.0
-    return _as_float(rx.dot(ry) / denom)
-
-
 def graph_health_monitor(
     graph: torch.Tensor,
-    tau_graph: float,
     topk: int = 5,
     exclude_diag: bool = True,
 ) -> Dict[str, float]:
-    """
-    Graph health：看语义图是不是大锅饭、是不是 hub 很严重、是不是所有类都互相很像。
-    这些指标直接作用于图本身和 softmax(graph/tau) 后的邻居分布。
-    """
+    """Summarize the raw Graph-GP kernel without an obsolete aggregation temperature."""
     stats: Dict[str, float] = {}
     if not torch.is_tensor(graph) or graph.dim() != 2 or graph.shape[0] != graph.shape[1]:
         return stats
@@ -837,7 +587,7 @@ def graph_health_monitor(
         stats["graph_prob_prior_monitor_graph_pairs_gt_0_9_undirected"] = float(int(directed_09.item()) // 2)
         stats["graph_prob_prior_monitor_graph_pairs_gt_0_8_undirected"] = float(int(directed_08.item()) // 2)
 
-    neighbor = F.softmax(graph / float(tau_graph), dim=-1)
+    neighbor = _row_probability_from_nonnegative(graph)
     diag = torch.diagonal(neighbor)
     stats.update(tensor_stats("graph_prob_prior_monitor_neighbor_self_mass", diag))
     stats.update(_row_entropy_stats("graph_prob_prior_monitor_neighbor", neighbor))
@@ -857,7 +607,6 @@ def graph_health_monitor(
     stats.update(tensor_stats("graph_prob_prior_monitor_neighbor_hubness", hubness))
     stats["graph_prob_prior_monitor_neighbor_hubness_gini"] = _gini(hubness)
     return stats
-
 
 def prior_health_monitor(
     prior_mu: torch.Tensor,
@@ -914,171 +663,6 @@ def prior_health_monitor(
     if bool(compute_effective_rank):
         stats["graph_prob_prior_monitor_prior_effective_rank"] = _effective_rank(mu, center=True)
     return stats
-
-
-def residual_anchor_prior_monitor(
-    residual_attr: torch.Tensor,
-    anchor: torch.Tensor,
-    prior_mu: torch.Tensor,
-    delta: Optional[torch.Tensor] = None,
-    context: Optional[torch.Tensor] = None,
-    graph: Optional[torch.Tensor] = None,
-    positive_weight: Optional[torch.Tensor] = None,
-    threshold: float = 0.9,
-) -> Dict[str, float]:
-    """
-    residual-anchor prior 专用监测。
-
-    这组指标回答三个问题：
-    1. 312 维标准化属性残差是否数值健康；
-    2. anchor_head 生成的类别锚点是否已经把类别拉开；
-    3. delta_head 的小修正是否过强，是否又把空间推回自由 MLP。
-    """
-    stats: Dict[str, float] = {}
-    if not torch.is_tensor(residual_attr) or not torch.is_tensor(anchor) or not torch.is_tensor(prior_mu):
-        return stats
-    residual = residual_attr.detach().float()
-    anchor = anchor.detach().float()
-    prior = prior_mu.detach().float()
-    if residual.dim() != 2 or anchor.dim() != 2 or prior.dim() != 2:
-        return stats
-
-    # residual_attr_norm_*：看标准化后的 312 维残差有没有整体过大或过小。
-    stats.update(tensor_stats("graph_prob_prior_monitor_residual_attr_norm", residual.norm(dim=-1)))
-
-    # anchor_pair_cosine_*：只看 anchor_head 输出，不混入 delta，用来判断主锚点是否已经缓解 collapse。
-    anchor_cos = F.normalize(anchor, p=2, dim=-1, eps=1e-12).matmul(
-        F.normalize(anchor, p=2, dim=-1, eps=1e-12).t()
-    )
-    anchor_off = _offdiag_values(anchor_cos)
-    if anchor_off.numel() > 0:
-        stats.update(tensor_stats("graph_prob_prior_monitor_anchor_pair_cosine", anchor_off))
-        stats["graph_prob_prior_monitor_anchor_pairs_gt_0_9"] = _as_float(
-            (anchor_off > float(threshold)).float().sum() / 2.0
-        )
-
-    # prior_pair_cosine_*：看最终 prior_mu 是否仍然塌缩。prior_health_monitor 也会记一部分，
-    # 这里补 q05/q50/q95，方便和 anchor_pair_cosine 直接对比。
-    prior_cos = F.normalize(prior, p=2, dim=-1, eps=1e-12).matmul(
-        F.normalize(prior, p=2, dim=-1, eps=1e-12).t()
-    )
-    prior_off = _offdiag_values(prior_cos)
-    if prior_off.numel() > 0:
-        stats.update(tensor_stats("graph_prob_prior_monitor_prior_pair_cosine", prior_off))
-
-    # prior_anchor_cos_*：看最终 prior_mu 是否仍沿着 anchor 方向；过低说明 delta 修正覆盖了主锚点。
-    if anchor.shape == prior.shape:
-        anchor_n = F.normalize(anchor, p=2, dim=-1, eps=1e-12)
-        prior_n = F.normalize(prior, p=2, dim=-1, eps=1e-12)
-        stats.update(tensor_stats("graph_prob_prior_monitor_prior_anchor_cos", (anchor_n * prior_n).sum(dim=-1)))
-
-    if delta is not None and torch.is_tensor(delta) and delta.shape == anchor.shape:
-        d = delta.detach().float()
-        delta_norm = d.norm(dim=-1)
-        anchor_norm = anchor.norm(dim=-1).clamp_min(1e-12)
-        # prior_delta_to_anchor_ratio：越大说明 correction 越像自由生成器；提示词期望它只是小修正。
-        stats.update(tensor_stats("graph_prob_prior_monitor_prior_delta_norm", delta_norm))
-        stats.update(tensor_stats("graph_prob_prior_monitor_prior_delta_to_anchor_ratio", delta_norm / anchor_norm))
-
-    if context is not None and torch.is_tensor(context) and context.shape == anchor.shape:
-        ctx = context.detach().float()
-        stats.update(tensor_stats("graph_prob_prior_monitor_context_anchor_cos", (
-            F.normalize(ctx, p=2, dim=-1, eps=1e-12) * F.normalize(anchor, p=2, dim=-1, eps=1e-12)
-        ).sum(dim=-1)))
-
-    if graph is not None and torch.is_tensor(graph) and graph.shape == prior_cos.shape:
-        graph_det = graph.detach().float().to(device=prior.device)
-        stats["graph_prob_prior_monitor_graph_pos_prior_relation_spearman"] = _spearman_corr(
-            _offdiag_values(graph_det),
-            _offdiag_values(prior_cos),
-        )
-        offdiag = ~torch.eye(int(graph_det.shape[0]), dtype=torch.bool, device=graph_det.device)
-        false_high = (graph_det > float(threshold)) & offdiag
-        if bool(false_high.any().item()):
-            stats["graph_prob_prior_monitor_false_high_prior_relation_still_gt_0_9"] = _as_float(
-                (prior_cos[false_high] > float(threshold)).float().sum()
-            )
-
-    if positive_weight is not None and torch.is_tensor(positive_weight) and positive_weight.shape == prior_cos.shape:
-        pos_mask = positive_weight.detach().to(device=prior.device) > 0.0
-        eye = torch.eye(int(pos_mask.shape[0]), dtype=torch.bool, device=prior.device)
-        pos_mask = pos_mask & ~eye
-        nonpos_mask = ~pos_mask & ~eye
-        if bool(pos_mask.any().item()):
-            stats["graph_prob_prior_monitor_true_neighbor_preservation_mean"] = _as_float(prior_cos[pos_mask].mean())
-        if bool(nonpos_mask.any().item()):
-            hard_values = prior_cos[nonpos_mask]
-            stats.update(tensor_stats("graph_prob_prior_monitor_hardneg_prior_cos", hard_values))
-            stats["graph_prob_prior_monitor_hardneg_violate_rate"] = _as_float(
-                (hard_values > float(threshold)).float().mean()
-            )
-    return stats
-
-
-def graph_prior_geometry_monitor(
-    d_norm: torch.Tensor,
-    dist_mu: torch.Tensor,
-    radius: torch.Tensor,
-    prior_mu: torch.Tensor,
-    graph: Optional[torch.Tensor] = None,
-    top_indices: Optional[torch.Tensor] = None,
-    margin_min: float = 0.1,
-) -> Dict[str, float]:
-    """
-    prior distribution geometry 监测。
-
-    d_norm 是提示词里的 D_cd：均值距离除以类别分布半径之和。
-    这些指标用来判断 prior mean 是否整体分散，以及 graph top-k 邻居是否被推得过远或过近。
-    """
-    stats: Dict[str, float] = {}
-    if not all(torch.is_tensor(x) for x in (d_norm, dist_mu, radius, prior_mu)):
-        return stats
-    if d_norm.dim() != 2 or d_norm.shape[0] != d_norm.shape[1]:
-        return stats
-    n = int(d_norm.shape[0])
-    eye = torch.eye(n, dtype=torch.bool, device=d_norm.device)
-    off_d = d_norm.detach().float()[~eye]
-    if off_d.numel() > 0:
-        stats.update(tensor_stats("graph_prob_prior_monitor_geom_prior_dist", off_d))
-        stats["graph_prob_prior_monitor_geom_pairs_lt_1_ratio"] = _as_float((off_d < 1.0).float().mean())
-    stats.update(tensor_stats("graph_prob_prior_monitor_geom_mu_dist", dist_mu.detach().float()[~eye]))
-    stats.update(tensor_stats("graph_prob_prior_monitor_geom_radius", radius.detach().float()))
-
-    prior = prior_mu.detach().float()
-    prior_cos = F.normalize(prior, p=2, dim=-1, eps=1e-12).matmul(
-        F.normalize(prior, p=2, dim=-1, eps=1e-12).t()
-    )
-    off_cos = prior_cos[~eye]
-    if off_cos.numel() > 0:
-        stats.update(tensor_stats("graph_prob_prior_monitor_geom_prior_cos", off_cos))
-        stats["graph_prob_prior_monitor_geom_pairs_cos_gt_0_9"] = _as_float((off_cos > 0.9).float().sum() / 2.0)
-
-    if top_indices is not None and torch.is_tensor(top_indices):
-        row = torch.arange(n, device=d_norm.device)[:, None]
-        top_d = d_norm.detach().float()[row, top_indices.to(device=d_norm.device)]
-        stats.update(tensor_stats("graph_prob_prior_monitor_geom_topk_dist", top_d))
-        stats["graph_prob_prior_monitor_geom_topk_boundary_violate_ratio"] = _as_float(
-            (top_d < (1.0 + float(margin_min))).float().mean()
-        )
-        if graph is not None and torch.is_tensor(graph) and graph.shape == d_norm.shape:
-            graph_top = graph.detach().float().to(device=d_norm.device)[row, top_indices.to(device=d_norm.device)]
-            stats["graph_prob_prior_monitor_geom_topk_graph_prior_corr"] = _spearman_corr(
-                graph_top.reshape(-1),
-                -top_d.reshape(-1),
-            )
-    return stats
-
-
-def _index_tensor(ids, device: torch.device) -> torch.Tensor:
-    """把 list/tuple/numpy/tensor 形式的类别 id 统一成 long tensor。"""
-    if ids is None:
-        return torch.empty(0, dtype=torch.long, device=device)
-    if torch.is_tensor(ids):
-        out = ids.detach().to(device=device, dtype=torch.long).view(-1)
-    else:
-        out = torch.as_tensor(ids, device=device, dtype=torch.long).view(-1)
-    return out[out >= 0]
-
 
 def seen_unseen_prior_monitor(
     prior_mu: torch.Tensor,
@@ -1149,7 +733,6 @@ def seen_unseen_prior_monitor(
         )
     return stats
 
-
 def gzsl_prior_risk_monitor(
     relation: torch.Tensor,
     seen_class_ids,
@@ -1211,7 +794,6 @@ def gzsl_prior_risk_monitor(
     stats[f"{prefix}_seen_hub_for_unseen_count_mean"] = _as_float(seen_hub.mean())
     return stats
 
-
 def false_high_pair_monitor(
     base_graph: torch.Tensor,
     new_relation: torch.Tensor,
@@ -1246,37 +828,10 @@ def false_high_pair_monitor(
                 stats[f"{prefix}_vs_true_neighbor_gap"] = _as_float(true_mean - new[false_mask].mean())
     return stats
 
-
 def graph_prob_prior_grad_monitor(named_parameters) -> Dict[str, float]:
-    """
-    backward 之后调用的梯度健康监测。
-    只读取参数梯度的 detach 值，判断 prior/stats head 是否真的收到梯度。
-    """
-    groups = {
-        "prior_head": (
-            "prior_head",
-            "factorized_semantic_prior_head",
-            "residual_anchor_head",
-            "residual_delta_head",
-            "residual_logvar_head",
-            "factorized_residual_anchor_head",
-            "factorized_residual_delta_head",
-            "factorized_residual_logvar_head",
-        ),
-        "learnable_scalar": (
-            "learnable_prior_mu_scale_raw",
-            "learnable_prior_delta_scale_raw",
-            "learnable_tau_graph_raw",
-            "learnable_tau_latent_raw",
-            "learnable_geom_tau_dist_raw",
-            "learnable_geom_bound_weight_raw",
-            "learnable_geom_ord_margin_scale_raw",
-            "learnable_geom_ord_non_overlap_weight_raw",
-        ),
-        "stats_head": ("stats_head",),
-    }
-    sum_sq = {key: 0.0 for key in groups}
-    counts = {key: 0 for key in groups}
+    """Report finite gradients and prompt-distributor stats-head gradient norm."""
+    sum_sq = 0.0
+    count = 0
     finite_num = 0
     finite_den = 0
     for name, param in named_parameters:
@@ -1287,108 +842,16 @@ def graph_prob_prior_grad_monitor(named_parameters) -> Dict[str, float]:
         finite = torch.isfinite(g)
         finite_num += int(finite.float().sum().item())
         finite_den += int(g.numel())
-        for key, needles in groups.items():
-            if any(needle in name for needle in needles):
-                finite_g = g[finite]
-                if finite_g.numel() > 0:
-                    sum_sq[key] += float(finite_g.pow(2).sum().item())
-                    counts[key] += int(finite_g.numel())
-    stats: Dict[str, float] = {}
-    for key, value in sum_sq.items():
-        stats[f"graph_prob_prior_monitor_grad_{key}_norm"] = math.sqrt(max(value, 0.0))
-        stats[f"graph_prob_prior_monitor_grad_{key}_param_count"] = float(counts[key])
-    stats["graph_prob_prior_monitor_grad_finite_ratio"] = float(finite_num) / float(max(finite_den, 1))
-    return stats
-
-
-def posterior_prior_alignment_monitor(
-    distance: torch.Tensor,
-    latent_prob: Optional[torch.Tensor],
-    targets_global: torch.Tensor,
-    topk: int = 5,
-) -> Dict[str, float]:
-    """
-    Posterior-prior alignment：看图像 posterior 是否真的更靠近正确类别 prior，
-    而不是所有类别 prior 距离都差不多。
-    """
-    stats: Dict[str, float] = {}
-    if not torch.is_tensor(distance) or not torch.is_tensor(targets_global) or distance.dim() != 2:
-        return stats
-    d = distance.detach().float()
-    y = targets_global.detach().to(device=d.device, dtype=torch.long).view(-1)
-    if y.numel() != d.shape[0]:
-        return stats
-    class_count = int(d.shape[1])
-    true_d = d.gather(1, y[:, None]).squeeze(1)
-    rank = 1 + (d < true_d[:, None]).float().sum(dim=-1)
-    stats["graph_prob_prior_monitor_posterior_true_rank_top1"] = _as_float((rank <= 1).float().mean())
-    stats["graph_prob_prior_monitor_posterior_true_rank_top5"] = _as_float((rank <= min(5, class_count)).float().mean())
-    stats["graph_prob_prior_monitor_posterior_true_rank_top10"] = _as_float((rank <= min(10, class_count)).float().mean())
-    stats.update(tensor_stats("graph_prob_prior_monitor_posterior_true_rank", rank))
-    stats.update(tensor_stats("graph_prob_prior_monitor_posterior_kl_true", true_d))
-
-    wrong = d.clone()
-    wrong.scatter_(1, y[:, None], float("inf"))
-    nearest_wrong = wrong.min(dim=-1).values
-    margin = nearest_wrong - true_d
-    stats.update(tensor_stats("graph_prob_prior_monitor_posterior_kl_nearest_wrong", nearest_wrong))
-    stats.update(tensor_stats("graph_prob_prior_monitor_posterior_kl_margin", margin))
-    stats["graph_prob_prior_monitor_posterior_kl_margin_positive_ratio"] = _as_float((margin > 0.0).float().mean())
-    if latent_prob is not None and torch.is_tensor(latent_prob):
-        stats.update(probability_stats("graph_prob_prior_monitor_latent_prob", latent_prob.detach(), true_index=y, topk=topk))
-    return stats
-
-
-def factorized_health_monitor(
-    semantic_mu: torch.Tensor,
-    semantic_logvar: torch.Tensor,
-    variation_mu: torch.Tensor,
-    variation_logvar: torch.Tensor,
-    targets_global: Optional[torch.Tensor] = None,
-    compute_effective_rank: bool = False,
-) -> Dict[str, float]:
-    """
-    Factorized latent：看 semantic factor 和 variation factor 是否各司其职，
-    有没有互相串信息，variation 是否偷学类别语义。
-    """
-    stats: Dict[str, float] = {}
-    if not all(torch.is_tensor(x) for x in (semantic_mu, semantic_logvar, variation_mu, variation_logvar)):
-        return stats
-    sm = semantic_mu.detach().float()
-    vm = variation_mu.detach().float()
-    stats.update(tensor_stats("graph_prob_prior_monitor_factorized_semantic_mu_norm", sm.norm(dim=-1)))
-    stats.update(tensor_stats("graph_prob_prior_monitor_factorized_variation_mu_norm", vm.norm(dim=-1)))
-    stats.update(tensor_stats("graph_prob_prior_monitor_factorized_semantic_var", semantic_logvar.detach().float().exp()))
-    stats.update(tensor_stats("graph_prob_prior_monitor_factorized_variation_var", variation_logvar.detach().float().exp()))
-    stats["graph_prob_prior_monitor_factorized_semantic_variation_norm_ratio"] = _as_float(
-        sm.norm(dim=-1).mean() / vm.norm(dim=-1).mean().clamp_min(1e-12)
-    )
-    sm_centered = sm - sm.mean(dim=0, keepdim=True)
-    vm_centered = vm - vm.mean(dim=0, keepdim=True)
-    cross_cov = sm_centered.t().matmul(vm_centered) / float(max(sm.shape[0], 1))
-    stats["graph_prob_prior_monitor_factorized_cross_cov_fro"] = _as_float(cross_cov.pow(2).sum().sqrt())
-    if bool(compute_effective_rank):
-        stats["graph_prob_prior_monitor_factorized_semantic_batch_effective_rank"] = _effective_rank(sm, center=True)
-        stats["graph_prob_prior_monitor_factorized_variation_batch_effective_rank"] = _effective_rank(vm, center=True)
-    if targets_global is not None and torch.is_tensor(targets_global):
-        y = targets_global.detach().to(device=vm.device, dtype=torch.long)
-        class_ids = torch.unique(y, sorted=True)
-        if class_ids.numel() > 1:
-            centers = []
-            within = []
-            for cid in class_ids:
-                vals = vm[y == cid]
-                center = vals.mean(dim=0)
-                centers.append(center)
-                within.append((vals - center).norm(dim=-1).mean())
-            centers = torch.stack(centers)
-            between = _offdiag_values(torch.cdist(centers, centers, p=2)).mean()
-            within_mean = torch.stack(within).mean()
-            stats["graph_prob_prior_monitor_factorized_variation_between_class_mean_dist"] = _as_float(between)
-            stats["graph_prob_prior_monitor_factorized_variation_within_class_mean_dist"] = _as_float(within_mean)
-            stats["graph_prob_prior_monitor_factorized_variation_class_ratio"] = _as_float(between / within_mean.clamp_min(1e-12))
-    return stats
-
+        if "stats_head" in name:
+            finite_g = g[finite]
+            if finite_g.numel() > 0:
+                sum_sq += float(finite_g.pow(2).sum().item())
+                count += int(finite_g.numel())
+    return {
+        "graph_prob_prior_monitor_grad_stats_head_norm": math.sqrt(max(sum_sq, 0.0)),
+        "graph_prob_prior_monitor_grad_stats_head_param_count": float(count),
+        "graph_prob_prior_monitor_grad_finite_ratio": float(finite_num) / float(max(finite_den, 1)),
+    }
 
 def loss_scale_monitor(
     main_loss: Optional[float] = None,
@@ -1404,7 +867,6 @@ def loss_scale_monitor(
         if main_loss is not None:
             stats["graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio"] = weighted / max(abs(float(main_loss)), eps)
     return stats
-
 
 def aggregate_monitor_rows(rows: Iterable[Dict[str, float]]) -> Dict[str, float]:
     """

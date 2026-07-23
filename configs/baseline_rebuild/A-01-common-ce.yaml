@@ -29,7 +29,6 @@ MODEL:
     DROPOUT: 0.0
     DISTRIBUTOR:
       ENABLE: false
-      FACTORIZED_ENABLE: false
   R_SIMILARITY:
     SCORE_MODE: "dot"
     LEARNABLE_SCALE: false

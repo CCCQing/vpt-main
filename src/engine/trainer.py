@@ -105,52 +105,6 @@ from ..utils.vis_pipeline import (
 logger = logging.get_logger("visual_prompt")
 
 
-def _load_graph_attr_name_embeddings(cfg: CfgNode) -> torch.Tensor:
-    """
-    Trainer 侧一次性读取属性名文本 embedding。
-
-    这样 GraphProbPriorLossComputer 只消费张量，不再读路径；
-    后续如果 dataset 自带 attr_name_embeddings，也可以在 batch 侧优先使用 dataset 的版本。
-    """
-    graph_cfg = cfg.MODEL.GRAPH_INPUT
-    path = str(graph_cfg.ATTR_NAME_EMBED_PATH)
-    if not path:
-        raise ValueError("MODEL.GRAPH_INPUT.ATTR_NAME_EMBED_PATH must be set when GraphProbPrior is enabled.")
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"MODEL.GRAPH_INPUT.ATTR_NAME_EMBED_PATH not found: {path}")
-
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".npy":
-        payload = np.load(path)
-    else:
-        payload = torch.load(path, map_location="cpu")
-
-    if isinstance(payload, dict):
-        for key in ("embeddings", "tensor"):
-            if key in payload:
-                payload = payload[key]
-                break
-    if isinstance(payload, np.ndarray):
-        payload = torch.from_numpy(payload)
-    if not torch.is_tensor(payload):
-        raise TypeError(f"ATTR_NAME_EMBED_PATH must load as tensor/ndarray/dict tensor, got {type(payload)} from {path}")
-
-    embeddings = payload.float().contiguous()
-    expected_shape = (int(graph_cfg.ATTR_DIM), int(graph_cfg.TEXT_DIM))
-    if tuple(embeddings.shape) != expected_shape:
-        raise ValueError(f"Expected attr_name_embeddings shape {expected_shape}, got {tuple(embeddings.shape)} from {path}")
-    return embeddings
-
-
-def _graph_prior_inputs_enabled(cfg: CfgNode) -> bool:
-    """Trainer 侧判断是否需要预加载属性名文本 embedding。"""
-    return (
-        bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE)
-        and float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT) > 0
-        and str(cfg.MODEL.GRAPH_PROB_PRIOR.PRIOR_MEAN_MODE).lower() != "graph_gp_conditioned"
-    )
-
-
 class Trainer():
     """
     训练/评测主调度器。
@@ -172,12 +126,6 @@ class Trainer():
         if self.affinity_aux_needed and bool(cfg.MODEL.AFFINITY.DETACH):
             raise ValueError("Affinity auxiliary losses require MODEL.AFFINITY.DETACH=False.")
         self._last_semantic_length = 0
-        self.graph_attr_name_embeddings = (
-            _load_graph_attr_name_embeddings(cfg)
-            if _graph_prior_inputs_enabled(cfg)
-            else None
-        )
-
         self.affinity_monitor_requested = bool(cfg.MONITOR.ENABLE) and bool(cfg.MONITOR.AFFINITY.ENABLE)
         self.use_affinity = cfg.MODEL.AFFINITY.ENABLE or self.affinity_aux_needed or self.affinity_monitor_requested
         if self.use_affinity:
@@ -2108,14 +2056,6 @@ class Trainer():
                 # GraphProbPrior 直接复用 dataloader 已加载的全类属性矩阵；
                 # 不再提供路径兜底，避免和语义分支的数据来源分叉。
                 dataset_class_attributes = dataset.class_attributes
-            dataset_attr_name_embeddings = None
-            if dataset is not None and hasattr(dataset, "attr_name_embeddings"):
-                dataset_attr_name_embeddings = dataset.attr_name_embeddings
-            attr_name_embeddings = (
-                dataset_attr_name_embeddings
-                if dataset_attr_name_embeddings is not None
-                else self.graph_attr_name_embeddings
-            )
             dataset_seen_classes = getattr(dataset, "seen_classes", None) if dataset is not None else None
             dataset_unseen_classes = getattr(dataset, "unseen_classes", None) if dataset is not None else None
             loss_kwargs = {
@@ -2124,7 +2064,6 @@ class Trainer():
                 # GraphProbPrior 使用全局类别 id；不能使用 local-output remap 后的 loss_targets。
                 "targets_global": effective_targets.detach(),
                 "class_attributes": dataset_class_attributes,
-                "attr_name_embeddings": attr_name_embeddings,
                 "seen_class_ids": dataset_seen_classes,
                 "unseen_class_ids": dataset_unseen_classes,
                 "epoch": int(self._trace_epoch + 1),

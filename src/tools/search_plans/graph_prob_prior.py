@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.monitoring.fields import GPP_MONITOR_ALIASES
+from src.configs.config import get_cfg
 from src.tools.parameter_search.search_scheduler import (
     SearchScheduler,
     build_run_command,
@@ -29,19 +30,12 @@ from src.tools.parameter_search.search_scheduler import (
     mapping_to_opts,
     parse_csv,
     parse_gpu_groups,
-    patch_ddp_forward_missing_attrs,
-    pick_free_port,
     validate_extra_opts,
     validate_gpu_groups,
     write_csv,
     write_json,
 )
 
-GRAPH_PROB_PRIOR_MODES = [
-    "graph_conditioned_semantic_prior",
-    "class_aggregate_mmd",
-    "factorized_latent",
-]
 GRAPH_METHOD_ALIASES = {
     "method1_diff": "m1d",
     "method2_diff": "m2d",
@@ -51,60 +45,6 @@ GRAPH_METHOD_ALIASES = {
     "method2_diff_llm_gate": "m2dlg",
     "method3_diff_llm_gate": "m3dlg",
 }
-MODE_ALIASES = {
-    "graph_conditioned_semantic_prior": "gcsp",
-    "class_aggregate_mmd": "mmd",
-    "factorized_latent": "fact",
-}
-LEGACY_SEARCH_STAGES = ["temperature", "other"]
-
-
-def _diagnose_with_ddp_attr_forward(argv: Sequence[str], _unused: Any = None) -> None:
-    patch_ddp_forward_missing_attrs()
-    from src.tools.historical_files.graph_prob_prior_diagnostics import diagnose_graph_prob_prior_temperatures as diagnose
-
-    old_argv = sys.argv
-    try:
-        sys.argv = [str(Path(diagnose.__file__).resolve())] + list(argv)
-        diagnose.main()
-    finally:
-        sys.argv = old_argv
-
-
-def _ddp_diagnose_main(argv: Sequence[str]) -> None:
-    parser = argparse.ArgumentParser("GraphProbPrior search DDP diagnose")
-    parser.add_argument("--nproc-per-node", type=int, required=True)
-    parser.add_argument("--dist-backend", default=default_dist_backend(), choices=["nccl", "gloo"])
-    parser.add_argument("--dist-url", default="")
-    known, diagnose_argv = parser.parse_known_args(list(argv))
-    if known.nproc_per_node <= 1:
-        raise ValueError("--nproc-per-node must be greater than 1 in DDP diagnose mode.")
-    if not diagnose_argv:
-        raise ValueError("Missing diagnose_graph_prob_prior_temperatures.py arguments after DDP launcher options.")
-
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
-
-    import torch.multiprocessing as mp
-
-    from src.utils import distributed as du
-
-    init_method = known.dist_url or "tcp://127.0.0.1:{}".format(pick_free_port())
-    mp.spawn(
-        du.run,
-        nprocs=int(known.nproc_per_node),
-        args=(
-            int(known.nproc_per_node),
-            _diagnose_with_ddp_attr_forward,
-            init_method,
-            0,
-            1,
-            str(known.dist_backend),
-            list(diagnose_argv),
-            None,
-        ),
-        join=True,
-    )
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
@@ -156,7 +96,6 @@ def _cartesian_grid(grid: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _configured_stage_names(grid_cfg: Mapping[str, Any]) -> List[str]:
-    """Return the stage order declared by the YAML, with legacy fallback."""
     raw_order = grid_cfg.get("STAGE_ORDER", grid_cfg.get("SEARCH_STAGES", None))
     if raw_order is not None:
         order = [str(item).lower() for item in _as_list(raw_order)]
@@ -164,22 +103,11 @@ def _configured_stage_names(grid_cfg: Mapping[str, Any]) -> List[str]:
             raise ValueError("STAGE_ORDER / SEARCH_STAGES is set but empty.")
         return order
 
-    mode_space = grid_cfg.get("MODE_SEARCH_SPACE", {})
-    discovered: List[str] = []
-    seen = set()
-    if isinstance(mode_space, Mapping):
-        for spec in mode_space.values():
-            if not isinstance(spec, Mapping):
-                continue
-            stage_map = spec.get("STAGES", None)
-            if not isinstance(stage_map, Mapping):
-                continue
-            for stage_name in stage_map.keys():
-                stage_name = str(stage_name).lower()
-                if stage_name not in seen:
-                    seen.add(stage_name)
-                    discovered.append(stage_name)
-    return discovered or list(LEGACY_SEARCH_STAGES)
+    search_space = grid_cfg.get("GRAPH_GP_SEARCH_SPACE", {})
+    stage_map = search_space.get("STAGES", {}) if isinstance(search_space, Mapping) else {}
+    if not isinstance(stage_map, Mapping) or not stage_map:
+        raise ValueError("GRAPH_GP_SEARCH_SPACE.STAGES must define at least one stage.")
+    return [str(stage).lower() for stage in stage_map.keys()]
 
 
 def _configured_stage_groups(grid_cfg: Mapping[str, Any], stage_order: Sequence[str]) -> List[List[str]]:
@@ -291,20 +219,7 @@ def _stage_specs(
             if grid or stage_name in selected_set:
                 stages.append({"stage": stage_name, "fixed": fixed, "grid": grid})
         return stages
-
-    if "temperature" in selected_set:
-        grid = spec.get("TEMPERATURE_GRID", spec.get("GRID", {}) or {}) or {}
-        fixed = dict(base_fixed)
-        fixed.update(dict(spec.get("TEMPERATURE_FIXED_OPTS", {}) or {}))
-        if grid:
-            stages.append({"stage": "temperature", "fixed": fixed, "grid": grid})
-    if "other" in selected_set:
-        grid = spec.get("OTHER_GRID", {}) or {}
-        fixed = dict(base_fixed)
-        fixed.update(dict(spec.get("OTHER_FIXED_OPTS", {}) or {}))
-        if grid:
-            stages.append({"stage": "other", "fixed": fixed, "grid": grid})
-    return stages
+    raise ValueError("GRAPH_GP_SEARCH_SPACE.STAGES must be a mapping.")
 
 
 def _load_graph_methods(grid_cfg: Mapping[str, Any], selected: str) -> List[str]:
@@ -319,23 +234,6 @@ def _load_graph_methods(grid_cfg: Mapping[str, Any], selected: str) -> List[str]
             raise ValueError(f"Unknown --graph-methods values {missing}; expected subset of {methods}.")
         return wanted
     return methods
-
-
-def _load_modes(grid_cfg: Mapping[str, Any], selected: str) -> List[str]:
-    mode_space = grid_cfg.get("MODE_SEARCH_SPACE", {})
-    if not isinstance(mode_space, dict) or not mode_space:
-        raise ValueError("Grid config MODE_SEARCH_SPACE must define at least one mode.")
-    modes = [str(mode) for mode in mode_space.keys()]
-    bad = [mode for mode in modes if mode not in GRAPH_PROB_PRIOR_MODES]
-    if bad:
-        raise ValueError(f"Unsupported modes in config: {bad}")
-    if selected and selected.lower() != "all":
-        wanted = parse_csv(selected)
-        missing = [item for item in wanted if item not in modes]
-        if missing:
-            raise ValueError(f"Unknown --modes values {missing}; expected subset of {modes}.")
-        return wanted
-    return modes
 
 
 def _validate_external_graph_file(repo_root: Path, grid_cfg: Mapping[str, Any], graph_methods: Sequence[str]) -> Path:
@@ -359,100 +257,79 @@ def _validate_external_graph_file(repo_root: Path, grid_cfg: Mapping[str, Any], 
     return path
 
 
-def _trial_name(index: int, stage: str, graph_method: str, mode: str, combo: Mapping[str, Any]) -> str:
+def _trial_name(index: int, stage: str, graph_method: str, combo: Mapping[str, Any]) -> str:
     combo_json = json.dumps(dict(combo), sort_keys=True, ensure_ascii=True)
     combo_hash = hashlib.md5(combo_json.encode("utf-8")).hexdigest()[:8]
     graph_alias = GRAPH_METHOD_ALIASES.get(str(graph_method), _sanitize(graph_method)[:12])
-    mode_alias = MODE_ALIASES.get(str(mode), _sanitize(mode)[:12])
     stage_alias = _sanitize(stage)[:12]
-    return f"t{index:04d}_{stage_alias}_{graph_alias}_{mode_alias}_{combo_hash}"
+    return f"t{index:04d}_{stage_alias}_{graph_alias}_{combo_hash}"
 
 
 def _build_trials(
     repo_root: Path,
     grid_cfg: Mapping[str, Any],
     graph_methods: Sequence[str],
-    modes: Sequence[str],
     config_file: str,
-    diagnose_script: str,
     train_script: str,
-    runner: str,
     python_bin: str,
     out_root: Path,
-    max_batches: int,
-    no_train_step: bool,
     extra_opts: Sequence[str],
     selected_stages: Sequence[str],
     stage_order: Sequence[str],
     stage_groups: Sequence[Sequence[str]],
     trial_order: str,
+    base_total_epochs: int,
 ) -> List[Dict[str, Any]]:
     fixed_opts = dict(grid_cfg.get("FIXED_OPTS", {}) or {})
-    mode_space = grid_cfg["MODE_SEARCH_SPACE"]
+    search_space = grid_cfg.get("GRAPH_GP_SEARCH_SPACE", {})
+    if not isinstance(search_space, Mapping):
+        raise ValueError("GRAPH_GP_SEARCH_SPACE must be a mapping.")
     graph_path = str(grid_cfg["EXTERNAL_GRAPH"]["PATH"])
-    runner = str(runner).lower()
-    if runner not in {"diagnose", "train"}:
-        raise ValueError(f"RUNNER must be 'diagnose' or 'train', got {runner}.")
     trials: List[Dict[str, Any]] = []
     index = 0
-    trial_order = str(trial_order or "graph_mode_stage").lower()
+    trial_order = str(trial_order or "graph_stage").lower()
+    extra_override_map = dict(zip(extra_opts[0::2], extra_opts[1::2]))
 
     def append_trials(
         graph_method: str,
-        mode: str,
         active_selected_stages: Sequence[str],
         active_stage_order: Sequence[str],
     ) -> None:
         nonlocal index
-        spec = mode_space[mode] or {}
         for stage_spec in _stage_specs(
-            spec,
+            search_space,
             active_selected_stages,
             active_stage_order,
             graph_method=graph_method,
         ):
             stage_name = str(stage_spec["stage"])
-            mode_fixed = dict(stage_spec["fixed"])
+            stage_fixed = dict(stage_spec["fixed"])
             combos = _cartesian_grid(stage_spec.get("grid", {}) or {})
             for combo_index, combo in enumerate(combos):
                 overrides: Dict[str, Any] = {}
                 overrides.update(fixed_opts)
-                overrides.update(mode_fixed)
+                overrides.update(stage_fixed)
                 overrides.update(
                     {
                         "MODEL.GRAPH_INPUT.EXTERNAL_GRAPH_PATH": graph_path,
                         "MODEL.GRAPH_INPUT.GRAPH_SOURCE": graph_method,
-                        "MODEL.GRAPH_PROB_PRIOR.MODE": mode,
                     }
                 )
                 overrides.update(combo)
-                trial_name = _trial_name(index, stage_name, graph_method, mode, combo)
-                output_dir = out_root / stage_name / graph_method / mode / trial_name
-                if runner == "train":
-                    run_overrides = dict(overrides)
-                    run_overrides["OUTPUT_DIR"] = str(output_dir)
-                    cmd = [
-                        python_bin,
-                        train_script,
-                        "--config-file",
-                        config_file,
-                    ]
-                    cmd.extend(mapping_to_opts(run_overrides))
-                else:
-                    run_overrides = dict(overrides)
-                    cmd = [
-                        python_bin,
-                        diagnose_script,
-                        "--config-file",
-                        config_file,
-                        "--max-batches",
-                        str(max_batches),
-                        "--output-dir",
-                        str(output_dir),
-                    ]
-                    if no_train_step:
-                        cmd.append("--no-train-step")
-                    cmd.extend(mapping_to_opts(run_overrides))
+                trial_name = _trial_name(index, stage_name, graph_method, combo)
+                output_dir = out_root / stage_name / graph_method / trial_name
+                run_overrides = dict(overrides)
+                run_overrides["OUTPUT_DIR"] = str(output_dir)
+                expected_epochs = int(
+                    extra_override_map.get(
+                        "SOLVER.TOTAL_EPOCH",
+                        run_overrides.get("SOLVER.TOTAL_EPOCH", base_total_epochs),
+                    )
+                )
+                if expected_epochs <= 0:
+                    raise ValueError("SOLVER.TOTAL_EPOCH must be positive for complete-trial detection.")
+                cmd = [python_bin, train_script, "--config-file", config_file]
+                cmd.extend(mapping_to_opts(run_overrides))
                 cmd.extend(extra_opts)
                 trials.append(
                     {
@@ -461,59 +338,37 @@ def _build_trials(
                         "combo_index": combo_index,
                         "trial_name": trial_name,
                         "graph_method": graph_method,
-                        "mode": mode,
                         "combo": dict(combo),
                         "overrides": dict(run_overrides),
                         "output_dir": str(output_dir),
                         "stdout_path": str(output_dir / "launcher_stdout.txt"),
                         "cmd": cmd,
                         "repo_root": str(repo_root),
-                        "runner": runner,
+                        "runner": "train",
+                        "expected_epochs": expected_epochs,
                         "identity_fields": {
                             "graph_method": graph_method,
-                            "mode": mode,
+                            "stage": stage_name,
                         },
                         "eta_fields": {
                             "graph_method": graph_method,
-                            "mode": mode,
+                            "stage": stage_name,
                         },
-                        "eta_compatibility_keys": ["runner", "mode"],
+                        "eta_compatibility_keys": ["runner", "stage"],
                     }
                 )
                 index += 1
 
-    if trial_order == "graph_mode_stage":
+    if trial_order == "graph_stage":
         for graph_method in graph_methods:
-            for mode in modes:
-                append_trials(graph_method, mode, selected_stages, stage_order)
+            append_trials(graph_method, selected_stages, stage_order)
     elif trial_order == "stage_group":
         for stage_group in _selected_stage_groups(stage_groups, selected_stages):
             for graph_method in graph_methods:
-                for mode in modes:
-                    append_trials(graph_method, mode, stage_group, stage_group)
+                append_trials(graph_method, stage_group, stage_group)
     else:
-        raise ValueError("TRIAL_ORDER must be 'graph_mode_stage' or 'stage_group'.")
+        raise ValueError("TRIAL_ORDER must be 'graph_stage' or 'stage_group'.")
     return trials
-
-
-def _summary_payload(output_dir: Path) -> Dict[str, Any]:
-    path = _diagnosis_json_path(output_dir)
-    if path is None:
-        return {}
-    with path.open("r", encoding="utf-8-sig") as handle:
-        return json.load(handle)
-
-
-def _diagnosis_json_path(output_dir: Path) -> Optional[Path]:
-    path = output_dir / "graph_prob_prior_temperature_diagnosis.json"
-    if not path.is_file():
-        if not output_dir.is_dir():
-            return None
-        matches = sorted(output_dir.rglob("graph_prob_prior_temperature_diagnosis.json"))
-        if not matches:
-            return None
-        return matches[0]
-    return path
 
 
 _GZSL_RECORD_RE = re.compile(
@@ -637,7 +492,6 @@ def _training_summary_payload(output_dir: Path) -> Dict[str, Any]:
         "num_epochs": int(max(int(row["epoch"]) for row in records)),
         "num_batches": "",
         "performance": performance,
-        "temperatures": {},
         "summary": _summarize_train_monitor_records(monitor_records),
         "records": records,
     }
@@ -645,75 +499,34 @@ def _training_summary_payload(output_dir: Path) -> Dict[str, Any]:
 
 def _trial_payload(trial: Mapping[str, Any]) -> Dict[str, Any]:
     output_dir = Path(str(trial["output_dir"]))
-    if str(trial.get("runner", "diagnose")).lower() == "train":
-        return _training_summary_payload(output_dir)
-    return _summary_payload(output_dir)
+    return _training_summary_payload(output_dir)
 
 
-def _trial_has_complete_output(trial: Mapping[str, Any], expected_batches: int) -> bool:
+def _trial_has_complete_output(trial: Mapping[str, Any]) -> bool:
     payload = _trial_payload(trial)
     if not payload:
         return False
-    if str(trial.get("runner", "diagnose")).lower() == "train":
-        performance = payload.get("performance")
-        if not isinstance(performance, dict):
-            return False
-        try:
-            expected_epochs = int((trial.get("overrides") or {}).get("SOLVER.TOTAL_EPOCH", 0))
-            num_epochs = int(payload.get("num_epochs", 0))
-        except (TypeError, ValueError):
-            return False
-        return expected_epochs <= 0 or num_epochs >= expected_epochs
+    performance = payload.get("performance")
+    if not isinstance(performance, dict):
+        return False
     try:
-        num_batches = int(payload.get("num_batches", 0))
+        expected_epochs = int(trial.get("expected_epochs", 0))
+        num_epochs = int(payload.get("num_epochs", 0))
     except (TypeError, ValueError):
         return False
-    if num_batches <= 0:
-        return False
-    if int(expected_batches) > 0 and num_batches < int(expected_batches):
-        return False
-    if not isinstance(payload.get("performance"), dict):
-        return False
-    return isinstance(payload.get("summary"), dict)
-
-
-def _existing_trial_result(
-    trial: Mapping[str, Any],
-    gpu_id: str,
-    command: Sequence[str],
-    num_gpus: int,
-    expected_batches: int,
-) -> Optional[Dict[str, Any]]:
-    if not _trial_has_complete_output(trial, expected_batches=expected_batches):
-        return None
-    return _flatten_result(
-        trial,
-        0,
-        gpu_id=gpu_id,
-        command=command,
-        num_gpus=num_gpus,
-        skipped_existing=True,
-    )
+    return expected_epochs > 0 and num_epochs >= expected_epochs
 
 
 def _resume_status(trial: Mapping[str, Any]) -> str:
     output_dir = Path(str(trial["output_dir"]))
-    if str(trial.get("runner", "diagnose")).lower() == "train":
-        payload = _training_summary_payload(output_dir)
-        if not payload:
-            return f"missing train gzsl-record under {output_dir}"
-        return f"complete train logs {payload.get('log_paths', [])}"
-    json_path = _diagnosis_json_path(output_dir)
-    if json_path is None:
-        return f"missing diagnosis json under {output_dir}"
-    payload = _summary_payload(output_dir)
+    payload = _training_summary_payload(output_dir)
     if not payload:
-        return f"unreadable diagnosis json {json_path}"
-    if not isinstance(payload.get("summary"), dict):
-        return f"diagnosis json has no summary {json_path}"
-    if not isinstance(payload.get("performance"), dict):
-        return f"diagnosis json has no post-diagnosis eval performance {json_path}"
-    return f"complete {json_path}"
+        return f"missing train gzsl-record under {output_dir}"
+    expected_epochs = int(trial.get("expected_epochs", 0))
+    completed_epochs = int(payload.get("num_epochs", 0))
+    if expected_epochs <= 0 or completed_epochs < expected_epochs:
+        return f"incomplete train epochs {completed_epochs}/{expected_epochs} under {output_dir}"
+    return f"complete train logs {payload.get('log_paths', [])}"
 
 
 def _flatten_result(
@@ -730,7 +543,6 @@ def _flatten_result(
         "stage": trial.get("stage", ""),
         "trial_name": trial["trial_name"],
         "graph_method": trial["graph_method"],
-        "mode": trial["mode"],
         "combo_index": trial["combo_index"],
         "returncode": returncode,
         "gpu": gpu_id,
@@ -754,8 +566,6 @@ def _flatten_result(
         for key, value in (payload.get("performance") or {}).items():
             if isinstance(value, (int, float, str, bool)):
                 row[key] = value
-        for key, value in (payload.get("temperatures") or {}).items():
-            row[f"temperature_{key}"] = value
         for key, value in (payload.get("summary") or {}).items():
             if isinstance(value, (int, float)):
                 row[key] = value
@@ -811,32 +621,15 @@ def _with_monitor_scores(row: MutableMapping[str, Any]) -> Dict[str, Any]:
         return scored
 
     score = 0.0
-    # TAU_GRAPH: old results show 0.05 was too sharp and 0.20 too flat; target a middle-entropy neighbor distribution.
-    score += _target_penalty(scored, "graph_prob_prior_monitor_tau_graph_neighbor_entropy_norm_mean", 0.55, 0.30, 1.2)
     score += _target_penalty(scored, "graph_prob_prior_monitor_neighbor_entropy_norm_mean", 0.55, 0.30, 1.2)
-    score += _target_penalty(scored, "graph_prob_prior_monitor_tau_graph_neighbor_top1_mean", 0.35, 0.30, 0.8)
     score += _target_penalty(scored, "graph_prob_prior_monitor_neighbor_top1_mean", 0.35, 0.30, 0.8)
     score += _lower_is_better(scored, "graph_prob_prior_monitor_neighbor_hubness_gini", 1.0, 0.5)
 
-    # TAU_LATENT: avoid all-class latent probabilities being almost uniform, but also avoid one-hot collapse.
-    score += _target_penalty(scored, "graph_prob_prior_monitor_tau_latent_entropy_norm_mean", 0.75, 0.25, 1.0)
-    score += _target_penalty(scored, "graph_prob_prior_monitor_latent_prob_entropy_norm_mean", 0.75, 0.25, 1.0)
-    score += _higher_is_better(scored, "graph_prob_prior_monitor_posterior_true_rank_top1", 0.20, 1.0)
-    score += _higher_is_better(scored, "graph_prob_prior_monitor_posterior_kl_margin_positive_ratio", 0.50, 0.8)
-
-    # MMD_SIGMA: old MMD_SIGMA=16 underflowed; 64 was too close to all-ones; target an informative mid kernel.
-    score += _target_penalty(scored, "graph_prob_prior_monitor_mmd_kernel_mean", 0.50, 0.35, 1.2)
-    score += _lower_is_better(scored, "graph_prob_prior_monitor_mmd_kernel_saturation_low_ratio", 1.0, 1.0)
-    score += _lower_is_better(scored, "graph_prob_prior_monitor_mmd_kernel_saturation_high_ratio", 1.0, 1.0)
-
-    # Prior shape and graph-specific pathology monitors from graph_prob_prior_monitors.py.
     score += _lower_is_better(scored, "graph_prob_prior_monitor_prior_overlap_risk_rate", 1.0, 1.0)
     score += _lower_is_better(scored, "graph_prob_prior_monitor_false_high_prior_relation_still_gt_0_9_count", 20.0, 0.8)
     score += _lower_is_better(scored, "graph_prob_prior_monitor_prior_gzsl_unseen_to_seen_bias_risk_mean", 1.0, 0.5)
-
-    # Dual mode: prefer P+/P- separation and fewer hard-negative violations.
-
-    # Keep auxiliary loss from overpowering classification when the monitor is available.
+    score += _higher_is_better(scored, "graph_prob_prior_graph_gp_energy_margin_positive_ratio", 0.50, 1.0)
+    score += _higher_is_better(scored, "graph_prob_prior_graph_gp_energy_pseudo_unseen_acc", 0.20, 1.0)
     score += _upper_penalty(scored, "graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio", 0.10, 1.0)
 
     loss = _row_float(scored, "graph_prob_prior_match_loss")
@@ -880,7 +673,6 @@ def _rank_rows(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
             float(row.get("selection_score", 1.0e9)),
             str(row.get("stage", "")),
             str(row.get("graph_method", "")),
-            str(row.get("mode", "")),
             int(row.get("trial_index", 0)),
         ),
     )
@@ -904,14 +696,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--python-bin", default="")
     parser.add_argument("--config-file", default="")
     parser.add_argument("--out-root", default="")
-    parser.add_argument("--max-batches", type=int, default=None)
     parser.add_argument("--graph-methods", default="all")
-    parser.add_argument("--modes", default="all")
     parser.add_argument("--stage", default="", help="Stage name from the YAML, or all.")
     parser.add_argument(
         "--stages",
         default="",
-        help="Comma-separated stage names from the YAML. Overrides --stage when set. Example: stage0_temperature_coarse,stage1_temperature_fine.",
+        help="Comma-separated stage names from the YAML. Overrides --stage when set.",
     )
     parser.add_argument("--gpus", default="", help="Comma-separated GPU ids for parallel trials.")
     parser.add_argument(
@@ -935,9 +725,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit", type=int, default=0, help="Run only the first N expanded trials; 0 means all.")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--no-resume", action="store_true", help="Rerun trials even when their diagnosis JSON already exists.")
+    parser.add_argument("--no-resume", action="store_true", help="Rerun trials even when a complete training result already exists.")
     parser.add_argument("--resume-debug", action="store_true", help="Print why an existing trial was or was not skipped.")
-    parser.add_argument("--no-train-step", action="store_true", help="Override YAML NO_TRAIN_STEP to true.")
     parser.add_argument("opts", nargs=argparse.REMAINDER, help="Extra KEY VALUE config overrides appended to every child run.")
     return parser.parse_args()
 
@@ -950,33 +739,32 @@ def main() -> None:
         grid_config = repo_root / grid_config
     grid_cfg = _read_yaml(grid_config)
 
-    config_file = args.config_file or str(grid_cfg.get("BASE_CONFIG_FILE", "configs/prompt/cub.yaml"))
-    diagnose_script = str(
-        grid_cfg.get(
-            "DIAGNOSE_SCRIPT",
-            "src/tools/historical_files/graph_prob_prior_diagnostics/diagnose_graph_prob_prior_temperatures.py",
-        )
+    config_file = args.config_file or str(
+        grid_cfg.get("BASE_CONFIG_FILE", "configs/graph_prob_prior/cub_graph_gp_energy_vpt_deep.yaml")
     )
+    base_config_path = Path(config_file)
+    if not base_config_path.is_absolute():
+        base_config_path = repo_root / base_config_path
+    base_cfg = get_cfg()
+    base_cfg.merge_from_file(str(base_config_path))
+    base_total_epochs = int(base_cfg.SOLVER.TOTAL_EPOCH)
     train_script = str(grid_cfg.get("TRAIN_SCRIPT", "train.py"))
-    runner = str(grid_cfg.get("RUNNER", "diagnose")).lower()
-    if runner not in {"diagnose", "train"}:
-        raise ValueError(f"RUNNER must be 'diagnose' or 'train', got {runner}.")
+    runner = str(grid_cfg.get("RUNNER", "train")).lower()
+    if runner != "train":
+        raise ValueError(f"Graph-GP search RUNNER must be 'train', got {runner}.")
     python_bin = str(args.python_bin or grid_cfg.get("PYTHON_BIN") or sys.executable)
     out_root = Path(args.out_root or str(grid_cfg.get("OUTPUT_DIR", "output/graph_prob_prior_search")))
     if not out_root.is_absolute():
         out_root = repo_root / out_root
-    max_batches = int(args.max_batches if args.max_batches is not None else int(grid_cfg.get("MAX_BATCHES", 111)))
-    no_train_step = bool(grid_cfg.get("NO_TRAIN_STEP", False)) or bool(args.no_train_step)
     extra_opts = validate_extra_opts(args.opts)
     stage_order = _configured_stage_names(grid_cfg)
     stage_groups = _configured_stage_groups(grid_cfg, stage_order)
-    trial_order = str(grid_cfg.get("TRIAL_ORDER", "graph_mode_stage")).lower()
+    trial_order = str(grid_cfg.get("TRIAL_ORDER", "graph_stage")).lower()
     raw_stage_selection = str(args.stages or args.stage or grid_cfg.get("STAGE", stage_order[0])).lower()
     selected_stages = _parse_stage_selection(raw_stage_selection, stage_order)
     stage_label = _stage_selection_label(selected_stages, stage_order)
 
     graph_methods = _load_graph_methods(grid_cfg, args.graph_methods)
-    modes = _load_modes(grid_cfg, args.modes)
     graph_npz = _validate_external_graph_file(repo_root, grid_cfg, graph_methods)
     gpu_groups = parse_gpu_groups(args.gpu_groups, args.gpus)
     validate_gpu_groups(gpu_groups, int(args.max_workers), int(args.nproc_per_trial))
@@ -987,20 +775,16 @@ def main() -> None:
         repo_root=repo_root,
         grid_cfg=grid_cfg,
         graph_methods=graph_methods,
-        modes=modes,
         config_file=config_file,
-        diagnose_script=diagnose_script,
         train_script=train_script,
-        runner=runner,
         python_bin=python_bin,
         out_root=out_root,
-        max_batches=max_batches,
-        no_train_step=no_train_step,
         extra_opts=extra_opts,
         selected_stages=selected_stages,
         stage_order=stage_order,
         stage_groups=stage_groups,
         trial_order=trial_order,
+        base_total_epochs=base_total_epochs,
     )
     if args.limit > 0:
         trials = trials[: int(args.limit)]
@@ -1016,12 +800,10 @@ def main() -> None:
             gpu_group=gpu_group,
             nproc_per_trial=int(args.nproc_per_trial),
             dist_backend=str(args.dist_backend),
-            ddp_launcher_path=str(Path(__file__).resolve()),
-            ddp_mode="--ddp-diagnose",
         )
 
     def complete_check(trial: Mapping[str, Any]) -> bool:
-        return _trial_has_complete_output(trial, expected_batches=max_batches)
+        return _trial_has_complete_output(trial)
 
     scheduler = SearchScheduler(
         trials=trials,
@@ -1042,15 +824,12 @@ def main() -> None:
     search_space = {
         "grid_config": str(grid_config),
         "base_config_file": config_file,
-        "diagnose_script": diagnose_script,
+        "base_total_epochs": base_total_epochs,
         "train_script": train_script,
         "runner": runner,
         "python_bin": python_bin,
         "external_graph_npz": str(graph_npz),
         "graph_methods": graph_methods,
-        "modes": modes,
-        "max_batches": max_batches,
-        "no_train_step": no_train_step,
         "stage": stage_label,
         "selected_stages": selected_stages,
         "stage_order": stage_order,
@@ -1076,16 +855,16 @@ def main() -> None:
             "completed_progress_cleanup": True,
         },
         "extra_opts": extra_opts,
-        "mode_search_space": grid_cfg.get("MODE_SEARCH_SPACE", {}),
+        "graph_gp_search_space": grid_cfg.get("GRAPH_GP_SEARCH_SPACE", {}),
         "fixed_opts": grid_cfg.get("FIXED_OPTS", {}),
         "commands_path": str(commands_path),
         "ranking": {
             "primary_order": "gzsl_h_last desc, gzsl_unseen_last desc, gzsl_seen_last desc, then monitor selection_score asc",
             "selection_score": "monitor_score + 0.01*log1p(graph_prob_prior_match_loss)",
             "notes": [
-                "ranked_summary is performance-first when post-diagnosis eval metrics are present",
+                "ranked_summary is performance-first when training eval metrics are present",
                 "lower selection_score is only a tie-breaker after final seen/unseen/H metrics",
-                "monitor score prefers balanced graph-neighbor entropy/top1, informative latent probabilities, non-saturated MMD kernel, low prior overlap, low false-high residue, low dual beta violation, and reasonable weighted loss scale",
+                "monitor score prefers balanced graph neighborhoods, low prior overlap, low false-high residue, healthy Graph-GP energy classification, and reasonable weighted loss scale",
             ],
         },
     }
@@ -1094,24 +873,24 @@ def main() -> None:
     rows = scheduler.dry_run() if args.dry_run else scheduler.run()
 
     ranked_rows = _rank_rows(rows)
-    best_by_stage_graph_mode = _best_rows(ranked_rows, ["stage", "graph_method", "mode"])
-    best_by_stage_mode = _best_rows(ranked_rows, ["stage", "mode"])
+    best_by_stage_graph = _best_rows(ranked_rows, ["stage", "graph_method"])
+    best_by_stage = _best_rows(ranked_rows, ["stage"])
     write_csv(out_root / "summary.csv", ranked_rows)
     write_json(out_root / "summary.json", {"search_space": search_space, "rows": ranked_rows})
     write_csv(out_root / "ranked_summary.csv", ranked_rows)
     write_json(out_root / "ranked_summary.json", {"search_space": search_space, "rows": ranked_rows})
-    write_csv(out_root / "best_by_stage_graph_mode.csv", best_by_stage_graph_mode)
-    write_json(out_root / "best_by_stage_graph_mode.json", {"rows": best_by_stage_graph_mode})
-    write_csv(out_root / "best_by_stage_mode.csv", best_by_stage_mode)
-    write_json(out_root / "best_by_stage_mode.json", {"rows": best_by_stage_mode})
+    write_csv(out_root / "best_by_stage_graph.csv", best_by_stage_graph)
+    write_json(out_root / "best_by_stage_graph.json", {"rows": best_by_stage_graph})
+    write_csv(out_root / "best_by_stage.csv", best_by_stage)
+    write_json(out_root / "best_by_stage.json", {"rows": best_by_stage})
     write_csv(out_root / f"summary{stage_suffix}.csv", ranked_rows)
     write_json(out_root / f"summary{stage_suffix}.json", {"search_space": search_space, "rows": ranked_rows})
     write_csv(out_root / f"ranked_summary{stage_suffix}.csv", ranked_rows)
     write_json(out_root / f"ranked_summary{stage_suffix}.json", {"search_space": search_space, "rows": ranked_rows})
-    write_csv(out_root / f"best_by_stage_graph_mode{stage_suffix}.csv", best_by_stage_graph_mode)
-    write_json(out_root / f"best_by_stage_graph_mode{stage_suffix}.json", {"rows": best_by_stage_graph_mode})
-    write_csv(out_root / f"best_by_stage_mode{stage_suffix}.csv", best_by_stage_mode)
-    write_json(out_root / f"best_by_stage_mode{stage_suffix}.json", {"rows": best_by_stage_mode})
+    write_csv(out_root / f"best_by_stage_graph{stage_suffix}.csv", best_by_stage_graph)
+    write_json(out_root / f"best_by_stage_graph{stage_suffix}.json", {"rows": best_by_stage_graph})
+    write_csv(out_root / f"best_by_stage{stage_suffix}.csv", best_by_stage)
+    write_json(out_root / f"best_by_stage{stage_suffix}.json", {"rows": best_by_stage})
     failures = [row for row in rows if int(row.get("returncode", 0)) not in {0, -1}]
     if failures:
         write_json(out_root / "failures.json", {"failures": failures})
@@ -1119,17 +898,14 @@ def main() -> None:
     print(f"wrote {out_root / 'summary.csv'}")
     print(f"wrote {out_root / 'summary.json'}")
     print(f"wrote {out_root / 'ranked_summary.csv'}")
-    print(f"wrote {out_root / 'best_by_stage_graph_mode.csv'}")
-    print(f"wrote {out_root / 'best_by_stage_mode.csv'}")
+    print(f"wrote {out_root / 'best_by_stage_graph.csv'}")
+    print(f"wrote {out_root / 'best_by_stage.csv'}")
     print(f"wrote {out_root / f'ranked_summary{stage_suffix}.csv'}")
-    print(f"wrote {out_root / f'best_by_stage_graph_mode{stage_suffix}.csv'}")
+    print(f"wrote {out_root / f'best_by_stage_graph{stage_suffix}.csv'}")
 
 
 def cli_main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "--ddp-diagnose":
-        _ddp_diagnose_main(sys.argv[2:])
-    else:
-        main()
+    main()
 
 
 if __name__ == "__main__":

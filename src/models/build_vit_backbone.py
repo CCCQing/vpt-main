@@ -93,10 +93,6 @@ def build_vit_sup_models(
                 external_allow_download=dist_cfg.EXTERNAL_ALLOW_DOWNLOAD,
                 output_param=dist_cfg.OUTPUT_PARAM,
                 fixed_eps_seed=dist_cfg.FIXED_EPS_SEED,
-                factorized_enable=dist_cfg.FACTORIZED_ENABLE,
-                factorized_semantic_dim=dist_cfg.FACTORIZED_SEMANTIC_DIM,
-                factorized_variation_dim=dist_cfg.FACTORIZED_VARIATION_DIM,
-                factorized_variation_gate_init=dist_cfg.FACTORIZED_VARIATION_GATE_INIT,
                 debug_distributor_shapes=dist_cfg.DEBUG_DISTRIBUTOR_SHAPES,
             )
     if prompt_cfg is not None:

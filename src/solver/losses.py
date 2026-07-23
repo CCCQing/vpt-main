@@ -514,19 +514,11 @@ class PromptKLAuxLoss(nn.Module):
 
 class GraphProbPriorAuxLoss(nn.Module):
     """
-    GraphProbPrior 辅助损失。
+    Graph-GP 辅助损失接入口。
 
-    该分支不替换 PromptKLAuxLoss 的代码，而是作为独立 aux loss 接入：
-    - posterior: prompt distributor runtime stats 中的 mu/logvar；
-    - prior: 由 semantic graph 的 A_conf/E_attr/G 生成 all-class Gaussian prior；
-    - graph_gp_conditioned: 用 Graph-GP 生成的 P_c(z) 做 energy classification；
-    - graph_conditioned_semantic_prior: 非 Graph-GP 旧分支，用 T_i 监督逐样本 latent matching；
-    - class_aggregate_mmd: 对 batch 内同类 posterior 聚合后做 MMD 分布匹配。
-    - factorized_latent: 只让 semantic factor 接受 semantic graph prior matching，
-      variation factor 默认不做逐样本 KL。
-
-    因此它可以单独开启，用来替代标准 N(0,I) KL；也可以和标准 KL 同时开启，
-    但同时开启时训练目标会变成“双 prior 约束”。
+    posterior 来自 prompt distributor 的完整 mu/logvar；Graph-GP 根据 support-seen
+    视觉中心与 external graph 推断全类 Gaussian prototype，再用 energy classification
+    约束 posterior。评测阶段不更新 support buffer，因此明确跳过该训练期辅助损失。
     """
 
     def __init__(self, cfg=None):
@@ -545,21 +537,17 @@ class GraphProbPriorAuxLoss(nn.Module):
         self.graph_prob_prior_weight = float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT)
 
         # 标准 Prompt KL 约束的是 q(z|x) 接近 N(0,I)；
-        # GraphProbPrior 约束的是 q(z|x) 接近由语义图生成的 class prior。
+        # GraphProbPrior 使用 Graph-GP prototype 上的 energy classification。
         # 两者同时打开不是错误，但语义上是“双 prior”共同约束同一个 posterior。
         if self.graph_prob_prior_weight > 0.0 and float(cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT) > 0.0:
             print(
                 "[graph-prob-prior] SOLVER.LOSS_PROMPT_KL_WEIGHT and "
                 "MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT are both > 0; "
-                "training will use both N(0,I) KL and graph-conditioned prior KL."
+                "training will use both N(0,I) KL and Graph-GP energy classification."
             )
 
-        # 具体的图构造、class prior 生成、KL/moment/MMD/factorized loss 计算
-        # 都放在 GraphProbPriorLossComputer 中；这个 AuxLoss 只负责和 CompositeLoss/trainer 对接。
+        # Graph-GP prior、energy loss 与监测都放在 GraphProbPriorLossComputer 中。
         self.computer = GraphProbPriorLossComputer(cfg)
-
-        # Graph-GP 固定读取完整 posterior；非 Graph-GP 分支再由 mode 决定是否读取 factorized posterior。
-        self.mode = str(cfg.MODEL.GRAPH_PROB_PRIOR.MODE).lower()
 
         # 保存最近一次 forward 的细粒度诊断项，CompositeLoss 会把它们合并到总 stats。
         self._last_loss_stats: Dict[str, float] = {}
@@ -596,15 +584,12 @@ class GraphProbPriorAuxLoss(nn.Module):
         #   model:              当前 ViT 模型引用，用于读取 runtime prompt stats；
         #   targets_global:     全局类别 id，不能用 local-output remap 后的 targets；
         #   class_attributes:   全类属性矩阵 A_conf；
-        #   attr_name_embeddings: 属性名文本 embedding E_attr；Graph-GP energy 分支不需要。
         if "model" not in kwargs:
             raise RuntimeError("GraphProbPrior loss requires kwargs['model'].")
         if "targets_global" not in kwargs:
             raise RuntimeError("GraphProbPrior loss requires kwargs['targets_global'].")
         if "class_attributes" not in kwargs:
             raise RuntimeError("GraphProbPrior loss requires kwargs['class_attributes'].")
-        if self.computer.prior_mean_mode != "graph_gp_conditioned" and "attr_name_embeddings" not in kwargs:
-            raise RuntimeError("GraphProbPrior loss requires kwargs['attr_name_embeddings'].")
 
         model = kwargs["model"]
         # PromptedTransformer 在前向时会缓存 distributor 返回的 stats；
@@ -616,83 +601,25 @@ class GraphProbPriorAuxLoss(nn.Module):
             raise RuntimeError("GraphProbPrior loss requires runtime prompt distribution stats dict.")
 
         is_train = bool(kwargs.get("is_train", self.training))
-        if (not is_train) and self.computer.prior_mean_mode == "graph_gp_conditioned":
+        if not is_train:
             self._last_loss_stats = {"graph_prob_prior_eval_skipped": 1.0}
             return self._zero_loss_like(pred_logits, targets)
 
-        if self.computer.prior_mean_mode == "graph_gp_conditioned":
-            if "mu" not in stats or "logvar" not in stats:
-                raise RuntimeError("Graph-GP energy classification requires stats['mu'] and stats['logvar'].")
-            loss = self.computer(
-                posterior_mu=stats["mu"],
-                posterior_logvar=stats["logvar"],
-                targets_global=kwargs["targets_global"],
-                class_attributes=kwargs["class_attributes"],
-                attr_name_embeddings=kwargs.get("attr_name_embeddings", None),
-                seen_class_ids=kwargs.get("seen_class_ids", None),
-                unseen_class_ids=kwargs.get("unseen_class_ids", None),
-                epoch=kwargs.get("epoch", None),
-                is_train=is_train,
-            )
-        elif self.mode == "factorized_latent":
-            # factorized_latent 不把完整 768 维 posterior 当作 GraphProbPrior 的直接训练对象，
-            # 而是强制使用 distributor 切出来的 semantic/variation 两段。
-            # 这里故意不做“缺了 factorized stats 就回退 stats['mu']”的保底设计；
-            # 如果配置没开 FACTORIZED_ENABLE，就让错误尽早暴露。
-            required_keys = (
-                "factorized_enable",
-                "semantic_mu",
-                "semantic_logvar",
-                "variation_mu",
-                "variation_logvar",
-            )
-            for key in required_keys:
-                if key not in stats:
-                    raise RuntimeError(f"GraphProbPrior {self.mode} requires stats['{key}'].")
-            if not bool(stats["factorized_enable"]):
-                raise RuntimeError(
-                    f"GraphProbPrior {self.mode} requires MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE=True."
-                )
+        if "mu" not in stats or "logvar" not in stats:
+            raise RuntimeError("Graph-GP energy classification requires stats['mu'] and stats['logvar'].")
+        loss = self.computer(
+            posterior_mu=stats["mu"],
+            posterior_logvar=stats["logvar"],
+            targets_global=kwargs["targets_global"],
+            class_attributes=kwargs["class_attributes"],
+            seen_class_ids=kwargs.get("seen_class_ids", None),
+            unseen_class_ids=kwargs.get("unseen_class_ids", None),
+            epoch=kwargs.get("epoch", None),
+            is_train=is_train,
+        )
 
-            # 传给 computer 的 posterior_mu/logvar 固定是 semantic/alpha factor；
-            # variation_mu/logvar 固定额外传入，factorized_latent 用它做可选正则。
-            loss = self.computer(
-                posterior_mu=stats["semantic_mu"],
-                posterior_logvar=stats["semantic_logvar"],
-                targets_global=kwargs["targets_global"],
-                class_attributes=kwargs["class_attributes"],
-                attr_name_embeddings=kwargs["attr_name_embeddings"],
-                variation_mu=stats["variation_mu"],
-                variation_logvar=stats["variation_logvar"],
-                seen_class_ids=kwargs.get("seen_class_ids", None),
-                unseen_class_ids=kwargs.get("unseen_class_ids", None),
-                # Graph-GP prior generator 需要 epoch 来稳定划分 support/pseudo 类；
-                # is_train 用于禁止评测阶段误触发训练期 center buffer 更新。
-                epoch=kwargs.get("epoch", None),
-                is_train=is_train,
-            )
-        else:
-            # 非 factorized mode 使用完整 posterior：
-            #   graph_conditioned_semantic_prior: 逐样本 q(z|x) 到 all-class prior 的 KL matching；
-            #   class_aggregate_mmd: batch 内同类 posterior 聚合后做 RBF-MMD matching。
-            if "mu" not in stats or "logvar" not in stats:
-                raise RuntimeError("GraphProbPrior loss requires stats['mu'] and stats['logvar'].")
-            loss = self.computer(
-                posterior_mu=stats["mu"],
-                posterior_logvar=stats["logvar"],
-                targets_global=kwargs["targets_global"],
-                class_attributes=kwargs["class_attributes"],
-                attr_name_embeddings=kwargs["attr_name_embeddings"],
-                seen_class_ids=kwargs.get("seen_class_ids", None),
-                unseen_class_ids=kwargs.get("unseen_class_ids", None),
-                # Graph-GP prior generator 需要 epoch 来稳定划分 support/pseudo 类；
-                # is_train 用于禁止评测阶段误触发训练期 center buffer 更新。
-                epoch=kwargs.get("epoch", None),
-                is_train=is_train,
-            )
-
-        # GraphProbPriorLossComputer 内部会记录细粒度指标，例如 match_loss、entropy、
-        # posterior/prior 方差均值、factorized 子项等；这里复制出来给 CompositeLoss 合并。
+        # GraphProbPriorLossComputer 内部会记录 energy、posterior/prior 和 Graph-GP 诊断项；
+        # 这里复制出来给 CompositeLoss 合并。
         self._last_loss_stats = dict(self.computer._last_loss_stats)
         return loss
 

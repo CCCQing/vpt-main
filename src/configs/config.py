@@ -48,11 +48,6 @@ _C.MODEL.PROMPT.DISTRIBUTOR.EVAL_SAMPLE_MODE = "fixed_eps"      # 评测采样�
 _C.MODEL.PROMPT.DISTRIBUTOR.FIXED_EPS_SEED = 0             # fixed_eps buffer 的独立随机种子；不影响全局 torch 随机状态
 _C.MODEL.PROMPT.DISTRIBUTOR.USE_SLOT_EMBED = True         # 是否给每个 instance prompt 加可学习槽位编码
 
-_C.MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_ENABLE = False      # 是否启用 split-latent prompt：把 posterior 切成 semantic/variation 两个因子
-_C.MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_SEMANTIC_DIM = 384  # semantic factor 维度；第一版默认 384
-_C.MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_VARIATION_DIM = 384 # variation factor 维度；第一版默认 384，二者之和必须等于 768
-_C.MODEL.PROMPT.DISTRIBUTOR.FACTORIZED_VARIATION_GATE_INIT = 0.0 # variation prompt 注入强度初值；0 表示初始先不让 variation 强扰动 prompt
-
 _C.MODEL.PROMPT.DISTRIBUTOR.CNN_NAME = "efficientnet_b0"   # cnn_torchvision 候选：efficientnet_b0 / mobilenet_v3_small
 _C.MODEL.PROMPT.DISTRIBUTOR.CLIP_NAME = "mobileclip_s0"    # clip_frozen 候选：mobileclip_s0 / tinyclip_vit8m；需本地权重
 _C.MODEL.PROMPT.DISTRIBUTOR.CLIP_LOCAL_DIR = ""            # clip_frozen 本地权重目录，期望存在 {CLIP_NAME}.pt
@@ -91,39 +86,20 @@ _C.MODEL.SEMANTIC_TOKENS.ORTHO.CODEBOOK_SEED = 0
 _C.MODEL.SEMANTIC_TOKENS.ORTHO.DEBUG = False
 
 _C.MODEL.GRAPH_INPUT = CfgNode()
-_C.MODEL.GRAPH_INPUT.ATTR_NAME_EMBED_PATH = "datasets/xlsa17/xlsa17/data/CUB/cub_attributes_sbert_all_mpnet_base_v2.pt" # 属性名文本 embedding 路径；默认与 ORTHO.TEXT_EMBED_PATH 指向同一缓存
 _C.MODEL.GRAPH_INPUT.NUM_CLASSES = 200               # CUB 全局类别数；类别关系图 G 的尺寸为 [NUM_CLASSES, NUM_CLASSES]
 _C.MODEL.GRAPH_INPUT.ATTR_DIM = 312                  # CUB 属性维度
-_C.MODEL.GRAPH_INPUT.TEXT_DIM = 768                  # 属性名文本 embedding 维度，也对应 prompt latent 维度
-_C.MODEL.GRAPH_INPUT.GRAPH_SOURCE = "fuse"           # 图来源：acc/acssc/fuse；或外部矩阵 key，如 method1_diff/method2_diff/method3_diff；external 兼容读取 key=graph
+_C.MODEL.GRAPH_INPUT.TEXT_DIM = 768                  # prompt posterior 与 Graph-GP prototype 的 latent 维度
+_C.MODEL.GRAPH_INPUT.GRAPH_SOURCE = "method1_diff"   # Graph-GP external graph key：method1_diff / method2_diff / method3_diff
 _C.MODEL.GRAPH_INPUT.EXTERNAL_GRAPH_PATH = ""        # GRAPH_SOURCE 指向外部 key 时读取的 [C,C] 类别关系矩阵文件；支持 .npz/.npy/.pt/.pth
 _C.MODEL.GRAPH_INPUT.EXTERNAL_GRAPH_SYMMETRIZE = True # 是否强制 external graph 对称化
 _C.MODEL.GRAPH_INPUT.EXTERNAL_GRAPH_CLAMP = True     # 是否把 external graph 截断到 [0,1]
 _C.MODEL.GRAPH_INPUT.EXTERNAL_GRAPH_DIAG_VALUE = 1.0 # external graph 对角线值；负数表示不改对角线
-_C.MODEL.GRAPH_INPUT.RHO = 0.0                       # fuse 图中 Acc 的融合权重；G=rho*Acc+(1-rho)*Acssc
-_C.MODEL.GRAPH_INPUT.TOPK = 16                       # 从 G[y] 中保留的语义相近类别数
-_C.MODEL.GRAPH_INPUT.TAU_ACC = 0.07                  # 构造语义 target T_y 时的 softmax 温度
-_C.MODEL.GRAPH_INPUT.TARGET_MIX_ALPHA = 0.1          # semantic target 与 one-hot 的混合比例；0=纯 one-hot，1=纯语义近邻分布
 _C.MODEL.GRAPH_INPUT.EPS = 1e-8                      # GraphProbPrior 概率归一化与 log 的数值稳定下界
 
 _C.MODEL.GRAPH_PROB_PRIOR = CfgNode()
-_C.MODEL.GRAPH_PROB_PRIOR.ENABLE = True                # 是否启用 GraphProbPrior；可单独替代标准 Prompt KL
-_C.MODEL.GRAPH_PROB_PRIOR.MODE = "graph_conditioned_semantic_prior" # 候选：graph_conditioned_semantic_prior / class_aggregate_mmd / factorized_latent
-_C.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT = 0.001             # GraphProbPrior 辅助损失权重；用于替代标准 N(0,I) KL 时单独开启
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_MEAN_MODE = "residual_anchor" # prior mean 构造方式：learned=旧 prior_head；residual_anchor=312维属性残差锚点+小修正；graph_gp_conditioned=用 support-seen 视觉中心经 Graph-GP 条件推断全类 prototype
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_VAR_MODE = "unit"       # prior 方差策略：learned=MLP预测；unit=logvar=0；constant=固定 PRIOR_LOGVAR_CONST
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_LOGVAR_CONST = 0.0      # PRIOR_VAR_MODE=constant 时使用的固定 logvar
-_C.MODEL.GRAPH_PROB_PRIOR.RESIDUAL_SIGMA_MIN = 0.05     # 312维属性残差标准化时的 std 下界，防止低方差属性被放大
-_C.MODEL.GRAPH_PROB_PRIOR.RESIDUAL_CLIP = 3.0           # 标准化属性残差的截断范围 [-clip, clip]
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE = 0.1       # small correction 强度：prior_mu 由 anchor + scale*tanh(delta) 得到
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE = 2.0          # prior_mu 的全局基础半径，控制 Gaussian KL/几何距离的整体尺度
-_C.MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_MU_SCALE = False
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE_MIN = 0.5
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_MU_SCALE_MAX = 5.0
-_C.MODEL.GRAPH_PROB_PRIOR.LEARN_PRIOR_DELTA_SCALE = False
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE_MIN = 0.0
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_DELTA_SCALE_MAX = 0.8
-_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_RADIUS_MODE = "residual_norm" # fixed=所有类别同半径；residual_norm=属性残差越大，类别 prior 半径越大
+_C.MODEL.GRAPH_PROB_PRIOR.ENABLE = False               # GraphProbPrior 启用后固定使用 Graph-GP energy classification
+_C.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT = 0.0             # Graph-GP 辅助损失权重
+_C.MODEL.GRAPH_PROB_PRIOR.PRIOR_LOGVAR_CONST = 0.0      # GRAPH_GP_PRIOR_VAR_SOURCE=constant 时使用的固定 logvar
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_SUPPORT_RATIO = 0.8  # graph_gp_conditioned 中 seen 类划为 support-seen 的比例；剩余 seen 类作为 pseudo-unseen 诊断外推能力
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_SPLIT_EVERY_EPOCH = 1 # 每多少个 epoch 重新划分一次 support-seen / pseudo-unseen；1 表示每个 epoch 换一次
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_SPLIT_SEED = 2027    # Graph-GP 类别 split 的随机种子；保证 support/pseudo 划分可复现
@@ -137,7 +113,7 @@ _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_RIDGE = 1e-4         # 加到 K_ss + R_s 对�
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_KERNEL_SYMMETRIZE = True # 条件推断前是否对 graph kernel 做对称化
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_KERNEL_CLAMP = True  # 条件推断前是否把 graph kernel 裁到非负，避免负边直接进入协方差
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_KERNEL_NORMALIZE = "diag" # Graph-GP kernel 归一化：diag 让对角线尺度接近 1；none 保留原始尺度
-_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_SOURCE = "unit" # Graph-GP prior_logvar 来源：unit / constant / current_prior_var_mode / dynamic_uncertainty
+_C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_SOURCE = "unit" # Graph-GP prior_logvar 来源：unit / constant / dynamic_uncertainty
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_FLOOR = 0.05    # dynamic_uncertainty 的最低 prior variance，避免 KL 因 prior 太窄而爆炸
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_PROTO_WEIGHT = 1.0  # dynamic_uncertainty 中 GP predictive uncertainty 的权重
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_VISUAL_WEIGHT = 1.0 # dynamic_uncertainty 中传播后的类内视觉方差权重
@@ -149,54 +125,7 @@ _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_OBJECTIVE = "energy_classification" # Graph-G
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_ENERGY_TAU = 1.0          # Graph-GP Energy Classification 的 softmax 温度
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_ENERGY_CLASS_SPACE = "seen" # energy classification 的类别空间；当前只支持 seen
 _C.MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PSEUDO_WEIGHT = 1.0       # pseudo-unseen 样本在 energy CE 中的样本权重；1 表示不额外加权
-_C.MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH = 0.07              # 用 G[c] 构造 graph top-k context / 旧 neighbor_bank 时的 softmax 温度
-_C.MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_GRAPH = False
-_C.MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH_MIN = 0.02
-_C.MODEL.GRAPH_PROB_PRIOR.TAU_GRAPH_MAX = 0.40
-_C.MODEL.GRAPH_PROB_PRIOR.TAU_LATENT = 1.0              # softmax(-KL(q||p_c)/tau) 的温度，控制 latent matching 分布尖锐程度
-_C.MODEL.GRAPH_PROB_PRIOR.LEARN_TAU_LATENT = False
-_C.MODEL.GRAPH_PROB_PRIOR.TAU_LATENT_MIN = 0.01
-_C.MODEL.GRAPH_PROB_PRIOR.TAU_LATENT_MAX = 0.30
-_C.MODEL.GRAPH_PROB_PRIOR.REL_WEIGHT = 0.0              # class_aggregate_* 专用全类 prior 关系正则权重；0 表示关闭
-_C.MODEL.GRAPH_PROB_PRIOR.TAU_PRIOR = 0.07              # prior Gaussian symKL 关系分布 softmax 温度，仅 REL_WEIGHT>0 时生效
-_C.MODEL.GRAPH_PROB_PRIOR.MMD_SAMPLES = 1               # class_aggregate_mmd 中每个 posterior/prior 高斯采样次数
-_C.MODEL.GRAPH_PROB_PRIOR.MMD_SIGMA = 1.0               # class_aggregate_mmd 的 RBF kernel sigma
-_C.MODEL.GRAPH_PROB_PRIOR.FACTORIZED_VARIATION_WEIGHT = 0.0 # factorized_latent 中 variation aggregate matching 权重；第一版默认关闭
-_C.MODEL.GRAPH_PROB_PRIOR.FACTORIZED_DECOUPLE_WEIGHT = 0.0  # factorized_latent 中 semantic/variation 去相关权重；0 表示不启用
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_ENABLE = False      # 是否启用 prior_mu 几何校准正则；默认关闭
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_TYPE = "soft_distribution_matching" # soft_distribution_matching / graph_ordinal_ranking
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_LOSS_WEIGHT = 1e-4       # geometry loss 加到 GraphProbPrior 内部的权重
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_TOPK = 5                 # geometry loss 使用的 graph top-k 邻居数
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_MARGIN_MIN = 0.1         # geometry 边界项的最小非交叠安全间隔 m0
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_SIGMA_PRIOR = 0.2        # 固定方差模式下 geometry 距离使用的 prior 半径
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_DETACH_RADIUS = True     # geometry 距离中是否截断 radius 梯度，防止用方差逃避约束
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_BARRIER = 0.1        # geometry soft boundary 的 softplus 平滑温度
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_GRAPH_DIST = 0.1     # soft_distribution_matching 的 graph target softmax 温度
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_DIST = 0.1           # soft_distribution_matching 中 softmax(-D/tau) 的距离温度
-_C.MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_TAU_DIST = False
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_DIST_MIN = 0.01
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_TAU_DIST_MAX = 0.30
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_BOUND_WEIGHT = 0.1       # soft_distribution_matching 可选边界项权重
-_C.MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_BOUND_WEIGHT = False
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_BOUND_WEIGHT_MIN = 0.0
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_BOUND_WEIGHT_MAX = 0.50
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_DISTANCE_TYPE = "clearance" # graph_ordinal_ranking 使用的距离：clearance复用分布半径距离；cosine/euclidean为诊断备选
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_BASE = 0.0    # ordinal ranking 的基础排序间隔
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE = 0.1   # graph 相似度差距越大，额外排序间隔越大
-_C.MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_ORD_MARGIN_SCALE = False
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE_MIN = 0.0
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_MARGIN_SCALE_MAX = 0.50
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_GRAPH_GAP_EPS = 1e-6 # graph 相似度差距小于该值时不构造排序对
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_WEIGHT_BY_GAP = True # 是否按归一化 graph gap 加权排序对
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_EPS = 1e-8           # ordinal ranking 内部归一化数值稳定项
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT = 0.0 # 可选 non-overlap 弱边界权重；默认关闭
-_C.MODEL.GRAPH_PROB_PRIOR.LEARN_GEOM_ORD_NON_OVERLAP_WEIGHT = False
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT_MIN = 0.0
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_WEIGHT_MAX = 0.08
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_MIN_DIST = 0.05 # d_norm 小于该值时认为分布间隔过小
-_C.MODEL.GRAPH_PROB_PRIOR.GEOM_ORD_NON_OVERLAP_SCOPE = "topk" # non-overlap 作用范围：topk / all
-_C.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE = False        # 是否记录 GraphProbPrior 温度/距离尺度监测量；默认关闭避免日常日志过长
-_C.MODEL.GRAPH_PROB_PRIOR.MONITOR_INACTIVE = False      # 是否额外计算当前 MODE 未使用的温度位置；默认关闭以避免额外开销
+_C.MODEL.GRAPH_PROB_PRIOR.MONITOR_ENABLE = False        # 是否记录 Graph-GP kernel、prototype、energy 与 GZSL 风险监测量
 _C.MODEL.GRAPH_PROB_PRIOR.MONITOR_TOPK = 5              # 监测 top-k mass 时使用的 k
 _C.MODEL.GRAPH_PROB_PRIOR.MONITOR_EVERY_N = 37           # 每多少次实际 GraphProbPrior 训练 forward 记录一次监测量；1 表示每次都记录
 _C.MODEL.GRAPH_PROB_PRIOR.MONITOR_EFFECTIVE_RANK = False # 是否计算 effective-rank 监测；关闭可避免 SVD/MAGMA 日志
