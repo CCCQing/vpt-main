@@ -262,10 +262,115 @@ class PromptParameterTracker:
             name: parameter.detach().float().cpu().clone()
             for name, parameter in self.parameters.items()
         }
+        self.layer_parameters = {}
+        input_prompt = next((
+            (name, parameter)
+            for name, parameter in self.parameters.items()
+            if name.lower().endswith("prompt_embeddings")
+            and not name.lower().endswith("deep_prompt_embeddings")
+            and parameter.dim() == 3
+        ), None)
+        deep_prompt = next((
+            (name, parameter)
+            for name, parameter in self.parameters.items()
+            if name.lower().endswith("deep_prompt_embeddings") and parameter.dim() == 3
+        ), None)
+        self.deep_layer_tracking_active = deep_prompt is not None
+        if input_prompt is not None and deep_prompt is not None:
+            name, parameter = input_prompt
+            self.layer_parameters[0] = (name, parameter, None)
+            deep_name, deep_parameter = deep_prompt
+            for index in range(int(deep_parameter.shape[0])):
+                self.layer_parameters[index + 1] = (deep_name, deep_parameter, index)
+        self.layer_initial = {
+            layer_index: self._parameter_layer_view(parameter, slice_index).detach().float().cpu().clone()
+            for layer_index, (_, parameter, slice_index) in self.layer_parameters.items()
+        }
+        self.reset_epoch_gradient_stats()
 
     @property
     def active(self) -> bool:
         return bool(self.parameters)
+
+    @staticmethod
+    def _parameter_layer_view(parameter: torch.Tensor, slice_index) -> torch.Tensor:
+        if slice_index is None:
+            return parameter[0]
+        return parameter[int(slice_index)]
+
+    @staticmethod
+    def _token_geometry(tokens: torch.Tensor) -> Dict[str, float]:
+        matrix = tokens.detach().float().reshape(-1, tokens.shape[-1])
+        normalized = torch.nn.functional.normalize(matrix, dim=-1)
+        cosine = normalized @ normalized.t()
+        mask = ~torch.eye(cosine.shape[0], dtype=torch.bool, device=cosine.device)
+        offdiag = cosine[mask]
+        centered = matrix - matrix.mean(dim=0, keepdim=True)
+        singular = (
+            torch.linalg.svdvals(centered)
+            if hasattr(torch.linalg, "svdvals")
+            else torch.svd(centered, some=False).S
+        )
+        probability = singular / singular.sum().clamp_min(1e-12)
+        effective_rank = torch.exp(
+            -(probability * probability.clamp_min(1e-12).log()).sum()
+        )
+        return {
+            "token_pair_cosine_mean": float(offdiag.mean().item()) if offdiag.numel() else 0.0,
+            "token_pair_cosine_max": float(offdiag.max().item()) if offdiag.numel() else 0.0,
+            "prompt_effective_rank": float(effective_rank.item()),
+        }
+
+    def reset_epoch_gradient_stats(self) -> None:
+        self.layer_grad_total = {layer_index: 0.0 for layer_index in self.layer_parameters}
+        self.layer_grad_max = {layer_index: 0.0 for layer_index in self.layer_parameters}
+        self.layer_grad_count = {layer_index: 0 for layer_index in self.layer_parameters}
+
+    def observe_gradients(self) -> None:
+        if not self.deep_layer_tracking_active:
+            return
+        for layer_index, (_, parameter, slice_index) in self.layer_parameters.items():
+            if parameter.grad is None or not torch.isfinite(parameter.grad).all():
+                continue
+            gradient = self._parameter_layer_view(parameter.grad, slice_index)
+            value = float(gradient.detach().float().norm().item())
+            self.layer_grad_total[layer_index] += value
+            self.layer_grad_max[layer_index] = max(self.layer_grad_max[layer_index], value)
+            self.layer_grad_count[layer_index] += 1
+
+    def layer_metrics(self) -> Dict[int, Dict[str, float]]:
+        if not self.deep_layer_tracking_active:
+            return {}
+        result = {}
+        previous = None
+        for layer_index in sorted(self.layer_parameters):
+            _, parameter, slice_index = self.layer_parameters[layer_index]
+            current = self._parameter_layer_view(parameter, slice_index).detach().float().cpu()
+            initial = self.layer_initial[layer_index]
+            delta = current - initial
+            count = int(self.layer_grad_count.get(layer_index, 0))
+            metrics = {
+                "prompt_param_norm": float(current.norm().item()),
+                "prompt_grad_norm_epoch_mean": float(
+                    self.layer_grad_total.get(layer_index, 0.0) / max(1, count)
+                ),
+                "prompt_grad_norm_epoch_max": float(self.layer_grad_max.get(layer_index, 0.0)),
+                "prompt_grad_observation_count": float(count),
+                "prompt_relative_update": float(
+                    delta.norm().item() / max(float(initial.norm().item()), 1e-12)
+                ),
+                "distance_from_initialization": float(delta.norm().item()),
+                **self._token_geometry(current),
+            }
+            if previous is not None:
+                metrics["previous_layer_prompt_cosine"] = float(
+                    torch.nn.functional.cosine_similarity(
+                        previous.reshape(-1), current.reshape(-1), dim=0, eps=1e-12
+                    ).item()
+                )
+            result[int(layer_index)] = metrics
+            previous = current
+        return result
 
     def metrics(self) -> Dict[str, float]:
         if not self.parameters:
@@ -296,21 +401,5 @@ class PromptParameterTracker:
                 token_matrices.append(value.reshape(-1, value.shape[-1]))
         if token_matrices:
             tokens = torch.cat(token_matrices, dim=0)
-            normalized = torch.nn.functional.normalize(tokens, dim=-1)
-            cosine = normalized @ normalized.t()
-            mask = ~torch.eye(cosine.shape[0], dtype=torch.bool, device=cosine.device)
-            offdiag = cosine[mask]
-            centered = (tokens - tokens.mean(dim=0, keepdim=True)).cpu()
-            singular = (
-                torch.linalg.svdvals(centered)
-                if hasattr(torch.linalg, "svdvals")
-                else torch.svd(centered, some=False).S
-            )
-            prob = singular / singular.sum().clamp_min(1e-12)
-            effective_rank = torch.exp(-(prob * prob.clamp_min(1e-12).log()).sum())
-            result.update({
-                "token_pair_cosine_mean": float(offdiag.mean().item()) if offdiag.numel() else 0.0,
-                "token_pair_cosine_max": float(offdiag.max().item()) if offdiag.numel() else 0.0,
-                "prompt_effective_rank": float(effective_rank.item()),
-            })
+            result.update(self._token_geometry(tokens))
         return result

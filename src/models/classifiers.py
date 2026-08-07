@@ -101,14 +101,23 @@ class RSimilarityClassifier(nn.Module):
         self,
         cls_feat: torch.Tensor,
         class_ids=None,
+        prototype_class_ids=None,
         semantic_state=None,
         runtime_targets=None,
     ) -> torch.Tensor:
         active_class_ids = self._resolve_active_class_space(
             class_ids, device=cls_feat.device
         )
+        active_prototype_ids = self._resolve_active_class_space(
+            class_ids if prototype_class_ids is None else prototype_class_ids,
+            device=cls_feat.device,
+        )
+        if active_class_ids.numel() != active_prototype_ids.numel():
+            raise ValueError(
+                "class_ids and prototype_class_ids must define equally sized class spaces."
+            )
         semantic_input = self._project_class_prototypes().index_select(
-            0, active_class_ids
+            0, active_prototype_ids
         )
         visual_input = cls_feat
 

@@ -41,6 +41,87 @@ class ParameterIntervention(AbstractContextManager):
         return False
 
 
+class PromptAttentionPathIntervention(AbstractContextManager):
+    VALID_MODES = {
+        "prompt_read_block",
+        "prompt_write_block",
+        "prompt_patch_uniform",
+        "patch_prompt_uniform",
+        "prompt_patch_value_globalize",
+        "attribute_concept_prompt_patch_block",
+        "random_prompt_patch_block",
+        "transport_prompt_patch_block",
+        "transport_random_patch_block",
+    }
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        mode: str,
+        **payload: Any,
+    ) -> None:
+        if str(mode) not in self.VALID_MODES:
+            raise ValueError(f"Unsupported prompt attention intervention: {mode}")
+        self.model = model
+        self.mode = str(mode)
+        self.payload = dict(payload)
+        self.saved: Dict[torch.nn.Module, Any] = {}
+
+    def __enter__(self):
+        layer_index = 0
+        for module in self.model.modules():
+            if not hasattr(module, "_prompt_path_intervention"):
+                continue
+            self.saved[module] = getattr(module, "_prompt_path_intervention")
+            intervention = dict(self.payload)
+            intervention.update({"mode": self.mode, "layer_index": layer_index})
+            setattr(module, "_prompt_path_intervention", intervention)
+            layer_index += 1
+        if not self.saved:
+            raise RuntimeError("No compatible Attention module was found for prompt path intervention")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for module, value in self.saved.items():
+            setattr(module, "_prompt_path_intervention", value)
+        self.saved.clear()
+        return False
+
+
+class PromptStateIntervention(AbstractContextManager):
+    VALID_MODES = {"prompt_context_swap"}
+
+    def __init__(self, model: torch.nn.Module, mode: str, **payload: Any) -> None:
+        if str(mode) not in self.VALID_MODES:
+            raise ValueError(f"Unsupported prompt state intervention: {mode}")
+        self.model = model
+        self.mode = str(mode)
+        self.payload = dict(payload)
+        self.saved: Dict[torch.nn.Module, Any] = {}
+
+    def __enter__(self):
+        for module in self.model.modules():
+            if not hasattr(module, "_prompt_state_intervention"):
+                continue
+            self.saved[module] = getattr(module, "_prompt_state_intervention")
+            setattr(
+                module,
+                "_prompt_state_intervention",
+                {"mode": self.mode, **self.payload},
+            )
+        if not self.saved:
+            raise RuntimeError(
+                "No compatible Encoder module was found for prompt state intervention"
+            )
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for module, value in self.saved.items():
+            setattr(module, "_prompt_state_intervention", value)
+        self.saved.clear()
+        return False
+
+
 def prompt_zero_intervention(model: torch.nn.Module) -> ParameterIntervention:
     return ParameterIntervention(
         model,
@@ -59,6 +140,121 @@ def attention_mediation_gamma_zero_intervention(model: torch.nn.Module) -> Param
         model,
         lambda name, parameter: "attention_mediation" in name.lower() and "gamma" in name.lower(),
         value=0.0,
+    )
+
+
+def prompt_read_block_intervention(model: torch.nn.Module) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(model, "prompt_read_block")
+
+
+def layer_prompt_read_block_intervention(
+    model: torch.nn.Module,
+    *,
+    target_layer: int,
+) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(
+        model,
+        "prompt_read_block",
+        target_layer=int(target_layer),
+    )
+
+
+def prompt_write_block_intervention(model: torch.nn.Module) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(model, "prompt_write_block")
+
+
+def prompt_patch_uniform_intervention(model: torch.nn.Module) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(model, "prompt_patch_uniform")
+
+
+def patch_prompt_uniform_intervention(model: torch.nn.Module) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(model, "patch_prompt_uniform")
+
+
+def prompt_patch_value_globalize_intervention(
+    model: torch.nn.Module,
+) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(
+        model,
+        "prompt_patch_value_globalize",
+    )
+
+
+def prompt_context_swap_intervention(
+    model: torch.nn.Module,
+    *,
+    target_layer: int,
+    permutation: torch.Tensor,
+) -> PromptStateIntervention:
+    return PromptStateIntervention(
+        model,
+        "prompt_context_swap",
+        target_layer=int(target_layer),
+        permutation=permutation,
+    )
+
+
+def attribute_concept_prompt_patch_block_intervention(
+    model: torch.nn.Module,
+    *,
+    attribute_directions: torch.Tensor,
+    margin_weights: torch.Tensor,
+    patch_ratio: float,
+    random_seed: int,
+) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(
+        model,
+        "attribute_concept_prompt_patch_block",
+        attribute_directions=attribute_directions,
+        margin_weights=margin_weights,
+        patch_ratio=float(patch_ratio),
+        random_seed=int(random_seed),
+    )
+
+
+def random_prompt_patch_block_intervention(
+    model: torch.nn.Module,
+    *,
+    attribute_directions: torch.Tensor,
+    margin_weights: torch.Tensor,
+    patch_ratio: float,
+    random_seed: int,
+) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(
+        model,
+        "random_prompt_patch_block",
+        attribute_directions=attribute_directions,
+        margin_weights=margin_weights,
+        patch_ratio=float(patch_ratio),
+        random_seed=int(random_seed),
+    )
+
+
+def transport_prompt_patch_block_intervention(
+    model: torch.nn.Module,
+    *,
+    selected_patch_indices: torch.Tensor,
+    reference_patch_scores: torch.Tensor,
+) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(
+        model,
+        "transport_prompt_patch_block",
+        selected_patch_indices=selected_patch_indices,
+        reference_patch_scores=reference_patch_scores,
+    )
+
+
+def transport_random_patch_block_intervention(
+    model: torch.nn.Module,
+    *,
+    selected_patch_indices: torch.Tensor,
+    reference_patch_scores: torch.Tensor,
+) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(
+        model,
+        "transport_random_patch_block",
+        selected_patch_indices=selected_patch_indices,
+        reference_patch_scores=reference_patch_scores,
     )
 
 
@@ -141,16 +337,145 @@ def paired_module_effect_metrics(
             "delta_accuracy": float(changed_correct[mask].mean() - normal_correct[mask].mean()),
             "support": int(mask.sum()),
         })
-    arrays = {
-        "targets": target,
-        "normal_logits": normal,
-        "intervention_logits": changed,
-        "normal_predictions": normal_pred,
-        "intervention_predictions": changed_pred,
-        "delta_true_margin": delta_true_margin,
-        "delta_seen_bias_margin": delta_bias,
-        "delta_entropy": changed_entropy - normal_entropy,
-        "beneficial_flip": beneficial.astype(np.int8),
-        "harmful_flip": harmful.astype(np.int8),
-    }
-    return {"summary": summary, "per_class": class_delta, "arrays": arrays}
+    return {"summary": summary, "per_class": class_delta}
+
+
+class PairedModuleEffectAccumulator:
+    def __init__(self, candidate_global_ids: Sequence[int], seen_global_ids: Sequence[int]) -> None:
+        self.candidate = np.asarray(candidate_global_ids, dtype=np.int64).reshape(-1)
+        seen_set = {int(item) for item in seen_global_ids}
+        self.seen_columns = np.asarray([int(item) in seen_set for item in self.candidate], dtype=bool)
+        self.unseen_columns = ~self.seen_columns
+        self.sample_count = 0
+        self.sums: Dict[str, float] = {
+            "delta_logits_norm": 0.0,
+            "delta_true_margin": 0.0,
+            "delta_seen_bias_margin": 0.0,
+            "prediction_flip_rate": 0.0,
+            "beneficial_flip_rate": 0.0,
+            "harmful_flip_rate": 0.0,
+            "delta_entropy": 0.0,
+            "feature_cosine_before_after": 0.0,
+        }
+        self.feature_count = 0
+        class_count = int(self.candidate.size)
+        self.class_support = np.zeros(class_count, dtype=np.int64)
+        self.class_normal_correct = np.zeros(class_count, dtype=np.int64)
+        self.class_changed_correct = np.zeros(class_count, dtype=np.int64)
+
+    @staticmethod
+    def _softmax(values: np.ndarray) -> np.ndarray:
+        shifted = values - values.max(axis=1, keepdims=True)
+        exp = np.exp(shifted)
+        return exp / np.maximum(exp.sum(axis=1, keepdims=True), 1e-12)
+
+    @staticmethod
+    def _true_margin(values: np.ndarray, target: np.ndarray) -> np.ndarray:
+        true = values[np.arange(target.size), target]
+        other = values.copy()
+        other[np.arange(target.size), target] = -np.inf
+        return true - other.max(axis=1)
+
+    def _bias_margin(self, values: np.ndarray) -> np.ndarray:
+        if not self.seen_columns.any() or not self.unseen_columns.any():
+            return np.zeros(values.shape[0], dtype=np.float32)
+        return values[:, self.seen_columns].max(axis=1) - values[:, self.unseen_columns].max(axis=1)
+
+    def update(
+        self,
+        normal_logits: Any,
+        intervention_logits: Any,
+        targets: Any,
+        *,
+        normal_features: Optional[Any] = None,
+        intervention_features: Optional[Any] = None,
+    ) -> None:
+        normal = np.asarray(normal_logits, dtype=np.float32)
+        changed = np.asarray(intervention_logits, dtype=np.float32)
+        target = np.asarray(targets, dtype=np.int64).reshape(-1)
+        if normal.ndim != 2 or normal.shape != changed.shape or normal.shape[0] != target.size:
+            raise ValueError("paired module-effect batches have incompatible shapes")
+        if normal.shape[1] != self.candidate.size:
+            raise ValueError("candidate_global_ids length does not match logits")
+        count = int(target.size)
+        if count == 0:
+            return
+        normal_pred = normal.argmax(axis=1)
+        changed_pred = changed.argmax(axis=1)
+        normal_correct = normal_pred == target
+        changed_correct = changed_pred == target
+        normal_prob = self._softmax(normal)
+        changed_prob = self._softmax(changed)
+        normal_entropy = -np.sum(normal_prob * np.log(np.maximum(normal_prob, 1e-12)), axis=1)
+        changed_entropy = -np.sum(changed_prob * np.log(np.maximum(changed_prob, 1e-12)), axis=1)
+        values = {
+            "delta_logits_norm": np.linalg.norm(changed - normal, axis=1),
+            "delta_true_margin": self._true_margin(changed, target) - self._true_margin(normal, target),
+            "delta_seen_bias_margin": self._bias_margin(changed) - self._bias_margin(normal),
+            "prediction_flip_rate": normal_pred != changed_pred,
+            "beneficial_flip_rate": (~normal_correct) & changed_correct,
+            "harmful_flip_rate": normal_correct & (~changed_correct),
+            "delta_entropy": changed_entropy - normal_entropy,
+        }
+        for name, data in values.items():
+            self.sums[name] += float(np.asarray(data, dtype=np.float32).sum())
+        if normal_features is not None and intervention_features is not None:
+            left = np.asarray(normal_features, dtype=np.float32)
+            right = np.asarray(intervention_features, dtype=np.float32)
+            if left.shape == right.shape and left.ndim == 2 and left.shape[0] == count:
+                denom = np.maximum(np.linalg.norm(left, axis=1) * np.linalg.norm(right, axis=1), 1e-12)
+                cosine = np.sum(left * right, axis=1) / denom
+                self.sums["feature_cosine_before_after"] += float(cosine.sum())
+                self.feature_count += count
+        np.add.at(self.class_support, target, 1)
+        np.add.at(self.class_normal_correct, target, normal_correct.astype(np.int64))
+        np.add.at(self.class_changed_correct, target, changed_correct.astype(np.int64))
+        self.sample_count += count
+
+    def finalize(self) -> Dict[str, Any]:
+        if self.sample_count <= 0:
+            return {"summary": {}, "per_class": []}
+        summary = {
+            name: float(value / self.sample_count)
+            for name, value in self.sums.items()
+            if name != "feature_cosine_before_after"
+        }
+        if self.feature_count > 0:
+            summary["feature_cosine_before_after"] = float(
+                self.sums["feature_cosine_before_after"] / self.feature_count
+            )
+        summary["net_beneficial_flip"] = float(
+            summary["beneficial_flip_rate"] - summary["harmful_flip_rate"]
+        )
+        per_class = []
+        deltas = []
+        for class_id in np.flatnonzero(self.class_support > 0):
+            support = int(self.class_support[class_id])
+            normal_accuracy = float(self.class_normal_correct[class_id] / support)
+            changed_accuracy = float(self.class_changed_correct[class_id] / support)
+            delta = changed_accuracy - normal_accuracy
+            deltas.append(delta)
+            per_class.append({
+                "local_class_id": int(class_id),
+                "global_class_id": int(self.candidate[class_id]),
+                "normal_accuracy": normal_accuracy,
+                "intervention_accuracy": changed_accuracy,
+                "delta_accuracy": float(delta),
+                "support": support,
+            })
+        delta_array = np.asarray(deltas, dtype=np.float32)
+        if delta_array.size:
+            summary.update({
+                "per_class_delta_mean": float(delta_array.mean()),
+                "per_class_delta_median": float(np.quantile(delta_array, 0.5)),
+                "per_class_delta_std": float(delta_array.std()),
+                "per_class_delta_q25": float(np.quantile(delta_array, 0.25)),
+                "per_class_delta_q75": float(np.quantile(delta_array, 0.75)),
+                "per_class_decline_ratio": float((delta_array < 0.0).mean()),
+            })
+            seen_mask = np.asarray([int(row["global_class_id"]) in set(self.candidate[self.seen_columns].tolist()) for row in per_class], dtype=bool)
+            if seen_mask.any():
+                summary["seen_per_class_delta_mean"] = float(delta_array[seen_mask].mean())
+            if (~seen_mask).any():
+                summary["unseen_per_class_delta_mean"] = float(delta_array[~seen_mask].mean())
+        return {"summary": summary, "per_class": per_class}

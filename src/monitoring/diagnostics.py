@@ -34,35 +34,6 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _compact_eval_scores(
-    scores: np.ndarray,
-    targets_local: np.ndarray,
-    *,
-    topk: int = 20,
-) -> Dict[str, np.ndarray]:
-    if scores.ndim != 2:
-        raise ValueError(f"eval scores must be 2-D, got shape={scores.shape}")
-    if targets_local.ndim != 1 or targets_local.shape[0] != scores.shape[0]:
-        raise ValueError(
-            "targets_local must be a 1-D array aligned with eval score rows, "
-            f"got targets={targets_local.shape}, scores={scores.shape}"
-        )
-    if scores.shape[1] == 0:
-        raise ValueError("eval scores must contain at least one candidate class")
-    if np.any(targets_local < 0) or np.any(targets_local >= scores.shape[1]):
-        raise ValueError("targets_local contains an index outside the eval candidate space")
-
-    retained_k = min(int(topk), int(scores.shape[1]))
-    topk_local_indices = np.argsort(-scores, axis=1, kind="mergesort")[:, :retained_k]
-    topk_scores = np.take_along_axis(scores, topk_local_indices, axis=1)
-    true_class_scores = scores[np.arange(scores.shape[0]), targets_local]
-    return {
-        "topk_scores": topk_scores.astype(np.float32, copy=False),
-        "topk_local_indices": topk_local_indices.astype(np.int32, copy=False),
-        "true_class_scores": true_class_scores.astype(np.float32, copy=False),
-    }
-
-
 class DiagnosticManager:
     def __init__(self, cfg: Any, monitor_manager: Any, *, is_writer: bool = True) -> None:
         self.cfg = cfg
@@ -74,7 +45,7 @@ class DiagnosticManager:
         self.session_id = str(monitor_manager.session_id)
         self.started_at = self._utc_now()
         self.finalized = False
-        self.eval_cache: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        self.calibration_pending: Dict[Tuple[int, str], Dict[str, Any]] = {}
         self.runtime = {
             "static_semantic_graph": self._new_state("one_time_evidence"),
             "prediction_health": self._new_state("eval_diagnostics"),
@@ -158,7 +129,6 @@ class DiagnosticManager:
                 },
             },
             "resolved_switches": {
-                "save_eval_cache": bool(self.cfg.MONITOR.DIAGNOSTICS.SAVE_EVAL_CACHE),
                 "prediction_health": bool(self.cfg.MONITOR.PREDICTION_HEALTH.ENABLE),
                 "class_error": bool(self.cfg.MONITOR.CLASS_ERROR.ENABLE),
                 "calibration_profile": bool(self.cfg.MONITOR.CALIBRATION.ENABLE),
@@ -226,44 +196,21 @@ class DiagnosticManager:
         split: str,
         scores: Any,
         targets_local: Any,
-        targets_global: Any,
-        sample_ids: Sequence[str],
         dataset: Any,
-        visual_features: Optional[Any] = None,
     ) -> Dict[str, Dict[str, float]]:
         if not self.enabled:
             return {"prediction_health": {}, "class_error": {}}
-        stored_score_matrix = _numpy(scores).astype(np.float32, copy=False)
-        score_matrix = stored_score_matrix
+        score_matrix = _numpy(scores).astype(np.float32, copy=False)
         local_targets = _numpy(targets_local).astype(np.int64, copy=False)
-        global_targets = _numpy(targets_global).astype(np.int64, copy=False)
         candidate = np.asarray(list(dataset.eval_local_classes), dtype=np.int64)
         position = {"epoch": int(epoch), "split": str(split)}
-        cache = {
-            "scores": score_matrix,
-            "targets_local": local_targets,
-            "targets_global": global_targets,
-            "sample_ids": np.asarray([str(item) for item in sample_ids]),
-            "candidate_global_ids": candidate,
-            "seen_global_ids": np.asarray(list(getattr(dataset, "seen_classes", [])), dtype=np.int64),
-            "unseen_global_ids": np.asarray(list(getattr(dataset, "unseen_classes", [])), dtype=np.int64),
-            "visual_features": None if visual_features is None else _numpy(visual_features),
-        }
-        self.eval_cache[(int(epoch), str(split))] = cache
-        if bool(self.cfg.MONITOR.DIAGNOSTICS.SAVE_EVAL_CACHE):
-            arrays = {name: value for name, value in cache.items() if value is not None}
-            if int(epoch) == int(self.cfg.SOLVER.TOTAL_EPOCH):
-                arrays["scores"] = stored_score_matrix
-            else:
-                arrays.pop("scores", None)
-                arrays.pop("visual_features", None)
-                arrays.update(_compact_eval_scores(stored_score_matrix, local_targets, topk=20))
-            self._write_npz_artifact(
-                "prediction_health",
-                f"eval_cache/epoch_{int(epoch):04d}/{split}.npz",
-                arrays,
-                position,
-            )
+        if bool(self.cfg.MONITOR.CALIBRATION.ENABLE) and str(split) in {"test_seen", "test_unseen"}:
+            self.calibration_pending[(int(epoch), str(split))] = {
+                "scores": score_matrix,
+                "targets_local": local_targets,
+                "candidate_global_ids": candidate,
+                "seen_global_ids": np.asarray(list(getattr(dataset, "seen_classes", [])), dtype=np.int64),
+            }
 
         prediction = {}
         if bool(self.cfg.MONITOR.PREDICTION_HEALTH.ENABLE):
@@ -329,12 +276,16 @@ class DiagnosticManager:
     def record_calibration(self, epoch: int) -> Dict[str, float]:
         if not self.enabled or not bool(self.cfg.MONITOR.CALIBRATION.ENABLE):
             return {}
-        seen = self.eval_cache.get((int(epoch), "test_seen"))
-        unseen = self.eval_cache.get((int(epoch), "test_unseen"))
+        seen_key = (int(epoch), "test_seen")
+        unseen_key = (int(epoch), "test_unseen")
+        seen = self.calibration_pending.get(seen_key)
+        unseen = self.calibration_pending.get(unseen_key)
         if seen is None or unseen is None:
             return {}
+        seen = self.calibration_pending.pop(seen_key)
+        unseen = self.calibration_pending.pop(unseen_key)
         if not np.array_equal(seen["candidate_global_ids"], unseen["candidate_global_ids"]):
-            raise ValueError("test_seen and test_unseen calibration caches use different candidate class order")
+            raise ValueError("test_seen and test_unseen calibration inputs use different candidate class order")
         profile = calibration_profile_metrics(
             seen["scores"],
             seen["targets_local"],
@@ -382,9 +333,36 @@ class DiagnosticManager:
         path = self.root / "probe_metrics.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = [
-            "run_id", "session_id", "checkpoint_id", "probe_id", "split",
-            "domain", "entity_type", "entity_id", "metric", "value",
+            "run_id", "session_id", "checkpoint_id", "probe_id", "selection_seed",
+            "probe_manifest_sha256", "split",
+            "condition", "domain", "entity_type", "entity_id", "metric", "value",
         ]
+        if path.exists():
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                existing_fields = list(reader.fieldnames or [])
+                existing_rows = list(reader)
+            condition_only_fields = [
+                name for name in fieldnames
+                if name not in {"selection_seed", "probe_manifest_sha256"}
+            ]
+            legacy_fields = [name for name in condition_only_fields if name != "condition"]
+            if existing_fields in (legacy_fields, condition_only_fields):
+                with path.open("w", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for row in existing_rows:
+                        writer.writerow({
+                            name: (
+                                "normal" if name == "condition" and "condition" not in row
+                                else json_safe(row.get(name))
+                            )
+                            for name in fieldnames
+                        })
+            elif existing_fields != fieldnames:
+                raise ValueError(
+                    "probe_metrics.csv schema does not match the current probe-identity format"
+                )
         write_header = not path.exists()
         with path.open("a", encoding="utf-8", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -395,31 +373,18 @@ class DiagnosticManager:
         self._observe("fixed_probe", path, {"stage": "fixed_probe"})
         return path
 
-    def record_probe_artifact(self, relative_path: str, payload: Mapping[str, Any], *, is_array: bool = False) -> Path:
+    def record_probe_artifact(self, relative_path: str, payload: Mapping[str, Any]) -> Path:
         position = {"stage": "fixed_probe"}
-        if is_array:
-            return self._write_npz_artifact("fixed_probe", relative_path, payload, position)
         return self._write_json_artifact("fixed_probe", relative_path, payload, position)
 
-    def record_module_effect_artifact(self, relative_path: str, payload: Mapping[str, Any], *, is_array: bool = False) -> Path:
+    def record_module_effect_artifact(self, relative_path: str, payload: Mapping[str, Any]) -> Path:
         position = {"stage": "module_effect"}
-        if is_array:
-            return self._write_npz_artifact("module_effect", relative_path, payload, position)
         return self._write_json_artifact("module_effect", relative_path, payload, position)
-
-    def record_module_effect_jsonl(self, relative_path: str, rows: Sequence[Mapping[str, Any]]) -> Path:
-        path = self.root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
-            for row in rows:
-                payload = {"run_id": self.run_id, "session_id": self.session_id, **dict(row)}
-                handle.write(json.dumps(json_safe(payload), ensure_ascii=False) + "\n")
-        self._observe("module_effect", path, {"stage": "module_effect"})
-        return path
 
     def finalize(self, *, status: str) -> None:
         if not self.enabled or self.finalized:
             return
+        self.calibration_pending.clear()
         write_json(
             self.root / "diagnostic_runtime_summary.json",
             {

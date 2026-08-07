@@ -796,6 +796,26 @@ class PromptedTransformer(Transformer):
             dim=1,
         )
 
+    @staticmethod
+    def _attach_prompt_layer_continuity(affinities):
+        previous_output = None
+        for affinity in affinities or []:
+            if not isinstance(affinity, dict):
+                previous_output = None
+                continue
+            current_input = affinity.get("_prompt_layer_input_vector")
+            current_output = affinity.get("_prompt_layer_output_vector")
+            if torch.is_tensor(previous_output) and torch.is_tensor(current_input):
+                affinity["prompt_previous_output_to_current_input_cosine"] = (
+                    torch.nn.functional.cosine_similarity(
+                        previous_output, current_input, dim=-1, eps=1e-12
+                    )
+                )
+                affinity["prompt_previous_output_to_current_input_gap_norm"] = (
+                    current_input - previous_output
+                ).norm(dim=-1)
+            previous_output = current_output if torch.is_tensor(current_output) else None
+
     def _active_semantic_length(self, semantics) -> int:
         if self.semantic_tokens_enable and torch.is_tensor(semantics):
             return int(self.semantic_tokens_cfg.NUM_TOKENS)
@@ -1257,6 +1277,8 @@ class PromptedTransformer(Transformer):
                 effective_prompt_tokens,
                 attention_mediation_config,
             )
+
+        self._attach_prompt_layer_continuity(affinities)
 
         self._last_attention_mediation_stats = [
             dict(block._last_attention_mediation_stats)

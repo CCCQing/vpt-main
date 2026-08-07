@@ -1,0 +1,36 @@
+OUTPUT_DIR: "output/graph_gp_search"
+BASE_CONFIG_FILE: "configs/graph_prob_prior/cub_graph_gp_energy_vpt_deep.yaml"
+TRAIN_SCRIPT: "train.py"
+RUNNER: "train"
+TRIAL_ORDER: "graph_stage"
+
+STAGE_ORDER:
+  - "stage0_conditioning"
+  - "stage1_prior_variance"
+  - "stage2_energy"
+
+EXTERNAL_GRAPH:
+  PATH: "cub_attribute_localization/05_hparam_searches/diff_only_graphs_v1/diff_only_method_matrices_v1.npz"
+  METHODS:
+    - "method1_diff"
+    - "method2_diff"
+    - "method3_diff"
+
+FIXED_OPTS:
+  MODEL.GRAPH_PROB_PRIOR.ENABLE: true
+  MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT: 0.001
+
+GRAPH_GP_SEARCH_SPACE:
+  FIXED_OPTS: {}
+  STAGES:
+    stage0_conditioning:
+      GRID:
+        MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_SUPPORT_RATIO: [0.7, 0.8, 0.9]
+        MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_RIDGE: [1.0e-5, 1.0e-4, 1.0e-3]
+    stage1_prior_variance:
+      GRID:
+        MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PRIOR_VAR_SOURCE: ["unit", "constant", "dynamic_uncertainty"]
+    stage2_energy:
+      GRID:
+        MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_ENERGY_TAU: [0.5, 1.0, 2.0]
+        MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PSEUDO_WEIGHT: [0.5, 1.0, 2.0]

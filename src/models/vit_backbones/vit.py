@@ -92,6 +92,8 @@ class Attention(nn.Module):
         self.debug_shapes = False
         self._shape_debug_forward_proj_logged = False
         self._last_mediation_stats = None
+        self._prompt_path_intervention = None
+        self._last_prompt_path_intervention_stats = None
 
     def transpose_for_scores(self, x):
         """将张量从 [B, N, D] 变形为 [B, h, N, d_k] 以便做多头注意力。"""
@@ -179,6 +181,391 @@ class Attention(nn.Module):
         keep_prob = 1.0 - dropout_p
         shared_mask = torch.empty_like(attention_probs).bernoulli_(keep_prob).div_(keep_prob)
         return attention_probs * shared_mask, modified_probs * shared_mask
+
+    def _apply_prompt_path_intervention(
+        self,
+        attention_probs: torch.Tensor,
+        prompt_length: int,
+        semantic_length: int,
+        hidden_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        self._last_prompt_path_intervention_stats = None
+        intervention = self._prompt_path_intervention
+        if not intervention:
+            return attention_probs
+        prompt_length = int(prompt_length)
+        semantic_length = int(semantic_length)
+        if prompt_length <= 0:
+            return attention_probs
+        sequence_length = int(attention_probs.shape[-1])
+        prompt_slice = slice(1, 1 + prompt_length)
+        patch_start = 1 + prompt_length
+        patch_end = sequence_length - semantic_length
+        if patch_end <= patch_start:
+            raise ValueError(
+                "Prompt attention intervention requires at least one visual Patch token"
+            )
+        patch_slice = slice(patch_start, patch_end)
+        mode = str(intervention.get("mode", ""))
+        target_layer = intervention.get("target_layer")
+        if target_layer is not None and int(intervention.get("layer_index", -1)) != int(
+            target_layer
+        ):
+            return attention_probs
+        changed = attention_probs.clone()
+        if mode == "prompt_patch_value_globalize":
+            return changed
+        if mode == "prompt_patch_uniform":
+            prompt_patch_mass = changed[:, :, prompt_slice, patch_slice].sum(
+                dim=-1, keepdim=True
+            )
+            changed[:, :, prompt_slice, patch_slice] = (
+                prompt_patch_mass / float(patch_end - patch_start)
+            )
+            return changed
+        if mode == "patch_prompt_uniform":
+            patch_prompt_mass = changed[:, :, patch_slice, prompt_slice].sum(
+                dim=-1, keepdim=True
+            )
+            changed[:, :, patch_slice, prompt_slice] = (
+                patch_prompt_mass / float(prompt_length)
+            )
+            return changed
+        if mode in {
+            "attribute_concept_prompt_patch_block",
+            "random_prompt_patch_block",
+        }:
+            if not torch.is_tensor(hidden_states):
+                raise ValueError(
+                    "Attribute-concept prompt intervention requires layer hidden states"
+                )
+            attribute_directions = intervention.get("attribute_directions")
+            margin_weights = intervention.get("margin_weights")
+            if not torch.is_tensor(attribute_directions) or not torch.is_tensor(
+                margin_weights
+            ):
+                raise ValueError(
+                    "Attribute-concept prompt intervention requires attribute directions and margin weights"
+                )
+            patch_hidden = hidden_states[:, patch_slice, :].detach().float()
+            directions = attribute_directions.detach().to(
+                device=patch_hidden.device, dtype=torch.float32
+            )
+            weights = margin_weights.detach().to(
+                device=patch_hidden.device, dtype=torch.float32
+            )
+            if (
+                directions.dim() != 2
+                or weights.dim() != 2
+                or directions.shape[0] != weights.shape[1]
+                or directions.shape[1] != patch_hidden.shape[-1]
+                or weights.shape[0] != patch_hidden.shape[0]
+            ):
+                raise ValueError(
+                    "Attribute-concept prompt intervention tensors have incompatible shapes"
+                )
+            patch_unit = torch.nn.functional.normalize(
+                patch_hidden, dim=-1, eps=1e-12
+            )
+            direction_unit = torch.nn.functional.normalize(
+                directions, dim=-1, eps=1e-12
+            )
+            attribute_scores = torch.matmul(
+                patch_unit, direction_unit.transpose(0, 1)
+            )
+            weighted_scores = attribute_scores * weights.unsqueeze(1)
+            positive_scores = torch.relu(weighted_scores).sum(dim=-1)
+            fallback = positive_scores.sum(dim=-1) <= 1e-12
+            concept_scores = torch.where(
+                fallback.unsqueeze(-1),
+                weighted_scores.abs().sum(dim=-1),
+                positive_scores,
+            )
+            patch_count = int(patch_end - patch_start)
+            patch_ratio = float(intervention.get("patch_ratio", 0.2))
+            if not 0.0 < patch_ratio < 1.0:
+                raise ValueError(
+                    "Attribute-concept prompt intervention patch_ratio must be between 0 and 1"
+                )
+            selected_count = min(
+                patch_count - 1,
+                max(1, int(math.ceil(patch_ratio * patch_count))),
+            )
+            if mode == "attribute_concept_prompt_patch_block":
+                selected_indices = concept_scores.topk(
+                    selected_count, dim=-1, largest=True
+                ).indices
+            else:
+                generator = torch.Generator(device=attention_probs.device)
+                random_seed = int(intervention.get("random_seed", 0))
+                layer_index = int(intervention.get("layer_index", 0))
+                generator.manual_seed(
+                    int((random_seed + 1000003 * layer_index) % (2 ** 63 - 1))
+                )
+                random_scores = torch.rand(
+                    concept_scores.shape,
+                    generator=generator,
+                    device=attention_probs.device,
+                    dtype=torch.float32,
+                )
+                selected_indices = random_scores.topk(
+                    selected_count, dim=-1, largest=True
+                ).indices
+            selected_mask = torch.zeros_like(concept_scores, dtype=torch.bool)
+            selected_mask.scatter_(1, selected_indices, True)
+            selected = selected_mask[:, None, None, :]
+            prompt_patch = changed[:, :, prompt_slice, patch_slice]
+            patch_mass_before = prompt_patch.sum(dim=-1)
+            selected_mass_before = (
+                prompt_patch * selected.to(dtype=prompt_patch.dtype)
+            ).sum(dim=-1, keepdim=True)
+            redistributed = selected_mass_before / float(
+                patch_count - selected_count
+            )
+            prompt_patch = torch.where(
+                selected,
+                torch.zeros_like(prompt_patch),
+                prompt_patch + redistributed,
+            )
+            changed[:, :, prompt_slice, patch_slice] = prompt_patch
+            patch_mass_after = prompt_patch.sum(dim=-1)
+            selected_mass_after = (
+                prompt_patch * selected.to(dtype=prompt_patch.dtype)
+            ).sum(dim=-1)
+            selected_score = concept_scores.gather(1, selected_indices).mean(dim=-1)
+            unselected_score = (
+                concept_scores.masked_fill(selected_mask, 0.0).sum(dim=-1)
+                / float(patch_count - selected_count)
+            )
+            batch_size = int(concept_scores.shape[0])
+            self._last_prompt_path_intervention_stats = {
+                "concept_intervention_selected_patch_ratio": concept_scores.new_full(
+                    (batch_size,), float(selected_count / patch_count)
+                ),
+                "concept_intervention_selected_score_mean": selected_score,
+                "concept_intervention_unselected_score_mean": unselected_score,
+                "concept_intervention_selection_score_gap": (
+                    selected_score - unselected_score
+                ),
+                "concept_intervention_selected_prompt_attention_mass_before": (
+                    selected_mass_before.squeeze(-1).mean(dim=(1, 2))
+                ),
+                "concept_intervention_selected_prompt_attention_mass_after": (
+                    selected_mass_after.mean(dim=(1, 2))
+                ),
+                "concept_intervention_prompt_patch_mass_abs_error": (
+                    patch_mass_after - patch_mass_before
+                ).abs().mean(dim=(1, 2)),
+                "concept_intervention_fallback_ratio": fallback.float(),
+                "concept_intervention_targeted": concept_scores.new_full(
+                    (batch_size,),
+                    1.0
+                    if mode == "attribute_concept_prompt_patch_block"
+                    else 0.0,
+                ),
+            }
+            return changed
+        if mode in {
+            "transport_prompt_patch_block",
+            "transport_random_patch_block",
+        }:
+            selected_indices = intervention.get("selected_patch_indices")
+            reference_scores = intervention.get("reference_patch_scores")
+            if not torch.is_tensor(selected_indices) or not torch.is_tensor(
+                reference_scores
+            ):
+                raise ValueError(
+                    "Transport prompt intervention requires fixed selected indices and reference scores"
+                )
+            selected_indices = selected_indices.detach().to(
+                device=attention_probs.device, dtype=torch.long
+            )
+            reference_scores = reference_scores.detach().to(
+                device=attention_probs.device, dtype=torch.float32
+            )
+            patch_count = int(patch_end - patch_start)
+            if (
+                selected_indices.dim() != 2
+                or reference_scores.dim() != 2
+                or selected_indices.shape[0] != attention_probs.shape[0]
+                or reference_scores.shape
+                != (attention_probs.shape[0], patch_count)
+                or selected_indices.shape[1] <= 0
+                or selected_indices.shape[1] >= patch_count
+                or int(selected_indices.min().item()) < 0
+                or int(selected_indices.max().item()) >= patch_count
+            ):
+                raise ValueError(
+                    "Transport prompt intervention tensors have incompatible shapes or indices"
+                )
+            selected_count = int(selected_indices.shape[1])
+            selected_mask = torch.zeros_like(reference_scores, dtype=torch.bool)
+            selected_mask.scatter_(1, selected_indices, True)
+            selected = selected_mask[:, None, None, :]
+            prompt_patch = changed[:, :, prompt_slice, patch_slice]
+            patch_mass_before = prompt_patch.sum(dim=-1)
+            selected_mass_before = (
+                prompt_patch * selected.to(dtype=prompt_patch.dtype)
+            ).sum(dim=-1, keepdim=True)
+            redistributed = selected_mass_before / float(
+                patch_count - selected_count
+            )
+            prompt_patch = torch.where(
+                selected,
+                torch.zeros_like(prompt_patch),
+                prompt_patch + redistributed,
+            )
+            changed[:, :, prompt_slice, patch_slice] = prompt_patch
+            patch_mass_after = prompt_patch.sum(dim=-1)
+            selected_mass_after = (
+                prompt_patch * selected.to(dtype=prompt_patch.dtype)
+            ).sum(dim=-1)
+            selected_score = reference_scores.gather(
+                1, selected_indices
+            ).mean(dim=-1)
+            unselected_score = (
+                reference_scores.masked_fill(selected_mask, 0.0).sum(dim=-1)
+                / float(patch_count - selected_count)
+            )
+            batch_size = int(reference_scores.shape[0])
+            self._last_prompt_path_intervention_stats = {
+                "transport_intervention_selected_patch_ratio": (
+                    reference_scores.new_full(
+                        (batch_size,), float(selected_count / patch_count)
+                    )
+                ),
+                "transport_intervention_selected_score_mean": selected_score,
+                "transport_intervention_unselected_score_mean": unselected_score,
+                "transport_intervention_selection_score_gap": (
+                    selected_score - unselected_score
+                ),
+                "transport_intervention_selected_prompt_attention_mass_before": (
+                    selected_mass_before.squeeze(-1).mean(dim=(1, 2))
+                ),
+                "transport_intervention_selected_prompt_attention_mass_after": (
+                    selected_mass_after.mean(dim=(1, 2))
+                ),
+                "transport_intervention_prompt_patch_mass_abs_error": (
+                    patch_mass_after - patch_mass_before
+                ).abs().mean(dim=(1, 2)),
+                "transport_intervention_targeted": reference_scores.new_full(
+                    (batch_size,),
+                    1.0 if mode == "transport_prompt_patch_block" else 0.0,
+                ),
+            }
+            return changed
+        if mode == "prompt_read_block":
+            prompt_patch_mass_before = changed[
+                :, :, prompt_slice, patch_slice
+            ].sum(dim=-1)
+            changed[:, :, prompt_slice, patch_slice] = 0.0
+            prompt_rows = changed[:, :, prompt_slice, :]
+            changed[:, :, prompt_slice, :] = prompt_rows / prompt_rows.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-12)
+            batch_size = int(changed.shape[0])
+            self._last_prompt_path_intervention_stats = {
+                "prompt_read_block_applied": prompt_patch_mass_before.new_ones(
+                    (batch_size,)
+                ),
+                "prompt_read_block_patch_mass_before": (
+                    prompt_patch_mass_before.mean(dim=(1, 2))
+                ),
+                "prompt_read_block_patch_mass_after": (
+                    prompt_patch_mass_before.new_zeros((batch_size,))
+                ),
+            }
+            return changed
+        if mode == "prompt_write_block":
+            changed[:, :, :1, prompt_slice] = 0.0
+            changed[:, :, patch_start:, prompt_slice] = 0.0
+            non_prompt_rows = torch.cat(
+                (changed[:, :, :1, :], changed[:, :, patch_start:, :]), dim=-2
+            )
+            non_prompt_rows = non_prompt_rows / non_prompt_rows.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-12)
+            changed[:, :, :1, :] = non_prompt_rows[:, :, :1, :]
+            changed[:, :, patch_start:, :] = non_prompt_rows[:, :, 1:, :]
+            return changed
+        raise ValueError(f"Unsupported prompt attention intervention: {mode}")
+
+    def _apply_prompt_value_intervention(
+        self,
+        context_layer: torch.Tensor,
+        attention_probs: torch.Tensor,
+        value_layer: torch.Tensor,
+        prompt_length: int,
+        semantic_length: int,
+    ) -> torch.Tensor:
+        intervention = self._prompt_path_intervention
+        if not intervention or str(intervention.get("mode", "")) != (
+            "prompt_patch_value_globalize"
+        ):
+            return context_layer
+        prompt_length = int(prompt_length)
+        semantic_length = int(semantic_length)
+        if prompt_length <= 0:
+            return context_layer
+        target_layer = intervention.get("target_layer")
+        if target_layer is not None and int(intervention.get("layer_index", -1)) != int(
+            target_layer
+        ):
+            return context_layer
+
+        sequence_length = int(attention_probs.shape[-1])
+        prompt_slice = slice(1, 1 + prompt_length)
+        patch_start = 1 + prompt_length
+        patch_end = sequence_length - semantic_length
+        if patch_end <= patch_start:
+            raise ValueError(
+                "Prompt value globalization requires at least one visual Patch token"
+            )
+        patch_slice = slice(patch_start, patch_end)
+        prompt_patch_attention = attention_probs[:, :, prompt_slice, patch_slice]
+        patch_values = value_layer[:, :, patch_slice, :]
+        mean_patch_value = patch_values.mean(dim=-2, keepdim=True)
+        original_prompt_patch_context = torch.matmul(
+            prompt_patch_attention, patch_values
+        )
+        globalized_prompt_patch_context = (
+            prompt_patch_attention.sum(dim=-1, keepdim=True) * mean_patch_value
+        )
+        changed = context_layer.clone()
+        changed[:, :, prompt_slice, :] = (
+            changed[:, :, prompt_slice, :]
+            - original_prompt_patch_context
+            + globalized_prompt_patch_context
+        )
+
+        with torch.no_grad():
+            batch_size = int(context_layer.shape[0])
+            patch_value_dispersion = (
+                patch_values.detach().float()
+                - mean_patch_value.detach().float()
+            ).norm(dim=-1).mean(dim=(1, 2))
+            context_delta = (
+                globalized_prompt_patch_context.detach().float()
+                - original_prompt_patch_context.detach().float()
+            )
+            self._last_prompt_path_intervention_stats = {
+                "prompt_value_globalize_applied": context_delta.new_ones(
+                    (batch_size,)
+                ),
+                "prompt_value_globalize_patch_value_dispersion_before": (
+                    patch_value_dispersion
+                ),
+                "prompt_value_globalize_patch_value_dispersion_after": (
+                    patch_value_dispersion.new_zeros((batch_size,))
+                ),
+                "prompt_value_globalize_prompt_context_delta_norm": (
+                    context_delta.norm(dim=-1).mean(dim=(1, 2))
+                ),
+                "prompt_value_globalize_attention_mass_abs_error": (
+                    context_delta.new_zeros((batch_size,))
+                ),
+            }
+        return changed
 
     @staticmethod
     def _row_normalize(x: torch.Tensor, dim: int, eps: float = 1e-8) -> torch.Tensor:
@@ -604,6 +991,7 @@ class Attention(nn.Module):
         block_s_to_cls: bool = False,
         mediation_config: Optional[Dict[str, Any]] = None,
         prompt_length: int = 0,
+        intervention_hidden_states: Optional[torch.Tensor] = None,
     ):
         """
         缩放点积注意力的核心计算部分。
@@ -639,7 +1027,18 @@ class Attention(nn.Module):
             attention_scores[:, :, semantic_slice, 0] = torch.finfo(attention_scores.dtype).min
 
         attention_probs = self.softmax(attention_scores) # B, num_head, num_patches(query), num_patches(key) # 行归一化
-        weights = attention_probs if self.vis else None     # 用于可视化
+        if self._prompt_path_intervention and mediation_config and mediation_config.get("enable", False):
+            raise ValueError(
+                "Prompt path intervention cannot be combined with Attention Mediation"
+            )
+        attention_probs = self._apply_prompt_path_intervention(
+            attention_probs,
+            prompt_length,
+            semantic_length,
+            intervention_hidden_states,
+        )
+        monitor_attention_probs = attention_probs
+        weights = monitor_attention_probs if self.vis else None     # 用于可视化
         # ATTENTION_MEDIATION 的介入点在 softmax 之后、attention dropout 之前。
         # 这样既能拿到 score/prob 两种来源，也能保证 correction 使用未 dropout 的完整注意力分布。
         mediation = self._compute_attention_mediation(
@@ -701,8 +1100,15 @@ class Attention(nn.Module):
 
         # 标准 MHSA 主路径不被替换；mediated correction 作为额外 delta 在 Block.forward 中合并。
         context_layer = torch.matmul(attention_probs, value_layer)
+        context_layer = self._apply_prompt_value_intervention(
+            context_layer,
+            attention_probs,
+            value_layer,
+            prompt_length,
+            semantic_length,
+        )
         attention_output = self._context_to_attention_output(context_layer, include_bias=True)
-        return attention_output, weights, mediation
+        return attention_output, weights, mediation, monitor_attention_probs
 
     @staticmethod
     def _minmax_normalize_lastdim(x: torch.Tensor) -> torch.Tensor:
@@ -725,7 +1131,7 @@ class Attention(nn.Module):
         返回 attention 输出及（可选）注意力权重，兼容原有调用路径。
         """
         query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
-        return self._scaled_attention(
+        attention_output, weights, mediation, _ = self._scaled_attention(
             query_layer,
             key_layer,
             value_layer,
@@ -733,7 +1139,9 @@ class Attention(nn.Module):
             block_s_to_cls,
             mediation_config,
             prompt_length,
+            hidden_states,
         )
+        return attention_output, weights, mediation
 
     def forward_with_projections(
         self,
@@ -749,7 +1157,7 @@ class Attention(nn.Module):
         供亲和矩阵等附加分支复用，避免重复线性映射计算。
         """
         query_layer, key_layer, value_layer = self._project_qkv(hidden_states)
-        attention_output, weights, mediation = self._scaled_attention(
+        attention_output, weights, mediation, monitor_attention_probs = self._scaled_attention(
             query_layer,
             key_layer,
             value_layer,
@@ -757,6 +1165,7 @@ class Attention(nn.Module):
             block_s_to_cls,
             mediation_config,
             prompt_length,
+            hidden_states,
         )
         if self.debug_shapes and (not self._shape_debug_forward_proj_logged):
             print(
@@ -767,9 +1176,27 @@ class Attention(nn.Module):
                 )
             )
             self._shape_debug_forward_proj_logged = True
-        return attention_output, weights, query_layer, key_layer, mediation
+        return (
+            attention_output,
+            weights,
+            query_layer,
+            key_layer,
+            value_layer,
+            mediation,
+            monitor_attention_probs,
+        )
 
-    def compute_prompt_visual_monitors(self, query_layer, key_layer, prompt_length, semantic_length=0, *, detach=True):
+    def compute_prompt_visual_monitors(
+        self,
+        query_layer,
+        key_layer,
+        prompt_length,
+        semantic_length=0,
+        *,
+        value_layer=None,
+        attention_probs=None,
+        detach=True,
+    ):
         """
         统一导出主干 prompt/visual 的原始亲和矩阵。
 
@@ -778,13 +1205,12 @@ class Attention(nn.Module):
         - 主输出一律保留 raw logits
         - 额外附带仅用于画图的 min-max 归一化版本
 
-        返回：
-        - QpQv_raw / QpQv_vis
-        - KpKv_raw / KpKv_vis
-        - QpKv_raw / QpKv_vis
+        返回 QpQv、KpKv 辅助关系，以及当前实际 token 类型之间全部有向跨类型
+        Q-K relation 的 raw / vis 矩阵。
         """
         q_base = query_layer.detach() if detach else query_layer
         k_base = key_layer.detach() if detach else key_layer
+        v_base = value_layer.detach() if detach and torch.is_tensor(value_layer) else value_layer
 
         if q_base.size(2) < 1 + prompt_length + semantic_length or k_base.size(2) < 1 + prompt_length + semantic_length:
             raise ValueError(
@@ -803,19 +1229,104 @@ class Attention(nn.Module):
         q_patch = q_base[:, :, patch_slice, :]
         q_semantic = q_base[:, :, semantic_slice, :]
         q_cls = q_base[:, :, :1, :]
+        k_cls = k_base[:, :, :1, :]
         k_prompt = k_base[:, :, prompt_slice, :]
         k_patch = k_base[:, :, patch_slice, :]
         k_semantic = k_base[:, :, semantic_slice, :]
         scale = 1.0 / math.sqrt(self.attention_head_size)
 
         monitors = {}
-        attention_probs = torch.softmax(torch.matmul(q_base, k_base.transpose(-1, -2)) * scale, dim=-1)
+        if torch.is_tensor(attention_probs):
+            attention_probs = attention_probs.detach() if detach else attention_probs
+            if attention_probs.shape[-2:] != (q_base.size(2), k_base.size(2)):
+                raise ValueError(
+                    "Provided Attention probability shape does not match projected Q/K sequence lengths"
+                )
+        else:
+            attention_probs = torch.softmax(
+                torch.matmul(q_base, k_base.transpose(-1, -2)) * scale,
+                dim=-1,
+            )
         monitors["AcKv_attn"] = attention_probs[:, :, :1, patch_slice]
         if prompt_length > 0:
             monitors["AcKp_attn"] = attention_probs[:, :, :1, prompt_slice]
             monitors["ApKv_attn"] = attention_probs[:, :, prompt_slice, patch_slice]
             monitors["AvKp_attn"] = attention_probs[:, :, patch_slice, prompt_slice]
             monitors["ApKc_attn"] = attention_probs[:, :, prompt_slice, :1]
+            if torch.is_tensor(v_base):
+                cls_probs = attention_probs[:, :, :1, :]
+                prompt_context = torch.matmul(cls_probs[:, :, :, prompt_slice], v_base[:, :, prompt_slice, :])
+                patch_context = torch.matmul(cls_probs[:, :, :, patch_slice], v_base[:, :, patch_slice, :])
+                total_context = torch.matmul(cls_probs, v_base)
+                prompt_output = torch.nn.functional.linear(
+                    self._merge_heads(prompt_context), self.out.weight, None
+                ).squeeze(1)
+                patch_output = torch.nn.functional.linear(
+                    self._merge_heads(patch_context), self.out.weight, None
+                ).squeeze(1)
+                total_output = torch.nn.functional.linear(
+                    self._merge_heads(total_context), self.out.weight, None
+                ).squeeze(1)
+                prompt_norm = prompt_output.norm(dim=-1)
+                patch_norm = patch_output.norm(dim=-1)
+                monitors.update({
+                    "cls_prompt_value_contribution_norm": prompt_norm,
+                    "cls_patch_value_contribution_norm": patch_norm,
+                    "cls_prompt_value_contribution_share": (
+                        prompt_norm / (prompt_norm + patch_norm).clamp_min(1e-12)
+                    ),
+                    "cls_prompt_value_to_total_cosine": torch.nn.functional.cosine_similarity(
+                        prompt_output, total_output, dim=-1, eps=1e-12
+                    ),
+                    "cls_prompt_value_to_patch_cosine": torch.nn.functional.cosine_similarity(
+                        prompt_output, patch_output, dim=-1, eps=1e-12
+                    ),
+                    "_cls_prompt_value_contribution_vector": prompt_output,
+                })
+                prompt_probs = attention_probs[:, :, prompt_slice, :]
+                prompt_patch_context = torch.matmul(
+                    prompt_probs[:, :, :, patch_slice],
+                    v_base[:, :, patch_slice, :],
+                )
+                prompt_total_context = torch.matmul(prompt_probs, v_base)
+                prompt_other_context = prompt_total_context - prompt_patch_context
+                prompt_patch_output = torch.nn.functional.linear(
+                    self._merge_heads(prompt_patch_context), self.out.weight, None
+                )
+                prompt_total_output = torch.nn.functional.linear(
+                    self._merge_heads(prompt_total_context), self.out.weight, None
+                )
+                prompt_other_output = torch.nn.functional.linear(
+                    self._merge_heads(prompt_other_context), self.out.weight, None
+                )
+                prompt_patch_norm = prompt_patch_output.norm(dim=-1)
+                prompt_other_norm = prompt_other_output.norm(dim=-1)
+                prompt_patch_value_sq_norm = (
+                    v_base[:, :, patch_slice, :].float().square().sum(dim=-1)
+                )
+                prompt_patch_av_magnitude = (
+                    prompt_probs[:, :, :, patch_slice].float().square()
+                    * prompt_patch_value_sq_norm.unsqueeze(2)
+                ).sum(dim=1).clamp_min(0.0).sqrt()
+                monitors.update({
+                    "prompt_patch_value_contribution_norm": prompt_patch_norm,
+                    "prompt_patch_value_contribution_share": (
+                        prompt_patch_norm
+                        / (prompt_patch_norm + prompt_other_norm).clamp_min(1e-12)
+                    ),
+                    "prompt_patch_value_to_total_cosine": (
+                        torch.nn.functional.cosine_similarity(
+                            prompt_patch_output,
+                            prompt_total_output,
+                            dim=-1,
+                            eps=1e-12,
+                        )
+                    ),
+                    "_prompt_patch_value_contribution_vector": prompt_patch_output,
+                    "_prompt_patch_pre_output_av_magnitude": (
+                        prompt_patch_av_magnitude
+                    ),
+                })
         if semantic_length > 0:
             monitors["AcKs_attn"] = attention_probs[:, :, :1, semantic_slice]
             monitors["AsKv_attn"] = attention_probs[:, :, semantic_slice, patch_slice]
@@ -843,10 +1354,25 @@ class Attention(nn.Module):
             monitors["QvKp_raw"] = qvkp_raw
             monitors["QvKp_vis"] = self._minmax_normalize_lastdim(qvkp_raw)
 
+        if q_cls.numel() > 0 and k_patch.numel() > 0:
+            qckv_raw = torch.matmul(q_cls, k_patch.transpose(-1, -2)) * scale
+            monitors["QcKv_raw"] = qckv_raw
+            monitors["QcKv_vis"] = self._minmax_normalize_lastdim(qckv_raw)
+
+        if q_patch.numel() > 0 and k_cls.numel() > 0:
+            qvkc_raw = torch.matmul(q_patch, k_cls.transpose(-1, -2)) * scale
+            monitors["QvKc_raw"] = qvkc_raw
+            monitors["QvKc_vis"] = self._minmax_normalize_lastdim(qvkc_raw)
+
         if q_cls.numel() > 0 and k_prompt.numel() > 0:
             qckp_raw = torch.matmul(q_cls, k_prompt.transpose(-1, -2)) * scale
             monitors["QcKp_raw"] = qckp_raw
             monitors["QcKp_vis"] = self._minmax_normalize_lastdim(qckp_raw)
+
+        if q_prompt.numel() > 0 and k_cls.numel() > 0:
+            qpkc_raw = torch.matmul(q_prompt, k_cls.transpose(-1, -2)) * scale
+            monitors["QpKc_raw"] = qpkc_raw
+            monitors["QpKc_vis"] = self._minmax_normalize_lastdim(qpkc_raw)
 
         if q_semantic.numel() > 0 and k_patch.numel() > 0:
             qskv_raw = torch.matmul(q_semantic, k_patch.transpose(-1, -2)) * scale
@@ -863,6 +1389,11 @@ class Attention(nn.Module):
             monitors["QcKs_raw"] = qcks_raw
             monitors["QcKs_vis"] = self._minmax_normalize_lastdim(qcks_raw)
 
+        if q_semantic.numel() > 0 and k_cls.numel() > 0:
+            qskc_raw = torch.matmul(q_semantic, k_cls.transpose(-1, -2)) * scale
+            monitors["QsKc_raw"] = qskc_raw
+            monitors["QsKc_vis"] = self._minmax_normalize_lastdim(qskc_raw)
+
         if q_semantic.numel() > 0 and k_prompt.numel() > 0:
             qskp_raw = torch.matmul(q_semantic, k_prompt.transpose(-1, -2)) * scale
             monitors["QsKp_raw"] = qskp_raw
@@ -872,6 +1403,9 @@ class Attention(nn.Module):
             qpks_raw = torch.matmul(q_prompt, k_semantic.transpose(-1, -2)) * scale
             monitors["QpKs_raw"] = qpks_raw
             monitors["QpKs_vis"] = self._minmax_normalize_lastdim(qpks_raw)
+
+        if isinstance(self._last_prompt_path_intervention_stats, dict):
+            monitors.update(self._last_prompt_path_intervention_stats)
 
         return monitors
 
@@ -1071,6 +1605,322 @@ class Block(nn.Module):
         )
         return mixed
 
+    @staticmethod
+    def _attach_prompt_layer_monitors(
+        affinity,
+        block_input,
+        block_output,
+        num_prompt_tokens,
+        *,
+        detach,
+        affinity_config=None,
+        layer_idx=0,
+    ):
+        if int(num_prompt_tokens) <= 0 or not isinstance(affinity, dict):
+            return
+        prompt_slice = slice(1, 1 + int(num_prompt_tokens))
+        prompt_input = block_input[:, prompt_slice, :].mean(dim=1)
+        prompt_output = block_output[:, prompt_slice, :].mean(dim=1)
+        if detach:
+            prompt_input = prompt_input.detach()
+            prompt_output = prompt_output.detach()
+        affinity.update({
+            "prompt_layer_input_norm": prompt_input.norm(dim=-1),
+            "prompt_layer_output_norm": prompt_output.norm(dim=-1),
+            "prompt_layer_change_norm": (prompt_output - prompt_input).norm(dim=-1),
+            "prompt_layer_input_output_cosine": torch.nn.functional.cosine_similarity(
+                prompt_input, prompt_output, dim=-1, eps=1e-12
+            ),
+            "_prompt_layer_input_vector": prompt_input,
+            "_prompt_layer_output_vector": prompt_output,
+        })
+        prompt_contribution = affinity.pop("_cls_prompt_value_contribution_vector", None)
+        if torch.is_tensor(prompt_contribution):
+            cls_delta = block_output[:, 0, :] - block_input[:, 0, :]
+            if detach:
+                cls_delta = cls_delta.detach()
+            affinity["cls_prompt_value_to_cls_delta_cosine"] = (
+                torch.nn.functional.cosine_similarity(
+                    prompt_contribution, cls_delta, dim=-1, eps=1e-12
+                )
+            )
+        prompt_patch_contribution = affinity.pop(
+            "_prompt_patch_value_contribution_vector", None
+        )
+        if torch.is_tensor(prompt_patch_contribution):
+            prompt_delta = (
+                block_output[:, prompt_slice, :] - block_input[:, prompt_slice, :]
+            )
+            if detach:
+                prompt_delta = prompt_delta.detach()
+            affinity["prompt_patch_value_to_prompt_delta_cosine"] = (
+                torch.nn.functional.cosine_similarity(
+                    prompt_patch_contribution,
+                    prompt_delta,
+                    dim=-1,
+                    eps=1e-12,
+                )
+            )
+
+        cls_patch_attention = affinity.get("AcKv_attn")
+        if not torch.is_tensor(cls_patch_attention) or cls_patch_attention.numel() == 0:
+            return
+        patch_count = int(cls_patch_attention.shape[-1])
+        patch_start = 1 + int(num_prompt_tokens)
+        patch_end = patch_start + patch_count
+        if patch_end > int(block_output.shape[1]):
+            return
+        prompt_tokens = block_output[:, prompt_slice, :]
+        patch_tokens = block_output[:, patch_start:patch_end, :]
+        if detach:
+            prompt_tokens = prompt_tokens.detach()
+            patch_tokens = patch_tokens.detach()
+            cls_patch_attention = cls_patch_attention.detach()
+        prompt_tokens = torch.nn.functional.normalize(prompt_tokens.float(), dim=-1, eps=1e-12)
+        patch_tokens = torch.nn.functional.normalize(patch_tokens.float(), dim=-1, eps=1e-12)
+
+        concept_config = affinity_config if isinstance(affinity_config, dict) else {}
+        selected_layers = {
+            int(item)
+            for item in concept_config.get("attribute_concept_selected_layers", [])
+        }
+        attribute_directions = concept_config.get("attribute_concept_directions")
+        true_weights = concept_config.get("attribute_concept_true_weights")
+        margin_weights = concept_config.get("attribute_concept_margin_weights")
+        concept_enabled = bool(
+            concept_config.get("attribute_concept_enable", False)
+            and (not selected_layers or int(layer_idx) in selected_layers)
+            and torch.is_tensor(attribute_directions)
+            and torch.is_tensor(true_weights)
+            and torch.is_tensor(margin_weights)
+        )
+        if concept_enabled:
+            directions = attribute_directions.detach().to(
+                device=prompt_tokens.device, dtype=torch.float32
+            )
+            true_attribute_weights = true_weights.detach().to(
+                device=prompt_tokens.device, dtype=torch.float32
+            )
+            margin_attribute_weights = margin_weights.detach().to(
+                device=prompt_tokens.device, dtype=torch.float32
+            )
+            if (
+                directions.dim() != 2
+                or true_attribute_weights.dim() != 2
+                or margin_attribute_weights.shape != true_attribute_weights.shape
+                or directions.shape[0] != true_attribute_weights.shape[1]
+                or directions.shape[1] != prompt_tokens.shape[-1]
+                or true_attribute_weights.shape[0] != prompt_tokens.shape[0]
+            ):
+                raise ValueError(
+                    "Attribute-concept monitor tensors have incompatible shapes"
+                )
+            direction_unit = torch.nn.functional.normalize(
+                directions, dim=-1, eps=1e-12
+            )
+
+            def normalize_profile(values):
+                return values / values.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+            def effective_count(values):
+                entropy = -(
+                    values * values.clamp_min(1e-12).log()
+                ).sum(dim=-1)
+                observed = values.sum(dim=-1) > 1e-12
+                return torch.where(
+                    observed,
+                    entropy.exp(),
+                    torch.zeros_like(entropy),
+                )
+
+            def profile_overlap(values):
+                if values.shape[1] < 2:
+                    return values.new_zeros(values.shape[0])
+                unit = torch.nn.functional.normalize(values, dim=-1, eps=1e-12)
+                similarity = torch.matmul(unit, unit.transpose(1, 2))
+                mask = ~torch.eye(
+                    values.shape[1], dtype=torch.bool, device=values.device
+                )
+                return similarity[:, mask].reshape(values.shape[0], -1).mean(dim=-1)
+
+            prompt_attribute_similarity = torch.matmul(
+                prompt_tokens, direction_unit.transpose(0, 1)
+            )
+            prompt_true_signal = (
+                torch.relu(prompt_attribute_similarity)
+                * true_attribute_weights.abs().unsqueeze(1)
+            )
+            prompt_margin_signal = torch.relu(
+                prompt_attribute_similarity
+                * margin_attribute_weights.unsqueeze(1)
+            )
+            prompt_true_profile = normalize_profile(prompt_true_signal)
+            prompt_margin_profile = normalize_profile(prompt_margin_signal)
+            affinity.update({
+                "_prompt_true_attribute_profile": prompt_true_profile,
+                "_prompt_margin_attribute_profile": prompt_margin_profile,
+                "prompt_true_attribute_effective_count": effective_count(
+                    prompt_true_profile
+                ),
+                "prompt_true_attribute_top1_share": prompt_true_profile.max(
+                    dim=-1
+                ).values,
+                "prompt_margin_attribute_effective_count": effective_count(
+                    prompt_margin_profile
+                ),
+                "prompt_margin_attribute_top1_share": prompt_margin_profile.max(
+                    dim=-1
+                ).values,
+                "prompt_true_attribute_role_overlap": profile_overlap(
+                    prompt_true_profile
+                ),
+                "prompt_margin_attribute_role_overlap": profile_overlap(
+                    prompt_margin_profile
+                ),
+            })
+
+            if torch.is_tensor(prompt_patch_contribution):
+                collection_tokens = torch.nn.functional.normalize(
+                    prompt_patch_contribution.detach().float(),
+                    dim=-1,
+                    eps=1e-12,
+                )
+                collection_similarity = torch.matmul(
+                    collection_tokens, direction_unit.transpose(0, 1)
+                )
+                collection_true_profile = normalize_profile(
+                    torch.relu(collection_similarity)
+                    * true_attribute_weights.abs().unsqueeze(1)
+                )
+                collection_margin_profile = normalize_profile(
+                    torch.relu(
+                        collection_similarity
+                        * margin_attribute_weights.unsqueeze(1)
+                    )
+                )
+                affinity.update({
+                    "_collection_true_attribute_profile": collection_true_profile,
+                    "_collection_margin_attribute_profile": collection_margin_profile,
+                    "collection_true_attribute_effective_count": effective_count(
+                        collection_true_profile
+                    ),
+                    "collection_margin_attribute_effective_count": effective_count(
+                        collection_margin_profile
+                    ),
+                    "collection_prompt_true_attribute_profile_cosine": (
+                        torch.nn.functional.cosine_similarity(
+                            collection_true_profile,
+                            prompt_true_profile,
+                            dim=-1,
+                            eps=1e-12,
+                        )
+                    ),
+                    "collection_prompt_margin_attribute_profile_cosine": (
+                        torch.nn.functional.cosine_similarity(
+                            collection_margin_profile,
+                            prompt_margin_profile,
+                            dim=-1,
+                            eps=1e-12,
+                        )
+                    ),
+                })
+
+            patch_attribute_similarity = torch.matmul(
+                patch_tokens, direction_unit.transpose(0, 1)
+            )
+            patch_weighted = (
+                patch_attribute_similarity
+                * margin_attribute_weights.unsqueeze(1)
+            )
+            patch_support = torch.relu(patch_weighted).sum(dim=-1)
+            patch_fallback = patch_support.sum(dim=-1) <= 1e-12
+            patch_support = torch.where(
+                patch_fallback.unsqueeze(-1),
+                patch_weighted.abs().sum(dim=-1),
+                patch_support,
+            )
+            patch_profile = normalize_profile(patch_support)
+            patch_effective = effective_count(patch_profile)
+            affinity.update({
+                "_attribute_concept_patch_support": patch_support,
+                "attribute_concept_patch_effective_count": patch_effective,
+                "attribute_concept_patch_effective_ratio": (
+                    patch_effective / float(patch_count)
+                ),
+                "attribute_concept_patch_top1_share": patch_profile.max(
+                    dim=-1
+                ).values,
+                "attribute_concept_patch_fallback_ratio": patch_fallback.float(),
+            })
+            prompt_patch_attention = affinity.get("ApKv_attn")
+            if torch.is_tensor(prompt_patch_attention) and prompt_patch_attention.numel():
+                attention_profile = prompt_patch_attention.detach().float().mean(dim=1)
+                attention_profile = normalize_profile(attention_profile)
+                patch_ratio = float(
+                    concept_config.get("attribute_concept_patch_ratio", 0.2)
+                )
+                if not 0.0 < patch_ratio < 1.0:
+                    raise ValueError(
+                        "attribute_concept_patch_ratio must be between 0 and 1"
+                    )
+                selected_count = min(
+                    patch_count - 1,
+                    max(1, int(math.ceil(patch_ratio * patch_count))),
+                )
+                concept_indices = patch_support.topk(
+                    selected_count, dim=-1, largest=True
+                ).indices
+                concept_mass = attention_profile.gather(
+                    2,
+                    concept_indices.unsqueeze(1).expand(
+                        -1, attention_profile.shape[1], -1
+                    ),
+                ).sum(dim=-1)
+                attention_indices = attention_profile.topk(
+                    selected_count, dim=-1, largest=True
+                ).indices
+                concept_mask = torch.zeros_like(patch_support, dtype=torch.bool)
+                concept_mask.scatter_(1, concept_indices, True)
+                overlap = concept_mask.unsqueeze(1).expand(
+                    -1, attention_profile.shape[1], -1
+                ).gather(2, attention_indices).float().mean(dim=-1)
+                affinity.update({
+                    "prompt_attention_to_attribute_concept_patch_mass": concept_mass,
+                    "prompt_attention_to_attribute_concept_patch_lift": (
+                        concept_mass / float(selected_count / patch_count)
+                    ),
+                    "prompt_attention_attribute_concept_topk_overlap": overlap,
+                })
+
+        prompt_patch_similarity = torch.matmul(
+            prompt_tokens, patch_tokens.transpose(-1, -2)
+        ).mean(dim=1)
+        cls_patch_mass = cls_patch_attention.float().mean(dim=1).squeeze(1)
+        centered_mass = cls_patch_mass - cls_patch_mass.mean(dim=-1, keepdim=True)
+        centered_similarity = (
+            prompt_patch_similarity
+            - prompt_patch_similarity.mean(dim=-1, keepdim=True)
+        )
+        correlation = (centered_mass * centered_similarity).sum(dim=-1) / (
+            centered_mass.square().sum(dim=-1).sqrt()
+            * centered_similarity.square().sum(dim=-1).sqrt()
+        ).clamp_min(1e-12)
+        selected_count = max(1, int(math.ceil(0.2 * patch_count)))
+        high_indices = cls_patch_mass.topk(selected_count, dim=-1, largest=True).indices
+        low_indices = cls_patch_mass.topk(selected_count, dim=-1, largest=False).indices
+        high_similarity = prompt_patch_similarity.gather(1, high_indices).mean(dim=-1)
+        low_similarity = prompt_patch_similarity.gather(1, low_indices).mean(dim=-1)
+        affinity.update({
+            "prompt_patch_similarity_mean": prompt_patch_similarity.mean(dim=-1),
+            "prompt_patch_similarity_within_sample_std": prompt_patch_similarity.std(
+                dim=-1, unbiased=False
+            ),
+            "cls_attention_prompt_patch_similarity_correlation": correlation,
+            "cls_high_attention_prompt_patch_similarity": high_similarity,
+            "cls_low_attention_prompt_patch_similarity": low_similarity,
+            "cls_high_minus_low_prompt_patch_similarity": high_similarity - low_similarity,
+        })
+
     def forward(
         self,
         x,
@@ -1178,10 +2028,19 @@ class Block(nn.Module):
             affinities: dict，包含 raw/vis 亲和矩阵
         """
         # --- 注意力分支 + 残差 ---
+        block_input = x
         h = x
         x_norm = self.attention_norm(x)
         # 同时拿到 MHSA 输出 + 多头形式的 q_proj / k_proj
-        x, weights, q_proj, k_proj, mediation = self.attn.forward_with_projections(
+        (
+            x,
+            weights,
+            q_proj,
+            k_proj,
+            v_proj,
+            mediation,
+            monitor_attention_probs,
+        ) = self.attn.forward_with_projections(
             x_norm,
             affinity_config.get("semantic_length", 0),
             affinity_config.get("block_s_to_cls", False),
@@ -1214,7 +2073,18 @@ class Block(nn.Module):
                 k_proj,
                 affinity_config.get("prompt_length", 0),
                 affinity_config.get("semantic_length", 0),
+                value_layer=v_proj,
+                attention_probs=monitor_attention_probs,
                 detach=affinity_config.get("detach", True),
+            )
+            self._attach_prompt_layer_monitors(
+                attn_aff,
+                block_input,
+                x,
+                num_prompt_tokens,
+                detach=affinity_config.get("detach", True),
+                affinity_config=affinity_config,
+                layer_idx=layer_idx,
             )
             return x, weights, attn_aff, semantics
 
@@ -1244,7 +2114,18 @@ class Block(nn.Module):
             k_proj,
             affinity_config.get("prompt_length", 0),
             affinity_config.get("semantic_length", 0),
+            value_layer=v_proj,
+            attention_probs=monitor_attention_probs,
             detach=affinity_config.get("detach", True),
+        )
+        self._attach_prompt_layer_monitors(
+            attn_aff,
+            block_input,
+            x,
+            num_prompt_tokens,
+            detach=affinity_config.get("detach", True),
+            affinity_config=affinity_config,
+            layer_idx=layer_idx,
         )
 
         return x, weights, attn_aff, semantics
@@ -1300,10 +2181,71 @@ class Encoder(nn.Module):
         self.layer = nn.ModuleList()    # 保存有序的多层子模块
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6) # 在所有 block 之后再做一次 LayerNorm
         self._last_attention_mediation_stats = []
+        self._prompt_state_intervention = None
+        self._last_prompt_state_intervention_stats = []
         for _ in range(config.transformer["num_layers"]):
             layer = Block(config, vis)  # 每层都是同结构的 Transformer Block（内部是 LN→MHSA→残差；LN→MLP→残差）
             self.layer.append(copy.deepcopy(layer))
         # 本实现的 Block 属于 Pre-LN（在每个子层前 LN），额外的末端 LN（有些论文称 final LN）有助于稳定训练并改善表征
+    def _apply_prompt_state_intervention(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        layer_idx: int,
+        num_prompt_tokens: int,
+    ):
+        intervention = self._prompt_state_intervention
+        if not intervention or int(num_prompt_tokens) <= 0:
+            return hidden_states, None
+        if int(intervention.get("target_layer", -1)) != int(layer_idx):
+            return hidden_states, None
+        mode = str(intervention.get("mode", ""))
+        if mode != "prompt_context_swap":
+            raise ValueError(f"Unsupported prompt state intervention: {mode}")
+        permutation = intervention.get("permutation")
+        if not torch.is_tensor(permutation):
+            raise ValueError("Prompt context swap requires a batch permutation")
+        permutation = permutation.detach().to(
+            device=hidden_states.device, dtype=torch.long
+        ).view(-1)
+        batch_size = int(hidden_states.shape[0])
+        if permutation.numel() != batch_size:
+            raise ValueError(
+                "Prompt context swap permutation length does not match batch size"
+            )
+        if not torch.equal(
+            permutation.sort().values,
+            torch.arange(batch_size, device=permutation.device),
+        ):
+            raise ValueError("Prompt context swap requires a complete batch permutation")
+        fixed_point = permutation == torch.arange(
+            batch_size, device=permutation.device
+        )
+        if batch_size > 1 and bool(fixed_point.any().item()):
+            raise ValueError("Prompt context swap permutation must not contain self-pairs")
+        prompt_slice = slice(1, 1 + int(num_prompt_tokens))
+        prompt_state = hidden_states[:, prompt_slice, :]
+        swapped_prompt = prompt_state.index_select(0, permutation)
+        changed = hidden_states.clone()
+        changed[:, prompt_slice, :] = swapped_prompt
+        with torch.no_grad():
+            cosine = torch.nn.functional.cosine_similarity(
+                prompt_state.detach().float().reshape(batch_size, -1),
+                swapped_prompt.detach().float().reshape(batch_size, -1),
+                dim=-1,
+            )
+            stats = {
+                "prompt_context_swap_applied": cosine.new_full(
+                    (batch_size,), 1.0 if batch_size > 1 else 0.0
+                ),
+                "prompt_context_swap_fixed_point_ratio": fixed_point.float(),
+                "prompt_context_swap_before_after_cosine": cosine,
+                "prompt_context_swap_delta_norm": (
+                    swapped_prompt.detach().float() - prompt_state.detach().float()
+                ).norm(dim=-1).mean(dim=-1),
+            }
+        return changed, stats
+
     def forward(
         self,
         hidden_states,
@@ -1316,7 +2258,18 @@ class Encoder(nn.Module):
         """常规前向：返回编码结果与（可选）各层注意力权重。"""
         attn_weights = []
         self._last_attention_mediation_stats = []
+        self._last_prompt_state_intervention_stats = []
         for layer_idx, layer_block in enumerate(self.layer):
+            hidden_states, prompt_state_stats = self._apply_prompt_state_intervention(
+                hidden_states,
+                layer_idx=layer_idx,
+                num_prompt_tokens=num_prompt_tokens,
+            )
+            if prompt_state_stats is not None:
+                self._last_prompt_state_intervention_stats.append({
+                    "layer_index": int(layer_idx),
+                    **prompt_state_stats,
+                })
             # attention_mediation_config 在所有层共享，layer_idx 用于取当前层独立的 gamma gate。
             hidden_states, weights, semantics = layer_block(hidden_states, semantics,
                     num_prompt_tokens, semantic_length, block_s_to_cls,
@@ -1361,7 +2314,13 @@ class Encoder(nn.Module):
         attn_weights = []
         affinities = []
         self._last_attention_mediation_stats = []
+        self._last_prompt_state_intervention_stats = []
         for layer_idx, layer_block in enumerate(self.layer):
+            hidden_states, prompt_state_stats = self._apply_prompt_state_intervention(
+                hidden_states,
+                layer_idx=layer_idx,
+                num_prompt_tokens=num_prompt_tokens,
+            )
             # forward_with_affinity 同时服务训练损失/可视化，因此 mediation 的插入点必须和常规 forward 一致。
             hidden_states, weights, affinity, semantics = layer_block.forward_with_affinity(
                 hidden_states,
@@ -1371,6 +2330,12 @@ class Encoder(nn.Module):
                 attention_mediation_config,
                 layer_idx,
             )
+            if prompt_state_stats is not None:
+                affinity.update(prompt_state_stats)
+                self._last_prompt_state_intervention_stats.append({
+                    "layer_index": int(layer_idx),
+                    **prompt_state_stats,
+                })
             if self.vis:
                 attn_weights.append(weights)
             affinities.append(affinity)

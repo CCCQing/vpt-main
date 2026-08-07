@@ -122,6 +122,70 @@ def _format_command(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(str(item)) for item in command)
 
 
+def _summary_command(python_bin: str, jobs: Sequence[Job], out_root: Path, seeds: Sequence[int]) -> List[str]:
+    models = []
+    for job in jobs:
+        if job.model not in models:
+            models.append(job.model)
+    command = [
+        python_bin,
+        str(ROOT / "src" / "tools" / "search_plans" / "a_series" / "summarize_baseline_monitoring.py"),
+        "--baseline-method",
+        "A0" if "A0" in models else models[0],
+        "--output-dir",
+        str(out_root / "a_series_summary"),
+        "--expected-seeds",
+        ",".join(str(seed) for seed in seeds),
+    ]
+    for job in jobs:
+        command.extend(["--run", "{}={}".format(job.model, job.output_root)])
+    return command
+
+
+def _transition_command(
+    python_bin: str,
+    jobs: Sequence[Job],
+    out_root: Path,
+    seeds: Sequence[int],
+) -> List[str]:
+    command = [
+        python_bin,
+        str(
+            ROOT
+            / "src"
+            / "tools"
+            / "search_plans"
+            / "a_series"
+            / "summarize_prediction_transitions.py"
+        ),
+        "--output-dir",
+        str(out_root / "a_series_summary"),
+        "--expected-seeds",
+        ",".join(str(seed) for seed in seeds),
+    ]
+    for job in jobs:
+        command.extend(["--run", "{}={}".format(job.model, job.output_root)])
+    return command
+
+
+def _run_summary(python_bin: str, jobs: Sequence[Job], out_root: Path, seeds: Sequence[int]) -> None:
+    command = _summary_command(python_bin, jobs, out_root, seeds)
+    process = subprocess.run(command, cwd=str(ROOT), check=False)
+    if process.returncode != 0:
+        raise SystemExit("A-series runs completed, but monitoring summary generation failed.")
+    if len({job.model for job in jobs}) >= 2:
+        transition_process = subprocess.run(
+            _transition_command(python_bin, jobs, out_root, seeds),
+            cwd=str(ROOT),
+            check=False,
+        )
+        if transition_process.returncode != 0:
+            raise SystemExit(
+                "A-series monitoring summary completed, but prediction transition aggregation failed."
+            )
+    print("A-series monitoring summary: {}".format(out_root / "a_series_summary"), flush=True)
+
+
 def _build_jobs(out_root: Path, models: Sequence[str], seeds: Sequence[int]) -> List[Job]:
     log_root = out_root / "launcher_logs"
     return [
@@ -260,6 +324,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-interval", type=float, default=2.0)
     parser.add_argument("--progress-width", type=int, default=120)
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--no-summary", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -311,9 +376,21 @@ def main() -> None:
             print(
                 "[dry-run] gpu={} {}".format(gpu, _format_command(_command(args.python_bin, job)))
             )
+        if not args.no_summary:
+            print("[dry-run summary] {}".format(
+                _format_command(_summary_command(args.python_bin, jobs, out_root, seeds))
+            ))
+            if len(set(models)) >= 2:
+                print("[dry-run prediction transitions] {}".format(
+                    _format_command(
+                        _transition_command(args.python_bin, jobs, out_root, seeds)
+                    )
+                ))
         return
     if not pending:
         print("All requested A-series tasks are already completed.", flush=True)
+        if not args.no_summary:
+            _run_summary(args.python_bin, jobs, out_root, seeds)
         return
 
     results = _run_workers(
@@ -341,6 +418,8 @@ def main() -> None:
                 flush=True,
             )
         raise SystemExit(1)
+    if not args.no_summary:
+        _run_summary(args.python_bin, jobs, out_root, seeds)
 
 
 if __name__ == "__main__":

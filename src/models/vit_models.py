@@ -205,7 +205,7 @@ class ViT(nn.Module):
         if self.cfg.MODEL.LOG_TRAINABLE or self.cfg.SOLVER.DBG_TRAINABLE:
             self._log_trainable_parameters()
 
-    def forward(self, x, return_feature=False, semantics=None, class_ids=None, runtime_targets=None):
+    def forward(self, x, return_feature=False, semantics=None, class_ids=None, prototype_class_ids=None, runtime_targets=None):
 
         self.clear_runtime_state()
         x = self.enc(x, semantics=semantics)  # batch_size x self.feat_dim
@@ -233,6 +233,7 @@ class ViT(nn.Module):
         x = self.r_similarity_head(
             x,
             class_ids=class_ids,
+            prototype_class_ids=prototype_class_ids,
             semantic_state=self._runtime_semantic_state,
             runtime_targets=runtime_targets,
         )
@@ -267,7 +268,7 @@ class ViT(nn.Module):
         x = self.enc(x)  # batch_size x self.feat_dim
         return x
 
-    def forward_with_affinity(self, x, affinity_config, semantics=None, vis=False, class_ids=None, runtime_targets=None):
+    def forward_with_affinity(self, x, affinity_config, semantics=None, vis=False, class_ids=None, prototype_class_ids=None, runtime_targets=None):
         """
         甯︿翰鍜岃緭鍑虹殑鍓嶅悜鎺ュ彛锛氫笌 enc/backbone 鐨?forward_with_affinity 骞宠銆?
 
@@ -304,6 +305,7 @@ class ViT(nn.Module):
         logits = self.r_similarity_head(
             feats,
             class_ids=class_ids,
+            prototype_class_ids=prototype_class_ids,
             semantic_state=self._runtime_semantic_state,
             runtime_targets=runtime_targets,
         )

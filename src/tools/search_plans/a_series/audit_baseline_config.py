@@ -83,7 +83,82 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         "MONITOR.CLASS_ERROR.ENABLE": (bool(cfg.MONITOR.CLASS_ERROR.ENABLE), True),
         "MONITOR.CALIBRATION.ENABLE": (bool(cfg.MONITOR.CALIBRATION.ENABLE), True),
         "MONITOR.PROBE.ENABLE": (bool(cfg.MONITOR.PROBE.ENABLE), True),
+        "MONITOR.PROBE.REQUIRE_FULL_CLASS_COVERAGE": (
+            bool(cfg.MONITOR.PROBE.REQUIRE_FULL_CLASS_COVERAGE), True
+        ),
+        "MONITOR.PROBE.REQUIRE_PER_CLASS_QUOTA": (
+            bool(cfg.MONITOR.PROBE.REQUIRE_PER_CLASS_QUOTA), True
+        ),
+        "MONITOR.PROBE.ALLOW_MAX_SAMPLES_TRUNCATION": (
+            bool(cfg.MONITOR.PROBE.ALLOW_MAX_SAMPLES_TRUNCATION), False
+        ),
+        "MONITOR.PROBE.SEMANTIC_INTERVENTION.ENABLE": (
+            bool(cfg.MONITOR.PROBE.SEMANTIC_INTERVENTION.ENABLE), True
+        ),
+        "MONITOR.PROBE.TARGET_RELEVANCE.ENABLE": (
+            bool(cfg.MONITOR.PROBE.TARGET_RELEVANCE.ENABLE), True
+        ),
+        "MONITOR.PROBE.ATTRIBUTE_CONCEPT_ENABLE": (
+            bool(cfg.MONITOR.PROBE.ATTRIBUTE_CONCEPT_ENABLE), True
+        ),
+        "MONITOR.PROBE.ATTRIBUTE_CONCEPT_PATCH_RATIO": (
+            float(cfg.MONITOR.PROBE.ATTRIBUTE_CONCEPT_PATCH_RATIO), 0.2
+        ),
+        "MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.ENABLE": (
+            bool(cfg.MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.ENABLE), True
+        ),
+        "MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.COST": (
+            str(cfg.MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.COST).lower(),
+            "cosine",
+        ),
+        "MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.PATCH_RATIO": (
+            float(cfg.MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.PATCH_RATIO),
+            0.2,
+        ),
         "MONITOR.MODULE_EFFECT.ENABLE": (bool(cfg.MONITOR.MODULE_EFFECT.ENABLE), True),
+        "MONITOR.MODULE_EFFECT.PROMPT_READ_BLOCK": (
+            bool(cfg.MONITOR.MODULE_EFFECT.PROMPT_READ_BLOCK), True
+        ),
+        "MONITOR.MODULE_EFFECT.PROMPT_WRITE_BLOCK": (
+            bool(cfg.MONITOR.MODULE_EFFECT.PROMPT_WRITE_BLOCK), True
+        ),
+        "MONITOR.MODULE_EFFECT.PROMPT_SELECTION_UNIFORM": (
+            bool(cfg.MONITOR.MODULE_EFFECT.PROMPT_SELECTION_UNIFORM), True
+        ),
+        "MONITOR.MODULE_EFFECT.PATCH_PROMPT_SELECTION_UNIFORM": (
+            bool(cfg.MONITOR.MODULE_EFFECT.PATCH_PROMPT_SELECTION_UNIFORM), True
+        ),
+        "MONITOR.MODULE_EFFECT.PROMPT_VALUE_GLOBALIZE": (
+            bool(cfg.MONITOR.MODULE_EFFECT.PROMPT_VALUE_GLOBALIZE), True
+        ),
+        "MONITOR.MODULE_EFFECT.LAYERWISE_PROMPT_READ_BLOCK": (
+            bool(cfg.MONITOR.MODULE_EFFECT.LAYERWISE_PROMPT_READ_BLOCK), True
+        ),
+        "MONITOR.MODULE_EFFECT.LAYERWISE_PROMPT_READ_LAYERS": (
+            [int(item) for item in cfg.MONITOR.MODULE_EFFECT.LAYERWISE_PROMPT_READ_LAYERS],
+            [0, 3, 6, 9],
+        ),
+        "MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP": (
+            bool(cfg.MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP), True
+        ),
+        "MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP_LAYER": (
+            int(cfg.MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP_LAYER), 9
+        ),
+        "MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP_SEED": (
+            int(cfg.MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP_SEED), 57721
+        ),
+        "MONITOR.MODULE_EFFECT.ATTRIBUTE_CONCEPT_PATCH_BLOCK": (
+            bool(cfg.MONITOR.MODULE_EFFECT.ATTRIBUTE_CONCEPT_PATCH_BLOCK), True
+        ),
+        "MONITOR.MODULE_EFFECT.ATTRIBUTE_CONCEPT_RANDOM_SEED": (
+            int(cfg.MONITOR.MODULE_EFFECT.ATTRIBUTE_CONCEPT_RANDOM_SEED), 271828
+        ),
+        "MONITOR.MODULE_EFFECT.TRANSPORT_PATCH_BLOCK": (
+            bool(cfg.MONITOR.MODULE_EFFECT.TRANSPORT_PATCH_BLOCK), True
+        ),
+        "MONITOR.MODULE_EFFECT.TRANSPORT_RANDOM_SEED": (
+            int(cfg.MONITOR.MODULE_EFFECT.TRANSPORT_RANDOM_SEED), 161803
+        ),
     }
 
     for name, (actual, target) in expected.items():
@@ -106,6 +181,19 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         failures.append("DATA.NUM_WORKERS must be 4 for the current A-series deterministic multi-worker loader")
     if bool(cfg.CUDNN_BENCHMARK):
         failures.append("CUDNN_BENCHMARK must be false for the current A-series single-GPU contract")
+    probe_selection_seeds = [int(cfg.MONITOR.PROBE.SELECTION_SEED)] + [
+        int(item) for item in cfg.MONITOR.PROBE.ROBUSTNESS_SELECTION_SEEDS
+    ]
+    if any(seed < 0 for seed in probe_selection_seeds):
+        failures.append("fixed-probe selection seeds must be non-negative")
+    if len(set(probe_selection_seeds)) != len(probe_selection_seeds):
+        failures.append("fixed-probe primary and robustness selection seeds must be unique")
+    if int(cfg.MONITOR.PROBE.TARGET_RELEVANCE.BATCH_SIZE) <= 0:
+        failures.append("MONITOR.PROBE.TARGET_RELEVANCE.BATCH_SIZE must be positive")
+    if float(cfg.MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.TEMPERATURE) <= 0.0:
+        failures.append(
+            "MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.TEMPERATURE must be positive"
+        )
     streams = seed_streams(cfg.SEED)
     if any(streams[name] is None for name in ("classifier_init", "prompt_init", "data_order")):
         failures.append("classifier_init, prompt_init, and data_order streams must all be derived")
