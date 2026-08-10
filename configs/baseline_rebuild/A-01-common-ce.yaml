@@ -116,6 +116,35 @@ MONITOR:
     TARGET_RELEVANCE:
       ENABLE: true
       BATCH_SIZE: 4
+    PROMPT_ANALYSIS:
+      ENABLE: true
+      CONTENT_ENABLE: true
+      SOURCE_DECOMPOSITION_ENABLE: true
+      SEMANTIC_GRANULARITY_ENABLE: false
+      LOCAL_ATTRIBUTE_INDICES: []
+      GLOBAL_ATTRIBUTE_INDICES: []
+      FLIP_ENABLE: false
+      ROLE_PROFILE_EXPORT_ENABLE: false
+      LABEL_DEPENDENCY_GUARD_ENABLE: false
+    BAYESIAN_OBJECT_SELECTION:
+      ENABLE: false
+      CANDIDATE_SPACES: [raw_latent, injected_prompt, contextualized_prompt, cls_effect, logit_effect]
+      AUXILIARY_VIEWS: [semantic_aligned_contextualized_prompt, decision_margin_effect]
+      LAYERS: []
+      PERTURBATION_MODE: normalized_direction
+      PERTURBATION_SCALES: [0.01, 0.03]
+      DIRECTION_COUNT: 4
+      RANDOM_SEED: 424243
+      HIERARCHY_TRACE_ENABLE: true
+      HIERARCHY_VARIANT_SOURCE: controlled_perturbation
+      HIERARCHY_VARIANT_COUNT: 8
+      HIERARCHY_REFERENCE: unperturbed_same_checkpoint
+      BOOTSTRAP_SAMPLES: 200
+      COLLAPSE_RELATIVE_THRESHOLD: 0.05
+      DISTANCE_EPS: 1.0e-8
+      EXPORT_SAMPLE_VECTORS: false
+    EXPLANATION_VALIDITY:
+      ENABLE: false
   MODULE_EFFECT:
     ENABLE: true
     PROMPT_ZERO: true
@@ -133,6 +162,11 @@ MONITOR:
     ATTRIBUTE_CONCEPT_RANDOM_SEED: 271828
     TRANSPORT_PATCH_BLOCK: true
     TRANSPORT_RANDOM_SEED: 161803
+    INSTANCE_PROMPT_ZERO: false
+    DOMAIN_PROMPT_ZERO: false
+    BOTH_PROMPT_ZERO: false
+    INSTANCE_PROMPT_SWAP: false
+    PROMPT_VALUE_ZERO: false
     ATTENTION_MEDIATION_GAMMA_ZERO: false
   PROMPT:
     ENABLE: false

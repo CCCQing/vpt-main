@@ -54,6 +54,7 @@ class ViT(nn.Module):
         不属于分类头内部计算，因此统一挂在 ViT model 上。
         """
         self._runtime_token_sequence = None
+        self._runtime_injected_prompt_tokens = None
         self._runtime_affinities = None
         self._runtime_semantic_state = None
         self._runtime_prompt_distribution_stats = None
@@ -68,8 +69,11 @@ class ViT(nn.Module):
         return self._runtime_affinities
 
     def get_runtime_token_sequence(self):
-        """返回最近一次 forward_with_affinity 的最终 token 序列。"""
+        """返回最近一次 forward 的最终 token 序列。"""
         return self._runtime_token_sequence
+
+    def get_runtime_injected_prompt_tokens(self):
+        return self._runtime_injected_prompt_tokens
 
     def get_runtime_prompt_distribution_stats(self):
         """
@@ -226,6 +230,14 @@ class ViT(nn.Module):
             raise ValueError("r_similarity_head must be attached before ViT.forward is used.")
 
         transformer = self.enc.transformer
+        token_sequence = getattr(transformer, "_last_token_sequence", None)
+        self._runtime_token_sequence = (
+            token_sequence.detach() if torch.is_tensor(token_sequence) else None
+        )
+        injected_prompt = getattr(transformer, "_last_injected_prompt_tokens", None)
+        self._runtime_injected_prompt_tokens = (
+            injected_prompt.detach() if torch.is_tensor(injected_prompt) else None
+        )
         self._runtime_semantic_state = transformer._last_semantic_token_state
         # 缓存 prompt distributor stats，供 loss 侧读取；分类头仍只接收最终 CLS feature。
         self._runtime_prompt_distribution_stats = getattr(transformer, "_last_prompt_distribution_stats", None)
@@ -294,6 +306,10 @@ class ViT(nn.Module):
         transformer = self.enc.transformer
         token_sequence = getattr(transformer, "_last_token_sequence", None)
         self._runtime_token_sequence = token_sequence.detach() if torch.is_tensor(token_sequence) else None
+        injected_prompt = getattr(transformer, "_last_injected_prompt_tokens", None)
+        self._runtime_injected_prompt_tokens = (
+            injected_prompt.detach() if torch.is_tensor(injected_prompt) else None
+        )
         self._runtime_affinities = affinities
         self._runtime_semantic_state = transformer._last_semantic_token_state
         # forward_with_affinity 路径同样缓存 stats，保证启用 affinity aux 时 KL/graph loss 仍可用。

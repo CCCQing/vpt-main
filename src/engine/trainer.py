@@ -42,6 +42,7 @@ import ast
 import hashlib
 import json
 import re
+from collections import defaultdict
 from contextlib import nullcontext
 import matplotlib
 matplotlib.use("Agg")
@@ -80,11 +81,17 @@ from ..monitoring.module_effect import (
     attribute_concept_prompt_patch_block_intervention,
     attention_mediation_gamma_zero_intervention,
     checkpoint_sha256,
+    both_prompt_zero_intervention,
+    domain_prompt_zero_intervention,
+    instance_prompt_swap_intervention,
+    instance_prompt_zero_intervention,
     layer_prompt_read_block_intervention,
     PairedModuleEffectAccumulator,
     patch_prompt_uniform_intervention,
     prompt_patch_uniform_intervention,
     prompt_patch_value_globalize_intervention,
+    prompt_value_zero_intervention,
+    relevance_edge_delete_intervention,
     prompt_context_swap_intervention,
     prompt_read_block_intervention,
     random_prompt_patch_block_intervention,
@@ -92,6 +99,21 @@ from ..monitoring.module_effect import (
     transport_random_patch_block_intervention,
     prompt_zero_intervention,
     prompt_write_block_intervention,
+)
+from ..monitoring.prompt_analysis import (
+    PairedFlipAccumulator,
+    PromptSourceDecompositionAccumulator,
+    build_relevance_deletion_masks,
+    summarize_deletion_curves,
+)
+from ..monitoring.bayesian_object_selection import (
+    BayesianHierarchyTraceAccumulator,
+    StaticPromptPerturbation,
+    build_candidate_registry,
+    build_object_selection_report,
+    normalized_latent_direction,
+    numeric_leaf_metrics,
+    static_prompt_vector,
 )
 from ..monitoring.probe import (
     FixedProbeDataset,
@@ -2589,6 +2611,19 @@ class Trainer():
         prompt_length = int(prompt_length)
         prompt_available = prompt_length > 0
         prompt_parameter_available = bool(self.prompt_parameter_tracker.active)
+        distributor_cfg = self.cfg.MODEL.PROMPT.DISTRIBUTOR
+        distributor_available = bool(
+            prompt_available
+            and distributor_cfg.ENABLE
+            and str(self.cfg.MODEL.PROMPT.INIT_SOURCE).lower()
+            == "distributor_mean"
+        )
+        instance_prompt_length = (
+            int(distributor_cfg.INSTANCE_TOKENS) if distributor_available else 0
+        )
+        domain_prompt_length = (
+            int(distributor_cfg.DOMAIN_TOKENS) if distributor_available else 0
+        )
         path_intervention_available = bool(
             prompt_available
             and not self.cfg.MODEL.ATTENTION_MEDIATION.ENABLE
@@ -2633,6 +2668,83 @@ class Trainer():
                 "attention_route_retained": True,
             },
             True,
+        )
+        add(
+            self.cfg.MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_ZERO,
+            "instance_prompt_zeroed",
+            instance_prompt_zero_intervention,
+            bool(distributor_available and instance_prompt_length > 0),
+            (
+                "prompt_distributor_not_active"
+                if not distributor_available
+                else "no_instance_prompt_tokens"
+            ),
+            {
+                "changed_object": "raw_instance_prompt_output",
+                "replacement": "zero",
+                "domain_prompt_preserved": True,
+            },
+            True,
+        )
+        add(
+            self.cfg.MONITOR.MODULE_EFFECT.DOMAIN_PROMPT_ZERO,
+            "domain_prompt_zeroed",
+            domain_prompt_zero_intervention,
+            bool(distributor_available and domain_prompt_length > 0),
+            (
+                "prompt_distributor_not_active"
+                if not distributor_available
+                else "no_domain_prompt_tokens"
+            ),
+            {
+                "changed_object": "raw_domain_prompt_output",
+                "replacement": "zero",
+                "instance_prompt_preserved": True,
+            },
+            True,
+        )
+        add(
+            self.cfg.MONITOR.MODULE_EFFECT.BOTH_PROMPT_ZERO,
+            "both_prompt_zeroed",
+            both_prompt_zero_intervention,
+            bool(
+                distributor_available
+                and instance_prompt_length > 0
+                and domain_prompt_length > 0
+            ),
+            (
+                "prompt_distributor_not_active"
+                if not distributor_available
+                else "instance_and_domain_prompt_tokens_required"
+            ),
+            {
+                "changed_object": "raw_instance_and_domain_prompt_output",
+                "replacement": "zero",
+            },
+            True,
+        )
+        add(
+            self.cfg.MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_SWAP,
+            "instance_prompt_swapped",
+            instance_prompt_swap_intervention,
+            bool(distributor_available and instance_prompt_length > 0),
+            (
+                "prompt_distributor_not_active"
+                if not distributor_available
+                else "no_instance_prompt_tokens"
+            ),
+            {
+                "changed_object": "raw_instance_prompt_output",
+                "pairing": "deterministic_in_batch_derangement",
+                "pairing_identity": "instance_prompt_swap_seed_and_sample_id",
+                "domain_prompt_preserved": True,
+                "self_pair_allowed": False,
+                "swap_seed": int(
+                    self.cfg.MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_SWAP_SEED
+                ),
+            },
+            True,
+            "instance_prompt_swap",
         )
         add(
             self.cfg.MONITOR.MODULE_EFFECT.PROMPT_READ_BLOCK,
@@ -2723,6 +2835,20 @@ class Trainer():
                 "attention_weights_preserved": True,
                 "prompt_patch_mass_preserved": True,
                 "other_query_rows_preserved": True,
+            },
+            True,
+        )
+        add(
+            self.cfg.MONITOR.MODULE_EFFECT.PROMPT_VALUE_ZERO,
+            "prompt_value_zeroed",
+            prompt_value_zero_intervention,
+            path_intervention_available,
+            path_not_applicable_reason,
+            {
+                "changed_object": "prompt_value_contribution_to_all_queries",
+                "attention_weights_preserved": True,
+                "prompt_key_competition_preserved": True,
+                "value_replacement": "zero_contribution",
             },
             True,
         )
@@ -2970,6 +3096,89 @@ class Trainer():
             if bool(self.cfg.MODEL.SEMANTIC_TOKENS.ENABLE) else 0
         )
         selected_layers = [int(item) for item in self.cfg.MONITOR.PROBE.LAYERS]
+        explanation_cfg = self.cfg.MONITOR.PROBE.EXPLANATION_VALIDITY
+        explanation_requested = bool(explanation_cfg.ENABLE)
+        explanation_layers = [int(item) for item in explanation_cfg.LAYERS]
+        explanation_conditions = [
+            str(item).lower() for item in explanation_cfg.CONDITIONS
+        ]
+        explanation_fractions = [
+            float(item) for item in explanation_cfg.K_FRACTIONS
+        ]
+        explanation_paths = [str(item) for item in explanation_cfg.PATHS]
+        if explanation_requested:
+            if prompt_length <= 0:
+                raise ValueError(
+                    "MONITOR.PROBE.EXPLANATION_VALIDITY requires visual Prompt tokens"
+                )
+            if not bool(self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.ENABLE):
+                raise ValueError(
+                    "EXPLANATION_VALIDITY requires TARGET_RELEVANCE.ENABLE"
+                )
+            if not explanation_layers:
+                raise ValueError(
+                    "EXPLANATION_VALIDITY.LAYERS must be explicitly declared"
+                )
+            if not set(explanation_layers).issubset(set(selected_layers)):
+                raise ValueError(
+                    "EXPLANATION_VALIDITY.LAYERS must be a subset of MONITOR.PROBE.LAYERS"
+                )
+            if not explanation_conditions or not explanation_fractions:
+                raise ValueError(
+                    "EXPLANATION_VALIDITY requires conditions and k fractions"
+                )
+            supported_conditions = {
+                "positive", "negative", "absolute", "low", "random"
+            }
+            unknown_conditions = sorted(
+                set(explanation_conditions).difference(supported_conditions)
+            )
+            if unknown_conditions:
+                raise ValueError(
+                    "unsupported EXPLANATION_VALIDITY conditions: "
+                    + ",".join(unknown_conditions)
+                )
+            if not {"positive", "negative", "random"}.issubset(
+                set(explanation_conditions)
+            ):
+                raise ValueError(
+                    "EXPLANATION_VALIDITY.CONDITIONS must include positive, "
+                    "negative, and random equal-budget controls"
+                )
+            supported_paths = {
+                "cls_to_prompt",
+                "prompt_to_cls",
+                "prompt_to_patch",
+                "patch_to_prompt",
+            }
+            unknown_paths = sorted(
+                set(explanation_paths).difference(supported_paths)
+            )
+            if not explanation_paths or unknown_paths:
+                raise ValueError(
+                    "EXPLANATION_VALIDITY.PATHS must contain only supported "
+                    "Prompt-related paths"
+                )
+            if len(set(explanation_layers)) != len(explanation_layers):
+                raise ValueError(
+                    "EXPLANATION_VALIDITY.LAYERS must not contain duplicates"
+                )
+            if len(set(explanation_fractions)) != len(
+                explanation_fractions
+            ):
+                raise ValueError(
+                    "EXPLANATION_VALIDITY.K_FRACTIONS must not contain duplicates"
+                )
+            if any(not 0.0 < value < 1.0 for value in explanation_fractions):
+                raise ValueError(
+                    "EXPLANATION_VALIDITY.K_FRACTIONS must be between zero and one"
+                )
+        explanation_accumulators: Dict[
+            tuple[int, str, float], PairedModuleEffectAccumulator
+        ] = {}
+        explanation_metadata: Dict[tuple[int, str, float], Dict[str, float]] = (
+            defaultdict(lambda: defaultdict(float))
+        )
         true_accumulator = TargetRelevanceAccumulator(
             prompt_length=prompt_length,
             semantic_length=semantic_length,
@@ -2992,7 +3201,7 @@ class Trainer():
             "block_s_to_cls": bool(self.cfg.MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS),
         }
 
-        for input_data in probe_loader:
+        for batch_index, input_data in enumerate(probe_loader):
             inputs, targets_global, attributes = self.get_input(input_data)
             inputs = inputs.to(self.device, non_blocking=True)
             targets_global = targets_global.to(self.device, non_blocking=True)
@@ -3070,6 +3279,7 @@ class Trainer():
                     else list(range(len(attention_layers or [])))
                 )
                 gradient_inputs_by_layer = []
+                true_relevance_by_layer = {}
                 for layer_index in requested_layers:
                     if layer_index < 0 or layer_index >= len(attention_layers or []):
                         true_missing_layers.add(int(layer_index))
@@ -3094,10 +3304,21 @@ class Trainer():
                     for (layer_index, attention), gradient in zip(
                         gradient_inputs_by_layer, true_gradients
                     ):
-                        if gradient is None or not true_accumulator.update_layer(
+                        if gradient is None:
+                            true_missing_layers.add(int(layer_index))
+                            continue
+                        if not true_accumulator.update_layer(
                             layer_index, attention, gradient, correct
                         ):
                             true_missing_layers.add(int(layer_index))
+                        if (
+                            explanation_requested
+                            and int(layer_index) in explanation_layers
+                        ):
+                            true_relevance_by_layer[int(layer_index)] = (
+                                attention.detach().float()
+                                * gradient.detach().float()
+                            )
                     if bool(wrong.any()):
                         predicted_gradients = torch.autograd.grad(
                             predicted_margins[wrong].sum(),
@@ -3116,6 +3337,109 @@ class Trainer():
                                 correct[wrong],
                             ):
                                 predicted_missing_layers.add(int(layer_index))
+                if explanation_requested and true_relevance_by_layer:
+                    reference_logits_cpu = reference_logits.detach().cpu()
+                    for layer_index, relevance in sorted(
+                        true_relevance_by_layer.items()
+                    ):
+                        for fraction_index, fraction in enumerate(
+                            explanation_fractions
+                        ):
+                            masks, mask_metadata = build_relevance_deletion_masks(
+                                relevance,
+                                prompt_length=prompt_length,
+                                semantic_length=semantic_length,
+                                paths=explanation_paths,
+                                conditions=explanation_conditions,
+                                fraction=fraction,
+                                random_seed=int(
+                                    explanation_cfg.RANDOM_SEED
+                                    + 1000003 * batch_index
+                                    + 1009 * layer_index
+                                    + fraction_index
+                                ),
+                            )
+                            for condition, deletion_mask in masks.items():
+                                metadata = mask_metadata.get(condition, {})
+                                key = (
+                                    int(layer_index),
+                                    str(condition),
+                                    float(fraction),
+                                )
+                                accumulator = explanation_accumulators.setdefault(
+                                    key,
+                                    PairedModuleEffectAccumulator(
+                                        candidate_class_ids,
+                                        source_dataset.seen_classes,
+                                    ),
+                                )
+                                for name, value in metadata.items():
+                                    explanation_metadata[key][name] += float(value)
+                                if metadata.get("selected_edge_count", 0.0) <= 0.0:
+                                    accumulator.update(
+                                        reference_logits_cpu,
+                                        reference_logits_cpu,
+                                        target_local.detach().cpu().numpy(),
+                                    )
+                                    explanation_metadata[key][
+                                        "runtime_sample_count"
+                                    ] += float(reference_logits_cpu.shape[0])
+                                    continue
+                                explanation_metadata[key][
+                                    "expected_runtime_sample_count"
+                                ] += float(reference_logits_cpu.shape[0])
+                                with relevance_edge_delete_intervention(
+                                    model_ref,
+                                    target_layer=layer_index,
+                                    deletion_mask=deletion_mask,
+                                ):
+                                    with torch.no_grad():
+                                        changed_logits = model_ref(
+                                            inputs,
+                                            semantics=semantics,
+                                            class_ids=candidate_class_ids,
+                                            runtime_targets=None,
+                                        )
+                                runtime_sample_count = 0
+                                for module in model_ref.modules():
+                                    runtime_stats = getattr(
+                                        module,
+                                        "_last_prompt_path_intervention_stats",
+                                        None,
+                                    )
+                                    if not isinstance(runtime_stats, dict):
+                                        continue
+                                    applied = runtime_stats.get(
+                                        "relevance_delete_applied"
+                                    )
+                                    if not torch.is_tensor(applied):
+                                        continue
+                                    runtime_sample_count = max(
+                                        runtime_sample_count,
+                                        int(applied.numel()),
+                                    )
+                                    for name in (
+                                        "relevance_delete_mass",
+                                        "relevance_delete_edge_ratio",
+                                        "relevance_delete_row_mass_abs_error",
+                                    ):
+                                        values = runtime_stats.get(name)
+                                        if torch.is_tensor(values):
+                                            explanation_metadata[key][
+                                                f"{name}_sum"
+                                            ] += float(
+                                                values.detach().float().sum().item()
+                                            )
+                                explanation_metadata[key][
+                                    "runtime_sample_count"
+                                ] += float(runtime_sample_count)
+                                accumulator.update(
+                                    reference_logits_cpu,
+                                    changed_logits.detach().cpu(),
+                                    target_local.detach().cpu().numpy(),
+                                )
+                                del changed_logits, deletion_mask
+                    del reference_logits_cpu, true_relevance_by_layer
 
             model_ref.clear_runtime_state()
             del reference_logits, relevance_output, relevance_logits
@@ -3210,6 +3534,134 @@ class Trainer():
             "target_summary": predicted_target_summary,
             "by_layer": predicted_accumulator.finalize_by_layer(),
         }
+        explanation_effects = {}
+        for key, accumulator in sorted(explanation_accumulators.items()):
+            effect = accumulator.finalize()
+            metadata = explanation_metadata.get(key, {})
+            selected_count = float(metadata.get("selected_edge_count", 0.0))
+            eligible_count = float(metadata.get("eligible_edge_count", 0.0))
+            effect["summary"].update({
+                "selected_edge_count": selected_count,
+                "eligible_edge_count": eligible_count,
+                "actual_deletion_ratio": float(
+                    selected_count / max(eligible_count, 1.0)
+                ),
+            })
+            runtime_sample_count = float(
+                metadata.get("runtime_sample_count", 0.0)
+            )
+            if runtime_sample_count > 0.0:
+                for name in (
+                    "relevance_delete_mass",
+                    "relevance_delete_edge_ratio",
+                    "relevance_delete_row_mass_abs_error",
+                ):
+                    effect["summary"][name] = float(
+                        metadata.get(f"{name}_sum", 0.0)
+                        / runtime_sample_count
+                    )
+            explanation_effects[key] = effect
+        explanation_curves = summarize_deletion_curves(explanation_effects)
+        expected_explanation_keys = {
+            (int(layer), str(condition), float(fraction))
+            for layer in explanation_layers
+            for condition in explanation_conditions
+            for fraction in explanation_fractions
+        }
+        missing_budget_keys = {
+                key
+                for key, metadata in explanation_metadata.items()
+                if float(metadata.get("selected_edge_count", 0.0)) <= 0.0
+        }
+        runtime_missing_keys = {
+            key
+            for key, metadata in explanation_metadata.items()
+            if float(metadata.get("expected_runtime_sample_count", 0.0)) > 0.0
+            and float(metadata.get("runtime_sample_count", 0.0))
+            < float(metadata.get("expected_runtime_sample_count", 0.0))
+        }
+        unobserved_explanation_keys = expected_explanation_keys.difference(
+            explanation_effects
+        )
+        missing_explanation_keys = sorted(
+            unobserved_explanation_keys
+            .union(missing_budget_keys)
+            .union(runtime_missing_keys)
+        )
+        explanation_failure_reasons = []
+        if explanation_requested and not true_valid:
+            explanation_failure_reasons.append(
+                "target relevance reference was invalid"
+            )
+        if explanation_requested and (
+            unobserved_explanation_keys or missing_budget_keys
+        ):
+            explanation_failure_reasons.append(
+                "some declared layer/condition/fraction cells had no sign-valid deletion budget"
+            )
+        if explanation_requested and runtime_missing_keys:
+            explanation_failure_reasons.append(
+                "relevance deletion did not execute at the target Attention layer for all expected samples"
+            )
+        directional_checks = {}
+        for layer, comparison in explanation_curves[
+            "comparisons_by_layer"
+        ].items():
+            if "positive_minus_random_margin_drop_auc" in comparison:
+                directional_checks[
+                    f"layer_{layer}_positive_more_harmful_than_random"
+                ] = bool(
+                    comparison["positive_minus_random_margin_drop_auc"] > 0.0
+                )
+            if "negative_minus_random_margin_drop_auc" in comparison:
+                directional_checks[
+                    f"layer_{layer}_negative_less_harmful_than_random"
+                ] = bool(
+                    comparison["negative_minus_random_margin_drop_auc"] < 0.0
+                )
+        explanation_valid = bool(
+            explanation_requested
+            and true_valid
+            and explanation_effects
+            and not missing_explanation_keys
+        )
+        explanation_validity = {
+            **explanation_curves,
+            "requested": explanation_requested,
+            "applicability": (
+                "applicable" if explanation_requested else "not_requested"
+            ),
+            "valid": explanation_valid if explanation_requested else None,
+            "directional_support_pass": (
+                bool(directional_checks)
+                and all(directional_checks.values())
+                if explanation_requested
+                else None
+            ),
+            "directional_checks": directional_checks,
+            "failure_reasons": explanation_failure_reasons,
+            "layers": explanation_layers,
+            "conditions": explanation_conditions,
+            "k_fractions": explanation_fractions,
+            "paths": explanation_paths,
+            "missing_cells": [
+                {
+                    "layer": layer,
+                    "condition": condition,
+                    "fraction": fraction,
+                }
+                for layer, condition, fraction in missing_explanation_keys
+            ],
+            "runtime_missing_cells": [
+                {
+                    "layer": layer,
+                    "condition": condition,
+                    "fraction": fraction,
+                }
+                for layer, condition, fraction in sorted(runtime_missing_keys)
+            ],
+            "deletion_semantics": "post_softmax_zero_then_row_renormalize",
+        }
         return {
             "format": "target_relevance_reference_v3",
             "split": str(split),
@@ -3250,7 +3702,500 @@ class Trainer():
                 "true_class_margin": true_result,
                 "predicted_class_margin": predicted_result,
             },
+            "explanation_validity": explanation_validity,
             "storage_mode": "aggregate_only",
+        }
+
+    @torch.no_grad()
+    def _execute_bayesian_object_selection_probe(
+        self,
+        probe_loader,
+        source_dataset,
+        candidate_class_ids,
+        *,
+        split,
+    ):
+        model_ref = self._model_ref(self.model)
+        cfg = self.cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION
+        candidate_class_ids = [int(item) for item in candidate_class_ids]
+        prompt_enabled = bool(self.cfg.MODEL.PROMPT.ENABLE)
+        prompt_length = (
+            int(self.cfg.MODEL.PROMPT.NUM_TOKENS) if prompt_enabled else 0
+        )
+        distributor_active = bool(
+            prompt_enabled
+            and self.cfg.MODEL.PROMPT.DISTRIBUTOR.ENABLE
+            and str(self.cfg.MODEL.PROMPT.INIT_SOURCE).lower()
+            == "distributor_mean"
+        )
+        registry = build_candidate_registry(
+            requested_candidates=list(cfg.CANDIDATE_SPACES),
+            requested_auxiliary_views=list(cfg.AUXILIARY_VIEWS),
+            prompt_enabled=prompt_enabled,
+            distributor_active=distributor_active,
+            prompt_deep=bool(self.cfg.MODEL.PROMPT.DEEP),
+        )
+        base_result = {
+            "format": "bayesian_object_selection_probe_v1",
+            "requested": True,
+            "split": str(split),
+            "registry": registry,
+            "execution_contract": {
+                "same_checkpoint": True,
+                "same_probe_manifest": True,
+                "same_sample_id_order": True,
+                "same_candidate_class_ids": True,
+                "reference": str(cfg.HIERARCHY_REFERENCE),
+                "variant_source": str(cfg.HIERARCHY_VARIANT_SOURCE),
+                "upstream_only_perturbation": True,
+                "posterior_interpretation_allowed": False,
+                "sample_vectors_persisted": False,
+                "variant_storage_device": "cpu",
+                "gpu_live_variant_policy": "reference_plus_current_variant",
+            },
+        }
+        if not prompt_enabled:
+            return {
+                **base_result,
+                "applicability": "not_applicable_prompt_not_enabled",
+                "observed": False,
+                "valid": None,
+                "failure_reason": "prompt_not_enabled",
+            }
+        if str(cfg.PERTURBATION_MODE).lower() != "normalized_direction":
+            raise ValueError(
+                "BAYESIAN_OBJECT_SELECTION currently requires PERTURBATION_MODE='normalized_direction'"
+            )
+        if str(cfg.HIERARCHY_VARIANT_SOURCE).lower() != "controlled_perturbation":
+            raise ValueError(
+                "posterior_sample is unavailable before a Bayesian object and posterior are defined"
+            )
+        if str(cfg.HIERARCHY_REFERENCE).lower() != "unperturbed_same_checkpoint":
+            raise ValueError(
+                "BAYESIAN_OBJECT_SELECTION requires HIERARCHY_REFERENCE='unperturbed_same_checkpoint'"
+            )
+        if not bool(cfg.HIERARCHY_TRACE_ENABLE):
+            raise ValueError(
+                "BAYESIAN_OBJECT_SELECTION v1 requires HIERARCHY_TRACE_ENABLE=true when the master switch is enabled"
+            )
+        if bool(cfg.EXPORT_SAMPLE_VECTORS):
+            raise ValueError(
+                "BAYESIAN_OBJECT_SELECTION sample-vector export is not enabled in aggregate-only fixed probes"
+            )
+        scales = [float(item) for item in cfg.PERTURBATION_SCALES]
+        if not scales or any((not math.isfinite(item)) or item <= 0.0 for item in scales):
+            raise ValueError(
+                "BAYESIAN_OBJECT_SELECTION.PERTURBATION_SCALES must contain positive finite values"
+            )
+        direction_count = int(cfg.DIRECTION_COUNT)
+        if direction_count <= 0:
+            raise ValueError(
+                "BAYESIAN_OBJECT_SELECTION.DIRECTION_COUNT must be positive when enabled"
+            )
+        variant_specs = [
+            {
+                "variant_id": f"direction_{direction_id:03d}_scale_{scale:.8g}",
+                "perturbation_id": f"normalized_direction/{direction_id}/{scale:.8g}",
+                "direction_id": int(direction_id),
+                "scale": float(scale),
+                "perturbation_seed": int(cfg.RANDOM_SEED),
+            }
+            for direction_id in range(direction_count)
+            for scale in scales
+        ]
+        variant_limit = int(cfg.HIERARCHY_VARIANT_COUNT)
+        if variant_limit > 0:
+            variant_specs = variant_specs[:variant_limit]
+        if not variant_specs:
+            raise ValueError("BAYESIAN_OBJECT_SELECTION produced no controlled variants")
+        selected_layers = [int(item) for item in cfg.LAYERS]
+        accumulator = BayesianHierarchyTraceAccumulator(
+            candidate_class_ids,
+            bootstrap_samples=int(cfg.BOOTSTRAP_SAMPLES),
+            random_seed=int(cfg.RANDOM_SEED),
+            collapse_relative_threshold=float(cfg.COLLAPSE_RELATIVE_THRESHOLD),
+            distance_eps=float(cfg.DISTANCE_EPS),
+        )
+        global_to_local = {
+            global_id: local_id
+            for local_id, global_id in enumerate(candidate_class_ids)
+        }
+        source_distance_values = defaultdict(list)
+        semantic_view_requested = (
+            "semantic_aligned_contextualized_prompt"
+            in {str(item) for item in cfg.AUXILIARY_VIEWS}
+        )
+
+        def snapshot(inputs, semantics):
+            logits = model_ref(
+                inputs,
+                semantics=semantics,
+                class_ids=candidate_class_ids,
+                runtime_targets=None,
+            )
+            classifier_stats = model_ref.get_runtime_classifier_stats()
+            if not isinstance(classifier_stats, dict):
+                raise RuntimeError(
+                    "Bayesian object selection requires runtime classifier statistics"
+                )
+            cls_tensor = classifier_stats.get("visual_input")
+            semantic_tensor = classifier_stats.get("semantic_repr")
+            injected = model_ref.get_runtime_injected_prompt_tokens()
+            token_sequence = model_ref.get_runtime_token_sequence()
+            if not all(
+                torch.is_tensor(item)
+                for item in (cls_tensor, injected, token_sequence)
+            ):
+                raise RuntimeError(
+                    "Bayesian object selection requires injected Prompt, token sequence, and CLS runtime tensors"
+                )
+            if int(injected.shape[1]) != prompt_length:
+                raise RuntimeError("Injected Prompt length does not match configured identity")
+            contextualized = token_sequence[:, 1 : 1 + prompt_length, :]
+            semantic_aligned = None
+            pooled_prompt = contextualized.float().mean(dim=1)
+            if semantic_view_requested and torch.is_tensor(semantic_tensor):
+                semantic_float = semantic_tensor.float()
+                pooled_normalized = torch.nn.functional.normalize(
+                    pooled_prompt, dim=-1
+                )
+                if semantic_float.dim() == 2 and int(semantic_float.shape[-1]) == int(
+                    pooled_prompt.shape[-1]
+                ):
+                    semantic_aligned = pooled_normalized @ torch.nn.functional.normalize(
+                        semantic_float, dim=-1
+                    ).transpose(0, 1)
+                elif (
+                    semantic_float.dim() == 3
+                    and int(semantic_float.shape[0]) == int(pooled_prompt.shape[0])
+                    and int(semantic_float.shape[-1]) == int(pooled_prompt.shape[-1])
+                ):
+                    semantic_aligned = torch.einsum(
+                        "bd,bcd->bc",
+                        pooled_normalized,
+                        torch.nn.functional.normalize(semantic_float, dim=-1),
+                    )
+            prompt_stats = model_ref.get_runtime_prompt_distribution_stats()
+            return {
+                "logits": logits.detach(),
+                "injected_prompt": injected.detach(),
+                "contextualized_prompt": contextualized.detach(),
+                "semantic_aligned_contextualized_prompt": (
+                    semantic_aligned.detach()
+                    if torch.is_tensor(semantic_aligned)
+                    else None
+                ),
+                "cls": cls_tensor.detach(),
+                "prompt_distribution_stats": (
+                    prompt_stats if isinstance(prompt_stats, dict) else {}
+                ),
+            }
+
+        def detached_cpu(value):
+            return (
+                value.detach().to(device="cpu")
+                if torch.is_tensor(value)
+                else None
+            )
+
+        for input_data in probe_loader:
+            inputs, targets_global, attributes = self.get_input(input_data)
+            inputs = inputs.to(self.device, non_blocking=True)
+            targets_global = targets_global.to(self.device, non_blocking=True)
+            sample_ids = input_data.get("sample_id")
+            if sample_ids is None:
+                raise RuntimeError(
+                    "Bayesian object selection requires fixed-probe sample_id"
+                )
+            sample_ids = [str(item) for item in list(sample_ids)]
+            target_global_list = [
+                int(item) for item in targets_global.detach().cpu().tolist()
+            ]
+            targets_local = [global_to_local[item] for item in target_global_list]
+            semantics = self._prepare_semantics_for_stage(
+                attributes,
+                source_dataset,
+                batch_size=int(inputs.shape[0]),
+                is_train=False,
+            )
+            batch_size = int(inputs.shape[0])
+            if distributor_active:
+                discovery = snapshot(inputs, semantics)
+                discovery_stats = discovery["prompt_distribution_stats"]
+                reference_mu = discovery_stats.get("mu")
+                reference_logvar = discovery_stats.get("logvar")
+                if not torch.is_tensor(reference_mu) or not torch.is_tensor(
+                    reference_logvar
+                ):
+                    raise RuntimeError(
+                        "Active Prompt Distributor did not expose aligned mu/logvar"
+                    )
+                reference_mu = reference_mu.detach().clone()
+                reference_logvar = reference_logvar.detach().clone()
+                instance_tokens = int(
+                    self.cfg.MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS
+                )
+                fixed_eps = reference_mu.new_zeros(
+                    (batch_size, instance_tokens, int(reference_mu.shape[-1]))
+                )
+                model_ref.set_runtime_prompt_distribution_override(
+                    reference_mu, reference_logvar, eps=fixed_eps
+                )
+                reference = snapshot(inputs, semantics)
+                reference_source = reference_mu
+                del discovery, discovery_stats
+            else:
+                reference_source = static_prompt_vector(
+                    model_ref, selected_layers
+                ).unsqueeze(0).expand(batch_size, -1)
+                reference = snapshot(inputs, semantics)
+            variants = [
+                {
+                    "variant_id": "reference",
+                    "sample_ids": sample_ids,
+                    "source_object": detached_cpu(reference_source),
+                    "injected_prompt": detached_cpu(
+                        reference["injected_prompt"]
+                    ),
+                    "contextualized_prompt": detached_cpu(
+                        reference["contextualized_prompt"]
+                    ),
+                    "semantic_aligned_contextualized_prompt": detached_cpu(
+                        reference[
+                            "semantic_aligned_contextualized_prompt"
+                        ]
+                    ),
+                    "cls_effect": torch.zeros_like(
+                        reference["cls"], device="cpu"
+                    ),
+                    "logit_effect": torch.zeros_like(
+                        reference["logits"], device="cpu"
+                    ),
+                    "logits": detached_cpu(reference["logits"]),
+                }
+            ]
+            for spec in variant_specs:
+                if distributor_active:
+                    changed_mu = normalized_latent_direction(
+                        reference_mu,
+                        direction_id=spec["direction_id"],
+                        scale=spec["scale"],
+                        seed=spec["perturbation_seed"],
+                    )
+                    model_ref.set_runtime_prompt_distribution_override(
+                        changed_mu, reference_logvar, eps=fixed_eps
+                    )
+                    changed = snapshot(inputs, semantics)
+                    changed_source = changed_mu
+                else:
+                    with StaticPromptPerturbation(
+                        model_ref,
+                        direction_id=spec["direction_id"],
+                        scale=spec["scale"],
+                        seed=spec["perturbation_seed"],
+                        selected_layers=selected_layers,
+                    ) as intervention:
+                        changed_source = static_prompt_vector(
+                            model_ref, selected_layers
+                        ).unsqueeze(0).expand(batch_size, -1)
+                        changed = snapshot(inputs, semantics)
+                source_rms = (
+                    (changed_source.detach().float() - reference_source.detach().float())
+                    .reshape(batch_size, -1)
+                    .pow(2)
+                    .mean(dim=-1)
+                    .sqrt()
+                )
+                if not bool(
+                    (source_rms > float(cfg.DISTANCE_EPS)).all().item()
+                ):
+                    raise RuntimeError(
+                        f"Controlled Prompt variant {spec['variant_id']} did not change its source object"
+                    )
+                source_distance_values[spec["variant_id"]].extend(
+                    float(item) for item in source_rms.detach().cpu().tolist()
+                )
+                variants.append(
+                    {
+                        "variant_id": spec["variant_id"],
+                        "sample_ids": sample_ids,
+                        "source_object": detached_cpu(changed_source),
+                        "injected_prompt": detached_cpu(
+                            changed["injected_prompt"]
+                        ),
+                        "contextualized_prompt": detached_cpu(
+                            changed["contextualized_prompt"]
+                        ),
+                        "semantic_aligned_contextualized_prompt": detached_cpu(
+                            changed[
+                                "semantic_aligned_contextualized_prompt"
+                            ]
+                        ),
+                        "cls_effect": detached_cpu(
+                            changed["cls"] - reference["cls"]
+                        ),
+                        "logit_effect": detached_cpu(
+                            changed["logits"] - reference["logits"]
+                        ),
+                        "logits": detached_cpu(changed["logits"]),
+                    }
+                )
+                model_ref.clear_runtime_state()
+                del changed, changed_source
+                if distributor_active:
+                    del changed_mu
+            accumulator.update(
+                sample_ids=sample_ids,
+                targets_local=targets_local,
+                variants=variants,
+            )
+            model_ref.clear_runtime_prompt_distribution_override()
+            model_ref.clear_runtime_state()
+            del inputs, targets_global, semantics, variants, reference
+            del reference_source
+            if distributor_active:
+                del reference_mu, reference_logvar, fixed_eps
+
+        hierarchy_trace = accumulator.finalize()
+        distance_correspondence = hierarchy_trace.get(
+            "distance_correspondence", {}
+        )
+        if distributor_active:
+            for alias, canonical in {
+                "latent_to_injected_prompt_distance_spearman": "source_to_injected_distance_spearman",
+                "latent_to_contextual_prompt_distance_spearman": "source_to_contextualized_distance_spearman",
+                "latent_to_cls_delta_distance_spearman": "source_to_cls_effect_distance_spearman",
+                "latent_to_logit_delta_distance_spearman": "source_to_logit_effect_distance_spearman",
+            }.items():
+                if canonical in distance_correspondence:
+                    distance_correspondence[alias] = dict(
+                        distance_correspondence[canonical]
+                    )
+        contextual_alias = "contextualized_prompt_to_logit_delta_distance_spearman"
+        if contextual_alias in distance_correspondence:
+            distance_correspondence[
+                "contextual_prompt_to_logit_delta_distance_spearman"
+            ] = dict(distance_correspondence[contextual_alias])
+        hierarchy_trace["variant_protocol"] = variant_specs
+        hierarchy_trace["source_object_name"] = (
+            "raw_latent" if distributor_active else "static_prompt_parameter"
+        )
+        hierarchy_trace["prompt_type_contract"] = (
+            "instance_and_domain" if distributor_active else "visual"
+        )
+        hierarchy_trace["selected_layers"] = selected_layers
+        hierarchy_trace["source_distance_by_variant"] = {
+            name: {
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values)),
+                "count": int(len(values)),
+            }
+            for name, values in sorted(source_distance_values.items())
+            if values
+        }
+        observed_stages = set(hierarchy_trace.get("observed_stages", []))
+        stage_by_candidate = {
+            "raw_latent": "source_object" if distributor_active else None,
+            "injected_prompt": "injected_prompt",
+            "contextualized_prompt": "contextualized_prompt",
+            "cls_effect": "cls_effect",
+            "logit_effect": "logit_effect",
+        }
+        for name, state in registry["candidate_spaces"].items():
+            stage = stage_by_candidate[name]
+            if state["requested"] and state["applicable"]:
+                state["observed"] = bool(stage in observed_stages)
+                state["valid"] = bool(stage in observed_stages)
+                state["failure_reason"] = (
+                    None if state["observed"] else "runtime_stage_not_observed"
+                )
+        auxiliary_stage = "semantic_aligned_contextualized_prompt"
+        semantic_state = registry["auxiliary_views"][auxiliary_stage]
+        if semantic_state["requested"] and semantic_state["applicable"]:
+            semantic_state["observed"] = auxiliary_stage in observed_stages
+            semantic_state["valid"] = semantic_state["observed"]
+            semantic_state["failure_reason"] = (
+                None
+                if semantic_state["observed"]
+                else "not_applicable_no_shared_semantic_space"
+            )
+        decision_state = registry["auxiliary_views"]["decision_margin_effect"]
+        if decision_state["requested"] and decision_state["applicable"]:
+            decision_count = hierarchy_trace.get("prediction_effect", {}).get(
+                "true_vs_hard_negative_margin_effect", {}
+            ).get("count", 0)
+            decision_state["observed"] = int(decision_count) > 0
+            decision_state["valid"] = decision_state["observed"]
+            decision_state["failure_reason"] = (
+                None if decision_state["observed"] else "margin_effect_not_observed"
+            )
+        functional_geometry = {
+            "format": "prompt_functional_geometry_v1",
+            "valid": bool(hierarchy_trace.get("valid", False)),
+            "perturbation_mode": str(cfg.PERTURBATION_MODE),
+            "reference": str(cfg.HIERARCHY_REFERENCE),
+            "distance_normalization": "root_mean_square_per_dimension",
+            "bootstrap_unit": "sample_variant_distance_pair",
+            "source_object_name": hierarchy_trace["source_object_name"],
+            "distance_correspondence": hierarchy_trace.get(
+                "distance_correspondence", {}
+            ),
+            "class_structure": hierarchy_trace.get("class_structure", {}),
+            "scale_curve": {
+                "scales": scales,
+                "directions": direction_count,
+                "variant_count": len(variant_specs),
+                "source_distance_by_variant": hierarchy_trace[
+                    "source_distance_by_variant"
+                ],
+            },
+            "direction_effect_norm": {
+                "cls_effect": hierarchy_trace.get(
+                    "reference_distance_by_stage", {}
+                ).get("cls_effect", {}),
+                "logit_effect": hierarchy_trace.get(
+                    "reference_distance_by_stage", {}
+                ).get("logit_effect", {}),
+            },
+            "functional_null_direction": hierarchy_trace.get(
+                "perturbation_functional_null_direction_ratio", {}
+            ),
+            "local_jacobian": {
+                "status": "deferred_high_cost",
+                "reason": "run_only_after_shortlist_geometry_supports_a_candidate",
+            },
+            "posterior_interpretation_allowed": False,
+        }
+        source_retention = {
+            "format": "prompt_source_information_retention_v1",
+            "applicability": (
+                "applicable" if distributor_active else "not_applicable_prompt_generator_not_active"
+            ),
+            "observed": bool(distributor_active),
+            "interface_class_structure": (
+                hierarchy_trace.get("class_structure", {})
+                if distributor_active
+                else {}
+            ),
+            "heldout_linear_probe": {
+                "status": "deferred_high_cost",
+                "reason": "requires_predeclared_fit_and_heldout_subsets_after_shortlist",
+            },
+        }
+        report = build_object_selection_report(registry, hierarchy_trace)
+        return {
+            **base_result,
+            "applicability": "applicable",
+            "observed": True,
+            "valid": bool(hierarchy_trace.get("valid", False)),
+            "failure_reason": (
+                None if hierarchy_trace.get("valid", False) else "incomplete_hierarchy_trace"
+            ),
+            "registry": registry,
+            "functional_geometry": functional_geometry,
+            "hierarchy_trace": hierarchy_trace,
+            "source_retention": source_retention,
+            "object_selection_report": report,
         }
 
     @torch.no_grad()
@@ -3260,6 +4205,55 @@ class Trainer():
         global_to_local = {global_id: local_id for local_id, global_id in enumerate(candidate_class_ids)}
         prompt_length = int(self.cfg.MODEL.PROMPT.NUM_TOKENS) if bool(self.cfg.MODEL.PROMPT.ENABLE) else 0
         semantic_length = int(self.cfg.MODEL.SEMANTIC_TOKENS.NUM_TOKENS) if bool(self.cfg.MODEL.SEMANTIC_TOKENS.ENABLE) else 0
+        prompt_analysis_cfg = self.cfg.MONITOR.PROBE.PROMPT_ANALYSIS
+        prompt_analysis_requested = bool(prompt_analysis_cfg.ENABLE)
+        prompt_analysis_enabled = bool(
+            prompt_analysis_requested and prompt_length > 0
+        )
+        distributor_cfg = self.cfg.MODEL.PROMPT.DISTRIBUTOR
+        distributor_active = bool(
+            prompt_length > 0
+            and distributor_cfg.ENABLE
+            and str(self.cfg.MODEL.PROMPT.INIT_SOURCE).lower()
+            == "distributor_mean"
+        )
+        instance_prompt_length = (
+            int(distributor_cfg.INSTANCE_TOKENS) if distributor_active else 0
+        )
+        domain_prompt_length = (
+            int(distributor_cfg.DOMAIN_TOKENS) if distributor_active else 0
+        )
+        source_accumulator = (
+            PromptSourceDecompositionAccumulator(
+                instance_tokens=instance_prompt_length,
+                domain_tokens=domain_prompt_length,
+                contextualized_domain_applicable=not bool(
+                    self.cfg.MODEL.PROMPT.DEEP
+                ),
+            )
+            if prompt_analysis_enabled
+            and bool(prompt_analysis_cfg.SOURCE_DECOMPOSITION_ENABLE)
+            and distributor_active
+            else None
+        )
+        label_guard_requested = bool(
+            prompt_analysis_enabled
+            and prompt_analysis_cfg.LABEL_DEPENDENCY_GUARD_ENABLE
+        )
+        label_guard = {
+            "requested": label_guard_requested,
+            "applicability": (
+                "applicable"
+                if label_guard_requested and distributor_active
+                else "not_applicable_prompt_distributor_not_active"
+                if label_guard_requested
+                else "not_requested"
+            ),
+            "observed": False,
+            "valid": None,
+            "metrics": {},
+            "failure_reasons": [],
+        }
         normal_accumulator = StreamingFixedProbeAccumulator(candidate_class_ids, track_geometry=True)
         semantic_enabled = bool(self.cfg.MONITOR.PROBE.SEMANTIC_INTERVENTION.ENABLE)
         permutation = inverse = None
@@ -3307,6 +4301,43 @@ class Trainer():
             and attribute_concept_reference.get("available", False)
             and prompt_length > 0
         )
+        semantic_granularity_requested = bool(
+            prompt_analysis_enabled
+            and prompt_analysis_cfg.SEMANTIC_GRANULARITY_ENABLE
+        )
+        local_attribute_indices = [
+            int(item) for item in prompt_analysis_cfg.LOCAL_ATTRIBUTE_INDICES
+        ]
+        global_attribute_indices = [
+            int(item) for item in prompt_analysis_cfg.GLOBAL_ATTRIBUTE_INDICES
+        ]
+        semantic_granularity_applicable = bool(
+            semantic_granularity_requested
+            and attribute_concept_enabled
+            and local_attribute_indices
+            and global_attribute_indices
+        )
+        if semantic_granularity_requested:
+            overlap = set(local_attribute_indices).intersection(
+                global_attribute_indices
+            )
+            if overlap:
+                raise ValueError(
+                    "Prompt semantic local/global attribute groups must be disjoint"
+                )
+            attribute_count = int(
+                attribute_concept_reference.get("attribute_count", 0)
+            )
+            invalid_indices = [
+                item
+                for item in local_attribute_indices + global_attribute_indices
+                if item < 0 or item >= attribute_count
+            ]
+            if invalid_indices:
+                raise ValueError(
+                    "Prompt semantic attribute group contains out-of-range indices: "
+                    + ",".join(str(item) for item in sorted(set(invalid_indices)))
+                )
         patch_semantic_transport_enabled = bool(
             affinity_enabled
             and self.cfg.MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.ENABLE
@@ -3348,12 +4379,68 @@ class Trainer():
             "prompt_length": prompt_length,
             "semantic_length": semantic_length,
             "detach": True,
+            "offload_diagnostics_to_cpu": True,
             "block_s_to_cls": bool(self.cfg.MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS),
             "attribute_concept_enable": attribute_concept_enabled,
             "attribute_concept_selected_layers": selected_probe_layers,
             "attribute_concept_patch_ratio": float(
                 self.cfg.MONITOR.PROBE.ATTRIBUTE_CONCEPT_PATCH_RATIO
             ),
+            "local_attribute_indices": (
+                local_attribute_indices if semantic_granularity_applicable else []
+            ),
+            "global_attribute_indices": (
+                global_attribute_indices if semantic_granularity_applicable else []
+            ),
+        }
+        prompt_content_enabled = bool(
+            prompt_analysis_enabled
+            and prompt_analysis_cfg.CONTENT_ENABLE
+            and affinity_enabled
+        )
+        role_profile_export_enabled = bool(
+            prompt_analysis_enabled
+            and prompt_analysis_cfg.ROLE_PROFILE_EXPORT_ENABLE
+            and affinity_enabled
+        )
+        flip_requested = bool(
+            prompt_analysis_enabled and prompt_analysis_cfg.FLIP_ENABLE
+        )
+        flip_accumulator = (
+            PairedFlipAccumulator(
+                prompt_length=prompt_length,
+                semantic_length=semantic_length,
+                topk=int(prompt_analysis_cfg.FLIP_TOPK),
+                selected_layers=selected_probe_layers,
+            )
+            if flip_requested and affinity_enabled
+            else None
+        )
+        flip_pair_hash = hashlib.sha256()
+        flip_pair_sample_count = 0
+        prompt_accumulator_kwargs = {
+            "prompt_content_enable": prompt_content_enabled,
+            "instance_prompt_length": instance_prompt_length,
+            "domain_prompt_length": domain_prompt_length,
+            "content_redundancy_cosine": float(
+                prompt_analysis_cfg.CONTENT_REDUNDANCY_COSINE
+            ),
+            "content_opposition_cosine": float(
+                prompt_analysis_cfg.CONTENT_OPPOSITION_COSINE
+            ),
+            "content_cancellation_ratio": float(
+                prompt_analysis_cfg.CONTENT_CANCELLATION_RATIO
+            ),
+            "low_usage_fraction": float(
+                prompt_analysis_cfg.LOW_USAGE_FRACTION
+            ),
+            "low_function_fraction": float(
+                prompt_analysis_cfg.LOW_FUNCTION_FRACTION
+            ),
+            "low_role_coverage": float(
+                prompt_analysis_cfg.LOW_ROLE_COVERAGE
+            ),
+            "role_profile_export_enable": role_profile_export_enabled,
         }
         if affinity_enabled:
             affinity_metric_accumulator = ProbeAttentionAffinityAccumulator(
@@ -3384,6 +4471,7 @@ class Trainer():
                 ),
                 temperature=float(self.cfg.MONITOR.PROBE.AFFINITY_TEMPERATURE),
                 saturation_threshold=float(self.cfg.MONITOR.PROBE.AFFINITY_SATURATION_THRESHOLD),
+                **prompt_accumulator_kwargs,
             )
             token_accumulator = StreamingTokenViewAccumulator(len(candidate_class_ids), prompt_length, semantic_length)
 
@@ -3431,7 +4519,20 @@ class Trainer():
                 "pairing_hash": hashlib.sha256(),
             }
             for name, _, dynamic_context in intervention_factories
-            if dynamic_context == "prompt_swap"
+            if dynamic_context in {"prompt_swap", "instance_prompt_swap"}
+        }
+        prompt_output_intervention_states = {
+            name: {
+                "sums": defaultdict(float),
+                "counts": defaultdict(int),
+            }
+            for name, _, _ in intervention_factories
+            if name in {
+                "instance_prompt_zeroed",
+                "domain_prompt_zeroed",
+                "both_prompt_zeroed",
+                "instance_prompt_swapped",
+            }
         }
         diagnostic_intervention_names = {
             spec["name"]
@@ -3481,6 +4582,7 @@ class Trainer():
                     ),
                     temperature=float(self.cfg.MONITOR.PROBE.AFFINITY_TEMPERATURE),
                     saturation_threshold=float(self.cfg.MONITOR.PROBE.AFFINITY_SATURATION_THRESHOLD),
+                    **prompt_accumulator_kwargs,
                 )
                 for name in diagnostic_intervention_names
             }
@@ -3522,6 +4624,136 @@ class Trainer():
                 )
             ):
                 raise RuntimeError("fixed probe classifier statistics are incomplete")
+            prompt_distribution_stats_getter = getattr(
+                model_ref,
+                "get_runtime_prompt_distribution_stats",
+                None,
+            )
+            normal_prompt_distribution_stats = (
+                prompt_distribution_stats_getter()
+                if callable(prompt_distribution_stats_getter)
+                else {}
+            )
+            source_true_margin = None
+            if source_accumulator is not None:
+                source_target = torch.as_tensor(
+                    target_local,
+                    device=normal_logits.device,
+                    dtype=torch.long,
+                )
+                source_other = normal_logits.detach().float().clone()
+                source_other.scatter_(
+                    1,
+                    source_target.unsqueeze(1),
+                    torch.finfo(source_other.dtype).min,
+                )
+                source_true_margin = (
+                    normal_logits.detach().float().gather(
+                        1, source_target.unsqueeze(1)
+                    ).squeeze(1)
+                    - source_other.max(dim=1).values
+                )
+                source_accumulator.update_raw(
+                    normal_prompt_distribution_stats,
+                    target_local,
+                    cls_repr=normal_visual,
+                    true_margin=source_true_margin,
+                )
+            if (
+                label_guard_requested
+                and distributor_active
+                and not label_guard["observed"]
+            ):
+                if int(inputs.shape[0]) < 2:
+                    label_guard["applicability"] = (
+                        "not_applicable_singleton_first_batch"
+                    )
+                else:
+                    permutation = torch.roll(
+                        torch.arange(inputs.shape[0], device=inputs.device),
+                        shifts=1,
+                    )
+                    permuted_semantics = semantics
+                    if (
+                        torch.is_tensor(semantics)
+                        and semantics.dim() > 0
+                        and int(semantics.shape[0]) == int(inputs.shape[0])
+                    ):
+                        permuted_semantics = semantics.index_select(0, permutation)
+                    elif (
+                        torch.is_tensor(semantics)
+                        and semantics.dim() > 0
+                        and int(semantics.shape[0])
+                        == len(candidate_class_ids)
+                    ):
+                        semantic_permutation = torch.roll(
+                            torch.arange(
+                                semantics.shape[0], device=semantics.device
+                            ),
+                            shifts=1,
+                        )
+                        permuted_semantics = semantics.index_select(
+                            0, semantic_permutation
+                        )
+                    with torch.no_grad():
+                        model_ref(
+                            inputs,
+                            semantics=permuted_semantics,
+                            class_ids=candidate_class_ids,
+                            runtime_targets=targets_global.index_select(
+                                0, permutation
+                            ),
+                        )
+                    permuted_prompt_stats = (
+                        prompt_distribution_stats_getter()
+                        if callable(prompt_distribution_stats_getter)
+                        else {}
+                    )
+                    max_diffs = {}
+                    for field in ("mu", "logvar", "prompt_tokens"):
+                        reference = (
+                            normal_prompt_distribution_stats.get(field)
+                            if isinstance(normal_prompt_distribution_stats, dict)
+                            else None
+                        )
+                        changed = (
+                            permuted_prompt_stats.get(field)
+                            if isinstance(permuted_prompt_stats, dict)
+                            else None
+                        )
+                        if (
+                            not torch.is_tensor(reference)
+                            or not torch.is_tensor(changed)
+                            or reference.shape != changed.shape
+                        ):
+                            label_guard["failure_reasons"].append(
+                                f"{field} was unavailable or changed shape"
+                            )
+                            continue
+                        max_diffs[f"{field}_permuted_metadata_max_abs_diff"] = float(
+                            (reference.detach() - changed.detach()).abs().max().item()
+                        )
+                    tolerance = float(
+                        self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL
+                    )
+                    valid = bool(
+                        len(max_diffs) == 3
+                        and all(value <= tolerance for value in max_diffs.values())
+                    )
+                    if not valid and not label_guard["failure_reasons"]:
+                        label_guard["failure_reasons"].append(
+                            "Prompt Distributor output changed after label/class-attribute metadata permutation"
+                        )
+                    label_guard.update({
+                        "observed": True,
+                        "valid": valid,
+                        "metrics": {
+                            **max_diffs,
+                            "label_dependency_guard_pass": float(valid),
+                            "static_prompt_provider_receives_label": 0.0,
+                            "static_prompt_provider_receives_class_attribute": 0.0,
+                        },
+                    })
             normal_logits_cpu = normal_logits.detach().cpu()
             normal_visual_cpu = normal_visual.detach().cpu()
             normal_accumulator.update(normal_logits_cpu, target_local, normal_visual_cpu, normal_semantic)
@@ -3637,9 +4869,55 @@ class Trainer():
                         target_local,
                         semantic_prototypes=normal_semantic,
                     )
+                    if source_accumulator is not None:
+                        source_accumulator.update_contextualized(
+                            token_sequence,
+                            target_local,
+                            prompt_length=prompt_length,
+                            semantic_length=semantic_length,
+                            cls_repr=normal_visual,
+                            true_margin=source_true_margin,
+                        )
                 self._update_equivalence_state(
                     affinity_state, normal_logits_cpu, affinity_logits, target_local
                 )
+                if flip_accumulator is not None:
+                    flipped_inputs = torch.flip(inputs, dims=[-1])
+                    flipped_output = model_ref.forward_with_affinity(
+                        flipped_inputs,
+                        affinity_cfg,
+                        semantics=semantics,
+                        vis=use_attention,
+                        class_ids=candidate_class_ids,
+                        runtime_targets=None,
+                    )
+                    if use_attention:
+                        (
+                            flipped_logits,
+                            flipped_attention_layers,
+                            flipped_affinities,
+                        ) = flipped_output
+                    else:
+                        flipped_logits, flipped_affinities = flipped_output
+                        flipped_attention_layers = []
+                    flip_accumulator.update(
+                        list(attention_layers or []),
+                        list(affinities or []),
+                        list(flipped_attention_layers or []),
+                        list(flipped_affinities or []),
+                        normal_predictions=affinity_logits.detach().argmax(dim=1),
+                        flipped_predictions=flipped_logits.detach().argmax(dim=1),
+                    )
+                    sample_ids = input_data.get("sample_id")
+                    if sample_ids is None:
+                        raise RuntimeError(
+                            "paired horizontal flip requires fixed-probe sample_id"
+                        )
+                    sample_ids = [str(item) for item in list(sample_ids)]
+                    flip_pair_hash.update("|".join(sample_ids).encode("utf-8"))
+                    flip_pair_sample_count += len(sample_ids)
+                    del flipped_output, flipped_logits, flipped_attention_layers
+                    del flipped_affinities, flipped_inputs
                 del affinity_output, affinity_logits, attention_layers, affinities, token_sequence
 
             transport_intervention_batch = None
@@ -3722,11 +5000,11 @@ class Trainer():
                             "reference_scores"
                         ],
                     )
-                elif dynamic_context == "prompt_swap":
+                elif dynamic_context in {"prompt_swap", "instance_prompt_swap"}:
                     sample_ids = input_data.get("sample_id")
                     if sample_ids is None:
                         raise RuntimeError(
-                            "Prompt context swap requires fixed-probe sample_id"
+                            f"{dynamic_context} requires fixed-probe sample_id"
                         )
                     sample_ids = [str(item) for item in list(sample_ids)]
                     batch_size = len(sample_ids)
@@ -3736,6 +5014,8 @@ class Trainer():
                         )
                     swap_seed = int(
                         self.cfg.MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP_SEED
+                        if dynamic_context == "prompt_swap"
+                        else self.cfg.MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_SWAP_SEED
                     )
                     order = sorted(
                         range(batch_size),
@@ -3778,13 +5058,16 @@ class Trainer():
                             for index in range(batch_size)
                         ).encode("utf-8")
                     )
-                    context = factory(
-                        model_ref,
-                        target_layer=int(
-                            self.cfg.MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP_LAYER
-                        ),
-                        permutation=permutation,
-                    )
+                    if dynamic_context == "prompt_swap":
+                        context = factory(
+                            model_ref,
+                            target_layer=int(
+                                self.cfg.MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP_LAYER
+                            ),
+                            permutation=permutation,
+                        )
+                    else:
+                        context = factory(model_ref, permutation=permutation)
                 elif dynamic_context:
                     raise RuntimeError(
                         f"Unsupported dynamic intervention context: {dynamic_context}"
@@ -3796,6 +5079,38 @@ class Trainer():
                         inputs, semantics=semantics, class_ids=candidate_class_ids, runtime_targets=None
                     )
                     changed_stats = model_ref.get_runtime_classifier_stats()
+                    if intervention_name in prompt_output_intervention_states:
+                        prompt_output_stats = (
+                            prompt_distribution_stats_getter()
+                            if callable(prompt_distribution_stats_getter)
+                            else {}
+                        )
+                        state = prompt_output_intervention_states[
+                            intervention_name
+                        ]
+                        if isinstance(prompt_output_stats, dict):
+                            for name, values in prompt_output_stats.items():
+                                if name not in {
+                                    "prompt_output_intervention_applied",
+                                    "instance_prompt_norm_before",
+                                    "instance_prompt_norm_after",
+                                    "domain_prompt_norm_before",
+                                    "domain_prompt_norm_after",
+                                    "instance_prompt_swap_fixed_point_ratio",
+                                }:
+                                    continue
+                                if not torch.is_tensor(values):
+                                    continue
+                                values = values.detach().float().reshape(-1)
+                                finite = values[torch.isfinite(values)]
+                                if finite.numel() <= 0:
+                                    continue
+                                state["sums"][name] += float(
+                                    finite.sum().item()
+                                )
+                                state["counts"][name] += int(
+                                    finite.numel()
+                                )
                     changed_visual = changed_stats.get("visual_repr") if isinstance(changed_stats, dict) else None
                     changed_semantic_input = (
                         changed_stats.get("semantic_input")
@@ -3873,6 +5188,8 @@ class Trainer():
                 del changed_logits, changed_logits_cpu, changed_stats
                 del changed_visual, changed_visual_cpu, changed_semantic
                 del changed_semantic_input
+            if source_accumulator is not None:
+                del source_target, source_other, source_true_margin
             model_ref.clear_runtime_state()
             del normal_logits, normal_logits_cpu, normal_visual_input, normal_visual, normal_visual_cpu
             del normal_semantic_input, normal_semantic
@@ -3904,19 +5221,88 @@ class Trainer():
             "prompt_length": prompt_length,
             "semantic_length": semantic_length,
         }
+        source_decomposition = (
+            source_accumulator.finalize()
+            if source_accumulator is not None
+            else {
+                "format": "prompt_source_decomposition_v1",
+                "applicability": (
+                    "not_applicable_prompt_distributor_not_active"
+                    if prompt_analysis_requested
+                    and bool(prompt_analysis_cfg.SOURCE_DECOMPOSITION_ENABLE)
+                    else "not_requested"
+                ),
+                "metrics": {},
+            }
+        )
+        paired_flip = (
+            flip_accumulator.finalize()
+            if flip_accumulator is not None
+            else {
+                "format": "paired_prompt_horizontal_flip_v1",
+                "valid": False,
+                "applicability": (
+                    "not_applicable_affinity_probe_disabled"
+                    if flip_requested and not affinity_enabled
+                    else "not_applicable_no_prompt"
+                    if bool(prompt_analysis_cfg.FLIP_ENABLE) and prompt_length <= 0
+                    else "not_requested"
+                ),
+                "metrics": {},
+                "by_layer": {},
+            }
+        )
+        paired_flip.update({
+            "pair_sample_count": int(flip_pair_sample_count),
+            "pairing_sha256": (
+                flip_pair_hash.hexdigest() if flip_pair_sample_count > 0 else None
+            ),
+            "transform": "horizontal_flip_tensor_last_dimension",
+        })
+        result["prompt_analysis"] = {
+            "format": "prompt_analysis_bundle_v1",
+            "requested": prompt_analysis_requested,
+            "applicability": (
+                "applicable"
+                if prompt_analysis_enabled
+                else "not_applicable_no_prompt"
+                if prompt_analysis_requested
+                else "not_requested"
+            ),
+            "source_decomposition": source_decomposition,
+            "label_dependency_guard": label_guard,
+            "semantic_granularity": {
+                "requested": semantic_granularity_requested,
+                "applicability": (
+                    "applicable"
+                    if semantic_granularity_applicable
+                    else "not_applicable_missing_attribute_groups_or_reference"
+                    if semantic_granularity_requested
+                    else "not_requested"
+                ),
+                "local_attribute_indices": local_attribute_indices,
+                "global_attribute_indices": global_attribute_indices,
+            },
+            "paired_flip": paired_flip,
+        }
         for intervention_name, runtime_contract in intervention_runtime_contracts.items():
             sample_count = int(runtime_contract["sample_count"])
             effect = result["module_effects"][intervention_name]
+            metric_prefix = (
+                "prompt_context_swap"
+                if intervention_name == "prompt_context_swapped"
+                else "instance_prompt_swap"
+            )
             effect["summary"].update({
-                "prompt_context_swap_coverage_ratio": float(
+                f"{metric_prefix}_coverage_ratio": float(
                     runtime_contract["swapped_sample_count"]
                     / max(1, sample_count)
                 ),
-                "prompt_context_swap_same_class_pair_ratio": float(
+                f"{metric_prefix}_same_class_pair_ratio": float(
                     runtime_contract["same_class_pair_count"]
                     / max(1, sample_count)
                 ),
-                "prompt_context_swap_singleton_batch_ratio": float(
+                f"{metric_prefix}_singleton_batch_ratio": float(
                     runtime_contract["singleton_batch_count"]
                     / max(1, int(runtime_contract["batch_count"]))
                 ),
@@ -3936,6 +5322,13 @@ class Trainer():
                 "pairing_sha256": runtime_contract["pairing_hash"].hexdigest(),
                 "pairing_storage": "hash_only",
             }
+        for intervention_name, state in prompt_output_intervention_states.items():
+            effect = result["module_effects"][intervention_name]
+            effect["summary"].update({
+                name: float(total / max(1, state["counts"][name]))
+                for name, total in sorted(state["sums"].items())
+                if state["counts"][name] > 0
+            })
         if affinity_enabled:
             affinity_metrics = affinity_metric_accumulator.finalize()
             affinity_equivalence = self._finalize_equivalence_state(affinity_state)
@@ -3963,6 +5356,18 @@ class Trainer():
                 "prompt_patch_bridge_by_layer": affinity_metrics[
                     "prompt_patch_bridge_by_layer"
                 ],
+                "prompt_content_metrics": affinity_metrics[
+                    "prompt_content_metrics"
+                ],
+                "prompt_content_by_layer": affinity_metrics[
+                    "prompt_content_by_layer"
+                ],
+                "prompt_content_by_layer_and_head": affinity_metrics[
+                    "prompt_content_by_layer_and_head"
+                ],
+                "prompt_content_by_layer_and_prompt": affinity_metrics[
+                    "prompt_content_by_layer_and_prompt"
+                ],
                 "prompt_semantic_role_metrics": affinity_metrics[
                     "prompt_semantic_role"
                 ],
@@ -3972,6 +5377,7 @@ class Trainer():
                 "prompt_semantic_role_by_layer_and_prompt": affinity_metrics[
                     "prompt_semantic_role_by_layer_and_prompt"
                 ],
+                "prompt_role_profiles": affinity_metrics["prompt_role_profiles"],
                 "attribute_concept_grounding_metrics": affinity_metrics[
                     "attribute_concept_grounding"
                 ],
@@ -4489,6 +5895,62 @@ class Trainer():
                         effect["failure_reasons"].append(
                             "Prompt Patch-Value globalization did not collapse local Patch Value dispersion"
                         )
+                if intervention_name == "prompt_value_zeroed":
+                    value_metrics = diagnostics["affinity"][
+                        "attention_flow_metrics"
+                    ]
+                    applied = value_metrics.get("prompt_value_zero_applied")
+                    mass_error = value_metrics.get(
+                        "prompt_value_zero_attention_mass_abs_error"
+                    )
+                    context_delta = value_metrics.get(
+                        "prompt_value_zero_context_delta_norm"
+                    )
+                    tolerance = float(
+                        self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL
+                    )
+                    applied_pass = bool(
+                        applied is not None
+                        and float(applied) >= 1.0 - tolerance
+                    )
+                    attention_preserved_pass = bool(
+                        mass_error is not None
+                        and abs(float(mass_error)) <= tolerance
+                    )
+                    diagnostics["prompt_value_zero_contract"] = {
+                        "applied": applied,
+                        "applied_pass": applied_pass,
+                        "attention_mass_abs_error": mass_error,
+                        "attention_preserved_pass": attention_preserved_pass,
+                        "context_delta_norm": context_delta,
+                    }
+                    effect["summary"].update({
+                        "prompt_value_zero_applied_pass": float(
+                            applied_pass
+                        ),
+                        "prompt_value_zero_attention_preserved_pass": float(
+                            attention_preserved_pass
+                        ),
+                    })
+                    effect["valid"] = bool(
+                        diagnostics["affinity"]["paired_attention_valid"]
+                        and applied_pass
+                        and attention_preserved_pass
+                    )
+                    if not diagnostics["affinity"][
+                        "paired_attention_valid"
+                    ]:
+                        effect["failure_reasons"].append(
+                            "normal/intervention affinity forward equivalence was not jointly valid"
+                        )
+                    if not applied_pass:
+                        effect["failure_reasons"].append(
+                            "Prompt Value removal was not applied on all selected layers"
+                        )
+                    if not attention_preserved_pass:
+                        effect["failure_reasons"].append(
+                            "Prompt Value removal changed Attention probabilities"
+                        )
                 if intervention_name.startswith("prompt_read_blocked_layer_"):
                     source_layer = int(intervention_name.rsplit("_", 1)[-1])
                     source_metrics = diagnostics["affinity"][
@@ -4791,6 +6253,94 @@ class Trainer():
                             effect["failure_reasons"].append(
                                 "Targeted transport selection did not separate selected and unselected Patch scores"
                             )
+            if intervention_name in prompt_output_intervention_states:
+                tolerance = float(
+                    self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL
+                )
+                applied = effect["summary"].get(
+                    "prompt_output_intervention_applied"
+                )
+                applied_pass = bool(
+                    applied is not None
+                    and float(applied) >= 1.0 - tolerance
+                )
+                required_zero_fields = {
+                    "instance_prompt_zeroed": (
+                        "instance_prompt_norm_after",
+                    ),
+                    "domain_prompt_zeroed": (
+                        "domain_prompt_norm_after",
+                    ),
+                    "both_prompt_zeroed": (
+                        "instance_prompt_norm_after",
+                        "domain_prompt_norm_after",
+                    ),
+                }.get(intervention_name, ())
+                zero_pass = bool(
+                    all(
+                        field in effect["summary"]
+                        and abs(float(effect["summary"][field])) <= tolerance
+                        for field in required_zero_fields
+                    )
+                )
+                fixed_point = effect["summary"].get(
+                    "instance_prompt_swap_fixed_point_ratio"
+                )
+                no_self_pair_pass = bool(
+                    intervention_name != "instance_prompt_swapped"
+                    or (
+                        fixed_point is not None
+                        and abs(float(fixed_point)) <= tolerance
+                    )
+                )
+                paired_attention_valid = bool(
+                    diagnostics.get("affinity", {}).get(
+                        "paired_attention_valid", True
+                    )
+                )
+                diagnostics["prompt_output_intervention_contract"] = {
+                    "applied": applied,
+                    "applied_pass": applied_pass,
+                    "required_zero_fields": list(required_zero_fields),
+                    "zero_pass": zero_pass,
+                    "fixed_point_ratio": fixed_point,
+                    "no_self_pair_pass": no_self_pair_pass,
+                    "paired_attention_valid": paired_attention_valid,
+                }
+                effect["summary"].update({
+                    "prompt_output_intervention_applied_pass": float(
+                        applied_pass
+                    ),
+                    "prompt_output_intervention_zero_pass": float(
+                        zero_pass
+                    ),
+                    "instance_prompt_swap_no_self_pair_pass": float(
+                        no_self_pair_pass
+                    ),
+                })
+                effect["valid"] = bool(
+                    effect.get("valid", True)
+                    and applied_pass
+                    and zero_pass
+                    and no_self_pair_pass
+                    and paired_attention_valid
+                )
+                if not applied_pass:
+                    effect["failure_reasons"].append(
+                        "Prompt Distributor output intervention was not observed"
+                    )
+                if not zero_pass:
+                    effect["failure_reasons"].append(
+                        "Prompt Distributor zero intervention left a non-zero target component"
+                    )
+                if not no_self_pair_pass:
+                    effect["failure_reasons"].append(
+                        "Instance Prompt swap contained self-pairs"
+                    )
+                if not paired_attention_valid:
+                    effect["failure_reasons"].append(
+                        "normal/intervention affinity forward equivalence was not jointly valid"
+                    )
             effect["diagnostic_chain"] = diagnostics
             intervention_diagnostics[intervention_name] = diagnostics
         concept_targeted_name = "attribute_concept_prompt_patch_blocked"
@@ -4939,6 +6489,60 @@ class Trainer():
             result["prompt_zero_diagnostics"] = intervention_diagnostics[
                 "prompt_zeroed"
             ]
+        for intervention_name, runtime_contract in (
+            intervention_runtime_contracts.items()
+        ):
+            if int(runtime_contract["singleton_batch_count"]) <= 0:
+                continue
+            effect = result["module_effects"][intervention_name]
+            effect["valid"] = False
+            reasons = effect.setdefault("failure_reasons", [])
+            reason = (
+                "fixed-probe swap contained a singleton batch and could not "
+                "maintain the no-self-pair contract"
+            )
+            if reason not in reasons:
+                reasons.append(reason)
+        component_names = (
+            "instance_prompt_zeroed",
+            "domain_prompt_zeroed",
+            "both_prompt_zeroed",
+        )
+        if all(
+            name in result["module_effects"]
+            and bool(result["module_effects"][name].get("valid", True))
+            for name in component_names
+        ):
+            instance_summary = result["module_effects"][
+                "instance_prompt_zeroed"
+            ]["summary"]
+            domain_summary = result["module_effects"][
+                "domain_prompt_zeroed"
+            ]["summary"]
+            both_summary = result["module_effects"]["both_prompt_zeroed"][
+                "summary"
+            ]
+            interaction = {}
+            for metric_name in sorted(
+                set(instance_summary).intersection(domain_summary, both_summary)
+            ):
+                values = (
+                    instance_summary[metric_name],
+                    domain_summary[metric_name],
+                    both_summary[metric_name],
+                )
+                if all(
+                    isinstance(value, (int, float, np.integer, np.floating))
+                    and math.isfinite(float(value))
+                    for value in values
+                ):
+                    interaction[f"{metric_name}_interaction"] = float(
+                        values[2] - values[1] - values[0]
+                    )
+            result["prompt_component_synergy"] = {
+                "formula": "delta_both_zero_minus_delta_domain_zero_minus_delta_instance_zero",
+                "metrics": interaction,
+            }
         if semantic_enabled:
             synchronized = synchronized_accumulator.finalize()
             mismatched = mismatched_accumulator.finalize()
@@ -5260,7 +6864,7 @@ class Trainer():
         self.diagnostic_manager.record_module_effect_artifact(
             relative_path,
             {
-                "format": "baseline_module_effect_summary_v8",
+                "format": "baseline_module_effect_summary_v9",
                 "pair_id": pair_id,
                 "checkpoint": checkpoint_manifest,
                 "probe_id": manifest["probe_id"],
@@ -5327,6 +6931,13 @@ class Trainer():
             return
         selection_seed = int(selection_seed)
         artifact_prefix = str(artifact_prefix or "").strip("/")
+        if bool(
+            self.cfg.MONITOR.PROBE.EXPLANATION_VALIDITY.ENABLE
+        ) and not bool(self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.ENABLE):
+            raise ValueError(
+                "MONITOR.PROBE.EXPLANATION_VALIDITY.ENABLE requires "
+                "MONITOR.PROBE.TARGET_RELEVANCE.ENABLE"
+            )
 
         def artifact_path(relative_path):
             relative_path = str(relative_path).lstrip("/")
@@ -5357,7 +6968,7 @@ class Trainer():
         }
         output_root_reference = "../" * (1 + len([item for item in artifact_prefix.split("/") if item]))
         combined_manifest = {
-            "format": "baseline_fixed_probe_collection_v9",
+            "format": "baseline_fixed_probe_collection_v11",
             "run_id": self.monitor_manager.run_id,
             "session_id": self.monitor_manager.session_id,
             "selection_seed": selection_seed,
@@ -5378,6 +6989,9 @@ class Trainer():
             "validity": {},
             "semantic_interventions": {},
             "target_relevance": {},
+            "explanation_validity": {},
+            "prompt_analysis": {},
+            "bayesian_object_selection": {},
             "patch_semantic_transport": {},
         }
         normal_results = {}
@@ -5385,6 +6999,8 @@ class Trainer():
         class_aggregates = {}
         intervention_diagnostic_status = {}
         target_relevance_status = {}
+        bayesian_object_selection_status = {}
+        bayesian_object_selection_reports = {}
         all_rows = []
         deterministic_transform = get_transforms("test_seen", self.cfg.DATA.CROPSIZE)
         prepared_probes = []
@@ -5479,6 +7095,106 @@ class Trainer():
             bundle = self._execute_fixed_probe_bundle(
                 probe_loader, dataset, candidate_class_ids, split=split
             )
+            if bool(
+                self.cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION.ENABLE
+            ):
+                object_loader = torch.utils.data.DataLoader(
+                    FixedProbeDataset(dataset, manifest, deterministic_transform),
+                    batch_size=max(1, int(self.cfg.MONITOR.PROBE.BATCH_SIZE)),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=False,
+                    drop_last=False,
+                )
+                object_result = self._execute_bayesian_object_selection_probe(
+                    object_loader,
+                    dataset,
+                    candidate_class_ids,
+                    split=split,
+                )
+                object_root = f"bayesian_object_selection/{checkpoint_id}"
+                object_artifacts = {}
+                for artifact_name, payload_name in (
+                    ("candidate_registry", "registry"),
+                    ("functional_geometry", "functional_geometry"),
+                    ("hierarchy_trace", "hierarchy_trace"),
+                    ("source_retention", "source_retention"),
+                    ("candidate_report", "object_selection_report"),
+                ):
+                    payload = object_result.get(payload_name)
+                    if not isinstance(payload, dict):
+                        continue
+                    path = artifact_path(
+                        f"{object_root}/{split}_{artifact_name}.json"
+                    )
+                    self.diagnostic_manager.record_probe_artifact(
+                        path,
+                        {
+                            **payload,
+                            "checkpoint": checkpoint_manifest,
+                            "probe_id": manifest["probe_id"],
+                            "probe_manifest_sha256": manifest[
+                                "manifest_sha256"
+                            ],
+                            "selection_seed": selection_seed,
+                            "split": split,
+                            "candidate_class_ids": [
+                                int(item) for item in candidate_class_ids
+                            ],
+                        },
+                    )
+                    object_artifacts[artifact_name] = path
+                status = {
+                    "requested": True,
+                    "applicability": object_result.get("applicability"),
+                    "observed": bool(object_result.get("observed", False)),
+                    "valid": object_result.get("valid"),
+                    "failure_reason": object_result.get("failure_reason"),
+                    "artifacts": object_artifacts,
+                    "posterior_interpretation_allowed": False,
+                }
+                bayesian_object_selection_status[split] = status
+                combined_manifest["bayesian_object_selection"][split] = dict(
+                    status
+                )
+                object_report = object_result.get("object_selection_report")
+                if isinstance(object_report, dict):
+                    bayesian_object_selection_reports[split] = object_report
+                hierarchy_trace = object_result.get("hierarchy_trace", {})
+                all_rows.extend(self._probe_metric_rows(
+                    numeric_leaf_metrics(
+                        {
+                            "distance_correspondence": hierarchy_trace.get(
+                                "distance_correspondence", {}
+                            ),
+                            "normalized_trace_variance": hierarchy_trace.get(
+                                "normalized_trace_variance", {}
+                            ),
+                            "propagation": hierarchy_trace.get(
+                                "propagation", {}
+                            ),
+                            "collapse": hierarchy_trace.get("collapse", {}),
+                            "functional_null": hierarchy_trace.get(
+                                "perturbation_functional_null_direction_ratio", {}
+                            ),
+                            "reference_distance_by_stage": hierarchy_trace.get(
+                                "reference_distance_by_stage", {}
+                            ),
+                            "prediction_effect": hierarchy_trace.get(
+                                "prediction_effect", {}
+                            ),
+                        }
+                    ),
+                    checkpoint_id=checkpoint_id,
+                    probe_id=manifest["probe_id"],
+                    split=split,
+                    condition="controlled_perturbation",
+                    domain="bayesian_object_selection",
+                    entity_type="hierarchy_trace",
+                    entity_id="source_to_prediction",
+                    selection_seed=selection_seed,
+                    probe_manifest_sha256=manifest["manifest_sha256"],
+                ))
             if bool(self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.ENABLE):
                 relevance_loader = torch.utils.data.DataLoader(
                     FixedProbeDataset(dataset, manifest, deterministic_transform),
@@ -5532,6 +7248,106 @@ class Trainer():
                 combined_manifest["target_relevance"][split] = dict(
                     target_relevance_status[split]
                 )
+                explanation_validity = target_relevance.get(
+                    "explanation_validity", {}
+                )
+                if explanation_validity.get("requested", False):
+                    explanation_path = artifact_path(
+                        f"explanation_validity/{checkpoint_id}/{split}_summary.json"
+                    )
+                    self.diagnostic_manager.record_probe_artifact(
+                        explanation_path,
+                        {
+                            **explanation_validity,
+                            "checkpoint": checkpoint_manifest,
+                            "probe_id": manifest["probe_id"],
+                            "probe_manifest_sha256": manifest[
+                                "manifest_sha256"
+                            ],
+                            "selection_seed": selection_seed,
+                        },
+                    )
+                    combined_manifest["explanation_validity"][split] = {
+                        "requested": True,
+                        "valid": explanation_validity.get("valid"),
+                        "directional_support_pass": explanation_validity.get(
+                            "directional_support_pass"
+                        ),
+                        "artifact_path": explanation_path,
+                        "failure_reasons": explanation_validity.get(
+                            "failure_reasons", []
+                        ),
+                    }
+                    for layer_index, conditions in sorted(
+                        explanation_validity.get(
+                            "by_layer_condition", {}
+                        ).items()
+                    ):
+                        for condition, curve in sorted(conditions.items()):
+                            all_rows.extend(self._probe_metric_rows(
+                                {
+                                    "margin_drop_auc": curve[
+                                        "margin_drop_auc"
+                                    ],
+                                    "accuracy_drop_auc": curve[
+                                        "accuracy_drop_auc"
+                                    ],
+                                },
+                                checkpoint_id=checkpoint_id,
+                                probe_id=manifest["probe_id"],
+                                split=split,
+                                condition=f"{condition}_relevance_deleted",
+                                domain="explanation_validity",
+                                entity_type="layer_curve",
+                                entity_id=f"layer_{layer_index}",
+                                selection_seed=selection_seed,
+                                probe_manifest_sha256=manifest[
+                                    "manifest_sha256"
+                                ],
+                            ))
+                            for point in curve.get("points", []):
+                                fraction = float(point["fraction"])
+                                all_rows.extend(self._probe_metric_rows(
+                                    {
+                                        name: value
+                                        for name, value in point.items()
+                                        if name != "fraction"
+                                    },
+                                    checkpoint_id=checkpoint_id,
+                                    probe_id=manifest["probe_id"],
+                                    split=split,
+                                    condition=(
+                                        f"{condition}_relevance_deleted"
+                                    ),
+                                    domain="explanation_validity",
+                                    entity_type="layer_fraction",
+                                    entity_id=(
+                                        f"layer_{layer_index}/fraction_{fraction:g}"
+                                    ),
+                                    selection_seed=selection_seed,
+                                    probe_manifest_sha256=manifest[
+                                        "manifest_sha256"
+                                    ],
+                                ))
+                    for layer_index, metrics in sorted(
+                        explanation_validity.get(
+                            "comparisons_by_layer", {}
+                        ).items()
+                    ):
+                        all_rows.extend(self._probe_metric_rows(
+                            metrics,
+                            checkpoint_id=checkpoint_id,
+                            probe_id=manifest["probe_id"],
+                            split=split,
+                            condition="relevance_ranked_vs_random",
+                            domain="explanation_validity",
+                            entity_type="layer_control",
+                            entity_id=f"layer_{layer_index}",
+                            selection_seed=selection_seed,
+                            probe_manifest_sha256=manifest[
+                                "manifest_sha256"
+                            ],
+                        ))
                 all_rows.extend(self._probe_metric_rows(
                     target_relevance["equivalence"],
                     checkpoint_id=checkpoint_id,
@@ -5622,6 +7438,291 @@ class Trainer():
                 "selection_seed": selection_seed,
                 "normal": bundle["normal_accumulator"].class_aggregates(),
             }
+            prompt_analysis = bundle.get("prompt_analysis", {})
+            if prompt_analysis.get("requested", False):
+                prompt_analysis_status = {
+                    "format": prompt_analysis.get(
+                        "format", "prompt_analysis_bundle_v1"
+                    ),
+                    "requested": True,
+                    "applicability": prompt_analysis.get("applicability"),
+                    "source_decomposition": {},
+                    "label_dependency_guard": {},
+                    "semantic_granularity": prompt_analysis.get(
+                        "semantic_granularity", {}
+                    ),
+                    "paired_flip": {},
+                    "content": {
+                        "requested": bool(
+                            self.cfg.MONITOR.PROBE.PROMPT_ANALYSIS.CONTENT_ENABLE
+                        ),
+                        "observed": False,
+                        "valid": None,
+                    },
+                    "role_profile": {
+                        "requested": bool(
+                            self.cfg.MONITOR.PROBE.PROMPT_ANALYSIS.ROLE_PROFILE_EXPORT_ENABLE
+                        ),
+                        "observed": False,
+                        "valid": None,
+                    },
+                }
+                prompt_affinity = bundle.get("affinity")
+                if prompt_affinity is not None:
+                    prompt_equivalence_pass = bool(
+                        prompt_affinity.get("equivalence", {}).get(
+                            "affinity_forward_equivalence_pass", 0.0
+                        )
+                    )
+                    if prompt_analysis_status["content"]["requested"]:
+                        content_observed = bool(
+                            prompt_affinity.get(
+                                "prompt_content_by_layer", {}
+                            )
+                        )
+                        prompt_analysis_status["content"].update({
+                            "observed": content_observed,
+                            "valid": bool(
+                                prompt_equivalence_pass and content_observed
+                            ),
+                            "reason": (
+                                None
+                                if prompt_equivalence_pass and content_observed
+                                else "affinity_forward_equivalence_failed"
+                                if not prompt_equivalence_pass
+                                else "prompt_content_not_observed"
+                            ),
+                        })
+                    if prompt_analysis_status["role_profile"]["requested"]:
+                        profile_observed = bool(
+                            prompt_affinity.get("prompt_role_profiles", {})
+                        )
+                        prompt_analysis_status["role_profile"].update({
+                            "observed": profile_observed,
+                            "valid": bool(
+                                prompt_equivalence_pass and profile_observed
+                            ),
+                            "reason": (
+                                None
+                                if prompt_equivalence_pass and profile_observed
+                                else "affinity_forward_equivalence_failed"
+                                if not prompt_equivalence_pass
+                                else "prompt_role_profile_not_observed"
+                            ),
+                        })
+                source_decomposition = prompt_analysis.get(
+                    "source_decomposition", {}
+                )
+                if bool(
+                    self.cfg.MONITOR.PROBE.PROMPT_ANALYSIS.SOURCE_DECOMPOSITION_ENABLE
+                ):
+                    source_path = artifact_path(
+                        f"prompt_source/{checkpoint_id}/{split}_summary.json"
+                    )
+                    self.diagnostic_manager.record_probe_artifact(
+                        source_path,
+                        {
+                            **source_decomposition,
+                            "checkpoint": checkpoint_manifest,
+                            "probe_id": manifest["probe_id"],
+                            "probe_manifest_sha256": manifest[
+                                "manifest_sha256"
+                            ],
+                            "selection_seed": selection_seed,
+                            "split": split,
+                        },
+                    )
+                    prompt_analysis_status["source_decomposition"] = {
+                        "applicability": source_decomposition.get(
+                            "applicability"
+                        ),
+                        "raw_observed": source_decomposition.get(
+                            "raw_observed", False
+                        ),
+                        "contextualized_domain_observed": (
+                            source_decomposition.get(
+                                "contextualized_domain_observed", False
+                            )
+                        ),
+                        "artifact_path": source_path,
+                    }
+                    all_rows.extend(self._probe_metric_rows(
+                        source_decomposition.get("metrics", {}),
+                        checkpoint_id=checkpoint_id,
+                        probe_id=manifest["probe_id"],
+                        split=split,
+                        domain="prompt_distribution",
+                        entity_type="source_decomposition",
+                        entity_id="instance_domain_sources",
+                        selection_seed=selection_seed,
+                        probe_manifest_sha256=manifest[
+                            "manifest_sha256"
+                        ],
+                    ))
+                label_guard = prompt_analysis.get(
+                    "label_dependency_guard", {}
+                )
+                if bool(
+                    self.cfg.MONITOR.PROBE.PROMPT_ANALYSIS.LABEL_DEPENDENCY_GUARD_ENABLE
+                ):
+                    label_guard_path = artifact_path(
+                        f"prompt_label_dependency/{checkpoint_id}/"
+                        f"{split}_summary.json"
+                    )
+                    self.diagnostic_manager.record_probe_artifact(
+                        label_guard_path,
+                        {
+                            **label_guard,
+                            "checkpoint": checkpoint_manifest,
+                            "probe_id": manifest["probe_id"],
+                            "probe_manifest_sha256": manifest[
+                                "manifest_sha256"
+                            ],
+                            "selection_seed": selection_seed,
+                            "split": split,
+                        },
+                    )
+                    prompt_analysis_status["label_dependency_guard"] = {
+                        "applicability": label_guard.get("applicability"),
+                        "observed": label_guard.get("observed", False),
+                        "valid": label_guard.get("valid"),
+                        "artifact_path": label_guard_path,
+                        "failure_reasons": label_guard.get(
+                            "failure_reasons", []
+                        ),
+                    }
+                    all_rows.extend(self._probe_metric_rows(
+                        label_guard.get("metrics", {}),
+                        checkpoint_id=checkpoint_id,
+                        probe_id=manifest["probe_id"],
+                        split=split,
+                        domain="prompt_distribution",
+                        entity_type="runtime_guard",
+                        entity_id="label_dependency",
+                        selection_seed=selection_seed,
+                        probe_manifest_sha256=manifest[
+                            "manifest_sha256"
+                        ],
+                    ))
+                paired_flip = prompt_analysis.get("paired_flip", {})
+                if bool(
+                    self.cfg.MONITOR.PROBE.PROMPT_ANALYSIS.FLIP_ENABLE
+                ):
+                    flip_path = artifact_path(
+                        f"paired_flip/{checkpoint_id}/{split}_summary.json"
+                    )
+                    self.diagnostic_manager.record_probe_artifact(
+                        flip_path,
+                        {
+                            **paired_flip,
+                            "checkpoint": checkpoint_manifest,
+                            "probe_id": manifest["probe_id"],
+                            "probe_manifest_sha256": manifest[
+                                "manifest_sha256"
+                            ],
+                            "selection_seed": selection_seed,
+                            "split": split,
+                        },
+                    )
+                    prompt_analysis_status["paired_flip"] = {
+                        "applicability": paired_flip.get("applicability"),
+                        "valid": paired_flip.get("valid", False),
+                        "observed_layers": paired_flip.get(
+                            "observed_layers", []
+                        ),
+                        "artifact_path": flip_path,
+                    }
+                    spatial_metrics = {
+                        name: value
+                        for name, value in paired_flip.get(
+                            "metrics", {}
+                        ).items()
+                        if name.startswith(("prompt_patch_", "prompt_av_"))
+                    }
+                    assignment_metrics = {
+                        name: value
+                        for name, value in paired_flip.get(
+                            "metrics", {}
+                        ).items()
+                        if name.startswith("assignment_")
+                    }
+                    prediction_metrics = {
+                        name: value
+                        for name, value in paired_flip.get(
+                            "metrics", {}
+                        ).items()
+                        if name.startswith("prediction_")
+                    }
+                    for metrics, domain, entity_id in (
+                        (
+                            spatial_metrics,
+                            "attention_flow_reference",
+                            "paired_horizontal_flip_spatial",
+                        ),
+                        (
+                            assignment_metrics,
+                            "prompt_semantic_role_reference",
+                            "paired_horizontal_flip_assignment",
+                        ),
+                        (
+                            prediction_metrics,
+                            "prediction_health",
+                            "paired_horizontal_flip_prediction",
+                        ),
+                    ):
+                        all_rows.extend(self._probe_metric_rows(
+                            metrics,
+                            checkpoint_id=checkpoint_id,
+                            probe_id=manifest["probe_id"],
+                            split=split,
+                            condition="horizontal_flip_paired",
+                            domain=domain,
+                            entity_type="paired_transform",
+                            entity_id=entity_id,
+                            selection_seed=selection_seed,
+                            probe_manifest_sha256=manifest[
+                                "manifest_sha256"
+                            ],
+                        ))
+                    for layer_index, metrics in sorted(
+                        paired_flip.get("by_layer", {}).items()
+                    ):
+                        for prefix, domain, entity_suffix in (
+                            (
+                                ("prompt_patch_", "prompt_av_"),
+                                "attention_flow_reference",
+                                "spatial",
+                            ),
+                            (
+                                ("assignment_",),
+                                "prompt_semantic_role_reference",
+                                "assignment",
+                            ),
+                        ):
+                            selected = {
+                                name: value
+                                for name, value in metrics.items()
+                                if name.startswith(prefix)
+                            }
+                            all_rows.extend(self._probe_metric_rows(
+                                selected,
+                                checkpoint_id=checkpoint_id,
+                                probe_id=manifest["probe_id"],
+                                split=split,
+                                condition="horizontal_flip_paired",
+                                domain=domain,
+                                entity_type="layer_paired_transform",
+                                entity_id=(
+                                    f"layer_{layer_index}/{entity_suffix}"
+                                ),
+                                selection_seed=selection_seed,
+                                probe_manifest_sha256=manifest[
+                                    "manifest_sha256"
+                                ],
+                            ))
+                combined_manifest["prompt_analysis"][split] = (
+                    prompt_analysis_status
+                )
             for condition, condition_metrics in bundle["conditions"].items():
                 for domain in (
                     "classification", "representation_geometry",
@@ -5708,6 +7809,159 @@ class Trainer():
                     probe_manifest_sha256=manifest["manifest_sha256"],
                 ))
                 if equivalence_pass:
+                    all_rows.extend(self._probe_metric_rows(
+                        affinity["prompt_content_metrics"],
+                        checkpoint_id=checkpoint_id,
+                        probe_id=manifest["probe_id"],
+                        split=split,
+                        domain="attention_flow_reference",
+                        entity_type="prompt_content",
+                        entity_id="all_layers",
+                        selection_seed=selection_seed,
+                        probe_manifest_sha256=manifest[
+                            "manifest_sha256"
+                        ],
+                    ))
+                    for layer_index, layer_metrics in sorted(
+                        affinity["prompt_content_by_layer"].items()
+                    ):
+                        all_rows.extend(self._probe_metric_rows(
+                            layer_metrics,
+                            checkpoint_id=checkpoint_id,
+                            probe_id=manifest["probe_id"],
+                            split=split,
+                            domain="attention_flow_reference",
+                            entity_type="layer_prompt_content",
+                            entity_id=f"layer_{layer_index}",
+                            selection_seed=selection_seed,
+                            probe_manifest_sha256=manifest[
+                                "manifest_sha256"
+                            ],
+                        ))
+                    for layer_index, head_metrics in sorted(
+                        affinity[
+                            "prompt_content_by_layer_and_head"
+                        ].items()
+                    ):
+                        for head_index, metrics in sorted(
+                            head_metrics.items()
+                        ):
+                            all_rows.extend(self._probe_metric_rows(
+                                metrics,
+                                checkpoint_id=checkpoint_id,
+                                probe_id=manifest["probe_id"],
+                                split=split,
+                                domain="attention_flow_reference",
+                                entity_type="layer_head_prompt_content",
+                                entity_id=(
+                                    f"layer_{layer_index}/head_{head_index}"
+                                ),
+                                selection_seed=selection_seed,
+                                probe_manifest_sha256=manifest[
+                                    "manifest_sha256"
+                                ],
+                            ))
+                    for layer_index, prompt_metrics in sorted(
+                        affinity[
+                            "prompt_content_by_layer_and_prompt"
+                        ].items()
+                    ):
+                        for prompt_index, metrics in sorted(
+                            prompt_metrics.items()
+                        ):
+                            numeric_metrics = {
+                                name: value
+                                for name, value in metrics.items()
+                                if name != "prompt_type"
+                            }
+                            all_rows.extend(self._probe_metric_rows(
+                                numeric_metrics,
+                                checkpoint_id=checkpoint_id,
+                                probe_id=manifest["probe_id"],
+                                split=split,
+                                domain="prompt_semantic_role_reference",
+                                entity_type="layer_prompt_slot_health",
+                                entity_id=(
+                                    f"layer_{layer_index}/prompt_{prompt_index}/"
+                                    f"type_{metrics.get('prompt_type', 'visual')}"
+                                ),
+                                selection_seed=selection_seed,
+                                probe_manifest_sha256=manifest[
+                                    "manifest_sha256"
+                                ],
+                            ))
+                    role_profiles = affinity.get("prompt_role_profiles", {})
+                    if role_profiles:
+                        distributor_active = bool(
+                            self.cfg.MODEL.PROMPT.ENABLE
+                            and self.cfg.MODEL.PROMPT.DISTRIBUTOR.ENABLE
+                            and str(
+                                self.cfg.MODEL.PROMPT.INIT_SOURCE
+                            ).lower() == "distributor_mean"
+                        )
+                        instance_tokens = (
+                            int(
+                                self.cfg.MODEL.PROMPT.DISTRIBUTOR.INSTANCE_TOKENS
+                            )
+                            if distributor_active
+                            else 0
+                        )
+                        domain_tokens = (
+                            int(
+                                self.cfg.MODEL.PROMPT.DISTRIBUTOR.DOMAIN_TOKENS
+                            )
+                            if distributor_active
+                            else 0
+                        )
+                        prompt_types = [
+                            (
+                                "instance"
+                                if prompt_index < instance_tokens
+                                else "domain"
+                                if prompt_index
+                                < instance_tokens + domain_tokens
+                                else "visual"
+                            )
+                            for prompt_index in range(bundle["prompt_length"])
+                        ]
+                        role_profile_path = artifact_path(
+                            f"prompt_role_profiles/{checkpoint_id}/"
+                            f"{split}.json"
+                        )
+                        self.diagnostic_manager.record_probe_artifact(
+                            role_profile_path,
+                            {
+                                "format": "prompt_role_profile_v1",
+                                "checkpoint": checkpoint_manifest,
+                                "probe_id": manifest["probe_id"],
+                                "probe_manifest_sha256": manifest[
+                                    "manifest_sha256"
+                                ],
+                                "selection_seed": selection_seed,
+                                "split": split,
+                                "prompt_mode": (
+                                    "distributor_instance_domain"
+                                    if distributor_active
+                                    else "static_visual_prompt"
+                                ),
+                                "prompt_types": prompt_types,
+                                "layers": role_profiles,
+                            },
+                        )
+                        combined_manifest["prompt_analysis"].setdefault(
+                            split,
+                            {
+                                "requested": True,
+                                "applicability": "applicable",
+                            },
+                        ).setdefault("role_profile", {}).update({
+                            "requested": True,
+                            "observed": True,
+                            "valid": True,
+                            "artifact_path": role_profile_path,
+                            "layer_count": len(role_profiles),
+                            "reason": None,
+                        })
                     all_rows.extend(self._probe_metric_rows(
                         affinity["attention_flow_metrics"],
                         checkpoint_id=checkpoint_id,
@@ -6483,6 +8737,40 @@ class Trainer():
                     selection_seed=selection_seed,
                     probe_manifest_sha256=manifest["manifest_sha256"],
                 ))
+            component_synergy = bundle.get("prompt_component_synergy")
+            if component_synergy:
+                synergy_path = artifact_path(
+                    f"module_effect/{checkpoint_id}/{split}/"
+                    "instance_domain_synergy.json"
+                )
+                self.diagnostic_manager.record_module_effect_artifact(
+                    synergy_path,
+                    {
+                        "format": "prompt_component_synergy_v1",
+                        "checkpoint": checkpoint_manifest,
+                        "probe_id": manifest["probe_id"],
+                        "probe_manifest_sha256": manifest[
+                            "manifest_sha256"
+                        ],
+                        "selection_seed": selection_seed,
+                        "split": split,
+                        **component_synergy,
+                    },
+                )
+                all_rows.extend(self._probe_metric_rows(
+                    component_synergy.get("metrics", {}),
+                    checkpoint_id=checkpoint_id,
+                    probe_id=manifest["probe_id"],
+                    split=split,
+                    condition="instance_domain_component_zero",
+                    domain="module_effect",
+                    entity_type="component_interaction",
+                    entity_id="instance_domain_synergy",
+                    selection_seed=selection_seed,
+                    probe_manifest_sha256=manifest[
+                        "manifest_sha256"
+                    ],
+                ))
 
         if "probe_test_seen" in normal_results and "probe_test_unseen" in normal_results:
             seen_result = normal_results["probe_test_seen"]
@@ -6557,6 +8845,28 @@ class Trainer():
             probe_manifest=combined_manifest,
         )
         self.diagnostic_manager.record_probe_artifact(comparability_path, comparability)
+        if bayesian_object_selection_reports:
+            self.diagnostic_manager.record_probe_artifact(
+                artifact_path(
+                    "bayesian_object_selection/object_selection_report.json"
+                ),
+                {
+                    "format": "bayesian_object_selection_collection_v1",
+                    "checkpoint": checkpoint_manifest,
+                    "selection_seed": selection_seed,
+                    "probe_manifest_path": probe_manifest_path,
+                    "recommended_candidate": None,
+                    "selection_status": "insufficient_evidence",
+                    "reason": (
+                        "controlled perturbation evidence is available, but held-out "
+                        "and cross-training-seed gates are not completed"
+                    ),
+                    "reports_by_split": bayesian_object_selection_reports,
+                    "automatic_composite_score_used": False,
+                    "test_unseen_used_for_selection": False,
+                    "posterior_metrics_deferred": True,
+                },
+            )
         self.diagnostic_manager.record_probe_artifact(
             artifact_path("fixed_probe_class_aggregates.json"),
             {
@@ -6643,7 +8953,7 @@ class Trainer():
             self.diagnostic_manager.record_module_effect_artifact(
                 module_effect_manifest_path,
                 {
-                    "format": "baseline_module_effect_v8",
+                    "format": "baseline_module_effect_v9",
                     "checkpoint": checkpoint_manifest,
                     "selection_seed": selection_seed,
                     "probe_manifest_path": probe_manifest_path,
@@ -6686,6 +8996,24 @@ class Trainer():
                     self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.ENABLE
                 ),
                 "target_relevance_by_split": target_relevance_status,
+                "explanation_validity_enabled": bool(
+                    self.cfg.MONITOR.PROBE.EXPLANATION_VALIDITY.ENABLE
+                ),
+                "explanation_validity_by_split": combined_manifest[
+                    "explanation_validity"
+                ],
+                "prompt_analysis_enabled": bool(
+                    self.cfg.MONITOR.PROBE.PROMPT_ANALYSIS.ENABLE
+                ),
+                "prompt_analysis_by_split": combined_manifest[
+                    "prompt_analysis"
+                ],
+                "bayesian_object_selection_enabled": bool(
+                    self.cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION.ENABLE
+                ),
+                "bayesian_object_selection_by_split": (
+                    bayesian_object_selection_status
+                ),
                 "semantic_intervention_enabled": bool(self.cfg.MONITOR.PROBE.SEMANTIC_INTERVENTION.ENABLE),
                 "semantic_intervention_pass": semantic_overall_pass,
                 "semantic_intervention_failure_reasons": (
@@ -7055,7 +9383,7 @@ class Trainer():
             if isinstance(outputs, dict) and "logits" in outputs:
                 logits = outputs["logits"]
 
-            total_logits.append(logits)
+            total_logits.append(logits.detach().to(device="cpu"))
 
             # visualization：当前 split 若启用，就积累 trend 并保存若干样本图
             if self._vis_split_enabled(prefix):
@@ -7090,7 +9418,7 @@ class Trainer():
 
         # 一个 split 跑完后的整体日志
         # 把所有 batch 的 logits 拼成全量矩阵
-        joint_logits = torch.cat(total_logits, dim=0).cpu().numpy()
+        joint_logits = torch.cat(total_logits, dim=0).numpy()
 
         # 调 evaluator 做正式指标计算 这里已经是在 dataset-defined eval local space 上了
         raw_metrics = self.evaluator.classify(joint_logits, total_targets)

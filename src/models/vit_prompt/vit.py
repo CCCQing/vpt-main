@@ -32,7 +32,14 @@ from torch.nn import Conv2d, Dropout, LayerNorm
 from scipy import ndimage
 
 
-from ..vit_backbones.vit import CONFIGS, Transformer, VisionTransformer, np2th
+from ..vit_backbones.vit import (
+    CONFIGS,
+    Transformer,
+    VisionTransformer,
+    _attach_prompt_continuity_to_layer,
+    _offload_diagnostic_tree,
+    np2th,
+)
 from ...utils import logging
 from ...utils.reproducibility import make_torch_generator
 
@@ -682,6 +689,7 @@ class PromptedTransformer(Transformer):
         self._shape_debug_incorporate_logged = False
         self._last_prompt_path_info = {}
         self._last_prompt_distribution_stats = None
+        self._last_injected_prompt_tokens = None
         self._last_attention_mediation_stats = []
         self._runtime_prompt_distribution_override = None
 
@@ -800,21 +808,9 @@ class PromptedTransformer(Transformer):
     def _attach_prompt_layer_continuity(affinities):
         previous_output = None
         for affinity in affinities or []:
-            if not isinstance(affinity, dict):
-                previous_output = None
-                continue
-            current_input = affinity.get("_prompt_layer_input_vector")
-            current_output = affinity.get("_prompt_layer_output_vector")
-            if torch.is_tensor(previous_output) and torch.is_tensor(current_input):
-                affinity["prompt_previous_output_to_current_input_cosine"] = (
-                    torch.nn.functional.cosine_similarity(
-                        previous_output, current_input, dim=-1, eps=1e-12
-                    )
-                )
-                affinity["prompt_previous_output_to_current_input_gap_norm"] = (
-                    current_input - previous_output
-                ).norm(dim=-1)
-            previous_output = current_output if torch.is_tensor(current_output) else None
+            previous_output = _attach_prompt_continuity_to_layer(
+                affinity, previous_output
+            )
 
     def _active_semantic_length(self, semantics) -> int:
         if self.semantic_tokens_enable and torch.is_tensor(semantics):
@@ -912,6 +908,7 @@ class PromptedTransformer(Transformer):
         B = x.shape[0]
         self._last_semantic_token_state = None
         self._last_prompt_distribution_stats = None
+        self._last_injected_prompt_tokens = None
 
         # 提取 patch token，但此时还没有 CLS / pos / prompt
         # 先提取原始 ViT patch token；此时还没有 CLS、position embedding 和 prompt。
@@ -966,6 +963,10 @@ class PromptedTransformer(Transformer):
         else:
             prompt_tokens = x_base[:, :0, :]
             x = x_base
+
+        self._last_injected_prompt_tokens = (
+            prompt_tokens.detach() if torch.is_tensor(prompt_tokens) else None
+        )
 
         # semantic tokens 始终拼在序列最后，保持 affinity monitor 的切片协议不变。
         semantic_tokens = x[:, :0, :]
@@ -1172,6 +1173,16 @@ class PromptedTransformer(Transformer):
         # 带 affinity 输出的 deep prompt 路径也必须传入同一 mediation 配置，
         # 否则训练前向和可视化/监测前向会走不同的 attention 计算图。
         effective_affinity_config = affinity_config
+        offload_diagnostics = bool(
+            effective_affinity_config.get(
+                "offload_diagnostics_to_cpu", False
+            )
+        )
+        if offload_diagnostics and torch.is_grad_enabled():
+            raise RuntimeError(
+                "Affinity diagnostic CPU offload is only valid in a no-grad forward"
+            )
+        previous_prompt_output = None
         for i in range(num_layers):
             if i == 0:
                 # 第 0 层直接跑 ViT block 并导出本层 affinity，供监测/可视化使用。
@@ -1203,9 +1214,21 @@ class PromptedTransformer(Transformer):
                     attention_mediation_config,
                     i,
                 )
+            if offload_diagnostics:
+                previous_prompt_output = _attach_prompt_continuity_to_layer(
+                    affinity, previous_prompt_output
+                )
             if self.encoder.vis:
-                attn_weights.append(weights)
-            affinities.append(affinity)
+                attn_weights.append(
+                    _offload_diagnostic_tree(weights)
+                    if offload_diagnostics
+                    else weights
+                )
+            affinities.append(
+                _offload_diagnostic_tree(affinity)
+                if offload_diagnostics
+                else affinity
+            )
 
         encoded = self.encoder.encoder_norm(hidden_states)
         return encoded, attn_weights, affinities
@@ -1278,13 +1301,24 @@ class PromptedTransformer(Transformer):
                 attention_mediation_config,
             )
 
-        self._attach_prompt_layer_continuity(affinities)
+        offload_diagnostics = bool(
+            effective_affinity_config.get(
+                "offload_diagnostics_to_cpu", False
+            )
+        )
+        if not offload_diagnostics:
+            self._attach_prompt_layer_continuity(affinities)
 
-        self._last_attention_mediation_stats = [
+        attention_mediation_stats = [
             dict(block._last_attention_mediation_stats)
             for block in self.encoder.layer
             if block._last_attention_mediation_stats is not None
         ]
+        self._last_attention_mediation_stats = (
+            _offload_diagnostic_tree(attention_mediation_stats)
+            if offload_diagnostics
+            else attention_mediation_stats
+        )
         self._finalize_semantic_token_state(encoded)
         self._last_token_sequence = encoded
         return encoded, attn_weights, affinities

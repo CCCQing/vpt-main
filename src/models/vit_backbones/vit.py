@@ -64,6 +64,38 @@ def np2th(weights, conv=False):
         weights = weights.transpose([3, 2, 0, 1])
     return torch.from_numpy(weights)
 
+
+def _offload_diagnostic_tree(value):
+    if torch.is_tensor(value):
+        return value.detach().to(device="cpu")
+    if isinstance(value, dict):
+        return {
+            key: _offload_diagnostic_tree(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_offload_diagnostic_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_offload_diagnostic_tree(item) for item in value)
+    return value
+
+
+def _attach_prompt_continuity_to_layer(affinity, previous_output):
+    if not isinstance(affinity, dict):
+        return None
+    current_input = affinity.get("_prompt_layer_input_vector")
+    current_output = affinity.get("_prompt_layer_output_vector")
+    if torch.is_tensor(previous_output) and torch.is_tensor(current_input):
+        affinity["prompt_previous_output_to_current_input_cosine"] = (
+            torch.nn.functional.cosine_similarity(
+                previous_output, current_input, dim=-1, eps=1e-12
+            )
+        )
+        affinity["prompt_previous_output_to_current_input_gap_norm"] = (
+            current_input - previous_output
+        ).norm(dim=-1)
+    return current_output if torch.is_tensor(current_output) else None
+
 ACT2FN = {"gelu": torch.nn.functional.gelu}
 class Attention(nn.Module):
     """
@@ -213,7 +245,50 @@ class Attention(nn.Module):
         ):
             return attention_probs
         changed = attention_probs.clone()
-        if mode == "prompt_patch_value_globalize":
+        if mode == "relevance_edge_delete":
+            deletion_mask = intervention.get("deletion_mask")
+            if not torch.is_tensor(deletion_mask):
+                raise ValueError("relevance_edge_delete requires deletion_mask")
+            deletion_mask = deletion_mask.to(
+                device=attention_probs.device, dtype=torch.bool
+            )
+            if deletion_mask.shape != attention_probs.shape:
+                raise ValueError(
+                    "relevance_edge_delete mask shape does not match attention"
+                )
+            row_all_deleted = deletion_mask.all(dim=-1)
+            if bool(row_all_deleted.any()):
+                keep_index = attention_probs.argmax(dim=-1, keepdim=True)
+                deletion_mask = deletion_mask.clone()
+                deletion_mask.scatter_(
+                    -1,
+                    keep_index,
+                    deletion_mask.gather(-1, keep_index) & ~row_all_deleted.unsqueeze(-1),
+                )
+            deleted_mass = (
+                attention_probs * deletion_mask.to(attention_probs.dtype)
+            ).sum(dim=-1)
+            original_mass = attention_probs.sum(dim=-1, keepdim=True)
+            changed = changed.masked_fill(deletion_mask, 0.0)
+            changed = (
+                changed
+                / changed.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                * original_mass
+            )
+            self._last_prompt_path_intervention_stats = {
+                "relevance_delete_applied": deleted_mass.new_ones(
+                    int(deleted_mass.shape[0])
+                ),
+                "relevance_delete_mass": deleted_mass.mean(dim=(1, 2)),
+                "relevance_delete_edge_ratio": deletion_mask.float().mean(
+                    dim=(1, 2, 3)
+                ),
+                "relevance_delete_row_mass_abs_error": (
+                    changed.sum(dim=-1, keepdim=True) - original_mass
+                ).abs().mean(dim=(1, 2, 3)),
+            }
+            return changed
+        if mode in {"prompt_patch_value_globalize", "prompt_value_zero"}:
             return changed
         if mode == "prompt_patch_uniform":
             prompt_patch_mass = changed[:, :, prompt_slice, patch_slice].sum(
@@ -499,9 +574,10 @@ class Attention(nn.Module):
         semantic_length: int,
     ) -> torch.Tensor:
         intervention = self._prompt_path_intervention
-        if not intervention or str(intervention.get("mode", "")) != (
-            "prompt_patch_value_globalize"
-        ):
+        if not intervention:
+            return context_layer
+        mode = str(intervention.get("mode", ""))
+        if mode not in {"prompt_patch_value_globalize", "prompt_value_zero"}:
             return context_layer
         prompt_length = int(prompt_length)
         semantic_length = int(semantic_length)
@@ -515,6 +591,23 @@ class Attention(nn.Module):
 
         sequence_length = int(attention_probs.shape[-1])
         prompt_slice = slice(1, 1 + prompt_length)
+        if mode == "prompt_value_zero":
+            prompt_attention = attention_probs[:, :, :, prompt_slice]
+            prompt_values = value_layer[:, :, prompt_slice, :]
+            prompt_context = torch.matmul(prompt_attention, prompt_values)
+            changed = context_layer - prompt_context
+            with torch.no_grad():
+                batch_size = int(context_layer.shape[0])
+                self._last_prompt_path_intervention_stats = {
+                    "prompt_value_zero_applied": prompt_context.new_ones(batch_size),
+                    "prompt_value_zero_context_delta_norm": prompt_context.detach().float().norm(
+                        dim=-1
+                    ).mean(dim=(1, 2)),
+                    "prompt_value_zero_attention_mass_abs_error": prompt_context.new_zeros(
+                        batch_size
+                    ),
+                }
+            return changed
         patch_start = 1 + prompt_length
         patch_end = sequence_length - semantic_length
         if patch_end <= patch_start:
@@ -1326,6 +1419,9 @@ class Attention(nn.Module):
                     "_prompt_patch_pre_output_av_magnitude": (
                         prompt_patch_av_magnitude
                     ),
+                    "_prompt_patch_pre_output_content_by_head": (
+                        prompt_patch_context
+                    ),
                 })
         if semantic_length > 0:
             monitors["AcKs_attn"] = attention_probs[:, :, :1, semantic_slice]
@@ -1661,6 +1757,11 @@ class Block(nn.Module):
                     eps=1e-12,
                 )
             )
+            affinity["_prompt_patch_content_vector"] = (
+                prompt_patch_contribution.detach()
+                if detach
+                else prompt_patch_contribution
+            )
 
         cls_patch_attention = affinity.get("AcKv_attn")
         if not torch.is_tensor(cls_patch_attention) or cls_patch_attention.numel() == 0:
@@ -1743,6 +1844,35 @@ class Block(nn.Module):
                 )
                 return similarity[:, mask].reshape(values.shape[0], -1).mean(dim=-1)
 
+            local_attribute_indices = [
+                int(item)
+                for item in concept_config.get("local_attribute_indices", [])
+            ]
+            global_attribute_indices = [
+                int(item)
+                for item in concept_config.get("global_attribute_indices", [])
+            ]
+
+            def semantic_granularity(values, prefix):
+                if not local_attribute_indices or not global_attribute_indices:
+                    return {}
+                local_index = torch.as_tensor(
+                    local_attribute_indices, device=values.device, dtype=torch.long
+                )
+                global_index = torch.as_tensor(
+                    global_attribute_indices, device=values.device, dtype=torch.long
+                )
+                local_share = values.index_select(-1, local_index).sum(dim=-1)
+                global_share = values.index_select(-1, global_index).sum(dim=-1)
+                granularity = (global_share - local_share) / (
+                    global_share + local_share
+                ).clamp_min(1e-12)
+                return {
+                    f"{prefix}_local_attribute_share": local_share,
+                    f"{prefix}_global_attribute_share": global_share,
+                    f"{prefix}_semantic_granularity_index": granularity,
+                }
+
             prompt_attribute_similarity = torch.matmul(
                 prompt_tokens, direction_unit.transpose(0, 1)
             )
@@ -1778,6 +1908,12 @@ class Block(nn.Module):
                     prompt_margin_profile
                 ),
             })
+            affinity.update(
+                semantic_granularity(prompt_true_profile, "prompt_true")
+            )
+            affinity.update(
+                semantic_granularity(prompt_margin_profile, "prompt_margin")
+            )
 
             if torch.is_tensor(prompt_patch_contribution):
                 collection_tokens = torch.nn.functional.normalize(
@@ -1824,6 +1960,14 @@ class Block(nn.Module):
                         )
                     ),
                 })
+                affinity.update(
+                    semantic_granularity(collection_true_profile, "collection_true")
+                )
+                affinity.update(
+                    semantic_granularity(
+                        collection_margin_profile, "collection_margin"
+                    )
+                )
 
             patch_attribute_similarity = torch.matmul(
                 patch_tokens, direction_unit.transpose(0, 1)
@@ -2311,8 +2455,16 @@ class Encoder(nn.Module):
             attn_weights: list，长度 = num_layers（视 vis 而定）
             affinities:   list，长度 = num_layers，每个元素是一层的 raw/vis 亲和字典
         """
+        offload_diagnostics = bool(
+            affinity_config.get("offload_diagnostics_to_cpu", False)
+        )
+        if offload_diagnostics and torch.is_grad_enabled():
+            raise RuntimeError(
+                "Affinity diagnostic CPU offload is only valid in a no-grad forward"
+            )
         attn_weights = []
         affinities = []
+        previous_prompt_output = None
         self._last_attention_mediation_stats = []
         self._last_prompt_state_intervention_stats = []
         for layer_idx, layer_block in enumerate(self.layer):
@@ -2332,15 +2484,39 @@ class Encoder(nn.Module):
             )
             if prompt_state_stats is not None:
                 affinity.update(prompt_state_stats)
-                self._last_prompt_state_intervention_stats.append({
+                prompt_state_record = {
                     "layer_index": int(layer_idx),
                     **prompt_state_stats,
-                })
+                }
+                self._last_prompt_state_intervention_stats.append(
+                    _offload_diagnostic_tree(prompt_state_record)
+                    if offload_diagnostics
+                    else prompt_state_record
+                )
+            if offload_diagnostics:
+                previous_prompt_output = _attach_prompt_continuity_to_layer(
+                    affinity, previous_prompt_output
+                )
             if self.vis:
-                attn_weights.append(weights)
-            affinities.append(affinity)
+                attn_weights.append(
+                    _offload_diagnostic_tree(weights)
+                    if offload_diagnostics
+                    else weights
+                )
+            affinities.append(
+                _offload_diagnostic_tree(affinity)
+                if offload_diagnostics
+                else affinity
+            )
             if layer_block._last_attention_mediation_stats is not None:
-                self._last_attention_mediation_stats.append(dict(layer_block._last_attention_mediation_stats))
+                mediation_stats = dict(
+                    layer_block._last_attention_mediation_stats
+                )
+                self._last_attention_mediation_stats.append(
+                    _offload_diagnostic_tree(mediation_stats)
+                    if offload_diagnostics
+                    else mediation_stats
+                )
         encoded = self.encoder_norm(hidden_states)
         return encoded, attn_weights, affinities
 

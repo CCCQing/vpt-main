@@ -98,6 +98,33 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         "MONITOR.PROBE.TARGET_RELEVANCE.ENABLE": (
             bool(cfg.MONITOR.PROBE.TARGET_RELEVANCE.ENABLE), True
         ),
+        "MONITOR.PROBE.PROMPT_ANALYSIS.ENABLE": (
+            bool(cfg.MONITOR.PROBE.PROMPT_ANALYSIS.ENABLE), True
+        ),
+        "MONITOR.PROBE.PROMPT_ANALYSIS.CONTENT_ENABLE": (
+            bool(cfg.MONITOR.PROBE.PROMPT_ANALYSIS.CONTENT_ENABLE), True
+        ),
+        "MONITOR.PROBE.PROMPT_ANALYSIS.SOURCE_DECOMPOSITION_ENABLE": (
+            bool(
+                cfg.MONITOR.PROBE.PROMPT_ANALYSIS.SOURCE_DECOMPOSITION_ENABLE
+            ),
+            True,
+        ),
+        "MONITOR.PROBE.PROMPT_ANALYSIS.FLIP_ENABLE": (
+            bool(cfg.MONITOR.PROBE.PROMPT_ANALYSIS.FLIP_ENABLE), False
+        ),
+        "MONITOR.PROBE.PROMPT_ANALYSIS.ROLE_PROFILE_EXPORT_ENABLE": (
+            bool(
+                cfg.MONITOR.PROBE.PROMPT_ANALYSIS.ROLE_PROFILE_EXPORT_ENABLE
+            ),
+            False,
+        ),
+        "MONITOR.PROBE.EXPLANATION_VALIDITY.ENABLE": (
+            bool(cfg.MONITOR.PROBE.EXPLANATION_VALIDITY.ENABLE), False
+        ),
+        "MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION.ENABLE": (
+            bool(cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION.ENABLE), False
+        ),
         "MONITOR.PROBE.ATTRIBUTE_CONCEPT_ENABLE": (
             bool(cfg.MONITOR.PROBE.ATTRIBUTE_CONCEPT_ENABLE), True
         ),
@@ -159,6 +186,21 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         "MONITOR.MODULE_EFFECT.TRANSPORT_RANDOM_SEED": (
             int(cfg.MONITOR.MODULE_EFFECT.TRANSPORT_RANDOM_SEED), 161803
         ),
+        "MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_ZERO": (
+            bool(cfg.MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_ZERO), False
+        ),
+        "MONITOR.MODULE_EFFECT.DOMAIN_PROMPT_ZERO": (
+            bool(cfg.MONITOR.MODULE_EFFECT.DOMAIN_PROMPT_ZERO), False
+        ),
+        "MONITOR.MODULE_EFFECT.BOTH_PROMPT_ZERO": (
+            bool(cfg.MONITOR.MODULE_EFFECT.BOTH_PROMPT_ZERO), False
+        ),
+        "MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_SWAP": (
+            bool(cfg.MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_SWAP), False
+        ),
+        "MONITOR.MODULE_EFFECT.PROMPT_VALUE_ZERO": (
+            bool(cfg.MONITOR.MODULE_EFFECT.PROMPT_VALUE_ZERO), False
+        ),
     }
 
     for name, (actual, target) in expected.items():
@@ -190,9 +232,89 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         failures.append("fixed-probe primary and robustness selection seeds must be unique")
     if int(cfg.MONITOR.PROBE.TARGET_RELEVANCE.BATCH_SIZE) <= 0:
         failures.append("MONITOR.PROBE.TARGET_RELEVANCE.BATCH_SIZE must be positive")
+    if bool(cfg.MONITOR.PROBE.EXPLANATION_VALIDITY.ENABLE):
+        if not bool(cfg.MONITOR.PROBE.TARGET_RELEVANCE.ENABLE):
+            failures.append(
+                "EXPLANATION_VALIDITY requires TARGET_RELEVANCE.ENABLE"
+            )
+        explanation_layers = [
+            int(item) for item in cfg.MONITOR.PROBE.EXPLANATION_VALIDITY.LAYERS
+        ]
+        probe_layers = [int(item) for item in cfg.MONITOR.PROBE.LAYERS]
+        if not explanation_layers or not set(explanation_layers).issubset(
+            probe_layers
+        ):
+            failures.append(
+                "EXPLANATION_VALIDITY.LAYERS must be a non-empty subset of PROBE.LAYERS"
+            )
+        fractions = [
+            float(item)
+            for item in cfg.MONITOR.PROBE.EXPLANATION_VALIDITY.K_FRACTIONS
+        ]
+        if not fractions or any(not 0.0 < value < 1.0 for value in fractions):
+            failures.append(
+                "EXPLANATION_VALIDITY.K_FRACTIONS must lie in (0, 1)"
+            )
+        explanation_conditions = {
+            str(item).lower()
+            for item in cfg.MONITOR.PROBE.EXPLANATION_VALIDITY.CONDITIONS
+        }
+        if not {"positive", "negative", "random"}.issubset(
+            explanation_conditions
+        ):
+            failures.append(
+                "EXPLANATION_VALIDITY.CONDITIONS must include positive, negative, and random"
+            )
+    if bool(cfg.MONITOR.PROBE.PROMPT_ANALYSIS.SEMANTIC_GRANULARITY_ENABLE):
+        local_attributes = {
+            int(item)
+            for item in cfg.MONITOR.PROBE.PROMPT_ANALYSIS.LOCAL_ATTRIBUTE_INDICES
+        }
+        global_attributes = {
+            int(item)
+            for item in cfg.MONITOR.PROBE.PROMPT_ANALYSIS.GLOBAL_ATTRIBUTE_INDICES
+        }
+        if not local_attributes or not global_attributes:
+            failures.append(
+                "semantic granularity requires non-empty local/global attribute groups"
+            )
+        if local_attributes.intersection(global_attributes):
+            failures.append(
+                "semantic granularity local/global attribute groups must be disjoint"
+            )
     if float(cfg.MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.TEMPERATURE) <= 0.0:
         failures.append(
             "MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.TEMPERATURE must be positive"
+        )
+    object_cfg = cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION
+    if str(object_cfg.PERTURBATION_MODE).lower() != "normalized_direction":
+        failures.append(
+            "BAYESIAN_OBJECT_SELECTION.PERTURBATION_MODE must be normalized_direction"
+        )
+    object_scales = [float(item) for item in object_cfg.PERTURBATION_SCALES]
+    if not object_scales or any(value <= 0.0 for value in object_scales):
+        failures.append(
+            "BAYESIAN_OBJECT_SELECTION.PERTURBATION_SCALES must be positive"
+        )
+    if int(object_cfg.DIRECTION_COUNT) <= 0:
+        failures.append(
+            "BAYESIAN_OBJECT_SELECTION.DIRECTION_COUNT must be positive"
+        )
+    if str(object_cfg.HIERARCHY_VARIANT_SOURCE).lower() != "controlled_perturbation":
+        failures.append(
+            "BAYESIAN_OBJECT_SELECTION cannot use posterior_sample before object selection"
+        )
+    if str(object_cfg.HIERARCHY_REFERENCE).lower() != "unperturbed_same_checkpoint":
+        failures.append(
+            "BAYESIAN_OBJECT_SELECTION reference must be unperturbed_same_checkpoint"
+        )
+    if not bool(object_cfg.HIERARCHY_TRACE_ENABLE):
+        failures.append(
+            "BAYESIAN_OBJECT_SELECTION v1 requires HIERARCHY_TRACE_ENABLE=true"
+        )
+    if bool(object_cfg.EXPORT_SAMPLE_VECTORS):
+        failures.append(
+            "A-series common config must not export Bayesian object sample vectors"
         )
     streams = seed_streams(cfg.SEED)
     if any(streams[name] is None for name in ("classifier_init", "prompt_init", "data_order")):

@@ -10,6 +10,7 @@ import torch
 import torchvision as tv
 
 from .eval_metrics import spearman_correlation
+from .prompt_analysis import PromptContentSlotAccumulator
 
 
 def manifest_sha256(payload: Mapping[str, Any]) -> str:
@@ -616,6 +617,13 @@ class _AttentionLayerAccumulator:
         "prompt_read_block_applied",
         "prompt_read_block_patch_mass_before",
         "prompt_read_block_patch_mass_after",
+        "prompt_value_zero_applied",
+        "prompt_value_zero_context_delta_norm",
+        "prompt_value_zero_attention_mass_abs_error",
+        "relevance_delete_applied",
+        "relevance_delete_mass",
+        "relevance_delete_edge_ratio",
+        "relevance_delete_row_mass_abs_error",
     )
 
     def __init__(self) -> None:
@@ -1818,6 +1826,30 @@ class _PromptClassRoleAccumulator:
                 }
         return result
 
+    def export_role_profiles(self) -> Dict[int, Dict[str, Any]]:
+        result: Dict[int, Dict[str, Any]] = {}
+        layer_ids = sorted(
+            set(self.consumption_by_layer).union(self.collection_by_layer)
+        )
+        for layer_index in layer_ids:
+            layer: Dict[str, Any] = {}
+            for name, state in (
+                ("cls_consumption", self.consumption_by_layer.get(layer_index)),
+                ("patch_collection", self.collection_by_layer.get(layer_index)),
+            ):
+                if state is None:
+                    continue
+                class_ids, profiles = state.observed_profiles()
+                if not class_ids.size:
+                    continue
+                layer[name] = {
+                    "class_local_ids": class_ids.astype(np.int64).tolist(),
+                    "prompt_vectors": profiles.T.astype(np.float32).tolist(),
+                }
+            if layer:
+                result[int(layer_index)] = layer
+        return result
+
     def finalize(self) -> Dict[str, float]:
         by_layer = self.finalize_by_layer()
         metric_values: Dict[str, List[float]] = defaultdict(list)
@@ -1843,6 +1875,18 @@ class _AttributeConceptGroundingAccumulator:
         "collection_margin_attribute_effective_count",
         "collection_prompt_true_attribute_profile_cosine",
         "collection_prompt_margin_attribute_profile_cosine",
+        "prompt_true_local_attribute_share",
+        "prompt_true_global_attribute_share",
+        "prompt_true_semantic_granularity_index",
+        "prompt_margin_local_attribute_share",
+        "prompt_margin_global_attribute_share",
+        "prompt_margin_semantic_granularity_index",
+        "collection_true_local_attribute_share",
+        "collection_true_global_attribute_share",
+        "collection_true_semantic_granularity_index",
+        "collection_margin_local_attribute_share",
+        "collection_margin_global_attribute_share",
+        "collection_margin_semantic_granularity_index",
         "attribute_concept_patch_effective_count",
         "attribute_concept_patch_effective_ratio",
         "attribute_concept_patch_top1_share",
@@ -2134,6 +2178,31 @@ class _AttributeConceptGroundingAccumulator:
             for name, values in sorted(buckets.items())
             if values
         }
+
+    def finalize_semantic_granularity(self) -> Dict[str, float]:
+        by_layer = self.finalize_by_layer()
+        result: Dict[str, float] = {}
+        names = sorted({
+            name
+            for metrics in by_layer.values()
+            for name in metrics
+            if name.endswith("semantic_granularity_index")
+        })
+        for name in names:
+            points = [
+                (int(layer), float(metrics[name]))
+                for layer, metrics in sorted(by_layer.items())
+                if name in metrics
+            ]
+            if len(points) < 2:
+                continue
+            layers = np.asarray([item[0] for item in points], dtype=np.float64)
+            values = np.asarray([item[1] for item in points], dtype=np.float64)
+            result[f"{name}_depth_spearman"] = float(
+                spearman_correlation(layers, values)
+            )
+            result[f"{name}_late_minus_early"] = float(values[-1] - values[0])
+        return result
 
 
 class _PatchSemanticTransportAccumulator:
@@ -2774,6 +2843,16 @@ class ProbeAttentionAffinityAccumulator:
         score_mode: str = "dot",
         temperature: float = 1.0,
         saturation_threshold: float = 10.0,
+        prompt_content_enable: bool = False,
+        instance_prompt_length: int = 0,
+        domain_prompt_length: int = 0,
+        content_redundancy_cosine: float = 0.9,
+        content_opposition_cosine: float = -0.5,
+        content_cancellation_ratio: float = 0.25,
+        low_usage_fraction: float = 0.25,
+        low_function_fraction: float = 0.25,
+        low_role_coverage: float = 0.01,
+        role_profile_export_enable: bool = False,
     ) -> None:
         self.selected_layers = {int(item) for item in selected_layers}
         self.attention = _AttentionFlowAccumulator(
@@ -2788,6 +2867,23 @@ class ProbeAttentionAffinityAccumulator:
         )
         self.prompt_mechanism = _PromptLayerMechanismAccumulator(selected_layers)
         self.prompt_patch_bridge = _PromptPatchBridgeAccumulator(selected_layers)
+        self.prompt_content = (
+            PromptContentSlotAccumulator(
+                prompt_length=prompt_length,
+                selected_layers=selected_layers,
+                instance_tokens=instance_prompt_length,
+                domain_tokens=domain_prompt_length,
+                redundancy_cosine=content_redundancy_cosine,
+                opposition_cosine=content_opposition_cosine,
+                cancellation_ratio=content_cancellation_ratio,
+                low_usage_fraction=low_usage_fraction,
+                low_function_fraction=low_function_fraction,
+                low_role_coverage=low_role_coverage,
+            )
+            if bool(prompt_content_enable) and int(prompt_length) > 0
+            else None
+        )
+        self.role_profile_export_enable = bool(role_profile_export_enable)
         self.prompt_class_role = (
             _PromptClassRoleAccumulator(
                 class_count=class_count,
@@ -2907,6 +3003,8 @@ class ProbeAttentionAffinityAccumulator:
                 targets=targets,
                 projected_semantic_reference=projected_semantic_reference,
             )
+        if self.prompt_content is not None:
+            self.prompt_content.update(attention_layers, affinity_layers)
         if self.attribute_concept is not None:
             self.attribute_concept.update(
                 affinity_layers,
@@ -2949,6 +3047,26 @@ class ProbeAttentionAffinityAccumulator:
             if self.attribute_concept is not None
             else {}
         )
+        if self.attribute_concept is not None:
+            attribute_concept_grounding.update(
+                self.attribute_concept.finalize_semantic_granularity()
+            )
+        prompt_content = (
+            self.prompt_content.finalize()
+            if self.prompt_content is not None
+            else {
+                "metrics": {},
+                "by_layer": {},
+                "by_layer_and_head": {},
+                "by_layer_and_prompt": {},
+            }
+        )
+        prompt_role_profiles = (
+            self.prompt_class_role.export_role_profiles()
+            if self.prompt_class_role is not None
+            and self.role_profile_export_enable
+            else {}
+        )
         attribute_concept_grounding_by_layer = (
             self.attribute_concept.finalize_by_layer()
             if self.attribute_concept is not None
@@ -2988,11 +3106,20 @@ class ProbeAttentionAffinityAccumulator:
             "prompt_layer_mechanism_by_layer": self.prompt_mechanism.finalize_by_layer(),
             "prompt_patch_bridge": self.prompt_patch_bridge.finalize(),
             "prompt_patch_bridge_by_layer": self.prompt_patch_bridge.finalize_by_layer(),
+            "prompt_content_metrics": prompt_content["metrics"],
+            "prompt_content_by_layer": prompt_content["by_layer"],
+            "prompt_content_by_layer_and_head": prompt_content[
+                "by_layer_and_head"
+            ],
+            "prompt_content_by_layer_and_prompt": prompt_content[
+                "by_layer_and_prompt"
+            ],
             "prompt_semantic_role": prompt_semantic_role,
             "prompt_semantic_role_by_layer": prompt_semantic_role_by_layer,
             "prompt_semantic_role_by_layer_and_prompt": (
                 prompt_semantic_role_by_layer_and_prompt
             ),
+            "prompt_role_profiles": prompt_role_profiles,
             "attribute_concept_grounding": attribute_concept_grounding,
             "attribute_concept_grounding_by_layer": (
                 attribute_concept_grounding_by_layer

@@ -285,6 +285,7 @@ class PreViTPromptDistributor(nn.Module):
         self.fixed_eps_seed = int(fixed_eps_seed)
         self.debug_distributor_shapes = bool(debug_distributor_shapes)
         self._debug_shapes_logged = False
+        self._prompt_output_intervention = None
 
         # 当前 ViT-B/16 主线 hidden size 固定为 768；其它 hidden size 需要同步检查
         # stats head、domain prompt、slot embedding 和可视化接口。
@@ -441,6 +442,49 @@ class PreViTPromptDistributor(nn.Module):
             instance_prompt = instance_prompt + self.slot_embed.to(device=mu.device, dtype=mu.dtype)
         return instance_prompt
 
+    def _apply_prompt_output_intervention(
+        self,
+        instance_prompt: torch.Tensor,
+        domain_prompt: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        intervention = self._prompt_output_intervention
+        if not isinstance(intervention, dict):
+            return instance_prompt, domain_prompt, {}
+        mode = str(intervention.get("mode", ""))
+        batch_size = int(instance_prompt.shape[0])
+        stats: Dict[str, torch.Tensor] = {
+            "prompt_output_intervention_applied": instance_prompt.new_ones(batch_size),
+        }
+        if mode == "instance_prompt_zero":
+            stats["instance_prompt_norm_before"] = instance_prompt.norm(dim=-1).mean(dim=1)
+            instance_prompt = torch.zeros_like(instance_prompt)
+        elif mode == "domain_prompt_zero":
+            stats["domain_prompt_norm_before"] = domain_prompt.norm(dim=-1).mean(dim=1)
+            domain_prompt = torch.zeros_like(domain_prompt)
+        elif mode == "both_prompt_zero":
+            stats["instance_prompt_norm_before"] = instance_prompt.norm(dim=-1).mean(dim=1)
+            stats["domain_prompt_norm_before"] = domain_prompt.norm(dim=-1).mean(dim=1)
+            instance_prompt = torch.zeros_like(instance_prompt)
+            domain_prompt = torch.zeros_like(domain_prompt)
+        elif mode == "instance_prompt_swap":
+            permutation = intervention.get("permutation")
+            if not torch.is_tensor(permutation):
+                raise ValueError("instance_prompt_swap requires a permutation tensor")
+            permutation = permutation.to(device=instance_prompt.device, dtype=torch.long)
+            if permutation.shape != (batch_size,):
+                raise ValueError("instance_prompt_swap permutation has incompatible shape")
+            if sorted(permutation.detach().cpu().tolist()) != list(range(batch_size)):
+                raise ValueError("instance_prompt_swap permutation must be bijective")
+            instance_prompt = instance_prompt.index_select(0, permutation)
+            stats["instance_prompt_swap_fixed_point_ratio"] = (
+                permutation == torch.arange(batch_size, device=permutation.device)
+            ).to(instance_prompt.dtype)
+        else:
+            raise ValueError(f"Unsupported Prompt Distributor intervention: {mode}")
+        stats["instance_prompt_norm_after"] = instance_prompt.norm(dim=-1).mean(dim=1)
+        stats["domain_prompt_norm_after"] = domain_prompt.norm(dim=-1).mean(dim=1)
+        return instance_prompt, domain_prompt, stats
+
     def prompt_from_distribution(
         self,
         mu: torch.Tensor,
@@ -463,12 +507,15 @@ class PreViTPromptDistributor(nn.Module):
         if self.use_slot_embed:
             instance_prompt = instance_prompt + self.slot_embed.to(device=mu.device, dtype=mu.dtype)
         domain_prompt = self.domain_prompt.to(device=mu.device, dtype=mu.dtype).expand(mu.shape[0], -1, -1)
+        instance_prompt, domain_prompt, intervention_stats = (
+            self._apply_prompt_output_intervention(instance_prompt, domain_prompt)
+        )
         prompt_tokens = torch.cat((instance_prompt, domain_prompt), dim=1)
         if tuple(prompt_tokens.shape) != (mu.shape[0], self.prompt_len, self.dim):
             raise ValueError(
                 f"External prompt_tokens must be [B,{self.prompt_len},{self.dim}], got {tuple(prompt_tokens.shape)}."
             )
-        return prompt_tokens, {
+        stats = {
             "visual_source": "external_distribution",
             "visual_input": mu,
             "visual_input_shape": tuple(mu.shape),
@@ -480,6 +527,8 @@ class PreViTPromptDistributor(nn.Module):
             "domain_prompt": domain_prompt,
             "prompt_tokens": prompt_tokens,
         }
+        stats.update(intervention_stats)
+        return prompt_tokens, stats
 
     def _debug_shapes(
         self,
@@ -563,6 +612,10 @@ class PreViTPromptDistributor(nn.Module):
         # 参数本体形状是 [1, domain_tokens, 768]；这里 expand 到 batch 维，得到 [B, domain_tokens, 768]。
         domain_prompt = self.domain_prompt.to(device=mu.device, dtype=mu.dtype).expand(mu.shape[0], -1, -1)
 
+        instance_prompt, domain_prompt, intervention_stats = (
+            self._apply_prompt_output_intervention(instance_prompt, domain_prompt)
+        )
+
         # token 顺序固定为 [instance prompt | domain prompt]，总长度必须等于 MODEL.PROMPT.NUM_TOKENS。
         # instance prompt 放前面，domain prompt 放后面；这个顺序会影响后续 ViT 中 prompt token 的位置。
         prompt_tokens = torch.cat((instance_prompt, domain_prompt), dim=1)
@@ -609,6 +662,7 @@ class PreViTPromptDistributor(nn.Module):
             "domain_prompt": domain_prompt,
             "prompt_tokens": prompt_tokens,
         }
+        stats.update(intervention_stats)
 
         # 返回值一：
         #   prompt_tokens: 立即送回 ViT 主干使用。

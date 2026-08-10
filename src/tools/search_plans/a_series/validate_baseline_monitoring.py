@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.configs.config import get_cfg
 from src.models.classifiers import RSimilarityClassifier
-from src.models.vit_backbones.vit import Attention, Block
+from src.models.vit_backbones.vit import Attention, Block, Encoder
 from src.models.vit_prompt.vit import PromptedTransformer
 from src.engine.trainer import Trainer
 from src.monitoring.comparability import build_comparability_identity
@@ -266,6 +266,13 @@ class SyntheticProbeModel(torch.nn.Module):
                 prompt_patch_attention = attention[
                     :, :, prompt_slice, patch_slice
                 ]
+                prompt_patch_context = torch.matmul(
+                    prompt_patch_attention,
+                    value_layer[:, :, patch_slice, :],
+                )
+                prompt_patch_content = prompt_patch_context.permute(
+                    0, 2, 1, 3
+                ).reshape(inputs.shape[0], prompt_length, -1)
                 patch_content = (
                     prompt_patch_attention.sum(dim=-1).mean(dim=1)
                     * (prompt_strength.abs() + 0.1)
@@ -279,6 +286,10 @@ class SyntheticProbeModel(torch.nn.Module):
                     "ApKv_attn": prompt_patch_attention,
                     "_prompt_patch_pre_output_av_magnitude": (
                         prompt_patch_attention.mean(dim=1).abs() + 0.01
+                    ),
+                    "_prompt_patch_content_vector": prompt_patch_content,
+                    "_prompt_patch_pre_output_content_by_head": (
+                        prompt_patch_context
                     ),
                     "prompt_patch_value_contribution_norm": patch_content,
                     "prompt_patch_value_contribution_share": (
@@ -918,6 +929,121 @@ def _validate_prompt_content_and_layer_mechanism():
     assert "patch_collection_projected_semantic_graph_spearman" in (
         result["prompt_semantic_role_by_layer"][0]
     )
+
+
+def _validate_affinity_diagnostic_cpu_offload():
+    tiny_config = SimpleNamespace(
+        hidden_size=4,
+        transformer={
+            "num_layers": 2,
+            "num_heads": 2,
+            "attention_dropout_rate": 0.0,
+            "mlp_dim": 8,
+            "dropout_rate": 0.0,
+        },
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    encoder = Encoder(tiny_config, vis=True).to(device).eval()
+    hidden = torch.randn(2, 4, 4, device=device)
+    base_cfg = {
+        "prompt_length": 1,
+        "semantic_length": 0,
+        "detach": True,
+        "block_s_to_cls": False,
+    }
+    with torch.no_grad():
+        expected_encoded, expected_attention, expected_affinity = (
+            encoder.forward_with_affinity(
+                hidden.clone(),
+                dict(base_cfg),
+                num_prompt_tokens=1,
+            )
+        )
+        PromptedTransformer._attach_prompt_layer_continuity(
+            expected_affinity
+        )
+        actual_encoded, actual_attention, actual_affinity = (
+            encoder.forward_with_affinity(
+                hidden.clone(),
+                {
+                    **base_cfg,
+                    "offload_diagnostics_to_cpu": True,
+                },
+                num_prompt_tokens=1,
+            )
+        )
+
+    assert torch.allclose(expected_encoded, actual_encoded, atol=0.0, rtol=0.0)
+
+    def assert_tree_equal(expected, actual):
+        if torch.is_tensor(expected):
+            assert torch.is_tensor(actual)
+            assert actual.device.type == "cpu"
+            assert torch.allclose(
+                expected.detach().cpu(), actual, atol=0.0, rtol=0.0
+            )
+            return
+        if isinstance(expected, dict):
+            assert isinstance(actual, dict)
+            assert set(expected) == set(actual)
+            for key in expected:
+                assert_tree_equal(expected[key], actual[key])
+            return
+        if isinstance(expected, (list, tuple)):
+            assert isinstance(actual, type(expected))
+            assert len(expected) == len(actual)
+            for left, right in zip(expected, actual):
+                assert_tree_equal(left, right)
+            return
+        assert expected == actual
+
+    assert_tree_equal(expected_attention, actual_attention)
+    assert_tree_equal(expected_affinity, actual_affinity)
+
+    deep_transformer = PromptedTransformer.__new__(PromptedTransformer)
+    torch.nn.Module.__init__(deep_transformer)
+    deep_transformer.encoder = Encoder(tiny_config, vis=True)
+    deep_transformer.vit_config = tiny_config
+    deep_transformer.num_tokens = 1
+    deep_transformer.prompt_backend = "vpt_deep"
+    deep_transformer.deep_prompt_embeddings = torch.nn.Parameter(
+        torch.randn(1, 1, 4)
+    )
+    deep_transformer.prompt_proj = torch.nn.Identity()
+    deep_transformer.prompt_dropout = torch.nn.Identity()
+    deep_transformer.prompt_init_provider = None
+    deep_transformer.semantic_tokens_enable = False
+    deep_transformer.attention_mediation_enable = False
+    deep_transformer.to(device).eval()
+    with torch.no_grad():
+        expected_deep = deep_transformer.forward_deep_prompt_with_affinity(
+            hidden.clone(), dict(base_cfg)
+        )
+        PromptedTransformer._attach_prompt_layer_continuity(
+            expected_deep[2]
+        )
+        actual_deep = deep_transformer.forward_deep_prompt_with_affinity(
+            hidden.clone(),
+            {**base_cfg, "offload_diagnostics_to_cpu": True},
+        )
+    assert torch.allclose(
+        expected_deep[0], actual_deep[0], atol=0.0, rtol=0.0
+    )
+    assert_tree_equal(expected_deep[1], actual_deep[1])
+    assert_tree_equal(expected_deep[2], actual_deep[2])
+
+    try:
+        encoder.forward_with_affinity(
+            hidden.clone().requires_grad_(True),
+            {**base_cfg, "offload_diagnostics_to_cpu": True},
+            num_prompt_tokens=1,
+        )
+    except RuntimeError as exc:
+        assert "only valid in a no-grad forward" in str(exc)
+    else:
+        raise AssertionError(
+            "gradient-enabled affinity forward accepted CPU offload"
+        )
 
 
 def _validate_prompt_role_metric_rows():
@@ -1637,6 +1763,8 @@ def _validate_fixed_probe_semantic_bundle():
     cfg.MONITOR.PROBE.SEMANTIC_INTERVENTION.ENABLE = True
     cfg.MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.ENABLE = True
     cfg.MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.PATCH_RATIO = 0.25
+    cfg.MONITOR.PROBE.PROMPT_ANALYSIS.ENABLE = True
+    cfg.MONITOR.PROBE.PROMPT_ANALYSIS.CONTENT_ENABLE = True
     cfg.MONITOR.MODULE_EFFECT.ENABLE = True
     cfg.MONITOR.MODULE_EFFECT.PROMPT_ZERO = True
     cfg.MONITOR.MODULE_EFFECT.PROMPT_READ_BLOCK = True
@@ -1694,6 +1822,13 @@ def _validate_fixed_probe_semantic_bundle():
     assert set(bundle["affinity"]["prompt_semantic_role_by_layer"]) == {0, 2, 3}
     assert set(
         bundle["affinity"]["prompt_semantic_role_by_layer_and_prompt"][0]
+    ) == {0, 1}
+    assert set(bundle["affinity"]["prompt_content_by_layer"]) == {0, 2, 3}
+    assert set(bundle["affinity"]["prompt_content_by_layer_and_head"][0]) == {
+        0, 1
+    }
+    assert set(
+        bundle["affinity"]["prompt_content_by_layer_and_prompt"][0]
     ) == {0, 1}
     assert bundle["affinity"]["token_metrics"][
         "prompt_semantic_role_reference"
@@ -2125,6 +2260,7 @@ def main():
     _validate_target_relevance_accumulator()
     _validate_prediction_transitions()
     _validate_prompt_content_and_layer_mechanism()
+    _validate_affinity_diagnostic_cpu_offload()
     _validate_prompt_role_metric_rows()
     _validate_prompt_attention_path_interventions()
     _validate_attribute_concept_grounding_and_intervention()

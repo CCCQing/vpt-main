@@ -120,6 +120,15 @@ class DiagnosticManager:
                 "class_error": {"kind": "eval_diagnostics", "intrusive": False, "extra_forward": False},
                 "calibration_profile": {"kind": "eval_diagnostics", "intrusive": False, "extra_forward": False},
                 "fixed_probe": {"kind": "fixed_probe", "intrusive": False, "requires_probe_manifest": True},
+                "bayesian_object_selection": {
+                    "kind": "checkpoint_fixed_probe",
+                    "intrusive": True,
+                    "requires_probe_manifest": True,
+                    "same_checkpoint": True,
+                    "same_sample_and_candidate_identity": True,
+                    "default_enabled": False,
+                    "posterior_interpretation_allowed": False,
+                },
                 "module_effect": {
                     "kind": "paired_intervention",
                     "intrusive": True,
@@ -133,6 +142,9 @@ class DiagnosticManager:
                 "class_error": bool(self.cfg.MONITOR.CLASS_ERROR.ENABLE),
                 "calibration_profile": bool(self.cfg.MONITOR.CALIBRATION.ENABLE),
                 "fixed_probe": bool(self.cfg.MONITOR.PROBE.ENABLE),
+                "bayesian_object_selection": bool(
+                    self.cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION.ENABLE
+                ),
                 "module_effect": bool(self.cfg.MONITOR.MODULE_EFFECT.ENABLE),
             },
         }

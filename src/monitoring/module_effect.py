@@ -48,6 +48,8 @@ class PromptAttentionPathIntervention(AbstractContextManager):
         "prompt_patch_uniform",
         "patch_prompt_uniform",
         "prompt_patch_value_globalize",
+        "prompt_value_zero",
+        "relevance_edge_delete",
         "attribute_concept_prompt_patch_block",
         "random_prompt_patch_block",
         "transport_prompt_patch_block",
@@ -73,6 +75,8 @@ class PromptAttentionPathIntervention(AbstractContextManager):
             if not hasattr(module, "_prompt_path_intervention"):
                 continue
             self.saved[module] = getattr(module, "_prompt_path_intervention")
+            if hasattr(module, "_last_prompt_path_intervention_stats"):
+                setattr(module, "_last_prompt_path_intervention_stats", None)
             intervention = dict(self.payload)
             intervention.update({"mode": self.mode, "layer_index": layer_index})
             setattr(module, "_prompt_path_intervention", intervention)
@@ -118,6 +122,43 @@ class PromptStateIntervention(AbstractContextManager):
     def __exit__(self, exc_type, exc_value, traceback):
         for module, value in self.saved.items():
             setattr(module, "_prompt_state_intervention", value)
+        self.saved.clear()
+        return False
+
+
+class PromptDistributionIntervention(AbstractContextManager):
+    VALID_MODES = {
+        "instance_prompt_zero",
+        "domain_prompt_zero",
+        "both_prompt_zero",
+        "instance_prompt_swap",
+    }
+
+    def __init__(self, model: torch.nn.Module, mode: str, **payload: Any) -> None:
+        if str(mode) not in self.VALID_MODES:
+            raise ValueError(f"Unsupported Prompt Distributor intervention: {mode}")
+        self.model = model
+        self.mode = str(mode)
+        self.payload = dict(payload)
+        self.saved: Dict[torch.nn.Module, Any] = {}
+
+    def __enter__(self):
+        for module in self.model.modules():
+            if not hasattr(module, "_prompt_output_intervention"):
+                continue
+            self.saved[module] = getattr(module, "_prompt_output_intervention")
+            setattr(
+                module,
+                "_prompt_output_intervention",
+                {"mode": self.mode, **self.payload},
+            )
+        if not self.saved:
+            raise RuntimeError("No compatible Prompt Distributor was found")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for module, value in self.saved.items():
+            setattr(module, "_prompt_output_intervention", value)
         self.saved.clear()
         return False
 
@@ -177,6 +218,56 @@ def prompt_patch_value_globalize_intervention(
     return PromptAttentionPathIntervention(
         model,
         "prompt_patch_value_globalize",
+    )
+
+
+def prompt_value_zero_intervention(
+    model: torch.nn.Module,
+) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(model, "prompt_value_zero")
+
+
+def relevance_edge_delete_intervention(
+    model: torch.nn.Module,
+    *,
+    target_layer: int,
+    deletion_mask: torch.Tensor,
+) -> PromptAttentionPathIntervention:
+    return PromptAttentionPathIntervention(
+        model,
+        "relevance_edge_delete",
+        target_layer=int(target_layer),
+        deletion_mask=deletion_mask,
+    )
+
+
+def instance_prompt_zero_intervention(
+    model: torch.nn.Module,
+) -> PromptDistributionIntervention:
+    return PromptDistributionIntervention(model, "instance_prompt_zero")
+
+
+def domain_prompt_zero_intervention(
+    model: torch.nn.Module,
+) -> PromptDistributionIntervention:
+    return PromptDistributionIntervention(model, "domain_prompt_zero")
+
+
+def both_prompt_zero_intervention(
+    model: torch.nn.Module,
+) -> PromptDistributionIntervention:
+    return PromptDistributionIntervention(model, "both_prompt_zero")
+
+
+def instance_prompt_swap_intervention(
+    model: torch.nn.Module,
+    *,
+    permutation: torch.Tensor,
+) -> PromptDistributionIntervention:
+    return PromptDistributionIntervention(
+        model,
+        "instance_prompt_swap",
+        permutation=permutation,
     )
 
 
