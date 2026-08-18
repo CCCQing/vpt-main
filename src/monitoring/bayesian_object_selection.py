@@ -19,6 +19,44 @@ MAIN_CANDIDATES = (
     "logit_effect",
 )
 
+BUILTIN_OBJECT_DEFINITIONS = {
+    "raw_latent": {
+        "role": "stochastic_root",
+        "is_random_variable": True,
+        "is_distribution_parameter": False,
+        "is_sampleable": True,
+        "downstream_consumer": "injected_prompt",
+    },
+    "injected_prompt": {
+        "role": "control_pushforward",
+        "is_random_variable": False,
+        "is_distribution_parameter": False,
+        "is_sampleable": False,
+        "downstream_consumer": "frozen_vit_attention",
+    },
+    "contextualized_prompt": {
+        "role": "contextual_state",
+        "is_random_variable": False,
+        "is_distribution_parameter": False,
+        "is_sampleable": False,
+        "downstream_consumer": "later_layer_or_replacement_boundary",
+    },
+    "cls_effect": {
+        "role": "functional_effect",
+        "is_random_variable": False,
+        "is_distribution_parameter": False,
+        "is_sampleable": False,
+        "downstream_consumer": "classifier",
+    },
+    "logit_effect": {
+        "role": "predictive_effect",
+        "is_random_variable": False,
+        "is_distribution_parameter": False,
+        "is_sampleable": False,
+        "downstream_consumer": "predictive_validation",
+    },
+}
+
 AUXILIARY_VIEWS = (
     "prompt_to_cls_contribution",
     "semantic_aligned_contextualized_prompt",
@@ -100,8 +138,18 @@ def build_candidate_registry(
     prompt_enabled: bool,
     distributor_active: bool,
     prompt_deep: bool,
+    registered_objects: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    unknown_candidates = sorted(set(requested_candidates).difference(MAIN_CANDIDATES))
+    definitions = {
+        name: {"object_id": name, **state}
+        for name, state in BUILTIN_OBJECT_DEFINITIONS.items()
+    }
+    for state in registered_objects or ():
+        if not isinstance(state, Mapping) or not state.get("object_id"):
+            raise ValueError("Registered Bayesian objects require object_id")
+        object_id = str(state["object_id"])
+        definitions[object_id] = dict(state)
+    unknown_candidates = sorted(set(requested_candidates).difference(definitions))
     unknown_views = sorted(set(requested_auxiliary_views).difference(AUXILIARY_VIEWS))
     if unknown_candidates:
         raise ValueError(
@@ -116,16 +164,18 @@ def build_candidate_registry(
         dict.fromkeys(str(item) for item in requested_auxiliary_views)
     )
     candidate_registry = {}
-    for name in MAIN_CANDIDATES:
+    for name, definition in definitions.items():
         requested = name in requested_candidates
         applicable = bool(prompt_enabled and (name != "raw_latent" or distributor_active))
+        if name not in MAIN_CANDIDATES:
+            applicable = bool(prompt_enabled)
         reason = None
         if requested and not prompt_enabled:
             reason = "prompt_not_enabled"
         elif requested and name == "raw_latent" and not distributor_active:
             reason = "prompt_distributor_not_active"
         candidate_registry[name] = {
-            "role": "main_candidate",
+            **definition,
             "requested": requested,
             "applicable": applicable if requested else False,
             "observed": False,
@@ -151,7 +201,7 @@ def build_candidate_registry(
             "failure_reason": reason if requested else "not_requested",
         }
     return {
-        "format": "bayesian_object_candidate_registry_v1",
+        "format": "bayesian_object_candidate_registry_v2",
         "prompt_identity": (
             "layer_x_prompt_type_x_slot" if prompt_deep else "prompt_type_x_slot"
         ),
@@ -330,12 +380,18 @@ class BayesianHierarchyTraceAccumulator:
         random_seed: int,
         collapse_relative_threshold: float,
         distance_eps: float,
+        distance_pairing_mode: str = "all_pairs",
     ) -> None:
         self.candidate_class_ids = tuple(int(item) for item in candidate_class_ids)
         self.bootstrap_samples = int(bootstrap_samples)
         self.random_seed = int(random_seed)
         self.collapse_relative_threshold = float(collapse_relative_threshold)
         self.distance_eps = float(distance_eps)
+        self.distance_pairing_mode = str(distance_pairing_mode).lower()
+        if self.distance_pairing_mode not in {"all_pairs", "reference_only"}:
+            raise ValueError(
+                "distance_pairing_mode must be 'all_pairs' or 'reference_only'"
+            )
         self.sample_ids = set()
         self.variant_ids = None
         self.observed_stages = set()
@@ -424,9 +480,16 @@ class BayesianHierarchyTraceAccumulator:
 
         pair_distances = {}
         for stage, stacked in stages.items():
-            distances = []
-            for left, right in combinations(range(len(variants)), 2):
-                distances.append(self._rms_distance(stacked[left], stacked[right]))
+            if self.distance_pairing_mode == "reference_only":
+                variant_pairs = (
+                    (0, index) for index in range(1, len(variants))
+                )
+            else:
+                variant_pairs = combinations(range(len(variants)), 2)
+            distances = [
+                self._rms_distance(stacked[left], stacked[right])
+                for left, right in variant_pairs
+            ]
             pair_distances[stage] = torch.cat(distances, dim=0).numpy()
         for left, right, name in self.RELATIONS:
             if left in pair_distances and right in pair_distances:
@@ -499,22 +562,32 @@ class BayesianHierarchyTraceAccumulator:
             return {"status": "not_observed"}
         features = torch.cat(chunks, dim=0)
         targets = torch.as_tensor(self.reference_targets, dtype=torch.long)
-        within = []
-        between = []
-        for left, right in combinations(range(int(features.shape[0])), 2):
-            distance = float(self._rms_distance(features[left], features[right]).item())
-            if int(targets[left]) == int(targets[right]):
-                within.append(distance)
-            else:
-                between.append(distance)
-        if not within or not between:
+        sample_count = int(features.shape[0])
+        if sample_count < 2:
             return {
                 "status": "insufficient_evidence",
-                "within_pair_count": int(len(within)),
-                "between_pair_count": int(len(between)),
+                "within_pair_count": 0,
+                "between_pair_count": 0,
             }
-        within_mean = float(np.mean(within))
-        between_mean = float(np.mean(between))
+        # torch.pdist preserves the same upper-triangular pair order as
+        # triu_indices but executes the high-dimensional distance calculation
+        # in one vectorized kernel instead of launching one tensor operation
+        # per Python pair.
+        pair_indices = torch.triu_indices(sample_count, sample_count, offset=1)
+        distances = torch.pdist(features, p=2.0) / math.sqrt(
+            max(1, int(features.shape[1]))
+        )
+        same_class = targets[pair_indices[0]] == targets[pair_indices[1]]
+        within = distances[same_class]
+        between = distances[~same_class]
+        if int(within.numel()) == 0 or int(between.numel()) == 0:
+            return {
+                "status": "insufficient_evidence",
+                "within_pair_count": int(within.numel()),
+                "between_pair_count": int(between.numel()),
+            }
+        within_mean = float(within.mean().item())
+        between_mean = float(between.mean().item())
         return {
             "status": "observed",
             "between_class_distance_mean": between_mean,
@@ -522,8 +595,8 @@ class BayesianHierarchyTraceAccumulator:
             "between_class_within_class_ratio": (
                 between_mean / max(within_mean, self.distance_eps)
             ),
-            "within_pair_count": int(len(within)),
-            "between_pair_count": int(len(between)),
+            "within_pair_count": int(within.numel()),
+            "between_pair_count": int(between.numel()),
             "class_count": int(torch.unique(targets).numel()),
             "sample_count": int(features.shape[0]),
         }
@@ -675,6 +748,7 @@ class BayesianHierarchyTraceAccumulator:
         return {
             "format": "bayesian_hierarchy_trace_v1",
             "valid": bool(self.sample_ids and self.variant_ids and correspondence),
+            "distance_pairing_mode": self.distance_pairing_mode,
             "sample_count": int(len(self.sample_ids)),
             "variant_ids": list(self.variant_ids or ()),
             "variant_count_including_reference": int(len(self.variant_ids or ())),
@@ -789,9 +863,49 @@ def build_object_selection_report(
     rejected = [
         name for name, card in cards.items() if card.get("status") == "fail"
     ]
+    predictive_validation_space = (
+        "logit_effect"
+        if registry.get("candidate_spaces", {}).get("logit_effect", {}).get(
+            "applicable", False
+        )
+        and "logit_effect" in hierarchy_trace.get("observed_stages", [])
+        else None
+    )
+    functional_interfaces = []
+    for name, state in hierarchy_trace.get("propagation", {}).items():
+        functional_interfaces.append(
+            {
+                "interface_id": str(name),
+                "status": "observed",
+                "propagation_ratio": (
+                    state.get("ratio") if isinstance(state, Mapping) else None
+                ),
+            }
+        )
+    deferred = [
+        name
+        for name, state in registry.get("candidate_spaces", {}).items()
+        if state.get("requested", False)
+        and state.get("role")
+        in {
+            "stochastic_root",
+            "control_pushforward",
+            "contextual_state",
+            "functional_effect",
+        }
+        and name not in rejected
+    ]
     return {
-        "format": "bayesian_object_selection_report_v1",
+        "format": "bayesian_object_selection_report_v2",
         "recommended_candidate": None,
+        "recommended_stochastic_root": None,
+        "recommended_transfer_space": None,
+        "predictive_validation_space": predictive_validation_space,
+        "functional_interfaces": functional_interfaces,
+        "deferred_candidates": deferred,
+        "rejected_candidates_with_reason": {
+            name: "functional_gate_failed" for name in rejected
+        },
         "rejected_candidates": rejected,
         "insufficient_evidence_candidates": insufficient,
         "candidate_cards": cards,

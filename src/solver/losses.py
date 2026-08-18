@@ -653,13 +653,23 @@ class CompositeLoss(nn.Module):
         total = self.main_loss(pred_logits, targets, per_cls_weights, kwargs=kwargs)
         main_loss_value = float(total.detach().item())
         stats = dict(self.main_loss._last_loss_stats)
+        component_names = [
+            name
+            for name in ("ce_loss", "ar_loss", "cm_loss")
+            if f"{name}.weighted" in stats
+        ]
         for aux_loss in self.aux_losses:
             weight = float(aux_loss.weight)
             if weight <= 0:
                 continue
             aux_value = aux_loss(pred_logits, targets, per_cls_weights, kwargs=kwargs)
             total = total + weight * aux_value
-            stats[aux_loss.name] = float(aux_value.detach().item())
+            raw_value = float(aux_value.detach().item())
+            stats[aux_loss.name] = raw_value
+            stats[f"{aux_loss.name}.raw"] = raw_value
+            stats[f"{aux_loss.name}.weight"] = weight
+            stats[f"{aux_loss.name}.weighted"] = weight * raw_value
+            component_names.append(str(aux_loss.name))
             if isinstance(aux_loss, GraphProbPriorAuxLoss):
                 stats.update(aux_loss._last_loss_stats)
                 stats.update(
@@ -669,6 +679,13 @@ class CompositeLoss(nn.Module):
                         loss_weight=weight,
                     )
                 )
+        total_value = float(total.detach().item())
+        stats["total_loss"] = total_value
+        denominator = max(abs(total_value), 1e-12)
+        for name in component_names:
+            weighted = stats.get(f"{name}.weighted")
+            if weighted is not None:
+                stats[f"{name}.weighted_share"] = float(weighted) / denominator
         self._last_loss_stats = stats
         return total
 
@@ -714,7 +731,13 @@ class RSimilarityLoss(nn.Module):
         weight = torch.tensor(per_cls_weights, device=logits.device)
         ce = F.cross_entropy(logits, targets, weight, reduction="mean")
         total = ce
-        self._last_loss_stats = {"ce_loss": float(ce.detach().item())}
+        ce_value = float(ce.detach().item())
+        self._last_loss_stats = {
+            "ce_loss": ce_value,
+            "ce_loss.raw": ce_value,
+            "ce_loss.weight": 1.0,
+            "ce_loss.weighted": ce_value,
+        }
 
         if self.align_mode == "none" or model is None or self.align_weight <= 0:
             return total
@@ -738,11 +761,23 @@ class RSimilarityLoss(nn.Module):
                     pos_proto = semantic_input.index_select(0, y)
                     diff = visual_input - pos_proto
                     align_term = diff.pow(2).sum(dim=-1).mean()
-                    self._last_loss_stats["ar_loss"] = float(align_term.detach().item())
+                    raw_align = float(align_term.detach().item())
+                    self._last_loss_stats.update({
+                        "ar_loss": raw_align,
+                        "ar_loss.raw": raw_align,
+                        "ar_loss.weight": self.align_weight,
+                        "ar_loss.weighted": self.align_weight * raw_align,
+                    })
         elif align_mode == "cm":
             align_term = _compute_cm_loss_from_rhead_cache(model=model, targets=targets, logits=logits)
             if align_term is not None:
-                self._last_loss_stats["cm_loss"] = float(align_term.detach().item())
+                raw_align = float(align_term.detach().item())
+                self._last_loss_stats.update({
+                    "cm_loss": raw_align,
+                    "cm_loss.raw": raw_align,
+                    "cm_loss.weight": self.align_weight,
+                    "cm_loss.weighted": self.align_weight * raw_align,
+                })
         else:
             raise ValueError(f"Unsupported SOLVER.RSIM.ALIGN_MODE='{self.align_mode}'")
 

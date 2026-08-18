@@ -35,7 +35,10 @@ from src.tools.search_plans.a_series.summarize_baseline_monitoring import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Re-run paired A-series fixed probes and aggregate prediction transitions."
+        description=(
+            "Legacy manual replay of paired A-series fixed probes. The output is "
+            "Probe context only and is not the formal complete-test transition source."
+        )
     )
     parser.add_argument(
         "--run", action="append", required=True, help="METHOD=OUTPUT_DIR; repeat per run"
@@ -95,7 +98,10 @@ def _load_model_and_dataset(run_dir: Path, batch_size: int):
     checkpoint_path = run_dir / str(cfg.SOLVER.TRAINABLE_FINAL_CHECKPOINT_NAME)
     if not checkpoint_path.exists():
         raise FileNotFoundError(str(checkpoint_path))
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Trainable-only checkpoints are written with CPU tensors.  Loading them on
+    # CPU is also compatible with older PyTorch releases where build_model may
+    # return an integer CUDA index, which is not a valid torch.load map_location.
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     if checkpoint.get("format") != "vpt_trainable_v1":
         raise ValueError(f"unsupported trainable checkpoint format: {checkpoint_path}")
     state = checkpoint.get("model_state", {})
@@ -346,6 +352,9 @@ def main() -> None:
     _write_csv(output_dir / "prediction_transition_runs.csv", transition_rows)
     payload = {
         "format": "a_series_prediction_transition_v1",
+        "analysis_role": "legacy_probe_context_only",
+        "formal_task_result_source": "decision_gain_decomposition_complete_test",
+        "automatic_launcher_integration": False,
         "status": "completed" if transition_rows else "no_valid_pairs",
         "expected_seeds": sorted(expected_seeds),
         "observed_seeds": sorted(int(seed) for seed in per_seed),

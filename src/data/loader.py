@@ -10,6 +10,7 @@ from ..utils import logging
 from ..utils import distributed as du
 from ..utils.reproducibility import derive_seed, make_torch_generator, seed_data_worker
 from .datasets.xlsa_dataset import CUB200Dataset, AWA2Dataset, SUNAttributeDataset
+from .transforms import get_transforms
 
 logger = logging.get_logger("visual_prompt")
 
@@ -20,7 +21,16 @@ _DATASET_CATALOG = {
 }
 
 
-def _construct_loader(cfg, split, batch_size, shuffle, drop_last):
+def _construct_loader(
+    cfg,
+    split,
+    batch_size,
+    shuffle,
+    drop_last,
+    *,
+    transform_split=None,
+    eval_class_ids=None,
+):
     """Build a DataLoader for one XLSA protocol split."""
     if not bool(cfg.DATA.XLSA.ENABLED):
         raise ValueError("Current data pipeline is XLSA-only. Please set DATA.XLSA.ENABLED=True.")
@@ -30,6 +40,15 @@ def _construct_loader(cfg, split, batch_size, shuffle, drop_last):
         raise ValueError("Dataset '{}' not supported".format(dataset_name))
 
     dataset = _DATASET_CATALOG[dataset_name](cfg, split)
+    if transform_split is not None:
+        dataset.transform = get_transforms(str(transform_split), cfg.DATA.CROPSIZE)
+    if eval_class_ids is not None:
+        if str(eval_class_ids) == "seen_unseen":
+            eval_class_ids = list(dataset.seen_classes) + list(dataset.unseen_classes)
+        dataset.eval_local_classes = [int(item) for item in list(eval_class_ids)]
+        dataset.eval_global_to_local = dataset._build_global_to_local(
+            dataset.num_classes, dataset.eval_local_classes
+        )
     world_size = du.get_world_size()
     rank = du.get_rank()
     data_order_seed = derive_seed(cfg.SEED, "data_order")
@@ -108,6 +127,20 @@ def construct_trainval_loader(cfg):
         batch_size=_per_rank_batch_size(cfg),
         shuffle=True,
         drop_last=False,
+    )
+
+
+def construct_train_eval_loader(cfg):
+    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
+        raise ValueError("train-eval monitoring is only defined for final_gzsl")
+    return _construct_loader(
+        cfg=cfg,
+        split="trainval",
+        batch_size=_per_rank_batch_size(cfg),
+        shuffle=False,
+        drop_last=False,
+        transform_split="test_seen",
+        eval_class_ids="seen_unseen",
     )
 
 

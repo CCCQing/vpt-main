@@ -1,0 +1,16 @@
+_BASE_: "A-04-A2-vpt-deep-ce.yaml"
+OUTPUT_DIR: "output/baseline_rebuild/A2-functional-interface-map"
+
+# Checkpoint-only use: map five representative Deep Prompt layers before any
+# stochastic Prompt architecture is selected. HIERARCHY_VARIANT_COUNT is per
+# selected layer for static Deep Prompt.
+MONITOR:
+  PROBE:
+    BAYESIAN_OBJECT_SELECTION:
+      ENABLE: true
+      LAYERS: [0, 3, 6, 9, 11]
+      HIERARCHY_VARIANT_COUNT: 8
+      CANDIDATE_SPACES:
+        [injected_prompt, contextualized_prompt, cls_effect, logit_effect]
+      AUXILIARY_VIEWS: [decision_margin_effect]
+

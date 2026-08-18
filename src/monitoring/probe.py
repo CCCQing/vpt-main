@@ -609,6 +609,10 @@ class _AttentionLayerAccumulator:
         "prompt_patch_value_to_prompt_delta_cosine",
     )
     INTERVENTION_METRICS = (
+        "prompt_patch_uniform_applied",
+        "prompt_patch_uniform_mass_abs_error",
+        "patch_prompt_uniform_applied",
+        "patch_prompt_uniform_mass_abs_error",
         "prompt_value_globalize_applied",
         "prompt_value_globalize_patch_value_dispersion_before",
         "prompt_value_globalize_patch_value_dispersion_after",
@@ -1894,6 +1898,7 @@ class _AttributeConceptGroundingAccumulator:
         "prompt_attention_to_attribute_concept_patch_mass",
         "prompt_attention_to_attribute_concept_patch_lift",
         "prompt_attention_attribute_concept_topk_overlap",
+        "concept_intervention_applied",
         "concept_intervention_selected_patch_ratio",
         "concept_intervention_selected_score_mean",
         "concept_intervention_unselected_score_mean",
@@ -2436,6 +2441,7 @@ class _PatchSemanticTransportAccumulator:
             "transport_selection_score_gap": selected_score - unselected_score,
         }
         for name in (
+            "transport_intervention_applied",
             "transport_intervention_selected_patch_ratio",
             "transport_intervention_selected_score_mean",
             "transport_intervention_unselected_score_mean",
@@ -3531,21 +3537,22 @@ class StreamingRepresentationAccumulator:
                 result["top_singular_value_ratio"] = 0.0
         observed, centers = self.class_centers()
         if observed.size:
-            within_sum = 0.0
+            within_by_class = []
             for class_id in observed:
                 support = int(self.class_support[int(class_id)].item())
                 class_sum = self.class_sum[int(class_id)]
-                within_sum += float(
+                class_sse = float(
                     self.class_square_norm_sum[int(class_id)].item()
                     - class_sum.square().sum().item() / max(1, support)
                 )
-            overall = (self.feature_sum / count).numpy()
-            within = within_sum / max(1, self.count * self.feature_dim)
-            between = float(np.square(centers - overall[None, :]).sum(axis=1).mean())
+                within_by_class.append(max(0.0, class_sse) / max(1, support))
+            macro_center = centers.mean(axis=0)
+            within = float(np.mean(within_by_class))
+            between = float(np.square(centers - macro_center[None, :]).sum(axis=1).mean())
             result.update({
-                "within_class_scatter": float(within),
-                "between_class_scatter": between,
-                "fisher_ratio": float(between / max(within, 1e-12)),
+                "within_class_scatter_trace": within,
+                "between_class_scatter_trace": between,
+                "fisher_trace_ratio": float(between / max(within, 1e-12)),
             })
         return result
 

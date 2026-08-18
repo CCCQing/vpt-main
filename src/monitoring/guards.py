@@ -262,6 +262,9 @@ class PromptParameterTracker:
             name: parameter.detach().float().cpu().clone()
             for name, parameter in self.parameters.items()
         }
+        self.previous_epoch = {
+            name: value.clone() for name, value in self.initial.items()
+        }
         self.layer_parameters = {}
         input_prompt = next((
             (name, parameter)
@@ -285,6 +288,9 @@ class PromptParameterTracker:
         self.layer_initial = {
             layer_index: self._parameter_layer_view(parameter, slice_index).detach().float().cpu().clone()
             for layer_index, (_, parameter, slice_index) in self.layer_parameters.items()
+        }
+        self.layer_previous_epoch = {
+            layer_index: value.clone() for layer_index, value in self.layer_initial.items()
         }
         self.reset_epoch_gradient_stats()
 
@@ -348,6 +354,8 @@ class PromptParameterTracker:
             current = self._parameter_layer_view(parameter, slice_index).detach().float().cpu()
             initial = self.layer_initial[layer_index]
             delta = current - initial
+            previous_epoch = self.layer_previous_epoch[layer_index]
+            epoch_delta = current - previous_epoch
             count = int(self.layer_grad_count.get(layer_index, 0))
             metrics = {
                 "prompt_param_norm": float(current.norm().item()),
@@ -360,6 +368,15 @@ class PromptParameterTracker:
                     delta.norm().item() / max(float(initial.norm().item()), 1e-12)
                 ),
                 "distance_from_initialization": float(delta.norm().item()),
+                "epoch_parameter_step_norm": float(epoch_delta.norm().item()),
+                "epoch_update_to_weight_ratio": float(
+                    epoch_delta.norm().item() / max(float(previous_epoch.norm().item()), 1e-12)
+                ),
+                "cross_epoch_prompt_cosine": float(
+                    torch.nn.functional.cosine_similarity(
+                        previous_epoch.reshape(-1), current.reshape(-1), dim=0, eps=1e-12
+                    ).item()
+                ),
                 **self._token_geometry(current),
             }
             if previous is not None:
@@ -386,12 +403,25 @@ class PromptParameterTracker:
                 grad_sq += float(parameter.grad.detach().float().norm().item()) ** 2
         current = torch.cat(current_flat)
         initial = torch.cat(initial_flat)
+        previous = torch.cat([
+            self.previous_epoch[name].reshape(-1) for name in self.parameters
+        ])
         delta = current - initial
+        epoch_delta = current - previous
         result = {
             "prompt_param_norm": float(current.norm().item()),
             "prompt_grad_norm": float(grad_sq ** 0.5),
             "prompt_relative_update": float(delta.norm().item() / max(float(initial.norm().item()), 1e-12)),
             "distance_from_initialization": float(delta.norm().item()),
+            "epoch_parameter_step_norm": float(epoch_delta.norm().item()),
+            "epoch_update_to_weight_ratio": float(
+                epoch_delta.norm().item() / max(float(previous.norm().item()), 1e-12)
+            ),
+            "cross_epoch_prompt_cosine": float(
+                torch.nn.functional.cosine_similarity(
+                    previous.reshape(-1), current.reshape(-1), dim=0, eps=1e-12
+                ).item()
+            ),
             "prompt_parameter_tensor_count": float(len(self.parameters)),
         }
         token_matrices = []
@@ -403,3 +433,15 @@ class PromptParameterTracker:
             tokens = torch.cat(token_matrices, dim=0)
             result.update(self._token_geometry(tokens))
         return result
+
+    def commit_epoch_snapshot(self) -> None:
+        for name, parameter in self.parameters.items():
+            self.previous_epoch[name] = parameter.detach().float().cpu().clone()
+        for layer_index, (_, parameter, slice_index) in self.layer_parameters.items():
+            self.layer_previous_epoch[layer_index] = (
+                self._parameter_layer_view(parameter, slice_index)
+                .detach()
+                .float()
+                .cpu()
+                .clone()
+            )

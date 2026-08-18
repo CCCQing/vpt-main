@@ -122,7 +122,15 @@ def _format_command(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(str(item)) for item in command)
 
 
-def _summary_command(python_bin: str, jobs: Sequence[Job], out_root: Path, seeds: Sequence[int]) -> List[str]:
+def _summary_command(
+    python_bin: str,
+    jobs: Sequence[Job],
+    out_root: Path,
+    seeds: Sequence[int],
+    *,
+    compact_probe_metrics: bool = True,
+    compact_module_effect_json: bool = True,
+) -> List[str]:
     models = []
     for job in jobs:
         if job.model not in models:
@@ -139,50 +147,33 @@ def _summary_command(python_bin: str, jobs: Sequence[Job], out_root: Path, seeds
     ]
     for job in jobs:
         command.extend(["--run", "{}={}".format(job.model, job.output_root)])
+    if compact_probe_metrics:
+        command.append("--compact-probe-metrics")
+    if compact_module_effect_json:
+        command.append("--compact-module-effect-json")
     return command
 
 
-def _transition_command(
+def _run_summary(
     python_bin: str,
     jobs: Sequence[Job],
     out_root: Path,
     seeds: Sequence[int],
-) -> List[str]:
-    command = [
+    *,
+    compact_probe_metrics: bool = True,
+    compact_module_effect_json: bool = True,
+) -> None:
+    command = _summary_command(
         python_bin,
-        str(
-            ROOT
-            / "src"
-            / "tools"
-            / "search_plans"
-            / "a_series"
-            / "summarize_prediction_transitions.py"
-        ),
-        "--output-dir",
-        str(out_root / "a_series_summary"),
-        "--expected-seeds",
-        ",".join(str(seed) for seed in seeds),
-    ]
-    for job in jobs:
-        command.extend(["--run", "{}={}".format(job.model, job.output_root)])
-    return command
-
-
-def _run_summary(python_bin: str, jobs: Sequence[Job], out_root: Path, seeds: Sequence[int]) -> None:
-    command = _summary_command(python_bin, jobs, out_root, seeds)
+        jobs,
+        out_root,
+        seeds,
+        compact_probe_metrics=compact_probe_metrics,
+        compact_module_effect_json=compact_module_effect_json,
+    )
     process = subprocess.run(command, cwd=str(ROOT), check=False)
     if process.returncode != 0:
         raise SystemExit("A-series runs completed, but monitoring summary generation failed.")
-    if len({job.model for job in jobs}) >= 2:
-        transition_process = subprocess.run(
-            _transition_command(python_bin, jobs, out_root, seeds),
-            cwd=str(ROOT),
-            check=False,
-        )
-        if transition_process.returncode != 0:
-            raise SystemExit(
-                "A-series monitoring summary completed, but prediction transition aggregation failed."
-            )
     print("A-series monitoring summary: {}".format(out_root / "a_series_summary"), flush=True)
 
 
@@ -270,7 +261,7 @@ def _progress_trial(job: Job, trial_index: int) -> Dict[str, object]:
         "runner": "train",
         "stage": str(job.model),
         "combo": {"model": str(job.model), "seed": int(job.seed)},
-        "overrides": {"SOLVER.TOTAL_EPOCH": 30},
+        "overrides": {"SOLVER.TOTAL_EPOCH": 15},
         "output_dir": str(job.output_root),
         "identity_fields": {"config_file": str(job.config_file)},
         "eta_fields": {"model": str(job.model)},
@@ -325,6 +316,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--progress-width", type=int, default=120)
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--no-summary", action="store_true")
+    parser.add_argument("--keep-uncompressed-probe-metrics", action="store_true")
+    parser.add_argument("--keep-uncompressed-module-effect-json", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -378,19 +371,27 @@ def main() -> None:
             )
         if not args.no_summary:
             print("[dry-run summary] {}".format(
-                _format_command(_summary_command(args.python_bin, jobs, out_root, seeds))
-            ))
-            if len(set(models)) >= 2:
-                print("[dry-run prediction transitions] {}".format(
-                    _format_command(
-                        _transition_command(args.python_bin, jobs, out_root, seeds)
-                    )
+                _format_command(_summary_command(
+                    args.python_bin,
+                    jobs,
+                    out_root,
+                    seeds,
+                    compact_probe_metrics=not args.keep_uncompressed_probe_metrics,
+                    compact_module_effect_json=not args.keep_uncompressed_module_effect_json,
                 ))
+            ))
         return
     if not pending:
         print("All requested A-series tasks are already completed.", flush=True)
         if not args.no_summary:
-            _run_summary(args.python_bin, jobs, out_root, seeds)
+            _run_summary(
+                args.python_bin,
+                jobs,
+                out_root,
+                seeds,
+                compact_probe_metrics=not args.keep_uncompressed_probe_metrics,
+                compact_module_effect_json=not args.keep_uncompressed_module_effect_json,
+            )
         return
 
     results = _run_workers(
@@ -419,7 +420,14 @@ def main() -> None:
             )
         raise SystemExit(1)
     if not args.no_summary:
-        _run_summary(args.python_bin, jobs, out_root, seeds)
+        _run_summary(
+            args.python_bin,
+            jobs,
+            out_root,
+            seeds,
+            compact_probe_metrics=not args.keep_uncompressed_probe_metrics,
+            compact_module_effect_json=not args.keep_uncompressed_module_effect_json,
+        )
 
 
 if __name__ == "__main__":

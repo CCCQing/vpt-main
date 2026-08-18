@@ -156,10 +156,17 @@ def train(cfg, args):
     )
 
     train_loader, val_loader, test_seen_loader, test_unseen_loader = get_loaders(cfg, logger)
+    train_eval_loader = None
+    if bool(cfg.MONITOR.ENABLE) and bool(cfg.MONITOR.TRAIN_EVAL.ENABLE):
+        logger.info("Loading deterministic train-eval data for monitoring...")
+        train_eval_loader = data_loader.construct_train_eval_loader(cfg)
     manifest_path = write_xlsa_dataset_manifest(
         cfg,
         {
             "train": train_loader.dataset if train_loader is not None else None,
+            "train_eval_seen": (
+                train_eval_loader.dataset if train_eval_loader is not None else None
+            ),
             "val_unseen": val_loader.dataset if val_loader is not None else None,
             "test_seen": test_seen_loader.dataset if test_seen_loader is not None else None,
             "test_unseen": test_unseen_loader.dataset if test_unseen_loader is not None else None,
@@ -225,6 +232,7 @@ def train(cfg, args):
             "val_unseen": val_loader,
             "test_seen": test_seen_loader,
             "test_unseen": test_unseen_loader,
+            "train_eval_seen": train_eval_loader,
         },
     )
     if distributed_checks:
@@ -243,6 +251,7 @@ def train(cfg, args):
         cfg,
         {
             "train": train_loader,
+            "train_eval_seen": train_eval_loader,
             "val_unseen": val_loader,
             "test_seen": test_seen_loader,
             "test_unseen": test_unseen_loader,
@@ -260,7 +269,13 @@ def train(cfg, args):
 
     # -----------------------------------
     if train_loader:
-        trainer.train_classifier(train_loader, val_loader, test_seen_loader, test_unseen_loader)
+        trainer.train_classifier(
+            train_loader,
+            val_loader,
+            test_seen_loader,
+            test_unseen_loader,
+            train_eval_loader=train_eval_loader,
+        )
     else:
         print("No train loader presented. Exit")
 

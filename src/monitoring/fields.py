@@ -94,6 +94,13 @@ MONITOR_FIELD_CATALOG: Dict[str, Tuple[MetricFieldSpec, ...]] = {
         MetricFieldSpec("batch_time_sec", "当前训练 epoch 的平均 batch 耗时", "seconds", "mean"),
         MetricFieldSpec("data_time_sec", "当前训练 epoch 的平均数据读取耗时", "seconds", "mean"),
     ),
+    "fixed_probe_runtime": (
+        MetricFieldSpec("probe_total_time_sec", "固定Probe对应阶段的总墙钟耗时", "seconds", "sum"),
+        MetricFieldSpec("probe_data_time_sec", "DataLoader创建迭代器及取得batch的累计等待时间", "seconds", "sum"),
+        MetricFieldSpec("probe_compute_time_sec", "总耗时扣除DataLoader等待后的模型执行、数据传输与聚合时间", "seconds", "sum"),
+        MetricFieldSpec("probe_data_time_ratio", "DataLoader等待时间占固定Probe总耗时的比例", "ratio", "derived"),
+        MetricFieldSpec("batch_count", "固定Probe对应阶段实际消费的batch数", "count", "sum"),
+    ),
     "train_debug": (
         MetricFieldSpec("ce_logits_std", "当前采样 batch 的 CE logits 总体标准差", "logit", "sampled_batch", True),
         MetricFieldSpec("ce_logits_abs_max", "当前采样 batch 的 CE logits 最大绝对值", "logit", "sampled_batch", True),
@@ -119,6 +126,14 @@ MONITOR_FIELD_CATALOG: Dict[str, Tuple[MetricFieldSpec, ...]] = {
     ),
     "prompt_distribution": (
         MetricFieldSpec("{mu,logvar,std,prompt_tokens}_{mean,std,abs_mean,norm_mean}", "实例条件 prompt 分布摘要", "latent_value", "sampled_batch"),
+        MetricFieldSpec("sampling_performed", "本次forward是否实际从分布生成采样Prompt", "boolean", "sampled_batch"),
+    ),
+    "deep_prompt_residual": (
+        MetricFieldSpec("layer_*.gate", "逐层确定性均值修正门控", "scalar", "sampled_batch"),
+        MetricFieldSpec("layer_*.{base_prompt_norm,raw_delta_norm,applied_delta_norm}", "逐层静态 Prompt 与直接均值修正的尺度", "feature_norm", "sampled_batch"),
+        MetricFieldSpec("layer_*.applied_delta_to_base_ratio", "实际注入残差相对静态 Prompt 的尺度", "ratio", "sampled_batch"),
+        MetricFieldSpec("layer_*.raw_delta_between_instance_variance", "同层残差在不同样本间是否真的变化", "variance", "sampled_batch"),
+        MetricFieldSpec("layer_*.raw_delta_slot_variance", "同一图像的均值修正在Prompt槽间是否保持直接复制合同；应为0", "variance", "sampled_batch"),
     ),
     "prompt_parameter_health": (
         MetricFieldSpec("*", "静态 prompt 参数、梯度、更新和秩摘要", "scalar", "epoch"),
@@ -135,6 +150,13 @@ MONITOR_FIELD_CATALOG: Dict[str, Tuple[MetricFieldSpec, ...]] = {
     "auxiliary_loss_health": (
         MetricFieldSpec("*", "非主 CE 辅助损失的有限标量与相对强度", "loss", "sampled_batch"),
     ),
+    "loss_component_trajectory": (
+        MetricFieldSpec("*.raw", "当前损失分量未乘权重的epoch样本加权均值", "loss", "sample_mean"),
+        MetricFieldSpec("*.weight", "当前损失分量实际使用的固定权重", "weight", "last"),
+        MetricFieldSpec("*.weighted", "权重乘原始损失后的epoch样本加权均值", "loss", "sample_mean"),
+        MetricFieldSpec("*.weighted_share", "加权分量相对总损失绝对值的比例", "ratio", "sample_mean"),
+        MetricFieldSpec("total_loss", "所有损失分量相加后的epoch样本加权均值", "loss", "sample_mean", True),
+    ),
     "classification": (
         MetricFieldSpec("*", "Evaluator 在完整数据集上计算的分类指标", "metric", "dataset"),
     ),
@@ -150,6 +172,16 @@ MONITOR_FIELD_CATALOG: Dict[str, Tuple[MetricFieldSpec, ...]] = {
     "class_error": (
         MetricFieldSpec("bottom_k_class_mean", "准确率最低 10% 已观测类别的平均准确率", "ratio", "dataset", True),
         MetricFieldSpec("max_prediction_share", "预测次数最多类别占全部预测的比例", "ratio", "dataset", True),
+    ),
+    "epoch_prediction_transition": (
+        MetricFieldSpec("transition_available", "当前epoch是否存在可配对的上一epoch样本状态", "boolean", "dataset", True),
+        MetricFieldSpec("prediction_flip_rate", "相邻epoch预测类别发生改变的样本比例", "ratio", "dataset"),
+        MetricFieldSpec("correction_rate", "上一epoch错误且当前epoch正确的样本比例", "ratio", "dataset"),
+        MetricFieldSpec("regression_rate", "上一epoch正确且当前epoch错误的样本比例", "ratio", "dataset"),
+        MetricFieldSpec("net_correction_rate", "correction_rate减regression_rate", "ratio", "dataset"),
+        MetricFieldSpec("persistent_correct_rate", "相邻两个epoch均预测正确的样本比例", "ratio", "dataset"),
+        MetricFieldSpec("persistent_wrong_rate", "相邻两个epoch均预测错误的样本比例", "ratio", "dataset"),
+        MetricFieldSpec("ever_correct_then_wrong_rate", "此前至少正确过但当前epoch错误的样本比例", "ratio", "dataset"),
     ),
     "calibration_profile": (
         MetricFieldSpec("ausuc", "固定 gamma 网格上 Seen-Unseen 曲线的诊断面积", "area", "dataset", True),

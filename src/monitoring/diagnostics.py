@@ -17,6 +17,7 @@ from .eval_metrics import (
     prediction_health_metrics,
     semantic_graph_reference_metrics,
 )
+from .epoch_transition import EpochPredictionTransitionTracker
 from .writer import json_safe, write_json
 
 
@@ -39,6 +40,14 @@ class DiagnosticManager:
         self.cfg = cfg
         self.monitor_manager = monitor_manager
         self.enabled = bool(cfg.MONITOR.ENABLE) and bool(cfg.MONITOR.DIAGNOSTICS.ENABLE) and bool(is_writer)
+        if (
+            self.enabled
+            and bool(cfg.MONITOR.PREDICTION_TRANSITION_TRAJECTORY.ENABLE)
+            and (int(cfg.NUM_GPUS) != 1 or int(cfg.NUM_SHARDS) != 1)
+        ):
+            raise ValueError(
+                "epoch prediction transition currently requires the single-GPU, single-shard evaluator contract"
+            )
         self.root = Path(str(cfg.OUTPUT_DIR)) / "diagnostics"
         self.output_policy = str(cfg.MONITOR.OUTPUT_POLICY).lower()
         self.run_id = str(monitor_manager.run_id)
@@ -46,10 +55,12 @@ class DiagnosticManager:
         self.started_at = self._utc_now()
         self.finalized = False
         self.calibration_pending: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        self.epoch_transition_tracker = EpochPredictionTransitionTracker()
         self.runtime = {
             "static_semantic_graph": self._new_state("one_time_evidence"),
             "prediction_health": self._new_state("eval_diagnostics"),
             "class_error": self._new_state("eval_diagnostics"),
+            "epoch_prediction_transition": self._new_state("cross_epoch_eval_diagnostics"),
             "calibration_profile": self._new_state("eval_diagnostics"),
             "fixed_probe": self._new_state("fixed_probe"),
             "module_effect": self._new_state("paired_intervention"),
@@ -109,7 +120,7 @@ class DiagnosticManager:
 
     def _write_manifest(self) -> None:
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": self.run_id,
             "session_id": self.session_id,
             "started_at": self.started_at,
@@ -118,6 +129,15 @@ class DiagnosticManager:
                 "static_semantic_graph": {"kind": "one_time_evidence", "intrusive": False},
                 "prediction_health": {"kind": "eval_diagnostics", "intrusive": False, "extra_forward": False},
                 "class_error": {"kind": "eval_diagnostics", "intrusive": False, "extra_forward": False},
+                "epoch_prediction_transition": {
+                    "kind": "cross_epoch_eval_diagnostics",
+                    "intrusive": False,
+                    "extra_forward": False,
+                    "sample_state_persisted": False,
+                    "aggregate_artifacts_only": True,
+                    "single_gpu_single_shard_required": True,
+                    "resume_without_previous_state": "invalid_until_next_consecutive_pair",
+                },
                 "calibration_profile": {"kind": "eval_diagnostics", "intrusive": False, "extra_forward": False},
                 "fixed_probe": {"kind": "fixed_probe", "intrusive": False, "requires_probe_manifest": True},
                 "bayesian_object_selection": {
@@ -140,6 +160,9 @@ class DiagnosticManager:
             "resolved_switches": {
                 "prediction_health": bool(self.cfg.MONITOR.PREDICTION_HEALTH.ENABLE),
                 "class_error": bool(self.cfg.MONITOR.CLASS_ERROR.ENABLE),
+                "epoch_prediction_transition": bool(
+                    self.cfg.MONITOR.PREDICTION_TRANSITION_TRAJECTORY.ENABLE
+                ),
                 "calibration_profile": bool(self.cfg.MONITOR.CALIBRATION.ENABLE),
                 "fixed_probe": bool(self.cfg.MONITOR.PROBE.ENABLE),
                 "bayesian_object_selection": bool(
@@ -209,6 +232,7 @@ class DiagnosticManager:
         scores: Any,
         targets_local: Any,
         dataset: Any,
+        sample_ids: Optional[Sequence[str]] = None,
     ) -> Dict[str, Dict[str, float]]:
         if not self.enabled:
             return {"prediction_health": {}, "class_error": {}}
@@ -283,7 +307,85 @@ class DiagnosticManager:
                 reducer="dataset",
                 n=int(score_matrix.shape[0]),
             )
-        return {"prediction_health": prediction, "class_error": class_summary}
+        transition = self._record_epoch_prediction_transition(
+            epoch=int(epoch),
+            split=str(split),
+            scores=score_matrix,
+            targets_local=local_targets,
+            candidate_global_ids=candidate,
+            sample_ids=sample_ids,
+        )
+        return {
+            "prediction_health": prediction,
+            "class_error": class_summary,
+            "epoch_prediction_transition": transition,
+        }
+
+    def _record_epoch_prediction_transition(
+        self,
+        *,
+        epoch: int,
+        split: str,
+        scores: np.ndarray,
+        targets_local: np.ndarray,
+        candidate_global_ids: np.ndarray,
+        sample_ids: Optional[Sequence[str]],
+    ) -> Dict[str, Any]:
+        cfg = self.cfg.MONITOR.PREDICTION_TRANSITION_TRAJECTORY
+        requested_splits = {str(item) for item in list(cfg.SPLITS)}
+        if not bool(cfg.ENABLE) or str(split) not in requested_splits:
+            return {}
+        if sample_ids is None:
+            raise ValueError(
+                "epoch prediction transition requires stable sample_ids from the evaluator"
+            )
+        payload = self.epoch_transition_tracker.update(
+            epoch=int(epoch),
+            split=str(split),
+            sample_ids=sample_ids,
+            predictions=np.asarray(scores).argmax(axis=1),
+            targets_local=targets_local,
+            candidate_global_ids=candidate_global_ids,
+        )
+        position = {"epoch": int(epoch), "split": str(split)}
+        arrays = payload.pop("arrays")
+        vectors_path = None
+        vectors_sha256 = None
+        if arrays:
+            vectors_path = self._write_npz_artifact(
+                "epoch_prediction_transition",
+                f"epoch_prediction_transition/epoch_{int(epoch):04d}/{split}.npz",
+                arrays,
+                position,
+            )
+            vectors_sha256 = _sha256(vectors_path)
+        candidate_ids = np.asarray(payload.pop("candidate_global_ids"), dtype=np.int64)
+        json_payload = {
+            **payload,
+            "candidate_global_ids": candidate_ids.tolist(),
+            "storage_mode": "aggregate_only",
+            "sample_ids_persisted": False,
+            "previous_epoch_sample_state_in_memory_only": True,
+            "vectors_path": (
+                str(vectors_path.relative_to(self.root)).replace("\\", "/")
+                if vectors_path is not None else None
+            ),
+            "vectors_sha256": vectors_sha256,
+        }
+        self._write_json_artifact(
+            "epoch_prediction_transition",
+            f"epoch_prediction_transition/epoch_{int(epoch):04d}/{split}.json",
+            json_payload,
+            position,
+        )
+        self.monitor_manager.record_epoch(
+            str(split),
+            "epoch_prediction_transition",
+            payload["summary"],
+            reducer="dataset",
+            n=int(scores.shape[0]),
+        )
+        return json_payload
 
     def record_calibration(self, epoch: int) -> Dict[str, float]:
         if not self.enabled or not bool(self.cfg.MONITOR.CALIBRATION.ENABLE):
@@ -343,6 +445,11 @@ class DiagnosticManager:
         if not self.enabled or not rows:
             return None
         path = self.root / "probe_metrics.csv"
+        compressed_path = path.with_name(path.name + ".gz")
+        if compressed_path.exists() and not path.exists():
+            raise RuntimeError(
+                "Cannot append fixed-probe metrics after probe_metrics.csv was compacted; use a new diagnostic output directory."
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = [
             "run_id", "session_id", "checkpoint_id", "probe_id", "selection_seed",
@@ -353,17 +460,22 @@ class DiagnosticManager:
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
                 reader = csv.DictReader(handle)
                 existing_fields = list(reader.fieldnames or [])
-                existing_rows = list(reader)
-            condition_only_fields = [
-                name for name in fieldnames
-                if name not in {"selection_seed", "probe_manifest_sha256"}
-            ]
-            legacy_fields = [name for name in condition_only_fields if name != "condition"]
-            if existing_fields in (legacy_fields, condition_only_fields):
+                condition_only_fields = [
+                    name for name in fieldnames
+                    if name not in {"selection_seed", "probe_manifest_sha256"}
+                ]
+                legacy_fields = [
+                    name for name in condition_only_fields if name != "condition"
+                ]
+                legacy_schema = existing_fields in (
+                    legacy_fields, condition_only_fields
+                )
+                existing_rows = list(reader) if legacy_schema else None
+            if legacy_schema:
                 with path.open("w", encoding="utf-8", newline="") as handle:
                     writer = csv.DictWriter(handle, fieldnames=fieldnames)
                     writer.writeheader()
-                    for row in existing_rows:
+                    for row in existing_rows or []:
                         writer.writerow({
                             name: (
                                 "normal" if name == "condition" and "condition" not in row
@@ -397,6 +509,7 @@ class DiagnosticManager:
         if not self.enabled or self.finalized:
             return
         self.calibration_pending.clear()
+        self.epoch_transition_tracker.clear()
         write_json(
             self.root / "diagnostic_runtime_summary.json",
             {

@@ -57,6 +57,7 @@ def build_vit_sup_models(
     prompt_backend = prompt_cfg.BACKEND.lower() if prompt_cfg is not None else "dynamic"
     if prompt_cfg is not None:
         dist_cfg = prompt_cfg.DISTRIBUTOR
+        deep_residual_enabled = bool(dist_cfg.DEEP_RESIDUAL.ENABLE)
         use_distributor = False
         if prompt_backend == "dynamic":
             use_distributor = (
@@ -65,8 +66,11 @@ def build_vit_sup_models(
             )
         elif prompt_backend == "vpt_deep":
             use_distributor = (
-                prompt_cfg.INIT_SOURCE.lower() == "distributor_mean"
-                and bool(dist_cfg.ENABLE)
+                bool(dist_cfg.ENABLE)
+                and (
+                    prompt_cfg.INIT_SOURCE.lower() == "distributor_mean"
+                    or deep_residual_enabled
+                )
             )
         if (
             use_distributor

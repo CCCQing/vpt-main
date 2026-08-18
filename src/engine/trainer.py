@@ -42,6 +42,7 @@ import ast
 import hashlib
 import json
 import re
+from typing import Dict
 from collections import defaultdict
 from contextlib import nullcontext
 import matplotlib
@@ -72,7 +73,9 @@ from ..monitoring.adapters import (
     auxiliary_loss_metrics,
     affinity_metrics,
     attention_mediation_metrics,
+    deep_prompt_residual_metrics,
     graph_prob_prior_metrics,
+    loss_component_metrics,
     prompt_distribution_metrics,
     semantic_token_metrics,
     train_debug_metrics,
@@ -83,6 +86,8 @@ from ..monitoring.module_effect import (
     checkpoint_sha256,
     both_prompt_zero_intervention,
     domain_prompt_zero_intervention,
+    deep_prompt_residual_swap_intervention,
+    deep_prompt_residual_zero_intervention,
     instance_prompt_swap_intervention,
     instance_prompt_zero_intervention,
     layer_prompt_read_block_intervention,
@@ -139,6 +144,55 @@ from ..utils.vis_pipeline import (
 )
 
 logger = logging.get_logger("visual_prompt")
+
+
+class _StreamingProbeMetricRows:
+    def __init__(self, diagnostic_manager, flush_rows=16384):
+        self.diagnostic_manager = diagnostic_manager
+        self.flush_rows = max(1, int(flush_rows))
+        self.buffer = []
+        self.total_count = 0
+
+    def extend(self, rows):
+        for row in rows:
+            self.buffer.append(row)
+            self.total_count += 1
+            if len(self.buffer) >= self.flush_rows:
+                self.flush()
+
+    def flush(self):
+        if not self.buffer:
+            return
+        self.diagnostic_manager.append_probe_metrics(self.buffer)
+        self.buffer.clear()
+
+    def __len__(self):
+        return int(self.total_count)
+
+
+class _TimedProbeLoader:
+    def __init__(self, loader):
+        self.loader = loader
+        self.data_time_sec = 0.0
+        self.batch_count = 0
+
+    def __iter__(self):
+        started = time.perf_counter()
+        iterator = iter(self.loader)
+        self.data_time_sec += time.perf_counter() - started
+        while True:
+            started = time.perf_counter()
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                self.data_time_sec += time.perf_counter() - started
+                return
+            self.data_time_sec += time.perf_counter() - started
+            self.batch_count += 1
+            yield batch
+
+    def __len__(self):
+        return len(self.loader)
 
 
 class Trainer():
@@ -256,6 +310,8 @@ class Trainer():
             else None
         )
         self.prompt_parameter_tracker = PromptParameterTracker(self._model_ref(self.model))
+        self._loss_component_epoch_sums = {}
+        self._loss_component_epoch_counts = {}
         self._optimizer_sanity_first_step_done = False
         self._optimizer_sanity_payload = None
         if self.optimizer_sanity is not None:
@@ -271,6 +327,11 @@ class Trainer():
             )
         self._probe_manifests = {}
         self._final_trainable_checkpoint_path = None
+        self._fixed_probe_checkpoint_source = None
+        self._milestone_probe_records = []
+        self._milestone_probe_epochs = self._resolve_milestone_probe_epochs(
+            int(cfg.SOLVER.TOTAL_EPOCH)
+        )
         self.monitor_manager.record_event(
             "monitor_initialized",
             {
@@ -456,6 +517,14 @@ class Trainer():
             if protocol_mode == "final_gzsl":
                 return "gzsl_unseen"
             raise ValueError("test_unseen is only valid under final_zsl/final_gzsl, got '{}'".format(protocol_mode))
+        if split == "train_eval_seen":
+            if protocol_mode != "final_gzsl":
+                raise ValueError(
+                    "train_eval_seen is only valid under final_gzsl, got '{}'".format(
+                        protocol_mode
+                    )
+                )
+            return "train_eval_seen"
         raise ValueError("Unsupported eval split '{}' for metric-key resolution".format(prefix))
 
     def _update_gzsl_record_metrics(
@@ -957,6 +1026,12 @@ class Trainer():
         self.monitor_manager.record_step(
             "prompt_distribution",
             prompt_distribution_metrics(model_ref.get_runtime_prompt_distribution_stats()),
+        )
+        self.monitor_manager.record_step(
+            "deep_prompt_residual",
+            deep_prompt_residual_metrics(
+                model_ref.get_runtime_deep_prompt_residual_trace()
+            ),
         )
         self.monitor_manager.record_step(
             "semantic_token_health",
@@ -2306,6 +2381,42 @@ class Trainer():
             "sample_count": sample_count,
         }
 
+    def _reset_loss_component_epoch_stats(self):
+        self._loss_component_epoch_sums = {}
+        self._loss_component_epoch_counts = {}
+
+    def _observe_loss_component_epoch_stats(self, sample_count):
+        if not bool(self.cfg.MONITOR.LOSS_COMPONENT_TRAJECTORY.ENABLE):
+            return
+        metrics = loss_component_metrics(
+            getattr(self.cls_criterion, "_last_loss_stats", None)
+        )
+        count = max(0, int(sample_count))
+        for name, value in metrics.items():
+            self._loss_component_epoch_sums[name] = (
+                self._loss_component_epoch_sums.get(name, 0.0)
+                + float(value) * count
+            )
+            self._loss_component_epoch_counts[name] = (
+                self._loss_component_epoch_counts.get(name, 0) + count
+            )
+
+    def _finalize_loss_component_epoch_stats(self):
+        result = {}
+        for name in sorted(self._loss_component_epoch_sums):
+            total = float(self._loss_component_epoch_sums[name])
+            count = int(self._loss_component_epoch_counts.get(name, 0))
+            if du.get_world_size() > 1:
+                state = torch.tensor(
+                    [total, float(count)], dtype=torch.float64, device=self.device
+                )
+                torch.distributed.all_reduce(state, op=torch.distributed.ReduceOp.SUM)
+                total = float(state[0].item())
+                count = int(round(float(state[1].item())))
+            if count > 0:
+                result[name] = total / count
+        return result
+
     def _build_train_progress(self, epoch, effective_total_epoch, total_data, train_loader):
         return self._runtime_progress.build_train_progress(
             epoch,
@@ -2345,6 +2456,7 @@ class Trainer():
         batch_time.reset()
         data_time.reset()
         self.prompt_parameter_tracker.reset_epoch_gradient_stats()
+        self._reset_loss_component_epoch_stats()
 
         sampler = getattr(train_loader, "sampler", None)
         if hasattr(sampler, "set_epoch"):
@@ -2384,6 +2496,7 @@ class Trainer():
                 )
 
                 losses.update(train_loss.item(), X.shape[0])
+                self._observe_loss_component_epoch_stats(X.shape[0])
                 if self.graph_prob_prior_loss_active:
                     self._graph_prob_prior_forward += 1
                 self._record_train_step_monitors(train_loss)
@@ -2484,6 +2597,19 @@ class Trainer():
             reducer="last",
             n=1,
         )
+        self.prompt_parameter_tracker.commit_epoch_snapshot()
+        if bool(self.cfg.MONITOR.LOSS_COMPONENT_TRAJECTORY.ENABLE):
+            loss_component_epoch_metrics = self._finalize_loss_component_epoch_stats()
+            self.monitor_manager.record_epoch(
+                "train",
+                "loss_component_trajectory",
+                loss_component_epoch_metrics,
+                reducer={
+                    name: ("last" if name.endswith(".weight") else "sample_mean")
+                    for name in loss_component_epoch_metrics
+                },
+                n=epoch_metrics["sample_count"],
+            )
 
         if self.scheduler is not None:
             self.scheduler.step()
@@ -2618,6 +2744,11 @@ class Trainer():
             and str(self.cfg.MODEL.PROMPT.INIT_SOURCE).lower()
             == "distributor_mean"
         )
+        deep_residual_available = bool(
+            prompt_available
+            and distributor_cfg.ENABLE
+            and distributor_cfg.DEEP_RESIDUAL.ENABLE
+        )
         instance_prompt_length = (
             int(distributor_cfg.INSTANCE_TOKENS) if distributor_available else 0
         )
@@ -2668,6 +2799,38 @@ class Trainer():
                 "attention_route_retained": True,
             },
             True,
+        )
+        add(
+            self.cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_ZERO,
+            "deep_prompt_residual_zeroed",
+            deep_prompt_residual_zero_intervention,
+            deep_residual_available,
+            "deep_prompt_residual_not_active",
+            {
+                "changed_object": "applied_delta_prompt_all_layers",
+                "replacement": "zero",
+                "static_deep_prompt_preserved": True,
+            },
+            True,
+        )
+        add(
+            self.cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_SWAP,
+            "deep_prompt_residual_swapped",
+            deep_prompt_residual_swap_intervention,
+            deep_residual_available,
+            "deep_prompt_residual_not_active",
+            {
+                "changed_object": "shared_distributor_mu",
+                "pairing": "deterministic_in_batch_derangement",
+                "pairing_identity": "deep_residual_mean_swap_seed_and_sample_id",
+                "static_deep_prompt_preserved": True,
+                "self_pair_allowed": False,
+                "swap_seed": int(
+                    self.cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_SWAP_SEED
+                ),
+            },
+            True,
+            "deep_residual_swap",
         )
         add(
             self.cfg.MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_ZERO,
@@ -3079,6 +3242,7 @@ class Trainer():
         candidate_class_ids,
         *,
         split,
+        include_explanation_validity=True,
     ):
         model_ref = self._model_ref(self.model)
         candidate_class_ids = [int(item) for item in candidate_class_ids]
@@ -3097,7 +3261,9 @@ class Trainer():
         )
         selected_layers = [int(item) for item in self.cfg.MONITOR.PROBE.LAYERS]
         explanation_cfg = self.cfg.MONITOR.PROBE.EXPLANATION_VALIDITY
-        explanation_requested = bool(explanation_cfg.ENABLE)
+        explanation_requested = bool(
+            explanation_cfg.ENABLE and include_explanation_validity
+        )
         explanation_layers = [int(item) for item in explanation_cfg.LAYERS]
         explanation_conditions = [
             str(item).lower() for item in explanation_cfg.CONDITIONS
@@ -3198,6 +3364,9 @@ class Trainer():
             "prompt_length": prompt_length,
             "semantic_length": semantic_length,
             "detach": True,
+            "retain_attention_for_relevance": True,
+            "selected_layers": selected_layers,
+            "include_visual_normalizations": False,
             "block_s_to_cls": bool(self.cfg.MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS),
         }
 
@@ -3237,6 +3406,18 @@ class Trainer():
                     runtime_targets=None,
                 )
                 relevance_logits, attention_layers, affinities = relevance_output
+                retained_attention_layers = []
+                for affinity in affinities or []:
+                    retained_attention_layers.append(
+                        affinity.pop("_target_relevance_attention", None)
+                        if isinstance(affinity, dict)
+                        else None
+                    )
+                if any(
+                    torch.is_tensor(attention)
+                    for attention in retained_attention_layers
+                ):
+                    attention_layers = retained_attention_layers
                 self._update_equivalence_state(
                     equivalence_state,
                     reference_logits,
@@ -3318,7 +3499,7 @@ class Trainer():
                             true_relevance_by_layer[int(layer_index)] = (
                                 attention.detach().float()
                                 * gradient.detach().float()
-                            )
+                            ).to(device="cpu")
                     if bool(wrong.any()):
                         predicted_gradients = torch.autograd.grad(
                             predicted_margins[wrong].sum(),
@@ -3342,11 +3523,14 @@ class Trainer():
                     for layer_index, relevance in sorted(
                         true_relevance_by_layer.items()
                     ):
+                        relevance_device = relevance.to(
+                            device=self.device, non_blocking=True
+                        )
                         for fraction_index, fraction in enumerate(
                             explanation_fractions
                         ):
                             masks, mask_metadata = build_relevance_deletion_masks(
-                                relevance,
+                                relevance_device,
                                 prompt_length=prompt_length,
                                 semantic_length=semantic_length,
                                 paths=explanation_paths,
@@ -3439,6 +3623,8 @@ class Trainer():
                                     target_local.detach().cpu().numpy(),
                                 )
                                 del changed_logits, deletion_mask
+                            del masks, mask_metadata
+                        del relevance_device
                     del reference_logits_cpu, true_relevance_by_layer
 
             model_ref.clear_runtime_state()
@@ -3689,6 +3875,9 @@ class Trainer():
                 "torch_grad_enabled": True,
                 "input_requires_grad": True,
                 "parameter_grad_accumulation": False,
+                "attention_capture": "graph_connected_post_softmax_affinity_private_key",
+                "attention_capture_independent_of_visualization": True,
+                "available_layers": sorted(available_layers),
                 "aggregation_dtype": "float32",
                 "batch_size": int(self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.BATCH_SIZE),
             },
@@ -3728,12 +3917,26 @@ class Trainer():
             and str(self.cfg.MODEL.PROMPT.INIT_SOURCE).lower()
             == "distributor_mean"
         )
+        selected_layers = [int(item) for item in cfg.LAYERS]
+        if not selected_layers:
+            selected_layers = (
+                [int(item) for item in self.cfg.MONITOR.PROBE.LAYERS]
+                if bool(self.cfg.MODEL.PROMPT.DEEP)
+                else [0]
+            )
+        selected_layers = list(dict.fromkeys(selected_layers))
+        registered_objects = (
+            model_ref.get_bayesian_candidate_registry()
+            if hasattr(model_ref, "get_bayesian_candidate_registry")
+            else []
+        )
         registry = build_candidate_registry(
             requested_candidates=list(cfg.CANDIDATE_SPACES),
             requested_auxiliary_views=list(cfg.AUXILIARY_VIEWS),
             prompt_enabled=prompt_enabled,
             distributor_active=distributor_active,
             prompt_deep=bool(self.cfg.MODEL.PROMPT.DEEP),
+            registered_objects=registered_objects,
         )
         base_result = {
             "format": "bayesian_object_selection_probe_v1",
@@ -3792,7 +3995,7 @@ class Trainer():
             raise ValueError(
                 "BAYESIAN_OBJECT_SELECTION.DIRECTION_COUNT must be positive when enabled"
             )
-        variant_specs = [
+        base_variant_specs = [
             {
                 "variant_id": f"direction_{direction_id:03d}_scale_{scale:.8g}",
                 "perturbation_id": f"normalized_direction/{direction_id}/{scale:.8g}",
@@ -3805,17 +4008,50 @@ class Trainer():
         ]
         variant_limit = int(cfg.HIERARCHY_VARIANT_COUNT)
         if variant_limit > 0:
-            variant_specs = variant_specs[:variant_limit]
+            base_variant_specs = base_variant_specs[:variant_limit]
+        if distributor_active:
+            variant_specs = list(base_variant_specs)
+        else:
+            variant_specs = [
+                {
+                    **spec,
+                    "variant_id": f"layer_{layer_id}/{spec['variant_id']}",
+                    "perturbation_id": f"layer_{layer_id}/{spec['perturbation_id']}",
+                    "target_layer": int(layer_id),
+                }
+                for layer_id in selected_layers
+                for spec in base_variant_specs
+            ]
         if not variant_specs:
             raise ValueError("BAYESIAN_OBJECT_SELECTION produced no controlled variants")
-        selected_layers = [int(item) for item in cfg.LAYERS]
+        use_layer_interface_map = (
+            not distributor_active
+            and bool(self.cfg.MODEL.PROMPT.DEEP)
+            and hasattr(model_ref, "get_runtime_layer_prompt_trace")
+        )
         accumulator = BayesianHierarchyTraceAccumulator(
             candidate_class_ids,
             bootstrap_samples=int(cfg.BOOTSTRAP_SAMPLES),
             random_seed=int(cfg.RANDOM_SEED),
             collapse_relative_threshold=float(cfg.COLLAPSE_RELATIVE_THRESHOLD),
             distance_eps=float(cfg.DISTANCE_EPS),
+            # Cross-layer variants share one unperturbed checkpoint reference.
+            # Reference-only distances avoid quadratic comparisons between
+            # interventions on different layer identities.
+            distance_pairing_mode=(
+                "reference_only" if use_layer_interface_map else "all_pairs"
+            ),
         )
+        layer_accumulators = {
+            int(layer_id): BayesianHierarchyTraceAccumulator(
+                candidate_class_ids,
+                bootstrap_samples=int(cfg.BOOTSTRAP_SAMPLES),
+                random_seed=int(cfg.RANDOM_SEED) + int(layer_id),
+                collapse_relative_threshold=float(cfg.COLLAPSE_RELATIVE_THRESHOLD),
+                distance_eps=float(cfg.DISTANCE_EPS),
+            )
+            for layer_id in selected_layers
+        } if use_layer_interface_map else {}
         global_to_local = {
             global_id: local_id
             for local_id, global_id in enumerate(candidate_class_ids)
@@ -3842,6 +4078,11 @@ class Trainer():
             semantic_tensor = classifier_stats.get("semantic_repr")
             injected = model_ref.get_runtime_injected_prompt_tokens()
             token_sequence = model_ref.get_runtime_token_sequence()
+            runtime_layer_trace = (
+                model_ref.get_runtime_layer_prompt_trace()
+                if hasattr(model_ref, "get_runtime_layer_prompt_trace")
+                else None
+            )
             if not all(
                 torch.is_tensor(item)
                 for item in (cls_tensor, injected, token_sequence)
@@ -3851,7 +4092,45 @@ class Trainer():
                 )
             if int(injected.shape[1]) != prompt_length:
                 raise RuntimeError("Injected Prompt length does not match configured identity")
-            contextualized = token_sequence[:, 1 : 1 + prompt_length, :]
+            layer_prompt_trace = {}
+            if isinstance(runtime_layer_trace, (list, tuple)):
+                for item in runtime_layer_trace:
+                    if not isinstance(item, dict):
+                        continue
+                    layer_id = int(item.get("layer_id", -1))
+                    layer_injected = item.get("injected_prompt")
+                    layer_contextualized = item.get("contextualized_prompt")
+                    if layer_id < 0 or not all(
+                        torch.is_tensor(value)
+                        for value in (layer_injected, layer_contextualized)
+                    ):
+                        continue
+                    layer_prompt_trace[layer_id] = {
+                        "injected_prompt": layer_injected,
+                        "contextualized_prompt": layer_contextualized,
+                    }
+            effective_layers = [
+                layer_id
+                for layer_id in selected_layers
+                if layer_id in layer_prompt_trace
+            ]
+            if effective_layers:
+                injected = torch.cat(
+                    [
+                        layer_prompt_trace[layer_id]["injected_prompt"]
+                        for layer_id in effective_layers
+                    ],
+                    dim=1,
+                )
+                contextualized = torch.cat(
+                    [
+                        layer_prompt_trace[layer_id]["contextualized_prompt"]
+                        for layer_id in effective_layers
+                    ],
+                    dim=1,
+                )
+            else:
+                contextualized = token_sequence[:, 1 : 1 + prompt_length, :]
             semantic_aligned = None
             pooled_prompt = contextualized.float().mean(dim=1)
             if semantic_view_requested and torch.is_tensor(semantic_tensor):
@@ -3889,6 +4168,8 @@ class Trainer():
                 "prompt_distribution_stats": (
                     prompt_stats if isinstance(prompt_stats, dict) else {}
                 ),
+                "layer_prompt_trace": layer_prompt_trace,
+                "observed_prompt_layers": effective_layers,
             }
 
         def detached_cpu(value):
@@ -3949,6 +4230,39 @@ class Trainer():
                     model_ref, selected_layers
                 ).unsqueeze(0).expand(batch_size, -1)
                 reference = snapshot(inputs, semantics)
+            layer_variants = {}
+            layer_reference_sources = {}
+            if layer_accumulators:
+                for layer_id in selected_layers:
+                    layer_trace = reference["layer_prompt_trace"].get(layer_id)
+                    if not isinstance(layer_trace, dict):
+                        raise RuntimeError(
+                            f"Bayesian object selection did not observe Prompt layer {layer_id}"
+                        )
+                    layer_source = static_prompt_vector(
+                        model_ref, [layer_id]
+                    ).unsqueeze(0).expand(batch_size, -1)
+                    layer_reference_sources[layer_id] = layer_source
+                    layer_variants[layer_id] = [
+                        {
+                            "variant_id": "reference",
+                            "sample_ids": sample_ids,
+                            "source_object": detached_cpu(layer_source),
+                            "injected_prompt": detached_cpu(
+                                layer_trace["injected_prompt"]
+                            ),
+                            "contextualized_prompt": detached_cpu(
+                                layer_trace["contextualized_prompt"]
+                            ),
+                            "cls_effect": torch.zeros_like(
+                                reference["cls"], device="cpu"
+                            ),
+                            "logit_effect": torch.zeros_like(
+                                reference["logits"], device="cpu"
+                            ),
+                            "logits": detached_cpu(reference["logits"]),
+                        }
+                    ]
             variants = [
                 {
                     "variant_id": "reference",
@@ -3988,15 +4302,19 @@ class Trainer():
                     changed = snapshot(inputs, semantics)
                     changed_source = changed_mu
                 else:
+                    target_layer = int(spec["target_layer"])
                     with StaticPromptPerturbation(
                         model_ref,
                         direction_id=spec["direction_id"],
                         scale=spec["scale"],
                         seed=spec["perturbation_seed"],
-                        selected_layers=selected_layers,
+                        selected_layers=[target_layer],
                     ) as intervention:
                         changed_source = static_prompt_vector(
                             model_ref, selected_layers
+                        ).unsqueeze(0).expand(batch_size, -1)
+                        changed_layer_source = static_prompt_vector(
+                            model_ref, [target_layer]
                         ).unsqueeze(0).expand(batch_size, -1)
                         changed = snapshot(inputs, semantics)
                 source_rms = (
@@ -4040,6 +4358,34 @@ class Trainer():
                         "logits": detached_cpu(changed["logits"]),
                     }
                 )
+                if layer_accumulators:
+                    changed_layer_trace = changed["layer_prompt_trace"].get(
+                        target_layer
+                    )
+                    if not isinstance(changed_layer_trace, dict):
+                        raise RuntimeError(
+                            f"Changed forward did not observe Prompt layer {target_layer}"
+                        )
+                    layer_variants[target_layer].append(
+                        {
+                            "variant_id": spec["variant_id"],
+                            "sample_ids": sample_ids,
+                            "source_object": detached_cpu(changed_layer_source),
+                            "injected_prompt": detached_cpu(
+                                changed_layer_trace["injected_prompt"]
+                            ),
+                            "contextualized_prompt": detached_cpu(
+                                changed_layer_trace["contextualized_prompt"]
+                            ),
+                            "cls_effect": detached_cpu(
+                                changed["cls"] - reference["cls"]
+                            ),
+                            "logit_effect": detached_cpu(
+                                changed["logits"] - reference["logits"]
+                            ),
+                            "logits": detached_cpu(changed["logits"]),
+                        }
+                    )
                 model_ref.clear_runtime_state()
                 del changed, changed_source
                 if distributor_active:
@@ -4049,6 +4395,12 @@ class Trainer():
                 targets_local=targets_local,
                 variants=variants,
             )
+            for layer_id, layer_accumulator in layer_accumulators.items():
+                layer_accumulator.update(
+                    sample_ids=sample_ids,
+                    targets_local=targets_local,
+                    variants=layer_variants[layer_id],
+                )
             model_ref.clear_runtime_prompt_distribution_override()
             model_ref.clear_runtime_state()
             del inputs, targets_global, semantics, variants, reference
@@ -4057,6 +4409,14 @@ class Trainer():
                 del reference_mu, reference_logvar, fixed_eps
 
         hierarchy_trace = accumulator.finalize()
+        layer_interface_map = {
+            f"layer_{layer_id}": {
+                **layer_accumulator.finalize(),
+                "layer_id": int(layer_id),
+                "source_object_name": "static_prompt_parameter",
+            }
+            for layer_id, layer_accumulator in layer_accumulators.items()
+        }
         distance_correspondence = hierarchy_trace.get(
             "distance_correspondence", {}
         )
@@ -4084,6 +4444,7 @@ class Trainer():
             "instance_and_domain" if distributor_active else "visual"
         )
         hierarchy_trace["selected_layers"] = selected_layers
+        hierarchy_trace["layer_interface_map"] = layer_interface_map
         hierarchy_trace["source_distance_by_variant"] = {
             name: {
                 "mean": float(np.mean(values)),
@@ -4102,10 +4463,28 @@ class Trainer():
             "logit_effect": "logit_effect",
         }
         for name, state in registry["candidate_spaces"].items():
-            stage = stage_by_candidate[name]
+            stage = stage_by_candidate.get(name)
+            if stage is None and "/layer_" in name:
+                prefix, layer_text = name.rsplit("/layer_", 1)
+                try:
+                    layer_key = f"layer_{int(layer_text)}"
+                except ValueError:
+                    layer_key = None
+                layer_trace = layer_interface_map.get(layer_key, {})
+                layer_observed = set(layer_trace.get("observed_stages", []))
+                stage = (
+                    "injected_prompt"
+                    if prefix in {"injected_prompt", "delta_prompt"}
+                    else "contextualized_prompt"
+                    if prefix == "contextualized_prompt"
+                    else None
+                )
+                observed_here = bool(stage and stage in layer_observed)
+            else:
+                observed_here = bool(stage in observed_stages)
             if state["requested"] and state["applicable"]:
-                state["observed"] = bool(stage in observed_stages)
-                state["valid"] = bool(stage in observed_stages)
+                state["observed"] = observed_here
+                state["valid"] = observed_here
                 state["failure_reason"] = (
                     None if state["observed"] else "runtime_stage_not_observed"
                 )
@@ -4135,11 +4514,15 @@ class Trainer():
             "perturbation_mode": str(cfg.PERTURBATION_MODE),
             "reference": str(cfg.HIERARCHY_REFERENCE),
             "distance_normalization": "root_mean_square_per_dimension",
+            "distance_pairing_mode": hierarchy_trace.get(
+                "distance_pairing_mode", "all_pairs"
+            ),
             "bootstrap_unit": "sample_variant_distance_pair",
             "source_object_name": hierarchy_trace["source_object_name"],
             "distance_correspondence": hierarchy_trace.get(
                 "distance_correspondence", {}
             ),
+            "layer_interface_map": layer_interface_map,
             "class_structure": hierarchy_trace.get("class_structure", {}),
             "scale_curve": {
                 "scales": scales,
@@ -4198,15 +4581,132 @@ class Trainer():
             "object_selection_report": report,
         }
 
+    @staticmethod
+    def _fixed_probe_execution_profile(value):
+        profile = str(value or "final_full").strip().lower()
+        supported = {"final_full", "milestone_core", "robustness_core"}
+        if profile not in supported:
+            raise ValueError(
+                "unsupported fixed-Probe execution profile: {} (expected one of {})".format(
+                    profile, ", ".join(sorted(supported))
+                )
+            )
+        return profile
+
+    @staticmethod
+    def _fixed_probe_profile_specs(specs, execution_profile):
+        if execution_profile == "final_full":
+            return list(specs)
+        core_names = {
+            "prompt_zeroed",
+            "prompt_read_blocked",
+            "prompt_write_blocked",
+            "prompt_patch_selection_uniform",
+            "patch_prompt_selection_uniform",
+            "prompt_patch_value_globalized",
+            "prompt_context_swapped",
+        }
+        return [
+            spec
+            for spec in specs
+            if spec["name"] in core_names
+            or spec["name"].startswith("prompt_read_blocked_layer_")
+        ]
+
+    def _fixed_probe_loader_settings(self):
+        num_workers = int(self.cfg.MONITOR.PROBE.NUM_WORKERS)
+        if num_workers < 0:
+            raise ValueError("MONITOR.PROBE.NUM_WORKERS must be non-negative")
+        return {
+            "num_workers": num_workers,
+            "pin_memory": bool(self.cfg.MONITOR.PROBE.PIN_MEMORY),
+        }
+
+    def _build_fixed_probe_loader(self, dataset, batch_size):
+        settings = self._fixed_probe_loader_settings()
+        return torch.utils.data.DataLoader(
+            dataset,
+            batch_size=max(1, int(batch_size)),
+            shuffle=False,
+            num_workers=settings["num_workers"],
+            pin_memory=settings["pin_memory"],
+            drop_last=False,
+        )
+
+    def _synchronize_probe_device(self):
+        device = torch.device(self.device)
+        if device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+    def _execute_timed_probe_stage(self, loader, execute):
+        timed_loader = _TimedProbeLoader(loader)
+        self._synchronize_probe_device()
+        started = time.perf_counter()
+        result = execute(timed_loader)
+        self._synchronize_probe_device()
+        total_time_sec = max(0.0, time.perf_counter() - started)
+        data_time_sec = min(total_time_sec, max(0.0, timed_loader.data_time_sec))
+        compute_time_sec = max(0.0, total_time_sec - data_time_sec)
+        return result, {
+            "probe_total_time_sec": total_time_sec,
+            "probe_data_time_sec": data_time_sec,
+            "probe_compute_time_sec": compute_time_sec,
+            "probe_data_time_ratio": (
+                data_time_sec / total_time_sec if total_time_sec > 0.0 else 0.0
+            ),
+            "batch_count": int(timed_loader.batch_count),
+        }
+
+    @staticmethod
+    def _aggregate_probe_stage_timings(timing_by_split):
+        stage_timings = [
+            timing
+            for split_timings in timing_by_split.values()
+            for timing in split_timings.values()
+        ]
+        total_time_sec = sum(
+            float(item.get("probe_total_time_sec", 0.0)) for item in stage_timings
+        )
+        data_time_sec = sum(
+            float(item.get("probe_data_time_sec", 0.0)) for item in stage_timings
+        )
+        compute_time_sec = sum(
+            float(item.get("probe_compute_time_sec", 0.0)) for item in stage_timings
+        )
+        return {
+            "probe_total_time_sec": total_time_sec,
+            "probe_data_time_sec": data_time_sec,
+            "probe_compute_time_sec": compute_time_sec,
+            "probe_data_time_ratio": (
+                data_time_sec / total_time_sec if total_time_sec > 0.0 else 0.0
+            ),
+            "batch_count": sum(
+                int(item.get("batch_count", 0)) for item in stage_timings
+            ),
+            "stage_count": len(stage_timings),
+        }
+
     @torch.no_grad()
-    def _execute_fixed_probe_bundle(self, probe_loader, source_dataset, candidate_class_ids, *, split):
+    def _execute_fixed_probe_bundle(
+        self,
+        probe_loader,
+        source_dataset,
+        candidate_class_ids,
+        *,
+        split,
+        execution_profile="final_full",
+    ):
+        execution_profile = self._fixed_probe_execution_profile(execution_profile)
+        core_profile = execution_profile != "final_full"
         model_ref = self._model_ref(self.model)
         candidate_class_ids = [int(item) for item in candidate_class_ids]
         global_to_local = {global_id: local_id for local_id, global_id in enumerate(candidate_class_ids)}
         prompt_length = int(self.cfg.MODEL.PROMPT.NUM_TOKENS) if bool(self.cfg.MODEL.PROMPT.ENABLE) else 0
         semantic_length = int(self.cfg.MODEL.SEMANTIC_TOKENS.NUM_TOKENS) if bool(self.cfg.MODEL.SEMANTIC_TOKENS.ENABLE) else 0
         prompt_analysis_cfg = self.cfg.MONITOR.PROBE.PROMPT_ANALYSIS
-        prompt_analysis_requested = bool(prompt_analysis_cfg.ENABLE)
+        prompt_analysis_requested = bool(
+            prompt_analysis_cfg.ENABLE and not core_profile
+        )
         prompt_analysis_enabled = bool(
             prompt_analysis_requested and prompt_length > 0
         )
@@ -4255,7 +4755,10 @@ class Trainer():
             "failure_reasons": [],
         }
         normal_accumulator = StreamingFixedProbeAccumulator(candidate_class_ids, track_geometry=True)
-        semantic_enabled = bool(self.cfg.MONITOR.PROBE.SEMANTIC_INTERVENTION.ENABLE)
+        semantic_enabled = bool(
+            self.cfg.MONITOR.PROBE.SEMANTIC_INTERVENTION.ENABLE
+            and not core_profile
+        )
         permutation = inverse = None
         permuted_ids = None
         synchronized_accumulator = mismatched_accumulator = mismatched_effect = None
@@ -4298,6 +4801,7 @@ class Trainer():
         )
         attribute_concept_enabled = bool(
             self.cfg.MONITOR.PROBE.ATTRIBUTE_CONCEPT_ENABLE
+            and not core_profile
             and attribute_concept_reference.get("available", False)
             and prompt_length > 0
         )
@@ -4340,6 +4844,7 @@ class Trainer():
                 )
         patch_semantic_transport_enabled = bool(
             affinity_enabled
+            and not core_profile
             and self.cfg.MONITOR.PROBE.PATCH_SEMANTIC_TRANSPORT.ENABLE
         )
         patch_semantic_transport_reference = {
@@ -4380,6 +4885,8 @@ class Trainer():
             "semantic_length": semantic_length,
             "detach": True,
             "offload_diagnostics_to_cpu": True,
+            "selected_layers": selected_probe_layers,
+            "include_visual_normalizations": False,
             "block_s_to_cls": bool(self.cfg.MODEL.SEMANTIC_TOKENS.BLOCK_S_TO_CLS),
             "attribute_concept_enable": attribute_concept_enabled,
             "attribute_concept_selected_layers": selected_probe_layers,
@@ -4475,24 +4982,27 @@ class Trainer():
             )
             token_accumulator = StreamingTokenViewAccumulator(len(candidate_class_ids), prompt_length, semantic_length)
 
-        intervention_specs = self._module_effect_intervention_specs(
-            prompt_length,
-            attribute_concept_available=bool(
-                attribute_concept_reference.get("available", False)
+        intervention_specs = self._fixed_probe_profile_specs(
+            self._module_effect_intervention_specs(
+                prompt_length,
+                attribute_concept_available=bool(
+                    attribute_concept_reference.get("available", False)
+                ),
+                attribute_concept_reason=str(
+                    attribute_concept_reference.get(
+                        "reason", "attribute_concept_reference_unavailable"
+                    )
+                ),
+                patch_semantic_transport_available=bool(
+                    patch_semantic_transport_reference["available"]
+                ),
+                patch_semantic_transport_reason=str(
+                    patch_semantic_transport_reference.get(
+                        "reason", "patch_semantic_transport_reference_unavailable"
+                    )
+                ),
             ),
-            attribute_concept_reason=str(
-                attribute_concept_reference.get(
-                    "reason", "attribute_concept_reference_unavailable"
-                )
-            ),
-            patch_semantic_transport_available=bool(
-                patch_semantic_transport_reference["available"]
-            ),
-            patch_semantic_transport_reason=str(
-                patch_semantic_transport_reference.get(
-                    "reason", "patch_semantic_transport_reference_unavailable"
-                )
-            ),
+            execution_profile,
         )
         effective_intervention_specs = [
             spec for spec in intervention_specs if spec["applicable"]
@@ -4519,7 +5029,7 @@ class Trainer():
                 "pairing_hash": hashlib.sha256(),
             }
             for name, _, dynamic_context in intervention_factories
-            if dynamic_context in {"prompt_swap", "instance_prompt_swap"}
+            if dynamic_context in {"prompt_swap", "instance_prompt_swap", "deep_residual_swap"}
         }
         prompt_output_intervention_states = {
             name: {
@@ -5000,7 +5510,7 @@ class Trainer():
                             "reference_scores"
                         ],
                     )
-                elif dynamic_context in {"prompt_swap", "instance_prompt_swap"}:
+                elif dynamic_context in {"prompt_swap", "instance_prompt_swap", "deep_residual_swap"}:
                     sample_ids = input_data.get("sample_id")
                     if sample_ids is None:
                         raise RuntimeError(
@@ -5012,11 +5522,18 @@ class Trainer():
                         raise RuntimeError(
                             "Prompt context swap sample identity count does not match batch size"
                         )
-                    swap_seed = int(
-                        self.cfg.MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP_SEED
-                        if dynamic_context == "prompt_swap"
-                        else self.cfg.MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_SWAP_SEED
-                    )
+                    if dynamic_context == "prompt_swap":
+                        swap_seed = int(
+                            self.cfg.MONITOR.MODULE_EFFECT.PROMPT_CONTEXT_SWAP_SEED
+                        )
+                    elif dynamic_context == "instance_prompt_swap":
+                        swap_seed = int(
+                            self.cfg.MONITOR.MODULE_EFFECT.INSTANCE_PROMPT_SWAP_SEED
+                        )
+                    else:
+                        swap_seed = int(
+                            self.cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_SWAP_SEED
+                        )
                     order = sorted(
                         range(batch_size),
                         key=lambda index: (
@@ -5214,6 +5731,7 @@ class Trainer():
         normal = normal_accumulator.finalize()
         normal_accumulator.representation.release_covariance()
         result = {
+            "execution_profile": execution_profile,
             "normal": normal,
             "normal_accumulator": normal_accumulator,
             "conditions": {"normal": normal},
@@ -5291,6 +5809,8 @@ class Trainer():
             metric_prefix = (
                 "prompt_context_swap"
                 if intervention_name == "prompt_context_swapped"
+                else "deep_prompt_residual_swap"
+                if intervention_name == "deep_prompt_residual_swapped"
                 else "instance_prompt_swap"
             )
             effect["summary"].update({
@@ -5548,16 +6068,20 @@ class Trainer():
                 selection_contract = {
                     "prompt_patch_selection_uniform": {
                         "delta_metric": "delta_prompt_to_patch_mass",
+                        "algorithm_metric": "prompt_patch_uniform_mass_abs_error",
+                        "applied_metric": "prompt_patch_uniform_applied",
                         "pass_metric": "prompt_patch_mass_preservation_pass",
                         "failure_reason": (
-                            "Prompt-to-Patch mass preservation was not observed"
+                            "Local Prompt-to-Patch mass preservation was not observed or failed"
                         ),
                     },
                     "patch_prompt_selection_uniform": {
                         "delta_metric": "delta_patch_to_prompt_mass",
+                        "algorithm_metric": "patch_prompt_uniform_mass_abs_error",
+                        "applied_metric": "patch_prompt_uniform_applied",
                         "pass_metric": "patch_prompt_mass_preservation_pass",
                         "failure_reason": (
-                            "Patch-to-Prompt mass preservation was not observed"
+                            "Local Patch-to-Prompt mass preservation was not observed or failed"
                         ),
                     },
                     "attribute_concept_prompt_patch_blocked": {
@@ -5704,24 +6228,28 @@ class Trainer():
                         ],
                     )
                     if selection_contract is not None:
-                        mass_delta = diagnostics["affinity"][
+                        downstream_mass_delta = diagnostics["affinity"][
                             "attention_delta"
                         ].get(selection_contract["delta_metric"])
                         mass_tolerance = float(
                             self.cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL
                         )
-                        mass_preservation_pass = bool(
-                            mass_delta is not None
-                            and abs(float(mass_delta)) <= mass_tolerance
+                        algorithm_mass_error = None
+                        applied = None
+                        algorithm_metric = selection_contract.get(
+                            "algorithm_metric"
                         )
-                        diagnostics["selection_mass_preservation"] = {
-                            selection_contract["delta_metric"]: mass_delta,
-                            "tolerance": mass_tolerance,
-                            "pass": mass_preservation_pass,
-                        }
-                        effect["summary"][selection_contract["pass_metric"]] = float(
-                            mass_preservation_pass
+                        applied_metric = selection_contract.get(
+                            "applied_metric"
                         )
+                        if algorithm_metric is not None:
+                            algorithm_mass_error = intervention_affinity_metrics[
+                                "attention_flow"
+                            ].get(algorithm_metric)
+                        if applied_metric is not None:
+                            applied = intervention_affinity_metrics[
+                                "attention_flow"
+                            ].get(applied_metric)
                         concept_mode = selection_contract.get("concept_mode")
                         if concept_mode is not None:
                             concept_metrics = intervention_affinity_metrics[
@@ -5730,6 +6258,10 @@ class Trainer():
                             concept_mass_error = concept_metrics.get(
                                 "all.concept_intervention_prompt_patch_mass_abs_error"
                             )
+                            applied = concept_metrics.get(
+                                "all.concept_intervention_applied"
+                            )
+                            algorithm_mass_error = concept_mass_error
                             selected_mass_after = concept_metrics.get(
                                 "all.concept_intervention_selected_prompt_attention_mass_after"
                             )
@@ -5783,6 +6315,10 @@ class Trainer():
                             transport_mass_error = transport_metrics.get(
                                 "all.transport_intervention_prompt_patch_mass_abs_error"
                             )
+                            applied = transport_metrics.get(
+                                "all.transport_intervention_applied"
+                            )
+                            algorithm_mass_error = transport_mass_error
                             selected_mass_after = transport_metrics.get(
                                 "all.transport_intervention_selected_prompt_attention_mass_after"
                             )
@@ -5828,6 +6364,30 @@ class Trainer():
                                     targeted_selection_pass
                                 ),
                             })
+                        algorithm_mass_pass = bool(
+                            algorithm_mass_error is not None
+                            and abs(float(algorithm_mass_error)) <= mass_tolerance
+                        )
+                        applied_pass = bool(
+                            applied is not None
+                            and float(applied) >= 1.0 - mass_tolerance
+                        )
+                        mass_preservation_pass = bool(
+                            algorithm_mass_pass and applied_pass
+                        )
+                        diagnostics["selection_mass_preservation"] = {
+                            selection_contract["delta_metric"]: downstream_mass_delta,
+                            "downstream_mass_delta_is_descriptive": True,
+                            "contract_basis": "local_intervention_mass_error",
+                            "local_mass_abs_error": algorithm_mass_error,
+                            "applied": applied,
+                            "applied_pass": applied_pass,
+                            "tolerance": mass_tolerance,
+                            "pass": mass_preservation_pass,
+                        }
+                        effect["summary"][selection_contract["pass_metric"]] = float(
+                            mass_preservation_pass
+                        )
                 if intervention_name == "prompt_patch_value_globalized":
                     value_metrics = diagnostics["affinity"][
                         "attention_flow_metrics"
@@ -6897,9 +7457,15 @@ class Trainer():
         checkpoint_epoch,
         selection_seed=None,
         artifact_prefix="",
+        execution_profile=None,
     ):
         if not self.diagnostic_manager.enabled or not bool(self.cfg.MONITOR.PROBE.ENABLE) or du.get_rank() != 0:
             return
+        execution_profile = self._fixed_probe_execution_profile(
+            execution_profile
+            if execution_profile is not None
+            else self.cfg.MONITOR.PROBE.EXECUTION_PROFILE
+        )
         if selection_seed is None:
             selection_seeds = [int(self.cfg.MONITOR.PROBE.SELECTION_SEED)]
             selection_seeds.extend(int(item) for item in self.cfg.MONITOR.PROBE.ROBUSTNESS_SELECTION_SEEDS)
@@ -6907,8 +7473,17 @@ class Trainer():
             if any(seed < 0 for seed in selection_seeds):
                 raise ValueError("fixed-probe selection seeds must be non-negative")
             executions = []
+            base_prefix = str(artifact_prefix or "").strip("/")
             for index, current_seed in enumerate(selection_seeds):
-                current_prefix = "" if index == 0 else f"fixed_probe_robustness/selection_seed_{current_seed}"
+                suffix = "" if index == 0 else f"fixed_probe_robustness/selection_seed_{current_seed}"
+                current_profile = (
+                    "robustness_core"
+                    if index > 0 and execution_profile == "final_full"
+                    else execution_profile
+                )
+                current_prefix = "/".join(
+                    item for item in (base_prefix, suffix) if item
+                )
                 executions.append(self._run_fixed_probes(
                     train_loader,
                     test_seen_loader,
@@ -6916,22 +7491,31 @@ class Trainer():
                     checkpoint_epoch=checkpoint_epoch,
                     selection_seed=current_seed,
                     artifact_prefix=current_prefix,
+                    execution_profile=current_profile,
                 ))
             self.diagnostic_manager.record_probe_artifact(
-                "probe_robustness_manifest.json",
+                "/".join(
+                    item for item in (base_prefix, "probe_robustness_manifest.json") if item
+                ),
                 {
                     "format": "baseline_fixed_probe_robustness_collection_v1",
                     "primary_selection_seed": selection_seeds[0],
                     "selection_seeds": selection_seeds,
                     "execution_count": len(executions),
                     "executions": executions,
+                    "primary_execution_profile": execution_profile,
+                    "execution_profiles": [
+                        execution.get("execution_profile")
+                        for execution in executions
+                        if isinstance(execution, dict)
+                    ],
                     "storage_mode": "aggregate_only",
                 },
             )
             return
         selection_seed = int(selection_seed)
         artifact_prefix = str(artifact_prefix or "").strip("/")
-        if bool(
+        if execution_profile == "final_full" and bool(
             self.cfg.MONITOR.PROBE.EXPLANATION_VALIDITY.ENABLE
         ) and not bool(self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.ENABLE):
             raise ValueError(
@@ -6946,32 +7530,75 @@ class Trainer():
         model_ref = self._model_ref(self.model)
         was_training = bool(model_ref.training)
         model_ref.eval()
-        checkpoint_id = f"final_epoch_{int(checkpoint_epoch):04d}"
+        checkpoint_source = dict(self._fixed_probe_checkpoint_source or {})
+        checkpoint_id = str(checkpoint_source.get(
+            "checkpoint_id", f"final_epoch_{int(checkpoint_epoch):04d}"
+        ))
+        checkpoint_path = checkpoint_source.get(
+            "checkpoint_path", self._final_trainable_checkpoint_path
+        )
         checkpoint_manifest = {
             "checkpoint_id": checkpoint_id,
             "checkpoint_epoch": int(checkpoint_epoch),
-            "checkpoint_global_step": int(self._trace_global_step),
-            "checkpoint_selection_rule": "predeclared_final_epoch",
-            "source_run_id": self.monitor_manager.run_id,
-            "source_session_id": self.monitor_manager.session_id,
-            "checkpoint_path": self._final_trainable_checkpoint_path,
+            "checkpoint_global_step": int(
+                checkpoint_source.get("checkpoint_global_step", self._trace_global_step)
+            ),
+            "checkpoint_selection_rule": checkpoint_source.get(
+                "checkpoint_selection_rule", "predeclared_final_epoch"
+            ),
+            "source_run_id": checkpoint_source.get(
+                "source_run_id", self.monitor_manager.run_id
+            ),
+            "source_session_id": checkpoint_source.get(
+                "source_session_id", self.monitor_manager.session_id
+            ),
+            "checkpoint_path": checkpoint_path,
             "checkpoint_sha256": (
-                checkpoint_sha256(self._final_trainable_checkpoint_path)
-                if self._final_trainable_checkpoint_path and os.path.isfile(self._final_trainable_checkpoint_path)
+                checkpoint_sha256(checkpoint_path)
+                if checkpoint_path and os.path.isfile(checkpoint_path)
                 else None
             ),
         }
+        if checkpoint_source:
+            checkpoint_manifest.update({
+                "diagnostic_replay": True,
+                "diagnostic_execution_run_id": self.monitor_manager.run_id,
+                "diagnostic_execution_session_id": self.monitor_manager.session_id,
+            })
+            expected_sha256 = checkpoint_source.get("checkpoint_sha256")
+            if (
+                expected_sha256 is not None
+                and checkpoint_manifest["checkpoint_sha256"] != expected_sha256
+            ):
+                raise RuntimeError(
+                    "fixed-probe replay checkpoint hash mismatch: expected={} actual={}".format(
+                        expected_sha256, checkpoint_manifest["checkpoint_sha256"]
+                    )
+                )
         split_sources = {
             "probe_train_seen": train_loader.dataset if train_loader is not None else None,
             "probe_test_seen": test_seen_loader.dataset if test_seen_loader is not None else None,
             "probe_test_unseen": test_unseen_loader.dataset if test_unseen_loader is not None else None,
         }
+        if execution_profile in {"milestone_core", "robustness_core"}:
+            split_sources = {
+                "probe_test_unseen": split_sources["probe_test_unseen"]
+            }
         output_root_reference = "../" * (1 + len([item for item in artifact_prefix.split("/") if item]))
         combined_manifest = {
             "format": "baseline_fixed_probe_collection_v11",
             "run_id": self.monitor_manager.run_id,
             "session_id": self.monitor_manager.session_id,
             "selection_seed": selection_seed,
+            "execution_profile": execution_profile,
+            "analysis_role": (
+                "final_full_evidence"
+                if execution_profile == "final_full"
+                else "diagnostic_mechanism_core"
+            ),
+            "required_splits": [
+                split for split, dataset in split_sources.items() if dataset is not None
+            ],
             "checkpoint": checkpoint_manifest,
             "storage_contract": {
                 "mode": "aggregate_only",
@@ -7001,7 +7628,9 @@ class Trainer():
         target_relevance_status = {}
         bayesian_object_selection_status = {}
         bayesian_object_selection_reports = {}
-        all_rows = []
+        all_rows = _StreamingProbeMetricRows(self.diagnostic_manager)
+        probe_loader_settings = self._fixed_probe_loader_settings()
+        probe_timing_by_split = {}
         deterministic_transform = get_transforms("test_seen", self.cfg.DATA.CROPSIZE)
         prepared_probes = []
         for split, dataset in split_sources.items():
@@ -7069,10 +7698,13 @@ class Trainer():
                 {
                     "status": "invalid_probe_manifest",
                     "selection_seed": selection_seed,
+                    "execution_profile": execution_profile,
                     "checkpoint": checkpoint_manifest,
                     "probe_count": int(len(combined_manifest["probes"])),
+                    "required_splits": list(combined_manifest["required_splits"]),
                     "metric_row_count": 0,
                     "storage_mode": "aggregate_only",
+                    "probe_loader": probe_loader_settings,
                     "failure_reasons": validity_collection["failure_reasons"],
                 },
             )
@@ -7084,34 +7716,41 @@ class Trainer():
             )
 
         for split, dataset, candidate_class_ids, manifest in prepared_probes:
-            probe_loader = torch.utils.data.DataLoader(
+            probe_timing_by_split[split] = {}
+            probe_loader = self._build_fixed_probe_loader(
                 FixedProbeDataset(dataset, manifest, deterministic_transform),
-                batch_size=max(1, int(self.cfg.MONITOR.PROBE.BATCH_SIZE)),
-                shuffle=False,
-                num_workers=0,
-                pin_memory=False,
-                drop_last=False,
+                self.cfg.MONITOR.PROBE.BATCH_SIZE,
             )
-            bundle = self._execute_fixed_probe_bundle(
-                probe_loader, dataset, candidate_class_ids, split=split
-            )
-            if bool(
-                self.cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION.ENABLE
-            ):
-                object_loader = torch.utils.data.DataLoader(
-                    FixedProbeDataset(dataset, manifest, deterministic_transform),
-                    batch_size=max(1, int(self.cfg.MONITOR.PROBE.BATCH_SIZE)),
-                    shuffle=False,
-                    num_workers=0,
-                    pin_memory=False,
-                    drop_last=False,
-                )
-                object_result = self._execute_bayesian_object_selection_probe(
-                    object_loader,
+            bundle, stage_timing = self._execute_timed_probe_stage(
+                probe_loader,
+                lambda timed_loader: self._execute_fixed_probe_bundle(
+                    timed_loader,
                     dataset,
                     candidate_class_ids,
                     split=split,
+                    execution_profile=execution_profile,
+                ),
+            )
+            probe_timing_by_split[split]["fixed_probe_bundle"] = stage_timing
+            if execution_profile == "final_full" and bool(
+                self.cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION.ENABLE
+            ):
+                object_loader = self._build_fixed_probe_loader(
+                    FixedProbeDataset(dataset, manifest, deterministic_transform),
+                    self.cfg.MONITOR.PROBE.BATCH_SIZE,
                 )
+                object_result, stage_timing = self._execute_timed_probe_stage(
+                    object_loader,
+                    lambda timed_loader: self._execute_bayesian_object_selection_probe(
+                        timed_loader,
+                        dataset,
+                        candidate_class_ids,
+                        split=split,
+                    ),
+                )
+                probe_timing_by_split[split][
+                    "bayesian_object_selection"
+                ] = stage_timing
                 object_root = f"bayesian_object_selection/{checkpoint_id}"
                 object_artifacts = {}
                 for artifact_name, payload_name in (
@@ -7196,22 +7835,23 @@ class Trainer():
                     probe_manifest_sha256=manifest["manifest_sha256"],
                 ))
             if bool(self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.ENABLE):
-                relevance_loader = torch.utils.data.DataLoader(
+                relevance_loader = self._build_fixed_probe_loader(
                     FixedProbeDataset(dataset, manifest, deterministic_transform),
-                    batch_size=max(
-                        1, int(self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.BATCH_SIZE)
-                    ),
-                    shuffle=False,
-                    num_workers=0,
-                    pin_memory=False,
-                    drop_last=False,
+                    self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.BATCH_SIZE,
                 )
-                target_relevance = self._execute_target_relevance_probe(
+                target_relevance, stage_timing = self._execute_timed_probe_stage(
                     relevance_loader,
-                    dataset,
-                    candidate_class_ids,
-                    split=split,
+                    lambda timed_loader: self._execute_target_relevance_probe(
+                        timed_loader,
+                        dataset,
+                        candidate_class_ids,
+                        split=split,
+                        include_explanation_validity=(
+                            execution_profile == "final_full"
+                        ),
+                    ),
                 )
+                probe_timing_by_split[split]["target_relevance"] = stage_timing
                 relevance_path = artifact_path(
                     f"target_relevance/{checkpoint_id}/{split}_summary.json"
                 )
@@ -8827,7 +9467,7 @@ class Trainer():
                 checkpoint_id=checkpoint_id,
                 probe_id=f"paired_train_test_seen-seed{selection_seed}",
                 split="train_seen_vs_test_seen",
-                domain="prediction_health",
+                domain="probe_context",
                 entity_type="cross_split",
                 entity_id="train_minus_test_seen",
                 selection_seed=selection_seed,
@@ -8851,11 +9491,14 @@ class Trainer():
                     "bayesian_object_selection/object_selection_report.json"
                 ),
                 {
-                    "format": "bayesian_object_selection_collection_v1",
+                    "format": "bayesian_object_selection_collection_v2",
                     "checkpoint": checkpoint_manifest,
                     "selection_seed": selection_seed,
                     "probe_manifest_path": probe_manifest_path,
                     "recommended_candidate": None,
+                    "recommended_stochastic_root": None,
+                    "recommended_transfer_space": None,
+                    "predictive_validation_space": "logit_effect",
                     "selection_status": "insufficient_evidence",
                     "reason": (
                         "controlled perturbation evidence is available, but held-out "
@@ -8871,6 +9514,8 @@ class Trainer():
             artifact_path("fixed_probe_class_aggregates.json"),
             {
                 "format": "baseline_fixed_probe_class_aggregates_v1",
+                "analysis_role": "probe_context_only",
+                "formal_task_result_source": "complete_test_epoch_metrics",
                 "checkpoint": checkpoint_manifest,
                 "selection_seed": selection_seed,
                 "probe_manifest_path": probe_manifest_path,
@@ -8921,16 +9566,19 @@ class Trainer():
                 )
                 if manifest_attribute_reference.get("available", False):
                     break
-            module_effect_specs = self._module_effect_intervention_specs(
-                prompt_length,
-                attribute_concept_available=bool(
-                    manifest_attribute_reference.get("available", False)
+            module_effect_specs = self._fixed_probe_profile_specs(
+                self._module_effect_intervention_specs(
+                    prompt_length,
+                    attribute_concept_available=bool(
+                        manifest_attribute_reference.get("available", False)
+                    ),
+                    attribute_concept_reason=str(
+                        manifest_attribute_reference.get(
+                            "reason", "attribute_concept_reference_unavailable"
+                        )
+                    ),
                 ),
-                attribute_concept_reason=str(
-                    manifest_attribute_reference.get(
-                        "reason", "attribute_concept_reference_unavailable"
-                    )
-                ),
+                execution_profile,
             )
             requested_conditions = [
                 spec["name"] for spec in module_effect_specs
@@ -8956,6 +9604,7 @@ class Trainer():
                     "format": "baseline_module_effect_v9",
                     "checkpoint": checkpoint_manifest,
                     "selection_seed": selection_seed,
+                    "execution_profile": execution_profile,
                     "probe_manifest_path": probe_manifest_path,
                     "probe_manifest_sha256_by_split": {
                         split: manifest["manifest_sha256"] for split, manifest in combined_manifest["probes"].items()
@@ -8978,16 +9627,38 @@ class Trainer():
                     "torch_no_grad": True,
                 },
             )
-        self.diagnostic_manager.append_probe_metrics(all_rows)
+        all_rows.flush()
         self.diagnostic_manager.record_probe_artifact(
             artifact_path("probe_runtime_summary.json"),
             {
                 "status": "completed",
                 "selection_seed": selection_seed,
+                "execution_profile": execution_profile,
+                "normal_task_output_role": "probe_context_only",
                 "checkpoint": checkpoint_manifest,
                 "probe_count": int(len(combined_manifest["probes"])),
+                "required_splits": list(combined_manifest["required_splits"]),
                 "metric_row_count": int(len(all_rows)),
                 "storage_mode": "aggregate_only",
+                "probe_loader": probe_loader_settings,
+                "probe_runtime_timing": {
+                    "definition": {
+                        "probe_data_time_sec": (
+                            "DataLoader iterator creation and next-batch wait time"
+                        ),
+                        "probe_compute_time_sec": (
+                            "remaining wall time including device transfer, model "
+                            "execution, intervention, and aggregation; not pure GPU time"
+                        ),
+                        "probe_data_time_ratio": (
+                            "probe_data_time_sec divided by probe_total_time_sec"
+                        ),
+                    },
+                    "by_split": probe_timing_by_split,
+                    "aggregate": self._aggregate_probe_stage_timings(
+                        probe_timing_by_split
+                    ),
+                },
                 "intervention_diagnostics_by_condition": intervention_diagnostic_status,
                 "prompt_zero_diagnostics_by_split": intervention_diagnostic_status.get(
                     "prompt_zeroed", {}
@@ -8998,23 +9669,29 @@ class Trainer():
                 "target_relevance_by_split": target_relevance_status,
                 "explanation_validity_enabled": bool(
                     self.cfg.MONITOR.PROBE.EXPLANATION_VALIDITY.ENABLE
+                    and execution_profile == "final_full"
                 ),
                 "explanation_validity_by_split": combined_manifest[
                     "explanation_validity"
                 ],
                 "prompt_analysis_enabled": bool(
                     self.cfg.MONITOR.PROBE.PROMPT_ANALYSIS.ENABLE
+                    and execution_profile == "final_full"
                 ),
                 "prompt_analysis_by_split": combined_manifest[
                     "prompt_analysis"
                 ],
                 "bayesian_object_selection_enabled": bool(
                     self.cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION.ENABLE
+                    and execution_profile == "final_full"
                 ),
                 "bayesian_object_selection_by_split": (
                     bayesian_object_selection_status
                 ),
-                "semantic_intervention_enabled": bool(self.cfg.MONITOR.PROBE.SEMANTIC_INTERVENTION.ENABLE),
+                "semantic_intervention_enabled": bool(
+                    self.cfg.MONITOR.PROBE.SEMANTIC_INTERVENTION.ENABLE
+                    and execution_profile == "final_full"
+                ),
                 "semantic_intervention_pass": semantic_overall_pass,
                 "semantic_intervention_failure_reasons": (
                     test_unseen_semantic.get("failure_reasons", [])
@@ -9028,6 +9705,7 @@ class Trainer():
         return {
             "selection_seed": selection_seed,
             "artifact_prefix": artifact_prefix,
+            "execution_profile": execution_profile,
             "valid": True,
             "probe_manifest_path": probe_manifest_path,
             "comparability_path": comparability_path,
@@ -9036,6 +9714,13 @@ class Trainer():
                 for split, manifest in combined_manifest["probes"].items()
             },
             "metric_row_count": int(len(all_rows)),
+            "probe_loader": probe_loader_settings,
+            "probe_runtime_timing": {
+                "by_split": probe_timing_by_split,
+                "aggregate": self._aggregate_probe_stage_timings(
+                    probe_timing_by_split
+                ),
+            },
         }
 
     def _train_classifier_dev(self, train_loader, val_loader, test_seen_loader, test_unseen_loader):
@@ -9122,7 +9807,14 @@ class Trainer():
                 logger.info("No improvement. Breaking out of loop.")
                 break
 
-    def _train_classifier_final(self, train_loader, test_seen_loader, test_unseen_loader):
+    def _train_classifier_final(
+        self,
+        train_loader,
+        test_seen_loader,
+        test_unseen_loader,
+        *,
+        train_eval_loader=None,
+    ):
         total_epoch = self.cfg.SOLVER.TOTAL_EPOCH
         total_data = len(train_loader)
         log_interval = self.cfg.SOLVER.LOG_EVERY_N
@@ -9160,6 +9852,12 @@ class Trainer():
                 epoch + 1,
             )
 
+            train_eval_every = max(1, int(self.cfg.MONITOR.TRAIN_EVAL.EVERY_N))
+            if train_eval_loader is not None and (
+                (epoch + 1) % train_eval_every == 0 or epoch + 1 == total_epoch
+            ):
+                self.eval_classifier(train_eval_loader, "train_eval_seen")
+
             if test_seen_loader is not None and str(self.evaluator.task_type).lower() == "gzsl":
                 seen_metrics = self.eval_classifier(test_seen_loader, "test_seen")
             else:
@@ -9172,6 +9870,13 @@ class Trainer():
 
             if str(self.evaluator.task_type).lower() == "gzsl":
                 self._update_gzsl_record_metrics(epoch, test_seen_loader, test_unseen_loader, seen_metrics, unseen_metrics)
+            self._run_milestone_probe_if_due(
+                epoch=epoch + 1,
+                total_epoch=total_epoch,
+                train_loader=train_loader,
+                test_seen_loader=test_seen_loader,
+                test_unseen_loader=test_unseen_loader,
+            )
             self._finish_progress_epoch(epoch, total_epoch)
 
         if bool(self.cfg.MONITOR.MODULE_EFFECT.ENABLE) and not bool(
@@ -9189,10 +9894,54 @@ class Trainer():
                 test_unseen_loader,
                 checkpoint_epoch=total_epoch,
             )
+            if self._milestone_probe_epochs:
+                self.diagnostic_manager.record_probe_artifact(
+                    "milestone_probe_manifest.json",
+                    {
+                        "format": "predeclared_milestone_probe_collection_v1",
+                        "analysis_role": "diagnostic_only",
+                        "checkpoint_selection_allowed": False,
+                        "configured_nonfinal_epochs": self._milestone_probe_epochs,
+                        "final_epoch": int(total_epoch),
+                        "records": list(self._milestone_probe_records),
+                        "final_probe_artifact_prefix": "",
+                        "selection_rule": "warmup_end_and_fixed_training_fractions",
+                    },
+                )
         if du.get_world_size() > 1:
             torch.distributed.barrier()
 
-    def _save_trainable_final_checkpoint(self, total_epoch):
+    def _resolve_milestone_probe_epochs(self, total_epoch):
+        cfg = self.cfg.MONITOR.MILESTONE_PROBE
+        if not bool(cfg.ENABLE):
+            return []
+        if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
+            raise ValueError("MONITOR.MILESTONE_PROBE is only supported for final_gzsl")
+        if int(self.cfg.NUM_GPUS) != 1 or int(self.cfg.NUM_SHARDS) != 1:
+            raise ValueError(
+                "MONITOR.MILESTONE_PROBE currently requires single-GPU, single-shard execution"
+            )
+        if bool(cfg.RUN_FIXED_PROBE) and not bool(self.cfg.MONITOR.PROBE.ENABLE):
+            raise ValueError("MILESTONE_PROBE.RUN_FIXED_PROBE requires MONITOR.PROBE.ENABLE")
+        if bool(cfg.RUN_FIXED_PROBE) and not bool(cfg.SAVE_CHECKPOINTS):
+            raise ValueError("milestone fixed probes require SAVE_CHECKPOINTS for checkpoint identity")
+        if not bool(cfg.SAVE_CHECKPOINTS) and not bool(cfg.RUN_FIXED_PROBE):
+            raise ValueError("milestone probe requires SAVE_CHECKPOINTS or RUN_FIXED_PROBE")
+        epochs = []
+        if bool(cfg.INCLUDE_WARMUP_END):
+            warmup = int(self.cfg.SOLVER.WARMUP_EPOCH)
+            if 0 < warmup < int(total_epoch):
+                epochs.append(warmup)
+        for raw_fraction in list(cfg.FRACTIONS):
+            fraction = float(raw_fraction)
+            if not 0.0 < fraction < 1.0:
+                raise ValueError("MONITOR.MILESTONE_PROBE.FRACTIONS must be inside (0, 1)")
+            epoch = int(round(float(total_epoch) * fraction))
+            if 0 < epoch < int(total_epoch):
+                epochs.append(epoch)
+        return sorted(set(epochs))
+
+    def _trainable_model_state(self):
         model_ref = self._model_ref(self.model)
         trainable_names = [name for name, param in model_ref.named_parameters() if param.requires_grad]
         state = model_ref.state_dict()
@@ -9204,6 +9953,10 @@ class Trainer():
         missing = sorted(set(trainable_names).difference(trainable_state))
         if missing:
             raise RuntimeError("Trainable checkpoint is missing model state keys: {}".format(missing[:20]))
+        return trainable_names, trainable_state
+
+    def _save_trainable_final_checkpoint(self, total_epoch):
+        trainable_names, trainable_state = self._trainable_model_state()
 
         checkpoint_name = str(self.cfg.SOLVER.TRAINABLE_FINAL_CHECKPOINT_NAME).strip()
         if not checkpoint_name or os.path.basename(checkpoint_name) != checkpoint_name:
@@ -9231,7 +9984,97 @@ class Trainer():
         )
         return checkpoint_path
 
-    def train_classifier(self, train_loader, val_loader, test_seen_loader, test_unseen_loader):
+    def _save_trainable_milestone_checkpoint(self, checkpoint_epoch, total_epoch):
+        trainable_names, trainable_state = self._trainable_model_state()
+        checkpoint_dir = os.path.join(str(self.cfg.OUTPUT_DIR), "milestone_checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_path = os.path.join(
+            checkpoint_dir, f"model_trainable_epoch_{int(checkpoint_epoch):04d}.pth"
+        )
+        torch.save(
+            {
+                "format": "vpt_trainable_milestone_v1",
+                "model_state": trainable_state,
+                "trainable_parameter_names": trainable_names,
+                "seed": int(self.cfg.SEED) if self.cfg.SEED is not None else None,
+                "cell_id": str(self.cfg.SOLVER.STAGE2_CHECKPOINT_CELL_ID),
+                "protocol_mode": str(self.cfg.DATA.XLSA.PROTOCOL_MODE),
+                "checkpoint_epoch": int(checkpoint_epoch),
+                "planned_total_epoch": int(total_epoch),
+                "checkpoint_selection_rule": "predeclared_training_milestone",
+                "config": str(self.cfg),
+            },
+            checkpoint_path,
+        )
+        return checkpoint_path
+
+    def _run_milestone_probe_if_due(
+        self,
+        *,
+        epoch,
+        total_epoch,
+        train_loader,
+        test_seen_loader,
+        test_unseen_loader,
+    ):
+        if int(epoch) not in self._milestone_probe_epochs:
+            return
+        if du.get_rank() == 0:
+            checkpoint_path = (
+                self._save_trainable_milestone_checkpoint(epoch, total_epoch)
+                if bool(self.cfg.MONITOR.MILESTONE_PROBE.SAVE_CHECKPOINTS)
+                else None
+            )
+            checkpoint_identity = {
+                "checkpoint_id": f"milestone_epoch_{int(epoch):04d}",
+                "checkpoint_epoch": int(epoch),
+                "checkpoint_global_step": int(self._trace_global_step),
+                "checkpoint_selection_rule": "predeclared_training_milestone",
+                "source_run_id": self.monitor_manager.run_id,
+                "source_session_id": self.monitor_manager.session_id,
+                "checkpoint_path": checkpoint_path,
+                "checkpoint_sha256": (
+                    checkpoint_sha256(checkpoint_path) if checkpoint_path else None
+                ),
+            }
+            artifact_prefix = f"milestone_probes/epoch_{int(epoch):04d}"
+            self._fixed_probe_checkpoint_source = checkpoint_identity
+            try:
+                if bool(self.cfg.MONITOR.MILESTONE_PROBE.RUN_FIXED_PROBE):
+                    self._run_fixed_probes(
+                        train_loader,
+                        test_seen_loader,
+                        test_unseen_loader,
+                        checkpoint_epoch=int(epoch),
+                        artifact_prefix=artifact_prefix,
+                        execution_profile=str(
+                            self.cfg.MONITOR.MILESTONE_PROBE.PROFILE
+                        ),
+                    )
+            finally:
+                self._fixed_probe_checkpoint_source = None
+            self._milestone_probe_records.append({
+                **checkpoint_identity,
+                "artifact_prefix": artifact_prefix,
+                "fixed_probe_executed": bool(
+                    self.cfg.MONITOR.MILESTONE_PROBE.RUN_FIXED_PROBE
+                ),
+                "execution_profile": str(
+                    self.cfg.MONITOR.MILESTONE_PROBE.PROFILE
+                ),
+            })
+        if du.get_world_size() > 1:
+            torch.distributed.barrier()
+
+    def train_classifier(
+        self,
+        train_loader,
+        val_loader,
+        test_seen_loader,
+        test_unseen_loader,
+        *,
+        train_eval_loader=None,
+    ):
         completed = False
         self._write_progress_state(
             force=True,
@@ -9255,6 +10098,7 @@ class Trainer():
                     train_loader,
                     test_seen_loader,
                     test_unseen_loader,
+                    train_eval_loader=train_eval_loader,
                 )
             completed = True
             return result
@@ -9316,6 +10160,7 @@ class Trainer():
         # initialize features and target
         total_logits = []
         total_targets = []
+        total_sample_ids = []
         model_ref = self._model_ref(self.model)
         model_ref.clear_runtime_state()
         if self._vis_split_enabled(prefix):
@@ -9327,6 +10172,11 @@ class Trainer():
             self._trace_iter = int(idx)
             end = time.time()
             X, targets, attributes = self.get_input(input_data)
+            batch_sample_ids = input_data.get("sample_id") if isinstance(input_data, dict) else None
+            if batch_sample_ids is not None:
+                if isinstance(batch_sample_ids, str):
+                    batch_sample_ids = [batch_sample_ids]
+                total_sample_ids.extend(str(item) for item in list(batch_sample_ids))
 
             data_time.update(time.time() - end)
 
@@ -9458,6 +10308,11 @@ class Trainer():
             scores=joint_logits,
             targets_local=np.asarray(total_targets, dtype=np.int64),
             dataset=dataset,
+            sample_ids=(
+                total_sample_ids
+                if len(total_sample_ids) == len(total_targets)
+                else None
+            ),
         )
         epoch_elapsed = self._runtime_progress.current_epoch_elapsed()
         self._write_progress_state(

@@ -163,6 +163,38 @@ class PromptDistributionIntervention(AbstractContextManager):
         return False
 
 
+class DeepPromptResidualIntervention(AbstractContextManager):
+    VALID_MODES = {"delta_zero", "mean_swap"}
+
+    def __init__(self, model: torch.nn.Module, mode: str, **payload: Any) -> None:
+        if str(mode) not in self.VALID_MODES:
+            raise ValueError(f"Unsupported Deep Prompt residual intervention: {mode}")
+        self.model = model
+        self.mode = str(mode)
+        self.payload = dict(payload)
+        self.saved: Dict[torch.nn.Module, Any] = {}
+
+    def __enter__(self):
+        for module in self.model.modules():
+            if module.__class__.__name__ != "MeanConditionedDeepPromptResidual":
+                continue
+            self.saved[module] = getattr(module, "_runtime_intervention", None)
+            setattr(
+                module,
+                "_runtime_intervention",
+                {"mode": self.mode, **self.payload},
+            )
+        if not self.saved:
+            raise RuntimeError("No compatible Deep Prompt residual module was found")
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for module, value in self.saved.items():
+            setattr(module, "_runtime_intervention", value)
+        self.saved.clear()
+        return False
+
+
 def prompt_zero_intervention(model: torch.nn.Module) -> ParameterIntervention:
     return ParameterIntervention(
         model,
@@ -267,6 +299,24 @@ def instance_prompt_swap_intervention(
     return PromptDistributionIntervention(
         model,
         "instance_prompt_swap",
+        permutation=permutation,
+    )
+
+
+def deep_prompt_residual_zero_intervention(
+    model: torch.nn.Module,
+) -> DeepPromptResidualIntervention:
+    return DeepPromptResidualIntervention(model, "delta_zero")
+
+
+def deep_prompt_residual_swap_intervention(
+    model: torch.nn.Module,
+    *,
+    permutation: torch.Tensor,
+) -> DeepPromptResidualIntervention:
+    return DeepPromptResidualIntervention(
+        model,
+        "mean_swap",
         permutation=permutation,
     )
 
@@ -461,6 +511,12 @@ class PairedModuleEffectAccumulator:
         return exp / np.maximum(exp.sum(axis=1, keepdims=True), 1e-12)
 
     @staticmethod
+    def _as_numpy(values: Any, dtype: Any) -> np.ndarray:
+        if torch.is_tensor(values):
+            values = values.detach().cpu().numpy()
+        return np.asarray(values, dtype=dtype)
+
+    @staticmethod
     def _true_margin(values: np.ndarray, target: np.ndarray) -> np.ndarray:
         true = values[np.arange(target.size), target]
         other = values.copy()
@@ -481,9 +537,9 @@ class PairedModuleEffectAccumulator:
         normal_features: Optional[Any] = None,
         intervention_features: Optional[Any] = None,
     ) -> None:
-        normal = np.asarray(normal_logits, dtype=np.float32)
-        changed = np.asarray(intervention_logits, dtype=np.float32)
-        target = np.asarray(targets, dtype=np.int64).reshape(-1)
+        normal = self._as_numpy(normal_logits, np.float32)
+        changed = self._as_numpy(intervention_logits, np.float32)
+        target = self._as_numpy(targets, np.int64).reshape(-1)
         if normal.ndim != 2 or normal.shape != changed.shape or normal.shape[0] != target.size:
             raise ValueError("paired module-effect batches have incompatible shapes")
         if normal.shape[1] != self.candidate.size:
@@ -511,8 +567,8 @@ class PairedModuleEffectAccumulator:
         for name, data in values.items():
             self.sums[name] += float(np.asarray(data, dtype=np.float32).sum())
         if normal_features is not None and intervention_features is not None:
-            left = np.asarray(normal_features, dtype=np.float32)
-            right = np.asarray(intervention_features, dtype=np.float32)
+            left = self._as_numpy(normal_features, np.float32)
+            right = self._as_numpy(intervention_features, np.float32)
             if left.shape == right.shape and left.ndim == 2 and left.shape[0] == count:
                 denom = np.maximum(np.linalg.norm(left, axis=1) * np.linalg.norm(right, axis=1), 1e-12)
                 cosine = np.sum(left * right, axis=1) / denom

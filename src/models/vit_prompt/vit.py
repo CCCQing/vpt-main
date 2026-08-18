@@ -42,6 +42,7 @@ from ..vit_backbones.vit import (
 )
 from ...utils import logging
 from ...utils.reproducibility import make_torch_generator
+from ..prompting.prompt_distribution import MeanConditionedDeepPromptResidual
 
 logger = logging.get_logger("visual_prompt")
 
@@ -674,6 +675,9 @@ class PromptedTransformer(Transformer):
         self.prompt_dropout = Dropout(self.prompt_config.DROPOUT)
 
         self.prompt_init_provider = prompt_init_provider
+        self.deep_residual_cfg = self.prompt_config.DISTRIBUTOR.DEEP_RESIDUAL
+        self.deep_prompt_residual_enable = bool(self.deep_residual_cfg.ENABLE)
+        self.deep_prompt_residual = None
         self.prompt_init_seed = None if prompt_init_seed is None else int(prompt_init_seed)
         prompt_init_generator = make_torch_generator(self.prompt_init_seed)
         self.prompt_proj = nn.Identity()
@@ -690,6 +694,13 @@ class PromptedTransformer(Transformer):
         self._last_prompt_path_info = {}
         self._last_prompt_distribution_stats = None
         self._last_injected_prompt_tokens = None
+        self._last_layer_prompt_trace = []
+        self._last_deep_prompt_residual_trace = []
+        self._current_deep_residual_mean = None
+        layer_zero_trace = None
+        self._last_layer_prompt_trace = []
+        self._last_deep_prompt_residual_trace = []
+        self._current_deep_residual_mean = None
         self._last_attention_mediation_stats = []
         self._runtime_prompt_distribution_override = None
 
@@ -712,6 +723,20 @@ class PromptedTransformer(Transformer):
                 raise ValueError(
                     "VPT deep prompt with INIT_SOURCE='distributor_mean' requires "
                     "MODEL.PROMPT.DISTRIBUTOR.ENABLE=True and a prompt_init_provider."
+                )
+        if self.deep_prompt_residual_enable:
+            if not (
+                self.prompt_enable
+                and self.prompt_backend == "vpt_deep"
+                and bool(self.prompt_config.DEEP)
+                and self.prompt_init_source == "learned"
+            ):
+                raise ValueError(
+                    "DEEP_RESIDUAL requires enabled learned vpt_deep Prompt with PROMPT.DEEP=True"
+                )
+            if not bool(self.prompt_config.DISTRIBUTOR.ENABLE) or self.prompt_init_provider is None:
+                raise ValueError(
+                    "DEEP_RESIDUAL requires MODEL.PROMPT.DISTRIBUTOR.ENABLE=True and a provider"
                 )
 
         # 把 shape debug 开关同步到语义分支与编码器各层
@@ -740,6 +765,13 @@ class PromptedTransformer(Transformer):
                 total_d_layer = config.transformer["num_layers"] - 1
                 self.deep_prompt_embeddings = nn.Parameter(torch.zeros(total_d_layer, num_tokens, prompt_dim))
                 self.deep_prompt_embeddings.data.uniform_(-val, val, generator=prompt_init_generator)
+            if self.deep_prompt_residual_enable:
+                self.deep_prompt_residual = MeanConditionedDeepPromptResidual(
+                    dim=prompt_dim,
+                    prompt_len=num_tokens,
+                    num_layers=num_layers,
+                    gate_init=float(self.deep_residual_cfg.GATE_INIT),
+                )
 
         if self.attention_mediation_enable:
             # attention mediation 是“当前 block 内”的注意力修正，因此每一层 ViT block 都有独立 gamma。
@@ -834,9 +866,11 @@ class PromptedTransformer(Transformer):
                 semantic_length=0,
                 block_s_to_cls=False,
             )
+            cls = encoded[:, 0, :].clone()
         if was_training:
             self.encoder.train(True)
-        return encoded[:, 0, :].detach()
+        del encoded
+        return cls
 
     def _call_prompt_init_provider(self, raw_image: torch.Tensor, patch_tokens: torch.Tensor, x_base: torch.Tensor):
         """
@@ -862,7 +896,10 @@ class PromptedTransformer(Transformer):
             return self.prompt_init_provider.prompt_from_distribution(mu, logvar, eps=eps)
         vit_image_tokens = x_base[:, 1:, :]
         vit_cls = None
-        if str(self.prompt_init_provider.source) == "vit_cls_prepass":
+        if str(self.prompt_init_provider.source) in {
+            "vit_cls_prepass",
+            "vit_cls_prepass_constant",
+        }:
             vit_cls = self._build_vit_cls_prepass(x_base)
         provider_out = self.prompt_init_provider(
             raw_image=raw_image,
@@ -873,6 +910,109 @@ class PromptedTransformer(Transformer):
         if (not isinstance(provider_out, tuple)) or len(provider_out) != 2:
             raise TypeError("prompt_init_provider must return exactly (prompt_tokens, provider_stats).")
         return provider_out
+
+    def _call_deep_residual_distribution_parameters(
+        self,
+        raw_image: torch.Tensor,
+        patch_tokens: torch.Tensor,
+        x_base: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        if self.prompt_init_provider is None or not hasattr(
+            self.prompt_init_provider, "distribution_parameters"
+        ):
+            raise RuntimeError(
+                "Deep Prompt residual requires a provider with distribution_parameters()"
+            )
+        vit_image_tokens = x_base[:, 1:, :]
+        vit_cls = None
+        if str(self.prompt_init_provider.source) in {
+            "vit_cls_prepass",
+            "vit_cls_prepass_constant",
+        }:
+            vit_cls = self._build_vit_cls_prepass(x_base)
+        stats = self.prompt_init_provider.distribution_parameters(
+            raw_image=raw_image,
+            vit_patch_tokens=patch_tokens,
+            vit_image_tokens=vit_image_tokens,
+            vit_cls=vit_cls,
+        )
+        if not isinstance(stats, dict) or not torch.is_tensor(stats.get("mu")):
+            raise RuntimeError("Deep Prompt residual provider did not expose tensor mu")
+        return stats
+
+    @staticmethod
+    def _detached_prompt_trace_value(value):
+        return value.detach() if torch.is_tensor(value) else value
+
+    def _compose_deep_prompt_layer(
+        self,
+        base_prompt: torch.Tensor,
+        layer_id: int,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        residual_enabled = bool(
+            getattr(self, "deep_prompt_residual_enable", False)
+        )
+        trace: Dict[str, Any] = {
+            "layer_id": int(layer_id),
+            "base_prompt": base_prompt.detach(),
+            "residual_enabled": residual_enabled,
+        }
+        if not residual_enabled:
+            return base_prompt, trace
+        if self.deep_prompt_residual is None or not torch.is_tensor(
+            self._current_deep_residual_mean
+        ):
+            raise RuntimeError("Deep Prompt residual state was not initialized")
+        delta, residual_stats = self.deep_prompt_residual.forward_layer(
+            self._current_deep_residual_mean,
+            int(layer_id),
+        )
+        if tuple(delta.shape) != tuple(base_prompt.shape):
+            raise RuntimeError(
+                f"Deep Prompt residual shape {tuple(delta.shape)} does not match base {tuple(base_prompt.shape)}"
+            )
+        trace.update(
+            {
+                key: self._detached_prompt_trace_value(value)
+                for key, value in residual_stats.items()
+            }
+        )
+        return base_prompt + delta, trace
+
+    def _record_prompt_layer_input(
+        self,
+        trace: Dict[str, Any],
+        injected_prompt: torch.Tensor,
+    ) -> None:
+        trace = dict(trace)
+        trace["injected_prompt"] = injected_prompt.detach()
+        if not hasattr(self, "_last_layer_prompt_trace"):
+            self._last_layer_prompt_trace = []
+        if not hasattr(self, "_last_deep_prompt_residual_trace"):
+            self._last_deep_prompt_residual_trace = []
+        self._last_layer_prompt_trace.append(trace)
+        if bool(trace.get("residual_enabled", False)):
+            self._last_deep_prompt_residual_trace.append(trace)
+
+    def _record_prompt_layer_output(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+    ) -> None:
+        layer_trace = getattr(self, "_last_layer_prompt_trace", None)
+        if not layer_trace:
+            return
+        trace = layer_trace[-1]
+        if int(trace.get("layer_id", -1)) != int(layer_id):
+            # Some diagnostic unit paths call the deep-forward helper directly
+            # without incorporate_prompt(), so no current-forward input trace
+            # exists for this layer.  Skipping the optional trace must not
+            # change the model forward; full model paths still reset and append
+            # one ordered trace per layer.
+            return
+        trace["contextualized_prompt"] = hidden_states[
+            :, 1 : 1 + self.num_tokens, :
+        ].detach().clone()
 
     def set_runtime_prompt_distribution_override(
         self,
@@ -909,6 +1049,14 @@ class PromptedTransformer(Transformer):
         self._last_semantic_token_state = None
         self._last_prompt_distribution_stats = None
         self._last_injected_prompt_tokens = None
+        # Runtime traces must describe exactly one forward.  Object-selection
+        # probes execute many controlled forwards from the same checkpoint; if
+        # these lists are only initialised in __init__, every forward retains a
+        # full set of GPU tensors and eventually exhausts device memory.
+        self._last_layer_prompt_trace = []
+        self._last_deep_prompt_residual_trace = []
+        self._current_deep_residual_mean = None
+        layer_zero_trace = None
 
         # 提取 patch token，但此时还没有 CLS / pos / prompt
         # 先提取原始 ViT patch token；此时还没有 CLS、position embedding 和 prompt。
@@ -938,7 +1086,16 @@ class PromptedTransformer(Transformer):
                 if self.prompt_init_source == "learned":
                     if self.prompt_embeddings is None:
                         raise ValueError("VPT deep prompt with INIT_SOURCE='learned' requires prompt_embeddings.")
-                    prompt_tokens = self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)
+                    base_prompt = self.prompt_proj(self.prompt_embeddings).expand(B, -1, -1)
+                    if self.deep_prompt_residual_enable:
+                        provider_stats = self._call_deep_residual_distribution_parameters(
+                            x, patch_tokens, x_base
+                        )
+                        self._last_prompt_distribution_stats = provider_stats
+                        self._current_deep_residual_mean = provider_stats["mu"]
+                    prompt_tokens, layer_zero_trace = self._compose_deep_prompt_layer(
+                        base_prompt, 0
+                    )
                 elif self.prompt_init_source == "distributor_mean":
                     # vpt_deep 下也允许只替换输入 prompt 来源，而不改后续 deep prompt 承接方式
                     # vpt_deep 下也只替换输入 prompt 来源，不改变后续 deep prompt 承接方式。
@@ -955,17 +1112,27 @@ class PromptedTransformer(Transformer):
                     raise ValueError(f"Unsupported MODEL.PROMPT.INIT_SOURCE='{self.prompt_config.INIT_SOURCE}'")
             else:
                 raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{self.prompt_backend}'")
+            effective_prompt_tokens = self.prompt_dropout(prompt_tokens)
             x = torch.cat((
                     x_base[:, :1, :],
-                    self.prompt_dropout(prompt_tokens),
+                    effective_prompt_tokens,
                     x_base[:, 1:, :]
                 ), dim=1)
+            if layer_zero_trace is None:
+                layer_zero_trace = {
+                    "layer_id": 0,
+                    "base_prompt": prompt_tokens.detach(),
+                    "residual_enabled": False,
+                }
+            self._record_prompt_layer_input(layer_zero_trace, effective_prompt_tokens)
         else:
             prompt_tokens = x_base[:, :0, :]
             x = x_base
 
         self._last_injected_prompt_tokens = (
-            prompt_tokens.detach() if torch.is_tensor(prompt_tokens) else None
+            effective_prompt_tokens.detach()
+            if self.prompt_enable and torch.is_tensor(effective_prompt_tokens)
+            else None
         )
 
         # semantic tokens 始终拼在序列最后，保持 affinity monitor 的切片协议不变。
@@ -1026,8 +1193,13 @@ class PromptedTransformer(Transformer):
                     self.prompt_init_provider.train(mode)
             elif self.prompt_backend == "vpt_deep":
                 self.prompt_proj.train(mode)
-                if self.prompt_init_source == "distributor_mean" and isinstance(self.prompt_init_provider, torch.nn.Module):
+                if (
+                    self.prompt_init_source == "distributor_mean"
+                    or self.deep_prompt_residual_enable
+                ) and isinstance(self.prompt_init_provider, torch.nn.Module):
                     self.prompt_init_provider.train(mode)
+                if isinstance(self.deep_prompt_residual, torch.nn.Module):
+                    self.deep_prompt_residual.train(mode)
         else:
             for module in self.children():
                 module.train(mode)
@@ -1103,6 +1275,7 @@ class PromptedTransformer(Transformer):
                     attention_mediation_config,
                     i,
                 )
+                self._record_prompt_layer_output(i, hidden_states)
                 if torch.is_tensor(hidden_states):
                     row_hidden_ok = torch.isfinite(hidden_states).flatten(1).all(dim=1)
                     if not bool(row_hidden_ok.all().item()):
@@ -1119,9 +1292,14 @@ class PromptedTransformer(Transformer):
                 if self.prompt_backend == "vpt_deep":
                     if self.deep_prompt_embeddings is None:
                         raise ValueError("VPT deep prompt backend requires deep_prompt_embeddings when PROMPT.DEEP=True")
-                    next_prompt = self.prompt_dropout(
-                        self.prompt_proj(self.deep_prompt_embeddings[i - 1]).expand(hidden_states.shape[0], -1, -1)
+                    base_prompt = self.prompt_proj(
+                        self.deep_prompt_embeddings[i - 1]
+                    ).expand(hidden_states.shape[0], -1, -1)
+                    next_prompt, layer_trace = self._compose_deep_prompt_layer(
+                        base_prompt, i
                     )
+                    next_prompt = self.prompt_dropout(next_prompt)
+                    self._record_prompt_layer_input(layer_trace, next_prompt)
                 else:
                     raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{self.prompt_backend}'")
 
@@ -1142,6 +1320,7 @@ class PromptedTransformer(Transformer):
                     attention_mediation_config,
                     i,
                 )
+                self._record_prompt_layer_output(i, hidden_states)
                 if torch.is_tensor(hidden_states):
                     row_hidden_ok = torch.isfinite(hidden_states).flatten(1).all(dim=1)
                     if not bool(row_hidden_ok.all().item()):
@@ -1194,13 +1373,19 @@ class PromptedTransformer(Transformer):
                     attention_mediation_config,
                     i,
                 )
+                self._record_prompt_layer_output(i, hidden_states)
             else:
                 if self.prompt_backend == "vpt_deep":
                     if self.deep_prompt_embeddings is None:
                         raise ValueError("VPT deep prompt backend requires deep_prompt_embeddings when PROMPT.DEEP=True")
-                    next_prompt = self.prompt_dropout(
-                        self.prompt_proj(self.deep_prompt_embeddings[i - 1]).expand(hidden_states.shape[0], -1, -1)
+                    base_prompt = self.prompt_proj(
+                        self.deep_prompt_embeddings[i - 1]
+                    ).expand(hidden_states.shape[0], -1, -1)
+                    next_prompt, layer_trace = self._compose_deep_prompt_layer(
+                        base_prompt, i
                     )
+                    next_prompt = self.prompt_dropout(next_prompt)
+                    self._record_prompt_layer_input(layer_trace, next_prompt)
                 else:
                     raise ValueError(f"Unsupported MODEL.PROMPT.BACKEND='{self.prompt_backend}'")
 
@@ -1214,6 +1399,7 @@ class PromptedTransformer(Transformer):
                     attention_mediation_config,
                     i,
                 )
+                self._record_prompt_layer_output(i, hidden_states)
             if offload_diagnostics:
                 previous_prompt_output = _attach_prompt_continuity_to_layer(
                     affinity, previous_prompt_output

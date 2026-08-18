@@ -308,6 +308,42 @@ def calibration_profile_metrics(
     }
 
 
+def class_geometry_trace_metrics(features: Any, labels: Any) -> Dict[str, float]:
+    """Class-balanced trace scatter metrics in the input feature space.
+
+    Each observed class contributes equally.  Both within- and between-class
+    scatter use the full squared L2 distance (the covariance trace), so their
+    ratio is dimensionally consistent.
+    """
+    matrix = np.asarray(features, dtype=np.float64)
+    label_ids = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        return {}
+    if label_ids.size != matrix.shape[0]:
+        raise ValueError("labels length does not match features")
+    finite = np.isfinite(matrix).all(axis=1)
+    matrix = matrix[finite]
+    label_ids = label_ids[finite]
+    if matrix.shape[0] == 0:
+        return {}
+    centers = []
+    within_by_class = []
+    for class_id in np.unique(label_ids):
+        values = matrix[label_ids == class_id]
+        center = values.mean(axis=0)
+        centers.append(center)
+        within_by_class.append(float(np.square(values - center).sum(axis=1).mean()))
+    centers_matrix = np.asarray(centers, dtype=np.float64)
+    macro_center = centers_matrix.mean(axis=0)
+    within = float(np.mean(within_by_class))
+    between = float(np.square(centers_matrix - macro_center).sum(axis=1).mean())
+    return {
+        "within_class_scatter_trace": within,
+        "between_class_scatter_trace": between,
+        "fisher_trace_ratio": float(between / max(within, 1e-12)),
+    }
+
+
 def representation_geometry_metrics(features: Any, labels: Optional[Any] = None) -> Dict[str, float]:
     matrix = np.asarray(features, dtype=np.float32)
     if matrix.ndim != 2 or matrix.shape[0] == 0:
@@ -333,27 +369,10 @@ def representation_geometry_metrics(features: Any, labels: Optional[Any] = None)
     }
     if labels is None:
         return result
-    label_ids = np.asarray(labels, dtype=np.int64).reshape(-1)[finite]
-    if label_ids.size != matrix.shape[0]:
+    label_ids = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if label_ids.size != finite.size:
         raise ValueError("labels length does not match features")
-    centers = []
-    within_sum = 0.0
-    within_count = 0
-    for class_id in np.unique(label_ids):
-        values = matrix[label_ids == class_id]
-        center = values.mean(axis=0)
-        centers.append(center)
-        within_sum += float(np.square(values - center).sum())
-        within_count += int(values.size)
-    centers_matrix = np.asarray(centers, dtype=np.float32)
-    overall = matrix.mean(axis=0)
-    within = float(within_sum / max(1, within_count))
-    between = float(np.square(centers_matrix - overall).sum(axis=1).mean()) if centers_matrix.size else 0.0
-    result.update({
-        "within_class_scatter": within,
-        "between_class_scatter": between,
-        "fisher_ratio": float(between / max(within, 1e-12)),
-    })
+    result.update(class_geometry_trace_metrics(matrix, label_ids[finite]))
     return result
 
 

@@ -48,7 +48,11 @@ def resolved_stage(cfg) -> str:
     if str(prompt.BACKEND).lower() == "dynamic" and not bool(prompt.DEEP):
         return "A1"
     if str(prompt.BACKEND).lower() == "vpt_deep" and bool(prompt.DEEP):
-        return "A2"
+        return (
+            "D"
+            if bool(prompt.DISTRIBUTOR.DEEP_RESIDUAL.ENABLE)
+            else "A2"
+        )
     return "invalid"
 
 
@@ -63,7 +67,10 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         "SOLVER.RSIM.ALIGN_MODE": (str(cfg.SOLVER.RSIM.ALIGN_MODE).lower(), "none"),
         "SOLVER.RSIM.ALIGN_WEIGHT": (float(cfg.SOLVER.RSIM.ALIGN_WEIGHT), 0.0),
         "MODEL.PROMPT.INIT_SOURCE": (str(cfg.MODEL.PROMPT.INIT_SOURCE).lower(), "learned"),
-        "MODEL.PROMPT.DISTRIBUTOR.ENABLE": (bool(cfg.MODEL.PROMPT.DISTRIBUTOR.ENABLE), False),
+        "MODEL.PROMPT.DISTRIBUTOR.ENABLE": (
+            bool(cfg.MODEL.PROMPT.DISTRIBUTOR.ENABLE),
+            stage == "D",
+        ),
         "MODEL.SEMANTIC_TOKENS.ENABLE": (bool(cfg.MODEL.SEMANTIC_TOKENS.ENABLE), False),
         "MODEL.AFFINITY.ENABLE": (bool(cfg.MODEL.AFFINITY.ENABLE), False),
         "MODEL.ATTENTION_MEDIATION.ENABLE": (bool(cfg.MODEL.ATTENTION_MEDIATION.ENABLE), False),
@@ -75,6 +82,8 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         "SOLVER.LOSS_PROMPT_KL_WEIGHT": (float(cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT), 0.0),
         "SOLVER.VIS.ENABLE": (bool(cfg.SOLVER.VIS.ENABLE), False),
         "SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT": (bool(cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT), True),
+        "SOLVER.BASE_LR": (float(cfg.SOLVER.BASE_LR), 0.0006),
+        "SOLVER.TOTAL_EPOCH": (int(cfg.SOLVER.TOTAL_EPOCH), 15),
         "MONITOR.ENABLE": (bool(cfg.MONITOR.ENABLE), True),
         "MONITOR.AFFINITY.ENABLE": (bool(cfg.MONITOR.AFFINITY.ENABLE), False),
         "MONITOR.NUMERICAL_GUARD.ENABLE": (bool(cfg.MONITOR.NUMERICAL_GUARD.ENABLE), True),
@@ -82,6 +91,17 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         "MONITOR.PREDICTION_HEALTH.ENABLE": (bool(cfg.MONITOR.PREDICTION_HEALTH.ENABLE), True),
         "MONITOR.CLASS_ERROR.ENABLE": (bool(cfg.MONITOR.CLASS_ERROR.ENABLE), True),
         "MONITOR.CALIBRATION.ENABLE": (bool(cfg.MONITOR.CALIBRATION.ENABLE), True),
+        "MONITOR.TRAIN_EVAL.ENABLE": (bool(cfg.MONITOR.TRAIN_EVAL.ENABLE), False),
+        "MONITOR.TRAIN_EVAL.EVERY_N": (int(cfg.MONITOR.TRAIN_EVAL.EVERY_N), 1),
+        "MONITOR.LOSS_COMPONENT_TRAJECTORY.ENABLE": (
+            bool(cfg.MONITOR.LOSS_COMPONENT_TRAJECTORY.ENABLE), True
+        ),
+        "MONITOR.PREDICTION_TRANSITION_TRAJECTORY.ENABLE": (
+            bool(cfg.MONITOR.PREDICTION_TRANSITION_TRAJECTORY.ENABLE), True
+        ),
+        "MONITOR.MILESTONE_PROBE.ENABLE": (
+            bool(cfg.MONITOR.MILESTONE_PROBE.ENABLE), False
+        ),
         "MONITOR.PROBE.ENABLE": (bool(cfg.MONITOR.PROBE.ENABLE), True),
         "MONITOR.PROBE.REQUIRE_FULL_CLASS_COVERAGE": (
             bool(cfg.MONITOR.PROBE.REQUIRE_FULL_CLASS_COVERAGE), True
@@ -208,11 +228,69 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
             failures.append(f"{name}: expected {target!r}, got {actual!r}")
 
     if stage == "invalid":
-        failures.append("prompt configuration is not one of A0/A1/A2")
-    if int(cfg.MODEL.PROMPT.NUM_TOKENS) != 5:
-        failures.append("MODEL.PROMPT.NUM_TOKENS must be 5 for the initial A-series protocol")
+        failures.append("prompt configuration is not one of A0/A1/A2/D")
+    if stage == "D":
+        dist_cfg = cfg.MODEL.PROMPT.DISTRIBUTOR
+        if str(dist_cfg.SOURCE).lower() not in {
+            "vit_cls_prepass",
+            "vit_cls_prepass_constant",
+        }:
+            failures.append(
+                "D direct-mean stage requires vit_cls_prepass or its constant control"
+            )
+        if int(dist_cfg.INSTANCE_TOKENS) != 16 or int(dist_cfg.DOMAIN_TOKENS) != 0:
+            failures.append(
+                "D direct-mean stage requires 16 instance delta Prompt slots and 0 domain slots"
+            )
+        if not bool(cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_ZERO):
+            failures.append("D direct-mean stage requires DEEP_RESIDUAL_ZERO=true")
+        if not bool(cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_SWAP):
+            failures.append("D direct-mean stage requires DEEP_RESIDUAL_SWAP=true")
+    if int(cfg.MODEL.PROMPT.NUM_TOKENS) != 16:
+        failures.append("MODEL.PROMPT.NUM_TOKENS must be 16 for the current A-series protocol")
     if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
         failures.append("DATA.XLSA.PROTOCOL_MODE must be 'final_gzsl' for the A-series")
+    if int(cfg.MONITOR.TRAIN_EVAL.EVERY_N) <= 0:
+        failures.append("MONITOR.TRAIN_EVAL.EVERY_N must be positive")
+    transition_splits = [
+        str(item).lower()
+        for item in cfg.MONITOR.PREDICTION_TRANSITION_TRAJECTORY.SPLITS
+    ]
+    allowed_transition_splits = {"test_seen", "test_unseen"}
+    if not transition_splits:
+        failures.append(
+            "MONITOR.PREDICTION_TRANSITION_TRAJECTORY.SPLITS must not be empty"
+        )
+    if len(set(transition_splits)) != len(transition_splits):
+        failures.append(
+            "MONITOR.PREDICTION_TRANSITION_TRAJECTORY.SPLITS must be unique"
+        )
+    invalid_transition_splits = sorted(
+        set(transition_splits) - allowed_transition_splits
+    )
+    if invalid_transition_splits:
+        failures.append(
+            "PREDICTION_TRANSITION_TRAJECTORY only supports test_seen/test_unseen; got {}".format(
+                ", ".join(invalid_transition_splits)
+            )
+        )
+    milestone_cfg = cfg.MONITOR.MILESTONE_PROBE
+    milestone_fractions = [float(item) for item in milestone_cfg.FRACTIONS]
+    if not milestone_fractions or any(
+        not 0.0 < value < 1.0 for value in milestone_fractions
+    ):
+        failures.append("MONITOR.MILESTONE_PROBE.FRACTIONS must lie in (0, 1)")
+    if len(set(milestone_fractions)) != len(milestone_fractions):
+        failures.append("MONITOR.MILESTONE_PROBE.FRACTIONS must be unique")
+    if bool(milestone_cfg.ENABLE):
+        if not bool(milestone_cfg.SAVE_CHECKPOINTS):
+            failures.append(
+                "enabled MILESTONE_PROBE requires SAVE_CHECKPOINTS=true"
+            )
+        if bool(milestone_cfg.RUN_FIXED_PROBE) and not bool(cfg.MONITOR.PROBE.ENABLE):
+            failures.append(
+                "MILESTONE_PROBE.RUN_FIXED_PROBE requires MONITOR.PROBE.ENABLE"
+            )
     if cfg.SEED is None:
         failures.append("SEED must be set for the A-series reproducibility protocol")
     if int(cfg.NUM_GPUS) != 1:
@@ -221,6 +299,8 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         failures.append("NUM_SHARDS must be 1 for the current A-series single-GPU contract")
     if int(cfg.DATA.NUM_WORKERS) != 4:
         failures.append("DATA.NUM_WORKERS must be 4 for the current A-series deterministic multi-worker loader")
+    if int(cfg.MONITOR.PROBE.NUM_WORKERS) < 0:
+        failures.append("MONITOR.PROBE.NUM_WORKERS must be non-negative")
     if bool(cfg.CUDNN_BENCHMARK):
         failures.append("CUDNN_BENCHMARK must be false for the current A-series single-GPU contract")
     probe_selection_seeds = [int(cfg.MONITOR.PROBE.SELECTION_SEED)] + [
@@ -341,7 +421,7 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
         failures.append("semantic-token parameters remain trainable")
     if any("attention_mediation" in name for name in trainable):
         failures.append("attention-mediation parameters remain trainable")
-    if any("prompt_init_provider" in name for name in trainable):
+    if stage != "D" and any("prompt_init_provider" in name for name in trainable):
         failures.append("prompt-distributor parameters remain trainable")
 
     prompt_names = [name for name in trainable if "prompt_embeddings" in name]
@@ -352,12 +432,29 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
         failures.append("A1 must train input prompt embeddings only")
     if stage == "A2" and (not prompt_names or not deep_names):
         failures.append("A2 must train both input and deep prompt embeddings")
+    if stage == "D" and (not prompt_names or not deep_names):
+        failures.append("D must retain both static input and deep prompt embeddings")
+    if stage == "D" and not any(
+        "prompt_init_provider.stats_head" in name for name in trainable
+    ):
+        failures.append("D must train the existing Prompt Distributor stats MLP")
+    if stage == "D" and not any(
+        name.endswith("deep_prompt_residual.layer_gate") for name in trainable
+    ):
+        failures.append("D must train one direct-mean residual gate per layer")
     allowed_prefixes = {
         "A0": ("r_similarity_head.prototype_proj.",),
         "A1": ("enc.transformer.prompt_embeddings", "r_similarity_head.prototype_proj."),
         "A2": (
             "enc.transformer.prompt_embeddings",
             "enc.transformer.deep_prompt_embeddings",
+            "r_similarity_head.prototype_proj.",
+        ),
+        "D": (
+            "enc.transformer.prompt_embeddings",
+            "enc.transformer.deep_prompt_embeddings",
+            "enc.transformer.prompt_init_provider.stats_head",
+            "enc.transformer.deep_prompt_residual.layer_gate",
             "r_similarity_head.prototype_proj.",
         ),
     }
@@ -393,7 +490,9 @@ def cross_config_stream_checks(configs) -> List[str]:
                     ),
                 )
             )
-    prompt_records = [record for record in records if record["stage"] in {"A1", "A2"}]
+    prompt_records = [
+        record for record in records if record["stage"] in {"A1", "A2", "D"}
+    ]
     if len(prompt_records) >= 2:
         prompt_values = {record["streams"]["prompt_init"] for record in prompt_records}
         if len(prompt_values) != 1:

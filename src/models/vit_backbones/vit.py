@@ -297,6 +297,18 @@ class Attention(nn.Module):
             changed[:, :, prompt_slice, patch_slice] = (
                 prompt_patch_mass / float(patch_end - patch_start)
             )
+            prompt_patch_mass_after = changed[
+                :, :, prompt_slice, patch_slice
+            ].sum(dim=-1)
+            batch_size = int(changed.shape[0])
+            self._last_prompt_path_intervention_stats = {
+                "prompt_patch_uniform_applied": prompt_patch_mass.new_ones(
+                    (batch_size,)
+                ),
+                "prompt_patch_uniform_mass_abs_error": (
+                    prompt_patch_mass_after - prompt_patch_mass.squeeze(-1)
+                ).abs().mean(dim=(1, 2)),
+            }
             return changed
         if mode == "patch_prompt_uniform":
             patch_prompt_mass = changed[:, :, patch_slice, prompt_slice].sum(
@@ -305,6 +317,18 @@ class Attention(nn.Module):
             changed[:, :, patch_slice, prompt_slice] = (
                 patch_prompt_mass / float(prompt_length)
             )
+            patch_prompt_mass_after = changed[
+                :, :, patch_slice, prompt_slice
+            ].sum(dim=-1)
+            batch_size = int(changed.shape[0])
+            self._last_prompt_path_intervention_stats = {
+                "patch_prompt_uniform_applied": patch_prompt_mass.new_ones(
+                    (batch_size,)
+                ),
+                "patch_prompt_uniform_mass_abs_error": (
+                    patch_prompt_mass_after - patch_prompt_mass.squeeze(-1)
+                ).abs().mean(dim=(1, 2)),
+            }
             return changed
         if mode in {
             "attribute_concept_prompt_patch_block",
@@ -414,6 +438,9 @@ class Attention(nn.Module):
             )
             batch_size = int(concept_scores.shape[0])
             self._last_prompt_path_intervention_stats = {
+                "concept_intervention_applied": concept_scores.new_ones(
+                    (batch_size,)
+                ),
                 "concept_intervention_selected_patch_ratio": concept_scores.new_full(
                     (batch_size,), float(selected_count / patch_count)
                 ),
@@ -504,6 +531,9 @@ class Attention(nn.Module):
             )
             batch_size = int(reference_scores.shape[0])
             self._last_prompt_path_intervention_stats = {
+                "transport_intervention_applied": reference_scores.new_ones(
+                    (batch_size,)
+                ),
                 "transport_intervention_selected_patch_ratio": (
                     reference_scores.new_full(
                         (batch_size,), float(selected_count / patch_count)
@@ -1289,6 +1319,7 @@ class Attention(nn.Module):
         value_layer=None,
         attention_probs=None,
         detach=True,
+        include_visual_normalizations=True,
     ):
         """
         统一导出主干 prompt/visual 的原始亲和矩阵。
@@ -1433,72 +1464,86 @@ class Attention(nn.Module):
         if q_prompt.numel() > 0 and q_patch.numel() > 0:
             qpqv_raw = torch.matmul(q_prompt, q_patch.transpose(-1, -2)) * scale
             monitors["QpQv_raw"] = qpqv_raw
-            monitors["QpQv_vis"] = self._minmax_normalize_lastdim(qpqv_raw)
+            if include_visual_normalizations:
+                monitors["QpQv_vis"] = self._minmax_normalize_lastdim(qpqv_raw)
 
         if k_prompt.numel() > 0 and k_patch.numel() > 0:
             kpkv_raw = torch.matmul(k_prompt, k_patch.transpose(-1, -2)) * scale
             monitors["KpKv_raw"] = kpkv_raw
-            monitors["KpKv_vis"] = self._minmax_normalize_lastdim(kpkv_raw)
+            if include_visual_normalizations:
+                monitors["KpKv_vis"] = self._minmax_normalize_lastdim(kpkv_raw)
 
         if q_prompt.numel() > 0 and k_patch.numel() > 0:
             qpkv_raw = torch.matmul(q_prompt, k_patch.transpose(-1, -2)) * scale
             monitors["QpKv_raw"] = qpkv_raw
-            monitors["QpKv_vis"] = self._minmax_normalize_lastdim(qpkv_raw)
+            if include_visual_normalizations:
+                monitors["QpKv_vis"] = self._minmax_normalize_lastdim(qpkv_raw)
 
         if q_patch.numel() > 0 and k_prompt.numel() > 0:
             qvkp_raw = torch.matmul(q_patch, k_prompt.transpose(-1, -2)) * scale
             monitors["QvKp_raw"] = qvkp_raw
-            monitors["QvKp_vis"] = self._minmax_normalize_lastdim(qvkp_raw)
+            if include_visual_normalizations:
+                monitors["QvKp_vis"] = self._minmax_normalize_lastdim(qvkp_raw)
 
         if q_cls.numel() > 0 and k_patch.numel() > 0:
             qckv_raw = torch.matmul(q_cls, k_patch.transpose(-1, -2)) * scale
             monitors["QcKv_raw"] = qckv_raw
-            monitors["QcKv_vis"] = self._minmax_normalize_lastdim(qckv_raw)
+            if include_visual_normalizations:
+                monitors["QcKv_vis"] = self._minmax_normalize_lastdim(qckv_raw)
 
         if q_patch.numel() > 0 and k_cls.numel() > 0:
             qvkc_raw = torch.matmul(q_patch, k_cls.transpose(-1, -2)) * scale
             monitors["QvKc_raw"] = qvkc_raw
-            monitors["QvKc_vis"] = self._minmax_normalize_lastdim(qvkc_raw)
+            if include_visual_normalizations:
+                monitors["QvKc_vis"] = self._minmax_normalize_lastdim(qvkc_raw)
 
         if q_cls.numel() > 0 and k_prompt.numel() > 0:
             qckp_raw = torch.matmul(q_cls, k_prompt.transpose(-1, -2)) * scale
             monitors["QcKp_raw"] = qckp_raw
-            monitors["QcKp_vis"] = self._minmax_normalize_lastdim(qckp_raw)
+            if include_visual_normalizations:
+                monitors["QcKp_vis"] = self._minmax_normalize_lastdim(qckp_raw)
 
         if q_prompt.numel() > 0 and k_cls.numel() > 0:
             qpkc_raw = torch.matmul(q_prompt, k_cls.transpose(-1, -2)) * scale
             monitors["QpKc_raw"] = qpkc_raw
-            monitors["QpKc_vis"] = self._minmax_normalize_lastdim(qpkc_raw)
+            if include_visual_normalizations:
+                monitors["QpKc_vis"] = self._minmax_normalize_lastdim(qpkc_raw)
 
         if q_semantic.numel() > 0 and k_patch.numel() > 0:
             qskv_raw = torch.matmul(q_semantic, k_patch.transpose(-1, -2)) * scale
             monitors["QsKv_raw"] = qskv_raw
-            monitors["QsKv_vis"] = self._minmax_normalize_lastdim(qskv_raw)
+            if include_visual_normalizations:
+                monitors["QsKv_vis"] = self._minmax_normalize_lastdim(qskv_raw)
 
         if q_patch.numel() > 0 and k_semantic.numel() > 0:
             qvks_raw = torch.matmul(q_patch, k_semantic.transpose(-1, -2)) * scale
             monitors["QvKs_raw"] = qvks_raw
-            monitors["QvKs_vis"] = self._minmax_normalize_lastdim(qvks_raw)
+            if include_visual_normalizations:
+                monitors["QvKs_vis"] = self._minmax_normalize_lastdim(qvks_raw)
 
         if q_cls.numel() > 0 and k_semantic.numel() > 0:
             qcks_raw = torch.matmul(q_cls, k_semantic.transpose(-1, -2)) * scale
             monitors["QcKs_raw"] = qcks_raw
-            monitors["QcKs_vis"] = self._minmax_normalize_lastdim(qcks_raw)
+            if include_visual_normalizations:
+                monitors["QcKs_vis"] = self._minmax_normalize_lastdim(qcks_raw)
 
         if q_semantic.numel() > 0 and k_cls.numel() > 0:
             qskc_raw = torch.matmul(q_semantic, k_cls.transpose(-1, -2)) * scale
             monitors["QsKc_raw"] = qskc_raw
-            monitors["QsKc_vis"] = self._minmax_normalize_lastdim(qskc_raw)
+            if include_visual_normalizations:
+                monitors["QsKc_vis"] = self._minmax_normalize_lastdim(qskc_raw)
 
         if q_semantic.numel() > 0 and k_prompt.numel() > 0:
             qskp_raw = torch.matmul(q_semantic, k_prompt.transpose(-1, -2)) * scale
             monitors["QsKp_raw"] = qskp_raw
-            monitors["QsKp_vis"] = self._minmax_normalize_lastdim(qskp_raw)
+            if include_visual_normalizations:
+                monitors["QsKp_vis"] = self._minmax_normalize_lastdim(qskp_raw)
 
         if q_prompt.numel() > 0 and k_semantic.numel() > 0:
             qpks_raw = torch.matmul(q_prompt, k_semantic.transpose(-1, -2)) * scale
             monitors["QpKs_raw"] = qpks_raw
-            monitors["QpKs_vis"] = self._minmax_normalize_lastdim(qpks_raw)
+            if include_visual_normalizations:
+                monitors["QpKs_vis"] = self._minmax_normalize_lastdim(qpks_raw)
 
         if isinstance(self._last_prompt_path_intervention_stats, dict):
             monitors.update(self._last_prompt_path_intervention_stats)
@@ -1700,6 +1745,16 @@ class Block(nn.Module):
             mediated[:, semantic_slice, :] - original[:, semantic_slice, :]
         )
         return mixed
+
+    @staticmethod
+    def _attach_target_relevance_attention(
+        affinity,
+        attention_probs,
+        affinity_config,
+    ):
+        """Expose the graph-connected post-softmax Attention only to relevance probes."""
+        if bool(affinity_config.get("retain_attention_for_relevance", False)):
+            affinity["_target_relevance_attention"] = attention_probs
 
     @staticmethod
     def _attach_prompt_layer_monitors(
@@ -2171,6 +2226,47 @@ class Block(nn.Module):
             weights:    注意力权重（仅 vis=True 时非 None）
             affinities: dict，包含 raw/vis 亲和矩阵
         """
+        selected_layers = affinity_config.get("selected_layers")
+        collect_full_diagnostics = (
+            selected_layers is None
+            or int(layer_idx) in {int(item) for item in selected_layers}
+        )
+
+        def build_affinity(block_output):
+            if collect_full_diagnostics:
+                affinity = self.attn.compute_prompt_visual_monitors(
+                    q_proj,
+                    k_proj,
+                    affinity_config.get("prompt_length", 0),
+                    affinity_config.get("semantic_length", 0),
+                    value_layer=v_proj,
+                    attention_probs=monitor_attention_probs,
+                    detach=affinity_config.get("detach", True),
+                    include_visual_normalizations=affinity_config.get(
+                        "include_visual_normalizations", True
+                    ),
+                )
+                self._attach_target_relevance_attention(
+                    affinity,
+                    monitor_attention_probs,
+                    affinity_config,
+                )
+            else:
+                # Continuity only needs compact Prompt input/output vectors.
+                # Avoid constructing full Q/K and value diagnostics for layers
+                # that the fixed Probe will discard.
+                affinity = {}
+            self._attach_prompt_layer_monitors(
+                affinity,
+                block_input,
+                block_output,
+                num_prompt_tokens,
+                detach=affinity_config.get("detach", True),
+                affinity_config=affinity_config,
+                layer_idx=layer_idx,
+            )
+            return affinity
+
         # --- 注意力分支 + 残差 ---
         block_input = x
         h = x
@@ -2212,24 +2308,7 @@ class Block(nn.Module):
                 attention_mediation_config,
                 layer_idx,
             )
-            attn_aff = self.attn.compute_prompt_visual_monitors(
-                q_proj,
-                k_proj,
-                affinity_config.get("prompt_length", 0),
-                affinity_config.get("semantic_length", 0),
-                value_layer=v_proj,
-                attention_probs=monitor_attention_probs,
-                detach=affinity_config.get("detach", True),
-            )
-            self._attach_prompt_layer_monitors(
-                attn_aff,
-                block_input,
-                x,
-                num_prompt_tokens,
-                detach=affinity_config.get("detach", True),
-                affinity_config=affinity_config,
-                layer_idx=layer_idx,
-            )
+            attn_aff = build_affinity(x)
             return x, weights, attn_aff, semantics
 
         scaled_delta = self._scale_attention_mediation_delta(
@@ -2253,24 +2332,7 @@ class Block(nn.Module):
             x = x + scaled_delta
 
         # --- 基于 Q/K 计算 prompt/patch 亲和 ---
-        attn_aff = self.attn.compute_prompt_visual_monitors(
-            q_proj,
-            k_proj,
-            affinity_config.get("prompt_length", 0),
-            affinity_config.get("semantic_length", 0),
-            value_layer=v_proj,
-            attention_probs=monitor_attention_probs,
-            detach=affinity_config.get("detach", True),
-        )
-        self._attach_prompt_layer_monitors(
-            attn_aff,
-            block_input,
-            x,
-            num_prompt_tokens,
-            detach=affinity_config.get("detach", True),
-            affinity_config=affinity_config,
-            layer_idx=layer_idx,
-        )
+        attn_aff = build_affinity(x)
 
         return x, weights, attn_aff, semantics
 

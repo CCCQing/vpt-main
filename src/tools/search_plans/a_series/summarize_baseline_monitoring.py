@@ -4,15 +4,48 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
+import hashlib
+import io
 import json
 import math
+import os
 import re
 import statistics
-from collections import defaultdict
+from collections import ChainMap, defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import yaml
 from scipy.stats import t as student_t
+
+try:
+    from .artifact_io import (
+        artifact_exists,
+        compact_to_gzip,
+        open_text_artifact,
+        resolve_text_artifact,
+    )
+    from .probe_evidence import (
+        MECHANISM_EVIDENCE,
+        PROBE_CONTEXT_ONLY,
+        VALIDITY_OR_IDENTITY,
+        probe_record_evidence_role,
+    )
+except ImportError:  # Direct script execution.
+    from artifact_io import (
+        artifact_exists,
+        compact_to_gzip,
+        open_text_artifact,
+        resolve_text_artifact,
+    )
+    from probe_evidence import (
+        MECHANISM_EVIDENCE,
+        PROBE_CONTEXT_ONLY,
+        VALIDITY_OR_IDENTITY,
+        probe_record_evidence_role,
+    )
 
 
 TASK_METRICS = (
@@ -35,20 +68,86 @@ TRAJECTORY_REQUIRED_FIELDS = (
 )
 TRAJECTORY_FIELD_MAP = {
     ("train_epoch", "train", "loss"): "train_loss",
+    ("train_epoch", "train", "lr"): "train_lr",
     ("classification", "test_seen", "nll"): "test_seen_nll",
     ("classification", "test_unseen", "nll"): "test_unseen_nll",
     ("classification", "test_seen", "top1"): "test_seen_top1",
     ("classification", "test_unseen", "top1"): "test_unseen_top1",
+    ("classification", "train_eval_seen", "nll"): "train_eval_seen_nll",
+    ("classification", "train_eval_seen", "top1"): "train_eval_seen_top1",
     ("classification", "test_gzsl", "gzsl_seen"): "gzsl_seen",
     ("classification", "test_gzsl", "gzsl_unseen"): "gzsl_unseen",
     ("classification", "test_gzsl", "gzsl_h"): "gzsl_h",
+    ("prediction_health", "test_seen", "true_class_rank_mean"): "test_seen_true_class_rank_mean",
+    ("prediction_health", "test_unseen", "true_class_rank_mean"): "test_unseen_true_class_rank_mean",
+    ("prediction_health", "train_eval_seen", "true_class_rank_mean"): "train_eval_seen_true_class_rank_mean",
+    ("prediction_health", "test_seen", "wrong_domain_prediction_rate"): "test_seen_wrong_domain_prediction_rate",
+    ("prediction_health", "test_unseen", "wrong_domain_prediction_rate"): "test_unseen_wrong_domain_prediction_rate",
+    ("prediction_health", "test_seen", "true_class_margin_mean"): "test_seen_true_class_margin_mean",
+    ("prediction_health", "test_unseen", "true_class_margin_mean"): "test_unseen_true_class_margin_mean",
+    ("prediction_health", "test_seen", "seen_probability_mass_mean"): "test_seen_seen_probability_mass_mean",
+    ("prediction_health", "test_unseen", "seen_probability_mass_mean"): "test_unseen_seen_probability_mass_mean",
+    ("prediction_health", "test_seen", "seen_unseen_logit_margin_mean"): "test_seen_seen_unseen_logit_margin_mean",
+    ("prediction_health", "test_unseen", "seen_unseen_logit_margin_mean"): "test_unseen_seen_unseen_logit_margin_mean",
+    ("prediction_health", "test_seen", "entropy_mean"): "test_seen_entropy_mean",
+    ("prediction_health", "test_unseen", "entropy_mean"): "test_unseen_entropy_mean",
+    ("prediction_health", "test_seen", "confidence_incorrect"): "test_seen_confidence_incorrect",
+    ("prediction_health", "test_unseen", "confidence_incorrect"): "test_unseen_confidence_incorrect",
+    ("class_error", "test_seen", "bottom_k_class_mean"): "test_seen_bottom_k_class_mean",
+    ("class_error", "test_unseen", "bottom_k_class_mean"): "test_unseen_bottom_k_class_mean",
+    ("class_error", "test_seen", "max_prediction_share"): "test_seen_max_prediction_share",
+    ("class_error", "test_unseen", "max_prediction_share"): "test_unseen_max_prediction_share",
+    ("calibration_profile", "test_gzsl", "ausuc"): "test_gzsl_ausuc",
+    ("calibration_profile", "test_gzsl", "raw_to_oracle_gain"): "test_gzsl_raw_to_oracle_gain",
+    ("calibration_profile", "test_gzsl", "oracle_peak_gamma"): "test_gzsl_oracle_peak_gamma",
+    ("prompt_parameter_health", "train", "prompt_param_norm"): "prompt_param_norm",
+    ("prompt_parameter_health", "train", "prompt_relative_update"): "prompt_relative_update",
+    ("prompt_parameter_health", "train", "distance_from_initialization"): "prompt_distance_from_initialization",
+    ("prompt_parameter_health", "train", "prompt_effective_rank"): "prompt_effective_rank",
+    ("prompt_parameter_health", "train", "token_pair_cosine_mean"): "prompt_token_pair_cosine_mean",
+    ("prompt_parameter_health", "train", "token_pair_cosine_max"): "prompt_token_pair_cosine_max",
+    ("prompt_parameter_health", "train", "prompt_grad_norm"): "prompt_grad_norm_last_batch",
+    ("prompt_parameter_health", "train", "epoch_parameter_step_norm"): "prompt_epoch_parameter_step_norm",
+    ("prompt_parameter_health", "train", "epoch_update_to_weight_ratio"): "prompt_epoch_update_to_weight_ratio",
+    ("prompt_parameter_health", "train", "cross_epoch_prompt_cosine"): "prompt_cross_epoch_cosine",
 }
+TRAJECTORY_DERIVED_OPTIONAL_FIELDS = (
+    "test_seen_minus_train_eval_nll_gap",
+    "train_eval_minus_test_seen_top1_gap",
+    "test_seen_minus_train_eval_true_class_rank_gap",
+)
+TRAJECTORY_OPTIONAL_FIELDS = tuple(dict.fromkeys(
+    (*TRAJECTORY_FIELD_MAP.values(), *TRAJECTORY_DERIVED_OPTIONAL_FIELDS)
+))
+TRAJECTORY_ANCHOR_FIELDS = (
+    "gzsl_seen",
+    "gzsl_unseen",
+    "gzsl_h",
+    "test_seen_true_class_rank_mean",
+    "test_unseen_true_class_rank_mean",
+    "test_unseen_wrong_domain_prediction_rate",
+    "test_gzsl_ausuc",
+    "test_seen_bottom_k_class_mean",
+    "test_unseen_bottom_k_class_mean",
+    "prompt_param_norm",
+    "prompt_relative_update",
+    "prompt_distance_from_initialization",
+    "prompt_effective_rank",
+    "prompt_token_pair_cosine_mean",
+    "prompt_epoch_parameter_step_norm",
+    "prompt_epoch_update_to_weight_ratio",
+    "prompt_cross_epoch_cosine",
+    *TRAJECTORY_DERIVED_OPTIONAL_FIELDS,
+)
 TRAJECTORY_WINDOW_FRACTION = 0.2
 TRAJECTORY_MIN_WINDOW_EPOCHS = 2
 TRAJECTORY_MIN_COMPLETE_EPOCHS = 4
 TRAJECTORY_ACCURACY_TOLERANCE = 0.005
 TRAJECTORY_LOSS_ABS_TOLERANCE = 0.01
 TRAJECTORY_LOSS_REL_TOLERANCE = 0.01
+TRAJECTORY_FORMATION_SUFFIX_RATIO = 0.8
+TRAJECTORY_FORMATION_MIN_WINDOWS = 3
+TRAJECTORY_LATE_LR_FRACTION = 0.25
 
 
 def parse_args():
@@ -57,6 +156,21 @@ def parse_args():
     parser.add_argument("--baseline-method", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--expected-seeds", default="0,1,2")
+    parser.add_argument(
+        "--trajectory-only",
+        action="store_true",
+        help="Recompute trajectory/cross-experiment inputs without parsing or rewriting large fixed-probe mechanism summaries.",
+    )
+    parser.add_argument(
+        "--compact-probe-metrics",
+        action="store_true",
+        help="After every compact summary is committed, gzip completed-run probe_metrics.csv files and remove the verified originals.",
+    )
+    parser.add_argument(
+        "--compact-module-effect-json",
+        action="store_true",
+        help="After summary generation, gzip completed-run module_effect JSON details and remove the verified originals.",
+    )
     return parser.parse_args()
 
 
@@ -105,6 +219,22 @@ def _generalization_trajectory_by_epoch(path: Path) -> List[Dict[str, Any]]:
     rows = []
     for epoch in sorted(epochs):
         values = epochs[epoch]
+        if "train_eval_seen_nll" in values and "test_seen_nll" in values:
+            values["test_seen_minus_train_eval_nll_gap"] = float(
+                values["test_seen_nll"] - values["train_eval_seen_nll"]
+            )
+        if "train_eval_seen_top1" in values and "test_seen_top1" in values:
+            values["train_eval_minus_test_seen_top1_gap"] = float(
+                values["train_eval_seen_top1"] - values["test_seen_top1"]
+            )
+        if (
+            "train_eval_seen_true_class_rank_mean" in values
+            and "test_seen_true_class_rank_mean" in values
+        ):
+            values["test_seen_minus_train_eval_true_class_rank_gap"] = float(
+                values["test_seen_true_class_rank_mean"]
+                - values["train_eval_seen_true_class_rank_mean"]
+            )
         missing = [field for field in TRAJECTORY_REQUIRED_FIELDS if field not in values]
         rows.append({
             "epoch": int(epoch),
@@ -113,6 +243,82 @@ def _generalization_trajectory_by_epoch(path: Path) -> List[Dict[str, Any]]:
             "missing_fields": ";".join(missing),
         })
     return rows
+
+
+def _prompt_layer_trajectory_by_epoch(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    pattern = re.compile(r"layer_(\d+)\.(.+)")
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            if str(row.get("namespace") or "") != "prompt_parameter_health":
+                continue
+            match = pattern.fullmatch(str(row.get("metric") or ""))
+            value = _float(row.get("value"))
+            if match is None or value is None:
+                continue
+            rows.append({
+                "epoch": int(float(row.get("epoch") or 0)),
+                "layer": int(match.group(1)),
+                "metric": str(match.group(2)),
+                "value": float(value),
+                "split": str(row.get("split") or "train"),
+            })
+    return sorted(rows, key=lambda row: (int(row["epoch"]), int(row["layer"]), str(row["metric"])))
+
+
+def _read_training_context(run_dir: Path) -> Dict[str, Any]:
+    path = run_dir / "resolved_config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(payload, Mapping):
+        return {}
+    data = payload.get("DATA", {}) or {}
+    xlsa = data.get("XLSA", {}) or {}
+    model = payload.get("MODEL", {}) or {}
+    prompt = model.get("PROMPT", {}) or {}
+    solver = payload.get("SOLVER", {}) or {}
+    rsim = solver.get("RSIM", {}) or {}
+    condition_fields = {
+        "data.name": data.get("NAME"),
+        "data.feature": data.get("FEATURE"),
+        "data.protocol_mode": xlsa.get("PROTOCOL_MODE"),
+        "model.type": model.get("TYPE"),
+        "model.transfer_type": model.get("TRANSFER_TYPE"),
+        "prompt.backend": prompt.get("BACKEND"),
+        "prompt.deep": bool(prompt.get("DEEP", False)),
+        "prompt.num_tokens": int(prompt.get("NUM_TOKENS", 0) or 0),
+        "solver.optimizer": solver.get("OPTIMIZER"),
+        "solver.base_lr": _float(solver.get("BASE_LR")),
+        "solver.weight_decay": _float(solver.get("WEIGHT_DECAY")),
+        "solver.scheduler": solver.get("SCHEDULER"),
+        "solver.total_epoch": int(solver.get("TOTAL_EPOCH", 0) or 0),
+        "solver.warmup_epoch": int(solver.get("WARMUP_EPOCH", 0) or 0),
+        "loss.rsim_align_mode": rsim.get("ALIGN_MODE"),
+        "loss.rsim_align_weight": _float(rsim.get("ALIGN_WEIGHT")),
+        "loss.attr_weight": _float(solver.get("LOSS_ATTR_WEIGHT")),
+        "loss.prompt_kl_weight": _float(solver.get("LOSS_PROMPT_KL_WEIGHT")),
+        "loss.semantic_mediation_weight": _float(solver.get("LOSS_SEM_MED_WEIGHT")),
+        "loss.semantic_prompt_value_weight": _float(solver.get("LOSS_SPV_WEIGHT")),
+    }
+    canonical = json.dumps(
+        condition_fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return {
+        "warmup_epoch": int(solver.get("WARMUP_EPOCH", 0) or 0),
+        "configured_total_epoch": int(solver.get("TOTAL_EPOCH", 0) or 0),
+        "scheduler": str(solver.get("SCHEDULER", "unknown")),
+        "base_lr": _float(solver.get("BASE_LR")),
+        "condition_fields": condition_fields,
+        "condition_fingerprint": hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def _trajectory_window_size(epoch_count: int) -> int:
@@ -138,6 +344,7 @@ def _summarize_generalization_trajectory(
     rows: Sequence[Mapping[str, Any]],
     *,
     run_completed: bool,
+    training_context: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     observed = sorted(rows, key=lambda row: int(row["epoch"]))
     complete = [row for row in observed if bool(row.get("complete"))]
@@ -177,6 +384,125 @@ def _summarize_generalization_trajectory(
         "diagnostic_best_h_window_start": int(best_h_rows[0]["epoch"]),
         "diagnostic_best_h_window_end": int(best_h_rows[-1]["epoch"]),
     }
+    context = dict(training_context or {})
+    warmup_end = max(0, int(context.get("warmup_epoch", 0) or 0))
+    summary.update({
+        "warmup_end_epoch": warmup_end if warmup_end > 0 else None,
+        "configured_total_epoch": int(context.get("configured_total_epoch", 0) or 0) or None,
+        "scheduler": str(context.get("scheduler", "unknown")),
+        "base_lr": _float(context.get("base_lr")),
+    })
+    lr_rows = [row for row in complete if _float(row.get("train_lr")) is not None]
+    if lr_rows:
+        peak_lr = max(float(row["train_lr"]) for row in lr_rows)
+        lr_tolerance = max(abs(peak_lr) * 1e-9, 1e-15)
+        peak_epochs = [
+            int(row["epoch"])
+            for row in lr_rows
+            if abs(float(row["train_lr"]) - peak_lr) <= lr_tolerance
+        ]
+        peak_start = min(peak_epochs)
+        peak_end = max(peak_epochs)
+        late_threshold = peak_lr * TRAJECTORY_LATE_LR_FRACTION
+        late_start = None
+        for index, row in enumerate(lr_rows):
+            epoch = int(row["epoch"])
+            if epoch <= peak_end or float(row["train_lr"]) > late_threshold + lr_tolerance:
+                continue
+            suffix = lr_rows[index:]
+            if all(float(item["train_lr"]) <= late_threshold + lr_tolerance for item in suffix):
+                late_start = epoch
+                break
+        summary.update({
+            "lr_phase_status": "observed",
+            "peak_lr": float(peak_lr),
+            "peak_lr_epoch_start": int(peak_start),
+            "peak_lr_epoch_end": int(peak_end),
+            "late_low_lr_threshold": float(late_threshold),
+            "late_low_lr_start_epoch": late_start,
+            "warmup_lr_observation_available": bool(
+                warmup_end > 0 and any(int(row["epoch"]) == warmup_end for row in lr_rows)
+            ),
+        })
+        for row in complete:
+            epoch = int(row["epoch"])
+            if warmup_end > 0 and epoch <= warmup_end:
+                row["lr_phase"] = "warmup"
+            elif late_start is not None and epoch >= int(late_start):
+                row["lr_phase"] = "late_low_lr"
+            elif epoch <= peak_end:
+                row["lr_phase"] = "post_warmup_peak_lr"
+            else:
+                row["lr_phase"] = "regular_decay"
+    else:
+        summary.update({
+            "lr_phase_status": "missing_train_lr",
+            "peak_lr": None,
+            "peak_lr_epoch_start": None,
+            "peak_lr_epoch_end": None,
+            "late_low_lr_threshold": None,
+            "late_low_lr_start_epoch": None,
+            "warmup_lr_observation_available": False,
+        })
+
+    rolling_h = [_trajectory_mean(window, "gzsl_h") for window in rolling]
+    diagnostic_best_h = max(rolling_h)
+    formation_threshold = diagnostic_best_h - TRAJECTORY_ACCURACY_TOLERANCE
+    formation_index = None
+    formation_ratio = None
+    for index, value in enumerate(rolling_h):
+        suffix = rolling_h[index:]
+        if len(suffix) < TRAJECTORY_FORMATION_MIN_WINDOWS or value < formation_threshold:
+            continue
+        ratio = float(sum(item >= formation_threshold for item in suffix) / len(suffix))
+        if ratio >= TRAJECTORY_FORMATION_SUFFIX_RATIO:
+            formation_index = index
+            formation_ratio = ratio
+            break
+    if formation_index is None:
+        summary.update({
+            "formation_status": "not_formed_within_observed_epochs",
+            "self_relative_formation_epoch": None,
+            "persistence_ratio": None,
+            "formation_window_count": 0,
+        })
+    else:
+        formation_window = rolling[formation_index]
+        summary.update({
+            "formation_status": "formed",
+            "self_relative_formation_epoch": int(formation_window[-1]["epoch"]),
+            "persistence_ratio": float(formation_ratio),
+            "formation_window_count": int(len(rolling_h) - formation_index),
+        })
+    summary.update({
+        "formation_h_threshold": float(formation_threshold),
+        "formation_suffix_ratio_required": float(TRAJECTORY_FORMATION_SUFFIX_RATIO),
+        "formation_min_windows_required": int(TRAJECTORY_FORMATION_MIN_WINDOWS),
+        "formation_epoch_semantics": "rolling_window_end_epoch_relative_to_own_diagnostic_best_h",
+    })
+
+    rows_by_epoch = {int(row["epoch"]): row for row in complete}
+    anchor_epochs = {
+        "warmup_end": warmup_end if warmup_end in rows_by_epoch else None,
+        "formation": summary.get("self_relative_formation_epoch"),
+        "final": complete_epochs[-1],
+    }
+    anchors = {}
+    for name, epoch in anchor_epochs.items():
+        if epoch is None or int(epoch) not in rows_by_epoch:
+            anchors[name] = {"available": False, "epoch": epoch, "metrics": {}}
+            continue
+        source = rows_by_epoch[int(epoch)]
+        anchors[name] = {
+            "available": True,
+            "epoch": int(epoch),
+            "metrics": {
+                field: float(source[field])
+                for field in TRAJECTORY_ANCHOR_FIELDS
+                if _float(source.get(field)) is not None
+            },
+        }
+    summary["decision_and_prompt_anchors"] = anchors
     for field in TRAJECTORY_REQUIRED_FIELDS:
         early_mean = _trajectory_mean(early_rows, field)
         late_mean = _trajectory_mean(late_rows, field)
@@ -282,11 +608,15 @@ def _mechanism_key(row: Mapping[str, Any]) -> str:
 
 
 def _latest_probe_records(run_dir: Path) -> List[Dict[str, Any]]:
-    path = run_dir / "diagnostics" / "probe_metrics.csv"
-    if not path.exists():
+    path = resolve_text_artifact(
+        run_dir / "diagnostics" / "probe_metrics.csv"
+    )
+    if not artifact_exists(path):
         return []
     records = []
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+    with open_text_artifact(
+        path, "r", encoding="utf-8-sig", newline=""
+    ) as handle:
         for row in csv.DictReader(handle):
             value = _float(row.get("value"))
             if value is not None:
@@ -301,12 +631,55 @@ def _latest_probe_records(run_dir: Path) -> List[Dict[str, Any]]:
     return records
 
 
-def _latest_probe_mechanisms(records: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+def _latest_probe_value_groups(run_dir: Path) -> Dict[str, Dict[str, float]]:
+    path = resolve_text_artifact(
+        run_dir / "diagnostics" / "probe_metrics.csv"
+    )
+    groups = {
+        MECHANISM_EVIDENCE: {},
+        PROBE_CONTEXT_ONLY: {},
+        VALIDITY_OR_IDENTITY: {},
+    }
+    if not artifact_exists(path):
+        return groups
+    with open_text_artifact(
+        path, "r", encoding="utf-8-sig", newline=""
+    ) as handle:
+        for row in csv.DictReader(handle):
+            value = _float(row.get("value"))
+            if value is None:
+                continue
+            record = dict(row)
+            selection_seed = _float(row.get("selection_seed"))
+            if selection_seed is None:
+                match = re.search(
+                    r"(?:^|-)seed(\d+)(?:-|$)",
+                    str(row.get("probe_id") or ""),
+                )
+                selection_seed = int(match.group(1)) if match else None
+            record["selection_seed"] = (
+                None if selection_seed is None else int(selection_seed)
+            )
+            role = probe_record_evidence_role(record)
+            if role in groups:
+                groups[role][_mechanism_key(record)] = float(value)
+    return groups
+
+
+def _latest_probe_values(
+    records: Sequence[Mapping[str, Any]],
+    evidence_role: str,
+) -> Dict[str, float]:
     return {
         _mechanism_key(row): float(row["value"])
         for row in records
         if _float(row.get("value")) is not None
+        and probe_record_evidence_role(row) == evidence_role
     }
+
+
+def _latest_probe_mechanisms(records: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+    return _latest_probe_values(records, MECHANISM_EVIDENCE)
 
 
 def _latest_epoch_mechanisms(path: Path) -> Dict[str, float]:
@@ -401,7 +774,12 @@ def _resolve_run_dir(run_dir: Path) -> Path:
     return candidates[0] if len(candidates) == 1 else run_dir
 
 
-def load_run(method: str, run_dir: Path) -> Dict[str, Any]:
+def load_run(
+    method: str,
+    run_dir: Path,
+    *,
+    include_probe_records: bool = True,
+) -> Dict[str, Any]:
     run_dir = _resolve_run_dir(run_dir)
     runtime_path = run_dir / "monitor_runtime_summary.json"
     epoch_path = run_dir / "metrics_epoch.csv"
@@ -415,6 +793,7 @@ def load_run(method: str, run_dir: Path) -> Dict[str, Any]:
         "mechanisms": {},
         "probe_records": [],
         "generalization_trajectory_epochs": [],
+        "prompt_layer_trajectory": [],
         "generalization_trajectory_summary": {
             "valid": False,
             "status": "missing_run_artifacts",
@@ -432,9 +811,13 @@ def load_run(method: str, run_dir: Path) -> Dict[str, Any]:
     row["failed"] = row["status"] != "completed"
     trajectory_epochs = _generalization_trajectory_by_epoch(epoch_path)
     row["generalization_trajectory_epochs"] = trajectory_epochs
+    row["prompt_layer_trajectory"] = _prompt_layer_trajectory_by_epoch(epoch_path)
+    training_context = _read_training_context(run_dir)
+    row["training_context"] = training_context
     row["generalization_trajectory_summary"] = _summarize_generalization_trajectory(
         trajectory_epochs,
         run_completed=row["status"] == "completed",
+        training_context=training_context,
     )
     epochs = _classification_by_epoch(epoch_path)
     complete = {
@@ -459,11 +842,13 @@ def load_run(method: str, run_dir: Path) -> Dict[str, Any]:
     for name in ("ausuc", "raw_to_oracle_gain", "oracle_peak_gamma"):
         if name in calibration:
             row[name] = calibration[name]
-    probe_records = _latest_probe_records(run_dir)
-    mechanisms = _latest_probe_mechanisms(probe_records)
-    mechanisms.update(_latest_epoch_mechanisms(epoch_path))
-    row["mechanisms"] = mechanisms
-    row["probe_records"] = probe_records
+    if include_probe_records:
+        probe_groups = _latest_probe_value_groups(run_dir)
+        mechanisms = dict(probe_groups[MECHANISM_EVIDENCE])
+        mechanisms.update(_latest_epoch_mechanisms(epoch_path))
+        row["mechanisms"] = mechanisms
+        row["probe_context"] = probe_groups[PROBE_CONTEXT_ONLY]
+        row["probe_validity"] = probe_groups[VALIDITY_OR_IDENTITY]
     row.update(_comparability(run_dir))
     row["prompt_mechanisms_status"] = "not_applicable" if row.get("stage") == "A0" else "applicable"
     return row
@@ -518,19 +903,78 @@ def _summary(values: Sequence[float]) -> Dict[str, Any]:
 
 
 def _flatten_run(row: Mapping[str, Any]) -> Dict[str, Any]:
-    flat = {
+    return {
         key: value
         for key, value in row.items()
         if key not in {
             "mechanisms",
+            "probe_context",
+            "probe_validity",
             "probe_records",
             "generalization_trajectory_epochs",
             "generalization_trajectory_summary",
+            "prompt_layer_trajectory",
+            "training_context",
         }
     }
-    for key, value in row.get("mechanisms", {}).items():
-        flat[f"mechanism::{key}"] = value
-    return flat
+
+
+@contextmanager
+def _atomic_csv_writer(path: Path, fieldnames: Sequence[str]):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    handle = None
+    try:
+        if path.suffix == ".gz":
+            raw_handle = temp_path.open("wb")
+            gzip_handle = gzip.GzipFile(
+                filename="",
+                mode="wb",
+                compresslevel=6,
+                fileobj=raw_handle,
+                mtime=0,
+            )
+            handle = io.TextIOWrapper(
+                gzip_handle, encoding="utf-8", newline=""
+            )
+        else:
+            raw_handle = None
+            handle = temp_path.open("w", encoding="utf-8", newline="")
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
+        writer.writeheader()
+        yield writer
+        handle.flush()
+        handle.close()
+        handle = None
+        if raw_handle is not None and not raw_handle.closed:
+            raw_handle.close()
+        os.replace(temp_path, path)
+    finally:
+        if handle is not None and not handle.closed:
+            handle.close()
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def _write_csv(
@@ -539,16 +983,75 @@ def _write_csv(
     *,
     fieldnames: Optional[Sequence[str]] = None,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     fields = list(fieldnames) if fieldnames is not None else sorted({str(key) for row in rows for key in row})
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
-        writer.writeheader()
+    with _atomic_csv_writer(path, fields) as writer:
         for row in rows:
             writer.writerow({name: row.get(name) for name in fields})
 
 
-def _method_summaries(by_method: Mapping[str, Sequence[Mapping[str, Any]]]):
+NAMED_SUMMARY_FIELDS = (
+    "evidence_role",
+    "method",
+    "metric_key",
+    "count",
+    "mean",
+    "std",
+    "median",
+    "min",
+    "max",
+    "ci95",
+    "ci95_low",
+    "ci95_high",
+    "ci95_method",
+    "positive_count",
+    "negative_count",
+    "zero_count",
+    "direction",
+    "direction_consistency",
+    "seed_values_json",
+)
+
+PAIRED_MECHANISM_DELTA_FIELDS = (
+    "pair",
+    "method",
+    "reference_method",
+    "seed",
+    "metric_key",
+    "delta",
+)
+
+PAIRED_MECHANISM_SUMMARY_FIELDS = (
+    "pair",
+    "method",
+    "reference_method",
+    "metric_key",
+    "count",
+    "mean",
+    "std",
+    "median",
+    "min",
+    "max",
+    "ci95",
+    "ci95_low",
+    "ci95_high",
+    "ci95_method",
+    "positive_count",
+    "negative_count",
+    "zero_count",
+    "direction",
+    "direction_consistency",
+    "positive_delta_ratio",
+    "effect_size",
+    "seed_values_json",
+)
+
+
+def _method_summaries(
+    by_method: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    named_summary_writer=None,
+    retain_named_payload: bool = True,
+):
     csv_rows = []
     payload = {}
     for method, rows in sorted(by_method.items()):
@@ -563,23 +1066,51 @@ def _method_summaries(by_method: Mapping[str, Sequence[Mapping[str, Any]]]):
                 **_summary(values_by_seed.values()),
                 "seed_values": values_by_seed,
             }
-        mechanism_names = sorted({name for row in rows for name in row.get("mechanisms", {})})
-        mechanisms = {}
-        for name in mechanism_names:
-            values_by_seed = {
-                str(int(row["seed"])): float(row["mechanisms"][name])
-                for row in rows
-                if row.get("seed") is not None
-                and _float(row.get("mechanisms", {}).get(name)) is not None
-            }
-            mechanisms[name] = {
-                **_summary(values_by_seed.values()),
-                "seed_values": values_by_seed,
-            }
+        named_payloads = {}
+        evidence_inventory = {}
+        for evidence_role, field in (
+            ("mechanism_evidence", "mechanisms"),
+            ("probe_context_only", "probe_context"),
+            ("validity_or_identity", "probe_validity"),
+        ):
+            names = sorted({name for row in rows for name in row.get(field, {})})
+            retained = {}
+            for name in names:
+                values_by_seed = {
+                    str(int(row["seed"])): float(row[field][name])
+                    for row in rows
+                    if row.get("seed") is not None
+                    and _float(row.get(field, {}).get(name)) is not None
+                }
+                stats = {
+                    **_summary(values_by_seed.values()),
+                    "seed_values": values_by_seed,
+                }
+                if named_summary_writer is not None:
+                    named_summary_writer.writerow({
+                        "evidence_role": evidence_role,
+                        "method": method,
+                        "metric_key": name,
+                        **{
+                            key: value
+                            for key, value in stats.items()
+                            if key not in {"values", "seed_values"}
+                        },
+                        "seed_values_json": json.dumps(
+                            values_by_seed, sort_keys=True, separators=(",", ":")
+                        ),
+                    })
+                if retain_named_payload:
+                    retained[name] = stats
+            named_payloads[field] = retained
+            evidence_inventory[evidence_role] = int(len(names))
         failed_count = int(sum(bool(row.get("failed")) for row in rows))
         payload[method] = {
             "task_metrics": tasks,
-            "mechanisms": mechanisms,
+            "mechanisms": named_payloads["mechanisms"],
+            "probe_context": named_payloads["probe_context"],
+            "probe_validity": named_payloads["probe_validity"],
+            "evidence_inventory": evidence_inventory,
             "failed_run_count": failed_count,
             "prompt_mechanisms_status": "not_applicable" if any(row.get("stage") == "A0" for row in rows) else "applicable",
         }
@@ -591,11 +1122,28 @@ def _method_summaries(by_method: Mapping[str, Sequence[Mapping[str, Any]]]):
         for metric, stats in tasks.items():
             for field, value in stats.items():
                 flat[f"{metric}_{field}"] = value
-        for metric, stats in mechanisms.items():
-            for field, value in stats.items():
-                flat[f"mechanism::{metric}::{field}"] = value
         csv_rows.append(flat)
     return csv_rows, payload
+
+
+def _summarize_named_values(
+    rows: Sequence[Mapping[str, Any]],
+    field: str,
+) -> Dict[str, Any]:
+    names = sorted({name for row in rows for name in row.get(field, {})})
+    payload = {}
+    for name in names:
+        values_by_seed = {
+            str(int(row["seed"])): float(row[field][name])
+            for row in rows
+            if row.get("seed") is not None
+            and _float(row.get(field, {}).get(name)) is not None
+        }
+        payload[name] = {
+            **_summary(values_by_seed.values()),
+            "seed_values": values_by_seed,
+        }
+    return payload
 
 
 def _pair_definitions(by_method: Mapping[str, Sequence[Mapping[str, Any]]], baseline_method: str):
@@ -616,7 +1164,37 @@ def _pair_definitions(by_method: Mapping[str, Sequence[Mapping[str, Any]]], base
     ]
 
 
-def _paired_summaries(by_method, baseline_method):
+def _is_gate_representation_metric(metric_key: str) -> bool:
+    return "condition=normal" in metric_key and any(
+        name in metric_key
+        for name in (
+            "metric=semantic_margin",
+            # Backward compatibility for summaries generated before the
+            # dimension-standardized Fisher metric was renamed.
+            "metric=fisher_trace_ratio",
+            "metric=fisher_ratio",
+        )
+    )
+
+
+def _paired_summaries(
+    by_method,
+    baseline_method,
+    *,
+    mechanism_delta_writer=None,
+    mechanism_summary_writer=None,
+    retain_mechanisms=True,
+):
+    def paired_metric_values(row):
+        # The evidence-role split is a reporting distinction. Historical pair
+        # comparisons covered both causal/mechanism evidence and descriptive
+        # Probe context, so preserve that comparison universe without putting
+        # either group back into the compact JSON payload.
+        return ChainMap(
+            row.get("mechanisms", {}),
+            row.get("probe_context", {}),
+        )
+
     paired_rows = []
     payload = {}
     for method, reference_method, pair_name in _pair_definitions(by_method, baseline_method):
@@ -625,8 +1203,8 @@ def _paired_summaries(by_method, baseline_method):
             if row.get("seed") is not None and not row.get("failed")
         }
         task_deltas: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
-        mechanism_deltas: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
         incompatible = 0
+        compatible_pairs = []
         for row in by_method.get(method, []):
             seed = row.get("seed")
             if seed is None or int(seed) not in reference_by_seed or row.get("failed"):
@@ -653,15 +1231,7 @@ def _paired_summaries(by_method, baseline_method):
                 delta = float(row[metric]) - float(reference[metric])
                 pair[f"delta_{metric}"] = delta
                 task_deltas[metric].append((int(seed), delta))
-            shared_mechanisms = set(row.get("mechanisms", {})).intersection(reference.get("mechanisms", {}))
-            for metric in sorted(shared_mechanisms):
-                left = _float(row["mechanisms"].get(metric))
-                right = _float(reference["mechanisms"].get(metric))
-                if left is None or right is None:
-                    continue
-                delta = float(left - right)
-                pair[f"mechanism_delta::{metric}"] = delta
-                mechanism_deltas[metric].append((int(seed), delta))
+            compatible_pairs.append((int(seed), row, reference, pair))
             paired_rows.append(pair)
         task_payload = {}
         for metric, seed_values in task_deltas.items():
@@ -675,21 +1245,74 @@ def _paired_summaries(by_method, baseline_method):
                 "effect_size": float(stats["mean"] / stats["std"]) if stats["std"] and stats["std"] > 0 else 0.0,
             }
         mechanism_payload = {}
-        for metric, seed_values in mechanism_deltas.items():
-            values_by_seed = {str(seed): value for seed, value in seed_values}
+        compatible_metric_pairs = [
+            (
+                seed,
+                paired_metric_values(row),
+                paired_metric_values(reference),
+                pair,
+            )
+            for seed, row, reference, pair in compatible_pairs
+        ]
+        mechanism_names = sorted({
+            name
+            for _, row_values, reference_values, _ in compatible_metric_pairs
+            for name in set(row_values).intersection(reference_values)
+        })
+        for metric in mechanism_names:
+            values_by_seed = {}
+            for seed, row_values, reference_values, pair in compatible_metric_pairs:
+                left = _float(row_values.get(metric))
+                right = _float(reference_values.get(metric))
+                if left is None or right is None:
+                    continue
+                delta = float(left - right)
+                values_by_seed[str(seed)] = delta
+                if retain_mechanisms:
+                    pair[f"mechanism_delta::{metric}"] = delta
+                if mechanism_delta_writer is not None:
+                    mechanism_delta_writer.writerow({
+                        "pair": pair_name,
+                        "method": method,
+                        "reference_method": reference_method,
+                        "seed": int(seed),
+                        "metric_key": metric,
+                        "delta": delta,
+                    })
+            if not values_by_seed:
+                continue
             values = list(values_by_seed.values())
             stats = _summary(values)
-            mechanism_payload[metric] = {
+            metric_payload = {
                 **stats,
                 "seed_values": values_by_seed,
                 "positive_delta_ratio": float(sum(value > 0.0 for value in values) / max(1, len(values))),
                 "effect_size": float(stats["mean"] / stats["std"]) if stats["std"] and stats["std"] > 0 else 0.0,
             }
+            if mechanism_summary_writer is not None:
+                mechanism_summary_writer.writerow({
+                    "pair": pair_name,
+                    "method": method,
+                    "reference_method": reference_method,
+                    "metric_key": metric,
+                    **{
+                        key: value
+                        for key, value in metric_payload.items()
+                        if key not in {"values", "seed_values"}
+                    },
+                    "seed_values_json": json.dumps(
+                        values_by_seed, sort_keys=True, separators=(",", ":")
+                    ),
+                })
+            gate_relevant = _is_gate_representation_metric(metric)
+            if retain_mechanisms or gate_relevant:
+                mechanism_payload[metric] = metric_payload
         payload[pair_name] = {
             "method": method,
             "reference_method": reference_method,
             "task_metrics": task_payload,
             "mechanisms": mechanism_payload,
+            "mechanism_metric_count": int(len(mechanism_names)),
             "incompatible_fingerprint_count": incompatible,
         }
     return paired_rows, payload
@@ -752,6 +1375,7 @@ def _summarize_paired_trajectory(rows: Sequence[Mapping[str, Any]]) -> Dict[str,
             best_h_rows, field
         )
     h_values = [float(row["delta_gzsl_h"]) for row in ordered]
+    summary["full_epoch_mean_delta_gzsl_h"] = float(statistics.mean(h_values))
     summary["h_positive_epoch_ratio"] = float(
         sum(value >= TRAJECTORY_ACCURACY_TOLERANCE for value in h_values)
         / len(h_values)
@@ -776,7 +1400,7 @@ def _summarize_paired_trajectory(rows: Sequence[Mapping[str, Any]]) -> Dict[str,
 
 def _trajectory_rule_contract() -> Dict[str, Any]:
     return {
-        "format": "generalization_trajectory_rule_v1",
+        "format": "generalization_trajectory_rule_v2",
         "required_fields": list(TRAJECTORY_REQUIRED_FIELDS),
         "window_fraction": TRAJECTORY_WINDOW_FRACTION,
         "minimum_window_epochs": TRAJECTORY_MIN_WINDOW_EPOCHS,
@@ -784,6 +1408,11 @@ def _trajectory_rule_contract() -> Dict[str, Any]:
         "accuracy_change_tolerance": TRAJECTORY_ACCURACY_TOLERANCE,
         "loss_absolute_tolerance": TRAJECTORY_LOSS_ABS_TOLERANCE,
         "loss_relative_tolerance": TRAJECTORY_LOSS_REL_TOLERANCE,
+        "formation_suffix_ratio": TRAJECTORY_FORMATION_SUFFIX_RATIO,
+        "formation_min_windows": TRAJECTORY_FORMATION_MIN_WINDOWS,
+        "formation_epoch_semantics": "rolling_window_end_epoch_relative_to_own_diagnostic_best_h",
+        "late_low_lr_fraction_of_peak": TRAJECTORY_LATE_LR_FRACTION,
+        "paired_positive_epoch_semantics": "delta_gzsl_h_greater_than_or_equal_to_accuracy_tolerance",
         "analysis_role": "diagnostic_only",
         "checkpoint_selection_allowed": False,
         "formal_checkpoint_rule": "predeclared_final_epoch_unchanged",
@@ -798,8 +1427,8 @@ def _trajectory_csv_fields() -> Dict[str, List[str]]:
     epoch_fields = [
         *run_identity,
         "trajectory_valid", "trajectory_status", "epoch",
-        *TRAJECTORY_REQUIRED_FIELDS,
-        "test_seen_top1", "test_unseen_top1", "complete", "missing_fields",
+        *TRAJECTORY_OPTIONAL_FIELDS,
+        "lr_phase", "complete", "missing_fields",
     ]
     run_fields = [
         *run_identity,
@@ -807,6 +1436,12 @@ def _trajectory_csv_fields() -> Dict[str, List[str]]:
         "analysis_role", "checkpoint_selection_allowed", "first_epoch", "final_epoch",
         "window_size", "early_window_start", "early_window_end", "late_window_start",
         "late_window_end", "diagnostic_best_h_window_start", "diagnostic_best_h_window_end",
+        "warmup_end_epoch", "configured_total_epoch", "scheduler", "base_lr",
+        "lr_phase_status", "peak_lr", "peak_lr_epoch_start", "peak_lr_epoch_end",
+        "late_low_lr_threshold", "late_low_lr_start_epoch", "warmup_lr_observation_available",
+        "formation_status", "self_relative_formation_epoch", "persistence_ratio",
+        "formation_window_count", "formation_h_threshold", "formation_suffix_ratio_required",
+        "formation_min_windows_required", "formation_epoch_semantics",
     ]
     for field in TRAJECTORY_REQUIRED_FIELDS:
         run_fields.extend([
@@ -849,6 +1484,7 @@ def _trajectory_csv_fields() -> Dict[str, List[str]]:
             f"diagnostic_best_delta_h_window_{field}_mean",
         ])
     pair_fields.extend([
+        "full_epoch_mean_delta_gzsl_h",
         "h_positive_epoch_ratio", "h_negative_epoch_ratio",
         "temporary_h_advantage_lost", "late_h_advantage_emerged",
     ])
@@ -896,6 +1532,8 @@ def _generalization_trajectory_outputs(
         "delta_gzsl_unseen",
         "delta_gzsl_h",
         "diagnostic_best_h_window_to_late_drop",
+        "self_relative_formation_epoch",
+        "persistence_ratio",
     )
     flag_fields = (
         "joint_generalization_gain",
@@ -1010,6 +1648,7 @@ def _generalization_trajectory_outputs(
                 pair_summaries.append(pair_summary)
 
         pair_metric_fields = (
+            "full_epoch_mean_delta_gzsl_h",
             "early_delta_gzsl_h_mean",
             "late_delta_gzsl_h_mean",
             "early_to_late_delta_gzsl_h_change",
@@ -1044,7 +1683,7 @@ def _generalization_trajectory_outputs(
             "metrics": metrics,
         }
     return epoch_rows, run_rows, pair_epoch_rows, pair_rows, {
-        "format": "baseline_generalization_trajectory_summary_v1",
+        "format": "baseline_generalization_trajectory_summary_v2",
         "rule_contract": _trajectory_rule_contract(),
         "methods": method_payload,
         "pairs": pair_payload,
@@ -1061,6 +1700,15 @@ def _probe_record_identity(record: Mapping[str, Any]) -> str:
         f"entity_id={record.get('entity_id') or 'unknown'}",
         f"metric={record.get('metric') or 'unknown'}",
     ))
+
+
+def _mechanism_key_fields(key: str) -> Dict[str, str]:
+    fields = {}
+    for item in str(key).split("|"):
+        name, separator, value = item.partition("=")
+        if separator:
+            fields[name] = value
+    return fields
 
 
 def _descriptive_summary(values: Sequence[float]) -> Dict[str, Any]:
@@ -1083,12 +1731,15 @@ def _probe_robustness_summaries(runs: Sequence[Mapping[str, Any]]) -> Dict[str, 
             continue
         method = str(run.get("method"))
         training_seed = int(run["seed"])
-        for record in run.get("probe_records", []):
-            probe_seed = record.get("selection_seed")
-            value = _float(record.get("value"))
+        for mechanism_key, raw_value in run.get("mechanisms", {}).items():
+            record = _mechanism_key_fields(mechanism_key)
+            probe_seed = _float(record.get("probe_selection_seed"))
+            value = _float(raw_value)
             if probe_seed is None or value is None:
                 continue
-            grouped[method][_probe_record_identity(record)][training_seed][int(probe_seed)] = float(value)
+            grouped[method][_probe_record_identity(record)][training_seed][
+                int(probe_seed)
+            ] = float(value)
 
     payload = {}
     for method, metric_groups in sorted(grouped.items()):
@@ -1156,9 +1807,10 @@ def _find_mechanism_values(runs, *needles):
     for row in runs:
         if row.get("failed"):
             continue
-        for key, value in row.get("mechanisms", {}).items():
-            if all(needle in key for needle in needles) and _float(value) is not None:
-                values.append(float(value))
+        for field in ("mechanisms", "probe_context", "probe_validity"):
+            for key, value in row.get(field, {}).items():
+                if all(needle in key for needle in needles) and _float(value) is not None:
+                    values.append(float(value))
     return values
 
 
@@ -1225,9 +1877,7 @@ def _gate_report(runs, paired_payload, expected_seeds):
         if u:
             raw_pairs.append(u.get("positive_delta_ratio", 0.0))
         for key, stats in payload["mechanisms"].items():
-            if "condition=normal" in key and (
-                "metric=semantic_margin" in key or "metric=fisher_ratio" in key
-            ):
+            if _is_gate_representation_metric(key):
                 representation_pairs.append(stats.get("positive_delta_ratio", 0.0))
     gate1_pass = bool(seed_protocol_pass and sync and mismatch and all(value >= 1.0 for value in sync + mismatch))
     gate2_pass = bool(seed_protocol_pass and sync and all(value >= 1.0 for value in sync) and relation)
@@ -1301,6 +1951,121 @@ def _gate_report(runs, paired_payload, expected_seeds):
     }
 
 
+def _cross_experiment_input(
+    runs: Sequence[Mapping[str, Any]],
+    method_payload: Mapping[str, Any],
+    trajectory_payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Build a compact, mechanism-free input for independent robustness studies."""
+    methods = {}
+    for method in sorted({str(run.get("method")) for run in runs}):
+        method_runs = [run for run in runs if str(run.get("method")) == method]
+        condition_by_seed = {}
+        stages = set()
+        for run in method_runs:
+            seed = run.get("seed")
+            if seed is None:
+                continue
+            if run.get("stage"):
+                stages.add(str(run["stage"]))
+            context = run.get("training_context", {}) or {}
+            condition_by_seed[str(int(seed))] = {
+                "condition_fingerprint": context.get("condition_fingerprint"),
+                "condition_fields": context.get("condition_fields", {}),
+                "run_status": run.get("status"),
+            }
+        fingerprints = sorted({
+            str(item.get("condition_fingerprint"))
+            for item in condition_by_seed.values()
+            if item.get("condition_fingerprint")
+        })
+        methods[method] = {
+            "stage": next(iter(stages)) if len(stages) == 1 else None,
+            "condition_status": (
+                "consistent_across_seeds" if len(fingerprints) == 1
+                else "missing_condition" if not fingerprints
+                else "mixed_conditions_across_seeds"
+            ),
+            "condition_fingerprints": fingerprints,
+            "condition_by_seed": condition_by_seed,
+            "task_metrics": dict(
+                method_payload.get(method, {}).get("task_metrics", {})
+            ),
+            "trajectory_metrics": dict(
+                trajectory_payload.get("methods", {})
+                .get(method, {})
+                .get("metrics", {})
+            ),
+        }
+    return {
+        "format": "baseline_cross_experiment_input_v1",
+        "analysis_role": "diagnostic_only",
+        "checkpoint_selection_allowed": False,
+        "selection_protocol_required": "independent_dev_or_pseudo_unseen_validation",
+        "methods": methods,
+        "within_experiment_pairs": dict(trajectory_payload.get("pairs", {})),
+    }
+
+
+def _compact_source_artifacts(
+    runs: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    *,
+    compact_probe_metrics: bool,
+    compact_module_effect_json: bool,
+) -> Dict[str, Any]:
+    records = []
+    seen_run_dirs = set()
+    for run in runs:
+        if run.get("failed") or str(run.get("status")) != "completed":
+            continue
+        run_dir = Path(str(run.get("run_dir"))).resolve()
+        if run_dir in seen_run_dirs:
+            continue
+        seen_run_dirs.add(run_dir)
+        if compact_probe_metrics:
+            source = run_dir / "diagnostics" / "probe_metrics.csv"
+            if artifact_exists(source):
+                records.append({
+                    "artifact_kind": "probe_metrics",
+                    "method": run.get("method"),
+                    "seed": run.get("seed"),
+                    **compact_to_gzip(source, remove_source=True),
+                })
+        if compact_module_effect_json:
+            module_root = run_dir / "diagnostics" / "module_effect"
+            if module_root.is_dir():
+                module_sources = {
+                    str(path): path for path in module_root.rglob("*.json")
+                }
+                for compressed in module_root.rglob("*.json.gz"):
+                    source = compressed.with_suffix("")
+                    module_sources.setdefault(str(source), source)
+                for source in sorted(module_sources.values(), key=str):
+                    records.append({
+                        "artifact_kind": "module_effect_json",
+                        "method": run.get("method"),
+                        "seed": run.get("seed"),
+                        **compact_to_gzip(source, remove_source=True),
+                    })
+    payload = {
+        "format": "baseline_artifact_compaction_v1",
+        "lossless_verified": True,
+        "records": records,
+        "uncompressed_bytes": int(sum(
+            int(item.get("uncompressed_size", 0)) for item in records
+        )),
+        "compressed_bytes": int(sum(
+            int(item.get("compressed_size", 0)) for item in records
+        )),
+    }
+    payload["space_saved_bytes"] = int(
+        payload["uncompressed_bytes"] - payload["compressed_bytes"]
+    )
+    _write_json_atomic(output_dir / "artifact_compaction_manifest.json", payload)
+    return payload
+
+
 def main():
     args = parse_args()
     runs = []
@@ -1308,19 +2073,49 @@ def main():
         if "=" not in item:
             raise ValueError("--run must use METHOD=OUTPUT_DIR")
         method, raw_path = item.split("=", 1)
-        runs.append(load_run(method.strip(), Path(raw_path).expanduser().resolve()))
+        runs.append(load_run(
+            method.strip(),
+            Path(raw_path).expanduser().resolve(),
+            include_probe_records=not bool(args.trajectory_only),
+        ))
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    _write_csv(output_dir / "cross_seed_runs.csv", [_flatten_run(row) for row in runs])
+    if not args.trajectory_only:
+        _write_csv(output_dir / "cross_seed_runs.csv", [_flatten_run(row) for row in runs])
 
     by_method: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for row in runs:
         by_method[str(row["method"])].append(row)
-    method_rows, method_payload = _method_summaries(by_method)
-    _write_csv(output_dir / "method_summary.csv", method_rows)
-
-    paired_rows, paired_payload = _paired_summaries(by_method, args.baseline_method)
-    _write_csv(output_dir / "paired_deltas.csv", paired_rows)
+    if args.trajectory_only:
+        method_rows, method_payload = _method_summaries(by_method)
+        paired_rows, paired_payload = _paired_summaries(
+            by_method, args.baseline_method
+        )
+    else:
+        with _atomic_csv_writer(
+            output_dir / "method_named_metric_summary.csv.gz",
+            NAMED_SUMMARY_FIELDS,
+        ) as named_summary_writer, _atomic_csv_writer(
+            output_dir / "paired_mechanism_deltas.csv.gz",
+            PAIRED_MECHANISM_DELTA_FIELDS,
+        ) as mechanism_delta_writer, _atomic_csv_writer(
+            output_dir / "paired_mechanism_summary.csv.gz",
+            PAIRED_MECHANISM_SUMMARY_FIELDS,
+        ) as mechanism_summary_writer:
+            method_rows, method_payload = _method_summaries(
+                by_method,
+                named_summary_writer=named_summary_writer,
+                retain_named_payload=False,
+            )
+            paired_rows, paired_payload = _paired_summaries(
+                by_method,
+                args.baseline_method,
+                mechanism_delta_writer=mechanism_delta_writer,
+                mechanism_summary_writer=mechanism_summary_writer,
+                retain_mechanisms=False,
+            )
+        _write_csv(output_dir / "method_summary.csv", method_rows)
+        _write_csv(output_dir / "paired_deltas.csv", paired_rows)
     expected_seeds = [int(item.strip()) for item in str(args.expected_seeds).split(",") if item.strip()]
     if not expected_seeds or len(set(expected_seeds)) != len(expected_seeds):
         raise ValueError("--expected-seeds must contain unique comma-separated integers")
@@ -1353,45 +2148,73 @@ def main():
         trajectory_pair_rows,
         fieldnames=trajectory_fields["pairs"],
     )
-    (output_dir / "generalization_trajectory_summary.json").write_text(
-        json.dumps(
-            trajectory_payload,
-            ensure_ascii=False,
-            indent=2,
-            allow_nan=False,
-        ) + "\n",
-        encoding="utf-8",
+    prompt_layer_rows = []
+    for run in runs:
+        identity = {
+            "method": run.get("method"),
+            "stage": run.get("stage"),
+            "seed": run.get("seed"),
+            "run_id": run.get("run_id"),
+            "session_id": run.get("session_id"),
+            "run_dir": run.get("run_dir"),
+        }
+        for metric_row in run.get("prompt_layer_trajectory", []):
+            prompt_layer_rows.append({**identity, **metric_row})
+    _write_csv(
+        output_dir / "generalization_prompt_layer_trajectory.csv",
+        prompt_layer_rows,
+        fieldnames=[
+            "method", "stage", "seed", "run_id", "session_id", "run_dir",
+            "epoch", "split", "layer", "metric", "value",
+        ],
     )
+    _write_json_atomic(
+        output_dir / "generalization_trajectory_summary.json",
+        trajectory_payload,
+    )
+    _write_json_atomic(
+        output_dir / "cross_experiment_input.json",
+        _cross_experiment_input(runs, method_payload, trajectory_payload),
+    )
+    if args.trajectory_only:
+        print(
+            "wrote trajectory-only summaries for {} runs to {} without parsing fixed-probe mechanisms".format(
+                len(runs), output_dir
+            )
+        )
+        return
     gates = _gate_report(runs, paired_payload, expected_seeds)
-    (output_dir / "four_gate_report.json").write_text(
-        json.dumps({"format": "a_series_four_gate_report_v1", "gates": gates}, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
+    _write_json_atomic(
+        output_dir / "four_gate_report.json",
+        {"format": "a_series_four_gate_report_v1", "gates": gates},
     )
     probe_robustness = _probe_robustness_summaries(runs)
-    (output_dir / "probe_robustness_summary.json").write_text(
-        json.dumps(
-            {
-                "format": "baseline_probe_robustness_summary_v1",
-                "expected_training_seeds": expected_seeds,
-                "methods": probe_robustness,
-            },
-            ensure_ascii=False,
-            indent=2,
-            allow_nan=False,
-        ) + "\n",
-        encoding="utf-8",
+    _write_json_atomic(
+        output_dir / "probe_robustness_summary.json",
+        {
+            "format": "baseline_probe_robustness_summary_v1",
+            "expected_training_seeds": expected_seeds,
+            "methods": probe_robustness,
+        },
     )
+    compact_methods = {
+        method: {
+            "task_metrics": payload["task_metrics"],
+            "evidence_inventory": payload.get("evidence_inventory", {}),
+            "failed_run_count": payload["failed_run_count"],
+            "prompt_mechanisms_status": payload[
+                "prompt_mechanisms_status"
+            ],
+        }
+        for method, payload in method_payload.items()
+    }
     summary = {
-        "format": "baseline_cross_seed_summary_v3",
+        "format": "baseline_cross_seed_summary_v4",
         "baseline_method": args.baseline_method,
         "expected_training_seeds": expected_seeds,
-        "methods": method_payload,
-        "mechanisms": {method: payload["mechanisms"] for method, payload in method_payload.items()},
+        "methods": compact_methods,
         "paired_deltas": {
             pair: payload["task_metrics"] for pair, payload in paired_payload.items()
-        },
-        "mechanism_paired_deltas": {
-            pair: payload["mechanisms"] for pair, payload in paired_payload.items()
         },
         "pairing_audit": {
             pair: {
@@ -1403,11 +2226,33 @@ def main():
         },
         "probe_robustness": probe_robustness,
         "gates": gates,
+        "artifact_index": {
+            "run_table": "cross_seed_runs.csv",
+            "method_task_summary": "method_summary.csv",
+            "method_named_metric_summary": "method_named_metric_summary.csv.gz",
+            "paired_task_deltas": "paired_deltas.csv",
+            "paired_mechanism_deltas": "paired_mechanism_deltas.csv.gz",
+            "paired_mechanism_summary": "paired_mechanism_summary.csv.gz",
+            "source_probe_metrics": "each run diagnostics/probe_metrics.csv or probe_metrics.csv.gz",
+        },
+        "storage_contract": {
+            "wide_mechanism_columns_emitted": False,
+            "full_named_metrics_embedded_in_json": False,
+            "lossless_named_metric_tables": True,
+            "compressed_long_form": True,
+        },
     }
-    (output_dir / "cross_seed_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
+    _write_json_atomic(
+        output_dir / "cross_seed_summary.json",
+        summary,
     )
+    if args.compact_probe_metrics or args.compact_module_effect_json:
+        _compact_source_artifacts(
+            runs,
+            output_dir,
+            compact_probe_metrics=bool(args.compact_probe_metrics),
+            compact_module_effect_json=bool(args.compact_module_effect_json),
+        )
 
 
 if __name__ == "__main__":

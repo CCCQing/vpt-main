@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, Iterable, Mapping, Optional
 
+import numpy as np
 import torch
 
 
@@ -66,6 +67,8 @@ def prompt_distribution_metrics(stats: Any) -> Dict[str, float]:
     if not isinstance(stats, Mapping):
         return {}
     result: Dict[str, float] = {}
+    if isinstance(stats.get("sampling_performed"), bool):
+        result["sampling_performed"] = float(stats["sampling_performed"])
     tensor_fields = (
         "visual_input", "mu", "logvar", "std", "instance_prompt", "domain_prompt",
         "prompt_tokens", "semantic_component", "variation_component",
@@ -91,6 +94,62 @@ def prompt_distribution_metrics(stats: Any) -> Dict[str, float]:
             instance_variance_mean = float(result.get("mu_between_instance_variance", 0.0))
             result["instance_to_noise_variance_ratio"] = instance_variance_mean / max(noise_variance, 1e-12)
     result.update(_effective_rank("generated_prompt", prompt_tokens))
+    return result
+
+
+def deep_prompt_residual_metrics(trace: Any) -> Dict[str, float]:
+    """Summarize the per-layer deterministic residual without storing samples."""
+    if not isinstance(trace, (list, tuple)):
+        return {}
+    result: Dict[str, float] = {}
+    ratios = []
+    gates = []
+    for item in trace:
+        if not isinstance(item, Mapping):
+            continue
+        layer_id = int(item.get("layer_id", -1))
+        if layer_id < 0:
+            continue
+        prefix = f"layer_{layer_id}"
+        base = item.get("base_prompt")
+        raw = item.get("raw_delta")
+        applied = item.get("applied_delta")
+        gate = item.get("gate")
+        if torch.is_tensor(base):
+            base_norm = float(base.detach().float().norm(dim=-1).mean().item())
+            result[f"{prefix}.base_prompt_norm"] = base_norm
+        else:
+            base_norm = 0.0
+        if torch.is_tensor(raw):
+            result[f"{prefix}.raw_delta_norm"] = float(
+                raw.detach().float().norm(dim=-1).mean().item()
+            )
+            if raw.dim() == 3 and raw.shape[1] > 0:
+                result[f"{prefix}.raw_delta_slot_variance"] = float(
+                    raw.detach().float().var(dim=1, unbiased=False).mean().item()
+                )
+            if raw.shape[0] > 1:
+                result[f"{prefix}.raw_delta_between_instance_variance"] = float(
+                    raw.detach().float().var(dim=0, unbiased=False).mean().item()
+                )
+        if torch.is_tensor(applied):
+            applied_norm = float(
+                applied.detach().float().norm(dim=-1).mean().item()
+            )
+            result[f"{prefix}.applied_delta_norm"] = applied_norm
+            ratio = applied_norm / max(base_norm, 1.0e-12)
+            result[f"{prefix}.applied_delta_to_base_ratio"] = ratio
+            ratios.append(ratio)
+        if torch.is_tensor(gate):
+            gate_value = float(gate.detach().float().mean().item())
+            result[f"{prefix}.gate"] = gate_value
+            gates.append(gate_value)
+    if ratios:
+        result["layers_mean.applied_delta_to_base_ratio"] = float(np.mean(ratios))
+        result["layers_max.applied_delta_to_base_ratio"] = float(np.max(ratios))
+    if gates:
+        result["layers_mean.gate"] = float(np.mean(gates))
+        result["layers_max_abs.gate"] = float(np.max(np.abs(gates)))
     return result
 
 
@@ -140,6 +199,22 @@ def auxiliary_loss_metrics(loss_stats: Any) -> Dict[str, float]:
         result[f"{key}.is_zero"] = float(abs(scalar) <= 1e-12)
     if result:
         result["finite_ratio"] = 1.0
+    return result
+
+
+def loss_component_metrics(loss_stats: Any) -> Dict[str, float]:
+    if not isinstance(loss_stats, Mapping):
+        return {}
+    result: Dict[str, float] = {}
+    for name, value in loss_stats.items():
+        key = str(name)
+        if key != "total_loss" and not key.endswith(
+            (".raw", ".weight", ".weighted", ".weighted_share")
+        ):
+            continue
+        scalar = _finite_number(value)
+        if scalar is not None:
+            result[key] = scalar
     return result
 
 

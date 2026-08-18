@@ -23,11 +23,99 @@ from torch import nn
 
 _ALLOWED_SOURCES = {
     "vit_cls_prepass",
+    "vit_cls_prepass_constant",
     "cnn_torchvision",
     "clip_frozen",
     "dinov2_small",
     "token_mlp",
 }
+
+
+class MeanConditionedDeepPromptResidual(nn.Module):
+    """Add the Distributor mean directly to every static Deep Prompt layer.
+
+    ``mu(x)`` is repeated across the requested Prompt slots without a learned
+    decoder.  The static A2 Prompt still differentiates slots and layers; this
+    module only supplies a sample-conditioned additive correction.  Each layer
+    owns one scalar gate, so a zero gate is exactly equivalent to the static
+    Deep Prompt baseline and does not consume sampling RNG.
+    """
+
+    _INTERVENTION_MODES = {"delta_zero", "mean_swap"}
+
+    def __init__(
+        self,
+        *,
+        dim: int,
+        prompt_len: int,
+        num_layers: int,
+        gate_init: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.prompt_len = int(prompt_len)
+        self.num_layers = int(num_layers)
+        if self.dim <= 0 or self.prompt_len <= 0 or self.num_layers <= 0:
+            raise ValueError("Deep Prompt residual dimensions must be positive")
+        self.layer_gate = nn.Parameter(
+            torch.full((self.num_layers,), float(gate_init))
+        )
+        self._runtime_intervention = None
+
+    def _effective_mean(self, mean: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if mean.dim() != 2 or int(mean.shape[-1]) != self.dim:
+            raise ValueError(
+                f"Deep Prompt residual expects mean [B,{self.dim}], got {tuple(mean.shape)}"
+            )
+        source = mean
+        stats: Dict[str, torch.Tensor] = {}
+        intervention = self._runtime_intervention
+        if isinstance(intervention, dict):
+            mode = str(intervention.get("mode", ""))
+            if mode not in self._INTERVENTION_MODES:
+                raise ValueError(f"Unsupported Deep Prompt residual intervention: {mode}")
+            if mode == "mean_swap":
+                permutation = intervention.get("permutation")
+                if not torch.is_tensor(permutation):
+                    raise ValueError("mean_swap requires a permutation tensor")
+                permutation = permutation.to(device=source.device, dtype=torch.long)
+                if tuple(permutation.shape) != (int(source.shape[0]),):
+                    raise ValueError("mean_swap permutation has incompatible shape")
+                if sorted(permutation.detach().cpu().tolist()) != list(range(int(source.shape[0]))):
+                    raise ValueError("mean_swap permutation must be bijective")
+                source = source.index_select(0, permutation)
+                stats["mean_swap_fixed_point_ratio"] = (
+                    permutation
+                    == torch.arange(int(source.shape[0]), device=permutation.device)
+                ).to(source.dtype)
+        return source, stats
+
+    def forward_layer(
+        self,
+        mean: torch.Tensor,
+        layer_id: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        layer_id = int(layer_id)
+        if layer_id < 0 or layer_id >= self.num_layers:
+            raise ValueError(
+                f"Deep Prompt residual layer_id={layer_id} outside [0,{self.num_layers - 1}]"
+            )
+        source, intervention_stats = self._effective_mean(mean)
+        raw_delta = source[:, None, :].expand(-1, self.prompt_len, -1)
+        gate = self.layer_gate[layer_id].to(device=raw_delta.device, dtype=raw_delta.dtype)
+        applied_delta = gate * raw_delta
+        intervention = self._runtime_intervention
+        if isinstance(intervention, dict) and str(intervention.get("mode", "")) == "delta_zero":
+            applied_delta = torch.zeros_like(applied_delta)
+        stats = {
+            "layer_id": layer_id,
+            "source_mu": source,
+            "raw_delta": raw_delta,
+            "applied_delta": applied_delta,
+            "gate": gate.expand(int(raw_delta.shape[0])),
+        }
+        stats.update(intervention_stats)
+        return applied_delta, stats
 
 
 def prompt_kl_loss(mu: torch.Tensor, logvar: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
@@ -307,7 +395,7 @@ class PreViTPromptDistributor(nn.Module):
         # 后续 mu/logvar 切分、采样、拼接 domain prompt 都走同一条逻辑。
         self.frozen_encoder = None
         self.stats_head = None
-        if self.source == "vit_cls_prepass":
+        if self.source in {"vit_cls_prepass", "vit_cls_prepass_constant"}:
             self.stats_head = _VectorStatsHead(768, self.hidden_dim, self.dim)
         elif self.source == "cnn_torchvision":
             self.frozen_encoder = FrozenTorchvisionCNN(cnn_name, bool(external_allow_download))
@@ -336,7 +424,8 @@ class PreViTPromptDistributor(nn.Module):
 
         # domain prompt 不依赖单张图像，是任务/数据集级可学习提示。
         self.domain_prompt = nn.Parameter(torch.zeros(1, self.domain_tokens, self.dim))
-        nn.init.normal_(self.domain_prompt, mean=0.0, std=0.02)
+        if self.domain_tokens > 0:
+            nn.init.normal_(self.domain_prompt, mean=0.0, std=0.02)
         # slot_embed 是可选的 instance prompt 槽位编码，只区分第几个 instance prompt。
         if self.use_slot_embed:
             self.slot_embed = nn.Parameter(torch.zeros(1, self.instance_tokens, self.dim))
@@ -378,10 +467,16 @@ class PreViTPromptDistributor(nn.Module):
         - visual_input: 原始统计输入，供 debug/后续诊断保存；  patch_tokens不含 CLS，不含 position embedding image_tokens含 position embedding
         - stats_out: [B, 2*768]，前半是 mu，后半是 logvar。
         """
-        if self.source == "vit_cls_prepass":
+        if self.source in {"vit_cls_prepass", "vit_cls_prepass_constant"}:
             if vit_cls is None:
-                raise ValueError("SOURCE='vit_cls_prepass' requires vit_cls from PromptedTransformer prepass.")
-            visual_input = vit_cls
+                raise ValueError(
+                    f"SOURCE='{self.source}' requires vit_cls from PromptedTransformer prepass."
+                )
+            visual_input = (
+                vit_cls
+                if self.source == "vit_cls_prepass"
+                else torch.ones_like(vit_cls)
+            )
             return visual_input, self.stats_head(visual_input)
 
         if self.source == "cnn_torchvision":
@@ -568,6 +663,40 @@ class PreViTPromptDistributor(nn.Module):
         )
         self._debug_shapes_logged = True
 
+    def distribution_parameters(
+        self,
+        raw_image: Optional[torch.Tensor] = None,
+        vit_patch_tokens: Optional[torch.Tensor] = None,
+        vit_image_tokens: Optional[torch.Tensor] = None,
+        vit_cls: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Return deterministic distribution parameters without sampling Prompt.
+
+        The deterministic Deep Prompt residual uses this interface so a zero
+        residual gate neither samples Prompt nor consumes RNG state relative to
+        the static A2 baseline.
+        """
+        visual_input, stats_out = self._encode_visual(
+            raw_image, vit_patch_tokens, vit_image_tokens, vit_cls
+        )
+        if tuple(stats_out.shape) != (visual_input.shape[0], self.dim * 2):
+            raise ValueError(
+                f"stats_out must be [B,{self.dim * 2}], got {tuple(stats_out.shape)}"
+            )
+        mu, logvar = stats_out.chunk(2, dim=-1)
+        logvar = logvar.clamp(min=self.logvar_min, max=self.logvar_max)
+        std = torch.exp(0.5 * logvar)
+        return {
+            "visual_source": self.source,
+            "visual_input": visual_input,
+            "visual_input_shape": tuple(visual_input.shape),
+            "stats_out": stats_out,
+            "mu": mu,
+            "logvar": logvar,
+            "std": std,
+            "sampling_performed": False,
+        }
+
     def forward(
         self,
         raw_image: Optional[torch.Tensor] = None,
@@ -588,21 +717,17 @@ class PreViTPromptDistributor(nn.Module):
         # _encode_visual 会把这些来源统一成：
         #   visual_input: stats_head 的真实输入，形状由 source 决定；
         #   stats_out:    [B, 2*768]，前 768 维是 mu，后 768 维是 logvar。
-        visual_input, stats_out = self._encode_visual(raw_image, vit_patch_tokens, vit_image_tokens, vit_cls)
-
-        # stats_out 是后续所有 prompt 分布逻辑的唯一参数来源。
-        # 这里强校验它必须是 [B,1536]，避免 source/head 改动后悄悄产生错位。
-        if tuple(stats_out.shape) != (visual_input.shape[0], self.dim * 2):
-            raise ValueError(f"stats_out must be [B,{self.dim * 2}], got {tuple(stats_out.shape)}")
-
-        # 2. 把 stats_head 输出切成 Gaussian posterior 的均值和 log 方差。
-        #   q(z|x) = N(mu, diag(exp(logvar)))
-        mu, logvar = stats_out.chunk(2, dim=-1)
-
-        # 对 logvar 做数值裁剪，防止 std 过小或过大导致 KL、采样和梯度不稳定。
-        # clamp 后再计算 std = exp(0.5 * logvar)。
-        logvar = logvar.clamp(min=self.logvar_min, max=self.logvar_max)
-        std = torch.exp(0.5 * logvar)
+        parameter_stats = self.distribution_parameters(
+            raw_image=raw_image,
+            vit_patch_tokens=vit_patch_tokens,
+            vit_image_tokens=vit_image_tokens,
+            vit_cls=vit_cls,
+        )
+        visual_input = parameter_stats["visual_input"]
+        stats_out = parameter_stats["stats_out"]
+        mu = parameter_stats["mu"]
+        logvar = parameter_stats["logvar"]
+        std = parameter_stats["std"]
 
         # 3. 使用完整 768 维 q(z|x) 生成图像条件 instance prompt。
         instance_prompt = self._sample_instance_prompt(mu, std)
@@ -661,6 +786,7 @@ class PreViTPromptDistributor(nn.Module):
             "instance_prompt": instance_prompt,
             "domain_prompt": domain_prompt,
             "prompt_tokens": prompt_tokens,
+            "sampling_performed": True,
         }
         stats.update(intervention_stats)
 
@@ -695,6 +821,7 @@ def generate_prompt_init(
 
 __all__ = [
     "PreViTPromptDistributor",
+    "MeanConditionedDeepPromptResidual",
     "prompt_kl_loss",
     "generate_prompt_init",
 ]

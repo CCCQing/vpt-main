@@ -55,6 +55,8 @@ class ViT(nn.Module):
         """
         self._runtime_token_sequence = None
         self._runtime_injected_prompt_tokens = None
+        self._runtime_layer_prompt_trace = None
+        self._runtime_deep_prompt_residual_trace = None
         self._runtime_affinities = None
         self._runtime_semantic_state = None
         self._runtime_prompt_distribution_stats = None
@@ -75,6 +77,13 @@ class ViT(nn.Module):
     def get_runtime_injected_prompt_tokens(self):
         return self._runtime_injected_prompt_tokens
 
+    def get_runtime_layer_prompt_trace(self):
+        """Return per-layer injected and contextualized Prompt identities."""
+        return self._runtime_layer_prompt_trace
+
+    def get_runtime_deep_prompt_residual_trace(self):
+        return self._runtime_deep_prompt_residual_trace
+
     def get_runtime_prompt_distribution_stats(self):
         """
         返回最近一次 forward 产生的 prompt distribution 统计量。
@@ -87,6 +96,131 @@ class ViT(nn.Module):
     def get_runtime_attention_mediation_stats(self):
         """Return detached scalar summaries from the latest attention-mediation forward."""
         return self._runtime_attention_mediation_stats
+
+    def get_bayesian_candidate_registry(self):
+        """Describe architecture objects by role instead of a fixed ranking list."""
+        if not bool(self.cfg.MODEL.PROMPT.ENABLE):
+            return []
+        transformer = self.enc.transformer
+        num_layers = int(transformer.vit_config.transformer["num_layers"])
+        deep = bool(self.cfg.MODEL.PROMPT.DEEP)
+        residual = bool(
+            self.cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ENABLE
+        )
+        architecture_id = (
+            str(
+                self.cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ARCHITECTURE_ID
+            )
+            if residual
+            else "A2-static-deep"
+            if deep
+            else "static-shallow"
+        )
+
+        def object_state(
+            object_id,
+            role,
+            *,
+            layer_id=None,
+            parent_object_id=None,
+            stochastic_root_id=None,
+            is_random_variable=False,
+            is_distribution_parameter=False,
+            is_sampleable=False,
+            downstream_consumer=None,
+        ):
+            return {
+                "object_id": str(object_id),
+                "architecture_version": architecture_id,
+                "role": str(role),
+                "layer_id": layer_id,
+                "parent_object_id": parent_object_id,
+                "stochastic_root_id": stochastic_root_id,
+                "tensor_shape": None,
+                "is_random_variable": bool(is_random_variable),
+                "is_distribution_parameter": bool(is_distribution_parameter),
+                "is_sampleable": bool(is_sampleable),
+                "is_test_time_available": True,
+                "uses_label_input": False,
+                "is_class_aggregatable": True,
+                "supports_intervention": True,
+                "reference_definition": "same_checkpoint_unperturbed_forward",
+                "downstream_consumer": downstream_consumer,
+            }
+
+        objects = []
+        root_id = None
+        if residual:
+            root_id = "shared_mu"
+            objects.append(
+                object_state(
+                    root_id,
+                    "stochastic_root_candidate",
+                    is_random_variable=False,
+                    is_distribution_parameter=True,
+                    is_sampleable=False,
+                    downstream_consumer="delta_prompt_layer",
+                )
+            )
+        layers = range(num_layers) if deep else range(1)
+        for layer_id in layers:
+            parent = None
+            if residual:
+                delta_id = f"delta_prompt/layer_{layer_id}"
+                objects.append(
+                    object_state(
+                        delta_id,
+                        "control_pushforward",
+                        layer_id=layer_id,
+                        parent_object_id=root_id,
+                        stochastic_root_id=root_id,
+                        downstream_consumer=f"injected_prompt/layer_{layer_id}",
+                    )
+                )
+                parent = delta_id
+            injected_id = f"injected_prompt/layer_{layer_id}"
+            contextualized_id = f"contextualized_prompt/layer_{layer_id}"
+            objects.append(
+                object_state(
+                    injected_id,
+                    "control_pushforward",
+                    layer_id=layer_id,
+                    parent_object_id=parent,
+                    stochastic_root_id=root_id,
+                    downstream_consumer=f"frozen_vit_block_{layer_id}",
+                )
+            )
+            objects.append(
+                object_state(
+                    contextualized_id,
+                    "contextual_state",
+                    layer_id=layer_id,
+                    parent_object_id=injected_id,
+                    stochastic_root_id=root_id,
+                    downstream_consumer=(
+                        "replacement_boundary"
+                        if deep and layer_id < num_layers - 1
+                        else "final_cls_readout"
+                    ),
+                )
+            )
+        objects.extend(
+            [
+                object_state(
+                    "cls_effect",
+                    "functional_effect",
+                    stochastic_root_id=root_id,
+                    downstream_consumer="r_similarity_classifier",
+                ),
+                object_state(
+                    "logit_effect",
+                    "predictive_effect",
+                    stochastic_root_id=root_id,
+                    downstream_consumer="predictive_validation",
+                ),
+            ]
+        )
+        return objects
 
     def get_runtime_classifier_stats(self):
         if self.r_similarity_head is None:
@@ -152,6 +286,11 @@ class ViT(nn.Module):
                         "deep_prompt_embeddings",
                         "prompt_proj",
                     ])
+                    if bool(cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ENABLE):
+                        trainable_keys.extend([
+                            "prompt_init_provider.stats_head",
+                            "deep_prompt_residual",
+                        ])
                 elif prompt_init_source == "distributor_mean":
                     trainable_keys.extend([
                         "prompt_init_provider",
@@ -238,6 +377,14 @@ class ViT(nn.Module):
         self._runtime_injected_prompt_tokens = (
             injected_prompt.detach() if torch.is_tensor(injected_prompt) else None
         )
+        self._runtime_layer_prompt_trace = [
+            dict(item)
+            for item in getattr(transformer, "_last_layer_prompt_trace", [])
+        ]
+        self._runtime_deep_prompt_residual_trace = [
+            dict(item)
+            for item in getattr(transformer, "_last_deep_prompt_residual_trace", [])
+        ]
         self._runtime_semantic_state = transformer._last_semantic_token_state
         # 缓存 prompt distributor stats，供 loss 侧读取；分类头仍只接收最终 CLS feature。
         self._runtime_prompt_distribution_stats = getattr(transformer, "_last_prompt_distribution_stats", None)
@@ -310,6 +457,14 @@ class ViT(nn.Module):
         self._runtime_injected_prompt_tokens = (
             injected_prompt.detach() if torch.is_tensor(injected_prompt) else None
         )
+        self._runtime_layer_prompt_trace = [
+            dict(item)
+            for item in getattr(transformer, "_last_layer_prompt_trace", [])
+        ]
+        self._runtime_deep_prompt_residual_trace = [
+            dict(item)
+            for item in getattr(transformer, "_last_deep_prompt_residual_trace", [])
+        ]
         self._runtime_affinities = affinities
         self._runtime_semantic_state = transformer._last_semantic_token_state
         # forward_with_affinity 路径同样缓存 stats，保证启用 affinity aux 时 KL/graph loss 仍可用。

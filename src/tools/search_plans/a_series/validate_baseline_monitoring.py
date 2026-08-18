@@ -40,6 +40,8 @@ from src.monitoring.eval_metrics import (
     semantic_visual_graph_metrics,
     visual_semantic_alignment_metrics,
 )
+from src.monitoring.adapters import loss_component_metrics
+from src.monitoring.epoch_transition import EpochPredictionTransitionTracker
 from src.monitoring.module_effect import (
     PairedModuleEffectAccumulator,
     attribute_concept_prompt_patch_block_intervention,
@@ -70,12 +72,28 @@ from src.monitoring.probe import (
 from src.tools.search_plans.a_series.summarize_baseline_monitoring import (
     _generalization_trajectory_outputs,
     _gate_report,
+    _is_gate_representation_metric,
     _method_summaries,
     _paired_summaries,
     _probe_robustness_summaries,
     _summarize_generalization_trajectory,
     _summary,
     load_run,
+)
+from src.tools.search_plans.a_series.summarize_cross_experiment_robustness import (
+    _condition_comparison,
+    _paired_seed_delta,
+)
+from src.tools.search_plans.a_series.probe_evidence import (
+    MECHANISM_EVIDENCE,
+    PROBE_CONTEXT_ONLY,
+    VALIDITY_OR_IDENTITY,
+    probe_record_evidence_role,
+)
+from src.tools.search_plans.a_series.artifact_io import (
+    compact_to_gzip,
+    open_text_artifact,
+    read_json_artifact,
 )
 
 
@@ -812,6 +830,30 @@ def _validate_prompt_content_and_layer_mechanism():
     assert "prompt_patch_value_to_prompt_delta_cosine" in block_affinity
     assert "prompt_patch_similarity_mean" in block_affinity
     assert "cls_attention_prompt_patch_similarity_correlation" in block_affinity
+    assert "_target_relevance_attention" not in block_affinity
+
+    relevance_output, _, relevance_affinity, _ = block.forward_with_affinity(
+        hidden,
+        {
+            "prompt_length": 1,
+            "semantic_length": 0,
+            "detach": True,
+            "block_s_to_cls": False,
+            "retain_attention_for_relevance": True,
+        },
+        num_prompt_tokens=1,
+    )
+    retained_attention = relevance_affinity.pop(
+        "_target_relevance_attention"
+    )
+    assert retained_attention.requires_grad
+    relevance_gradient = torch.autograd.grad(
+        relevance_output.square().sum(),
+        retained_attention,
+        allow_unused=True,
+    )[0]
+    assert relevance_gradient is not None
+    assert bool(torch.isfinite(relevance_gradient).all())
     continuity_layers = [
         block_affinity,
         {
@@ -951,6 +993,31 @@ def _validate_affinity_diagnostic_cpu_offload():
         "detach": True,
         "block_s_to_cls": False,
     }
+    relevance_encoder = Encoder(tiny_config, vis=False).to(device).eval()
+    relevance_hidden = hidden.clone().requires_grad_(True)
+    relevance_encoded, relevance_visual_attention, relevance_affinity = (
+        relevance_encoder.forward_with_affinity(
+            relevance_hidden,
+            {**base_cfg, "retain_attention_for_relevance": True},
+            num_prompt_tokens=1,
+        )
+    )
+    assert relevance_visual_attention == []
+    retained_attention = [
+        layer.pop("_target_relevance_attention")
+        for layer in relevance_affinity
+    ]
+    assert len(retained_attention) == tiny_config.transformer["num_layers"]
+    relevance_gradients = torch.autograd.grad(
+        relevance_encoded[..., 0].sum(),
+        retained_attention,
+        allow_unused=True,
+    )
+    assert all(gradient is not None for gradient in relevance_gradients)
+    assert all(
+        bool(torch.isfinite(gradient).all())
+        for gradient in relevance_gradients
+    )
     with torch.no_grad():
         expected_encoded, expected_attention, expected_affinity = (
             encoder.forward_with_affinity(
@@ -1000,6 +1067,23 @@ def _validate_affinity_diagnostic_cpu_offload():
     assert_tree_equal(expected_attention, actual_attention)
     assert_tree_equal(expected_affinity, actual_affinity)
 
+    with torch.no_grad():
+        selected_encoded, _, selected_affinity = encoder.forward_with_affinity(
+            hidden.clone(),
+            {
+                **base_cfg,
+                "offload_diagnostics_to_cpu": True,
+                "selected_layers": [1],
+                "include_visual_normalizations": False,
+            },
+            num_prompt_tokens=1,
+        )
+    assert torch.allclose(expected_encoded, selected_encoded, atol=0.0, rtol=0.0)
+    assert not any(key.endswith("_raw") for key in selected_affinity[0])
+    assert any(key.endswith("_raw") for key in selected_affinity[1])
+    assert not any(key.endswith("_vis") for layer in selected_affinity for key in layer)
+    assert "prompt_previous_output_to_current_input_cosine" in selected_affinity[1]
+
     deep_transformer = PromptedTransformer.__new__(PromptedTransformer)
     torch.nn.Module.__init__(deep_transformer)
     deep_transformer.encoder = Encoder(tiny_config, vis=True)
@@ -1044,6 +1128,26 @@ def _validate_affinity_diagnostic_cpu_offload():
         raise AssertionError(
             "gradient-enabled affinity forward accepted CPU offload"
         )
+
+
+def _validate_lossless_artifact_compaction():
+    with tempfile.TemporaryDirectory(prefix="artifact_compaction_") as temp_dir:
+        root = Path(temp_dir)
+        csv_path = root / "probe_metrics.csv"
+        csv_payload = "metric,value\nmargin,0.5\n" * 32
+        csv_path.write_text(csv_payload, encoding="utf-8")
+        manifest = compact_to_gzip(csv_path)
+        assert manifest["status"] == "compacted"
+        assert not csv_path.exists()
+        assert Path(manifest["compressed_path"]).is_file()
+        with open_text_artifact(csv_path, "r") as handle:
+            assert handle.read() == csv_payload
+
+        json_path = root / "module_effect.json"
+        json_payload = {"status": "valid", "values": list(range(64))}
+        json_path.write_text(json.dumps(json_payload), encoding="utf-8")
+        compact_to_gzip(json_path)
+        assert read_json_artifact(json_path) == json_payload
 
 
 def _validate_prompt_role_metric_rows():
@@ -1161,6 +1265,7 @@ def _validate_prompt_attention_path_interventions():
 
     with prompt_patch_uniform_intervention(holder):
         _, uniform_attention, _ = holder.attention(hidden, prompt_length=2)
+    prompt_uniform_stats = holder.attention._last_prompt_path_intervention_stats
     normal_prompt_patch = normal_attention[:, :, prompt_slice, patch_slice]
     uniform_prompt_patch = uniform_attention[:, :, prompt_slice, patch_slice]
     assert torch.allclose(
@@ -1168,9 +1273,14 @@ def _validate_prompt_attention_path_interventions():
         uniform_prompt_patch.sum(dim=-1),
         atol=1e-6,
     )
+    assert bool((prompt_uniform_stats["prompt_patch_uniform_applied"] == 1.0).all())
+    assert float(
+        prompt_uniform_stats["prompt_patch_uniform_mass_abs_error"].max().item()
+    ) <= 1e-6
 
     with patch_prompt_uniform_intervention(holder):
         _, patch_uniform_attention, _ = holder.attention(hidden, prompt_length=2)
+    patch_uniform_stats = holder.attention._last_prompt_path_intervention_stats
     assert holder.attention._prompt_path_intervention is None
     normal_patch_prompt = normal_attention[:, :, patch_slice, prompt_slice]
     uniform_patch_prompt = patch_uniform_attention[:, :, patch_slice, prompt_slice]
@@ -1179,6 +1289,10 @@ def _validate_prompt_attention_path_interventions():
         uniform_patch_prompt.sum(dim=-1),
         atol=1e-6,
     )
+    assert bool((patch_uniform_stats["patch_prompt_uniform_applied"] == 1.0).all())
+    assert float(
+        patch_uniform_stats["patch_prompt_uniform_mass_abs_error"].max().item()
+    ) <= 1e-6
     assert torch.allclose(
         uniform_patch_prompt,
         uniform_patch_prompt.mean(dim=-1, keepdim=True).expand_as(
@@ -1568,8 +1682,14 @@ def _validate_deep_prompt_parameter_health():
     assert set(metrics) == {0, 1, 2}
     assert all(values["prompt_grad_observation_count"] == 1.0 for values in metrics.values())
     assert metrics[1]["prompt_relative_update"] > 0.0
+    assert metrics[1]["epoch_parameter_step_norm"] > 0.0
     assert "previous_layer_prompt_cosine" in metrics[1]
     assert "prompt_effective_rank" in metrics[2]
+    overall = tracker.metrics()
+    assert overall["epoch_parameter_step_norm"] > 0.0
+    tracker.commit_epoch_snapshot()
+    assert np.isclose(tracker.metrics()["epoch_parameter_step_norm"], 0.0)
+    assert np.isclose(tracker.metrics()["cross_epoch_prompt_cosine"], 1.0)
 
 
 def _validate_streaming_fixed_probe_metrics():
@@ -1591,6 +1711,16 @@ def _validate_streaming_fixed_probe_metrics():
     )
     expected_geometry = representation_geometry_metrics(visual, targets)
     _assert_metric_maps_close(expected_geometry, streamed["representation_geometry"], "fixed_geometry")
+    assert {
+        "within_class_scatter_trace",
+        "between_class_scatter_trace",
+        "fisher_trace_ratio",
+    }.issubset(expected_geometry)
+    assert {
+        "within_class_scatter",
+        "between_class_scatter",
+        "fisher_ratio",
+    }.isdisjoint(expected_geometry)
     expected_alignment = visual_semantic_alignment_metrics(visual, semantic, targets)
     for name, value in expected_alignment.items():
         assert np.isclose(streamed["visual_semantic_alignment"][name], value, rtol=2e-5, atol=2e-6), name
@@ -1608,6 +1738,18 @@ def _validate_streaming_fixed_probe_metrics():
     for name, value in expected_effect["summary"].items():
         assert np.isclose(streamed_effect["summary"][name], value, rtol=2e-5, atol=2e-6), name
     assert streamed_effect["per_class"] == expected_effect["per_class"]
+
+    tensor_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tensor_effect_accumulator = PairedModuleEffectAccumulator([0, 1, 2], [0, 1])
+    tensor_effect_accumulator.update(
+        torch.as_tensor(logits, device=tensor_device).requires_grad_(True),
+        torch.as_tensor(changed, device=tensor_device).requires_grad_(True),
+        torch.as_tensor(targets, device=tensor_device),
+    )
+    tensor_effect = tensor_effect_accumulator.finalize()
+    for name, value in expected_effect["summary"].items():
+        assert np.isclose(tensor_effect["summary"][name], value, rtol=2e-5, atol=2e-6), name
+    assert tensor_effect["per_class"] == expected_effect["per_class"]
 
     cfg = get_cfg()
     head = RSimilarityClassifier(torch.from_numpy(semantic), hidden_size=5, cfg=cfg)
@@ -1712,6 +1854,9 @@ def _validate_fixed_probe_seed_dispatch():
 
     class DispatchHarness:
         diagnostic_manager = RecordingDiagnostics()
+        _fixed_probe_execution_profile = staticmethod(
+            Trainer._fixed_probe_execution_profile
+        )
 
         def __init__(self):
             self.cfg = cfg
@@ -1725,6 +1870,7 @@ def _validate_fixed_probe_seed_dispatch():
             checkpoint_epoch,
             selection_seed=None,
             artifact_prefix="",
+            execution_profile=None,
         ):
             if selection_seed is None:
                 return Trainer._run_fixed_probes(
@@ -1733,22 +1879,84 @@ def _validate_fixed_probe_seed_dispatch():
                     test_seen_loader,
                     test_unseen_loader,
                     checkpoint_epoch=checkpoint_epoch,
+                    execution_profile=execution_profile,
                 )
-            calls.append((int(selection_seed), str(artifact_prefix)))
+            calls.append(
+                (
+                    int(selection_seed),
+                    str(artifact_prefix),
+                    str(execution_profile),
+                )
+            )
             return {
                 "selection_seed": int(selection_seed),
                 "artifact_prefix": str(artifact_prefix),
+                "execution_profile": str(execution_profile),
                 "valid": True,
             }
 
     DispatchHarness()._run_fixed_probes(None, None, None, checkpoint_epoch=1)
     assert calls == [
-        (17, ""),
-        (18, "fixed_probe_robustness/selection_seed_18"),
-        (19, "fixed_probe_robustness/selection_seed_19"),
+        (17, "", "final_full"),
+        (18, "fixed_probe_robustness/selection_seed_18", "robustness_core"),
+        (19, "fixed_probe_robustness/selection_seed_19", "robustness_core"),
     ]
     assert artifacts[0][0] == "probe_robustness_manifest.json"
     assert artifacts[0][1]["selection_seeds"] == [17, 18, 19]
+
+
+def _validate_probe_runtime_timing():
+    trainer = Trainer.__new__(Trainer)
+    trainer.cfg = get_cfg()
+    trainer.device = torch.device("cpu")
+    dataset = torch.utils.data.TensorDataset(torch.arange(10))
+    loader = trainer._build_fixed_probe_loader(dataset, batch_size=4)
+    assert loader.num_workers == 0
+    assert not loader.pin_memory
+
+    def consume(timed_loader):
+        return sum(int(batch[0].shape[0]) for batch in timed_loader)
+
+    sample_count, timing = trainer._execute_timed_probe_stage(loader, consume)
+    assert sample_count == 10
+    assert timing["batch_count"] == 3
+    assert timing["probe_total_time_sec"] >= timing["probe_data_time_sec"] >= 0.0
+    assert timing["probe_compute_time_sec"] >= 0.0
+    assert 0.0 <= timing["probe_data_time_ratio"] <= 1.0
+    aggregate = trainer._aggregate_probe_stage_timings(
+        {"probe_test_unseen": {"fixed_probe_bundle": timing}}
+    )
+    assert aggregate["stage_count"] == 1
+    assert aggregate["batch_count"] == 3
+    assert aggregate["probe_total_time_sec"] == timing["probe_total_time_sec"]
+
+    trainer.cfg.defrost()
+    trainer.cfg.MONITOR.PROBE.NUM_WORKERS = -1
+    failed = False
+    try:
+        trainer._fixed_probe_loader_settings()
+    except ValueError:
+        failed = True
+    assert failed
+
+
+def _validate_probe_evidence_roles():
+    assert probe_record_evidence_role({
+        "condition": "normal", "domain": "classification"
+    }) == PROBE_CONTEXT_ONLY
+    assert probe_record_evidence_role({
+        "condition": "normal", "domain": "probe_context"
+    }) == PROBE_CONTEXT_ONLY
+    assert probe_record_evidence_role({
+        "condition": "prompt_zeroed_affinity_forward",
+        "domain": "affinity_forward_equivalence",
+    }) == VALIDITY_OR_IDENTITY
+    assert probe_record_evidence_role({
+        "condition": "prompt_zeroed", "domain": "module_effect"
+    }) == MECHANISM_EVIDENCE
+    assert probe_record_evidence_role({
+        "condition": "normal", "domain": "target_relevance_reference"
+    }) == MECHANISM_EVIDENCE
 
 
 def _validate_fixed_probe_semantic_bundle():
@@ -1942,6 +2150,13 @@ def _validate_fixed_probe_semantic_bundle():
     assert selection_uniform["selection_mass_preservation"]["pass"], (
         selection_uniform["selection_mass_preservation"],
     )
+    assert selection_uniform["selection_mass_preservation"][
+        "contract_basis"
+    ] == "local_intervention_mass_error"
+    assert selection_uniform["selection_mass_preservation"]["applied_pass"]
+    assert selection_uniform["selection_mass_preservation"][
+        "local_mass_abs_error"
+    ] <= cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL
     assert abs(
         selection_uniform["selection_mass_preservation"][
             "delta_prompt_to_patch_mass"
@@ -1960,6 +2175,13 @@ def _validate_fixed_probe_semantic_bundle():
     assert patch_selection_uniform["selection_mass_preservation"]["pass"], (
         patch_selection_uniform["selection_mass_preservation"],
     )
+    assert patch_selection_uniform["selection_mass_preservation"][
+        "contract_basis"
+    ] == "local_intervention_mass_error"
+    assert patch_selection_uniform["selection_mass_preservation"]["applied_pass"]
+    assert patch_selection_uniform["selection_mass_preservation"][
+        "local_mass_abs_error"
+    ] <= cfg.MONITOR.PROBE.FORWARD_EQUIVALENCE_ATOL
     assert abs(
         patch_selection_uniform["selection_mass_preservation"][
             "delta_patch_to_prompt_mass"
@@ -2054,6 +2276,8 @@ def _validate_generalization_trajectory_rules():
     assert tradeoff["seen_specialization_tradeoff"]
     assert tradeoff["primary_pattern"] == "seen_specialization_tradeoff"
     assert not tradeoff["checkpoint_selection_allowed"]
+    assert tradeoff["self_relative_formation_epoch"] == 2
+    assert np.isclose(tradeoff["persistence_ratio"], 1.0)
 
     h_values = [0.30, 0.42, 0.55, 0.58, 0.46, 0.40]
     seen_nll_values = [2.8, 2.4, 2.0, 1.9, 2.2, 2.4]
@@ -2079,6 +2303,76 @@ def _validate_generalization_trajectory_rules():
     assert degradation["primary_pattern"] == (
         "late_generalization_degradation_candidate"
     )
+
+
+def _validate_low_cost_trajectory_extensions():
+    tracker = EpochPredictionTransitionTracker()
+    first = tracker.update(
+        epoch=1,
+        split="test_unseen",
+        sample_ids=["sample-b", "sample-a", "sample-c"],
+        predictions=[1, 0, 2],
+        targets_local=[0, 0, 2],
+        candidate_global_ids=[10, 11, 12],
+    )
+    assert not first["valid"]
+    assert first["status"] == "previous_epoch_state_unavailable"
+    second = tracker.update(
+        epoch=2,
+        split="test_unseen",
+        sample_ids=["sample-c", "sample-a", "sample-b"],
+        predictions=[1, 0, 0],
+        targets_local=[2, 0, 0],
+        candidate_global_ids=[10, 11, 12],
+    )
+    assert second["valid"]
+    assert np.isclose(second["summary"]["prediction_flip_rate"], 2.0 / 3.0)
+    assert np.isclose(second["summary"]["correction_rate"], 1.0 / 3.0)
+    assert np.isclose(second["summary"]["regression_rate"], 1.0 / 3.0)
+    assert int(second["arrays"]["support"].sum()) == 3
+
+    loss_metrics = loss_component_metrics({
+        "ce_loss": 1.25,
+        "ce_loss.raw": 1.25,
+        "ce_loss.weight": 1.0,
+        "ce_loss.weighted": 1.25,
+        "ce_loss.weighted_share": 1.0,
+        "total_loss": 1.25,
+        "unrelated_debug": 7.0,
+    })
+    assert set(loss_metrics) == {
+        "ce_loss.raw",
+        "ce_loss.weight",
+        "ce_loss.weighted",
+        "ce_loss.weighted_share",
+        "total_loss",
+    }
+
+    reference_condition = {
+        "condition_status": "consistent_across_seeds",
+        "condition_by_seed": {
+            "0": {"condition_fields": {"data.name": "CUB", "solver.base_lr": 0.0006}}
+        },
+    }
+    target_condition = {
+        "condition_status": "consistent_across_seeds",
+        "condition_by_seed": {
+            "0": {"condition_fields": {"data.name": "CUB", "solver.base_lr": 0.0003}}
+        },
+    }
+    controlled = _condition_comparison(
+        reference_condition, target_condition, ["solver.base_lr"]
+    )
+    assert controlled["valid"]
+    assert controlled["status"] == "compatible_predeclared_axes"
+    uncontrolled = _condition_comparison(reference_condition, target_condition, [])
+    assert not uncontrolled["valid"]
+    paired = _paired_seed_delta(
+        {"seed_values": {"0": 0.4, "1": 0.5}},
+        {"seed_values": {"0": 0.5, "1": 0.45}},
+    )
+    assert paired["paired_seed_count"] == 2
+    assert np.isclose(paired["paired_seed_delta_mean"], 0.025)
 
 
 def _validate_cross_seed_mechanism_summary():
@@ -2138,6 +2432,7 @@ def _validate_cross_seed_mechanism_summary():
                         })
                     writer.writerows(epoch_rows)
                 probe_rows = [
+                    ("normal", "classification", "split", "all", "top1", base_value),
                     ("synchronized_class_permutation", "semantic_prototype_intervention", "intervention", "inverse_recovery", "synchronized_equivalence_pass", 1.0),
                     ("mismatched_semantic_permutation", "semantic_prototype_intervention", "intervention", "semantic_mismatch", "mismatched_semantic_effect_pass", 1.0),
                     ("normal", "relation_stability", "relationship", "prompt_cls_patch", "prompt_cls_gram_alignment", 0.7 + base_value),
@@ -2192,6 +2487,14 @@ def _validate_cross_seed_mechanism_summary():
         by_method = {stage: [row for row in runs if row["method"] == stage] for stage in stage_value}
         method_rows, method_payload = _method_summaries(by_method)
         assert method_rows and method_payload["A0"]["prompt_mechanisms_status"] == "not_applicable"
+        assert any(
+            "domain=classification" in key and "metric=top1" in key
+            for key in by_method["A0"][0]["probe_context"]
+        )
+        assert not any(
+            "domain=classification" in key and "metric=top1" in key
+            for key in by_method["A0"][0]["mechanisms"]
+        )
         assert any(
             "entity_type=layer" in key
             and "entity_id=layer_1" in key
@@ -2249,12 +2552,23 @@ def _validate_cross_seed_mechanism_summary():
         assert all(row["valid"] for row in trajectory_run_rows)
         assert trajectory_pair_epoch_rows
         assert all(row["valid"] for row in trajectory_pair_rows)
+        assert all(
+            row.get("full_epoch_mean_delta_gzsl_h") is not None
+            for row in trajectory_pair_rows
+        )
         assert set(trajectory_payload["pairs"]) == {"A1-A0", "A2-A0", "A2-A1"}
         assert trajectory_payload["rule_contract"]["analysis_role"] == "diagnostic_only"
         assert not trajectory_payload["rule_contract"]["checkpoint_selection_allowed"]
 
 
 def main():
+    _validate_lossless_artifact_compaction()
+    assert _is_gate_representation_metric(
+        "condition=normal|domain=representation_geometry|metric=fisher_ratio"
+    )
+    assert _is_gate_representation_metric(
+        "condition=normal|domain=representation_geometry|metric=fisher_trace_ratio"
+    )
     _validate_prompt_patch_retrieval_diversity()
     _validate_streaming_probe_metrics()
     _validate_target_relevance_accumulator()
@@ -2269,8 +2583,11 @@ def main():
     _validate_streaming_fixed_probe_metrics()
     _validate_comparability_identity()
     _validate_fixed_probe_seed_dispatch()
+    _validate_probe_runtime_timing()
+    _validate_probe_evidence_roles()
     _validate_fixed_probe_semantic_bundle()
     _validate_generalization_trajectory_rules()
+    _validate_low_cost_trajectory_extensions()
     _validate_cross_seed_mechanism_summary()
     rng = np.random.RandomState(7)
     seen_targets = np.asarray([0, 0, 1, 1, 0, 1], dtype=np.int64)

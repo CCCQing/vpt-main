@@ -225,6 +225,28 @@ def validate_trace_and_registry():
     assert trace["propagation"]["perturbation_cls_effect_to_logit_effect_propagation_ratio"]["ratio"] > 0.0
     assert not trace["posterior_interpretation_allowed"]
 
+    reference_only = BayesianHierarchyTraceAccumulator(
+        [0, 1, 2],
+        bootstrap_samples=20,
+        random_seed=9,
+        collapse_relative_threshold=0.05,
+        distance_eps=1.0e-8,
+        distance_pairing_mode="reference_only",
+    )
+    reference_only.update(
+        sample_ids=sample_ids,
+        targets_local=targets,
+        variants=variants,
+    )
+    reference_trace = reference_only.finalize()
+    assert reference_trace["valid"]
+    assert reference_trace["distance_pairing_mode"] == "reference_only"
+    assert (
+        reference_trace["distance_correspondence"]
+        ["source_to_logit_effect_distance_spearman"]["spearman"]
+        > 0.999
+    )
+
     registry = build_candidate_registry(
         requested_candidates=[
             "raw_latent",
@@ -247,6 +269,10 @@ def validate_trace_and_registry():
     assert not registry["auxiliary_views"]["prompt_to_cls_contribution"]["applicable"]
     report = build_object_selection_report(registry, trace)
     assert report["recommended_candidate"] is None
+    assert report["recommended_stochastic_root"] is None
+    assert report["recommended_transfer_space"] is None
+    assert report["predictive_validation_space"] == "logit_effect"
+    assert report["functional_interfaces"]
     assert report["posterior_metrics_deferred"]
 
     bad = [dict(item) for item in variants]
@@ -318,6 +344,41 @@ def validate_trace_and_registry():
         "ratio"
     ] == 1.0
     return trace
+
+
+def validate_vectorized_class_structure():
+    accumulator = BayesianHierarchyTraceAccumulator(
+        [0, 1],
+        bootstrap_samples=0,
+        random_seed=5,
+        collapse_relative_threshold=0.05,
+        distance_eps=1.0e-8,
+    )
+    features = torch.tensor(
+        [[0.0, 0.0], [0.0, 2.0], [3.0, 0.0], [3.0, 2.0]]
+    )
+    targets = torch.tensor([0, 0, 1, 1])
+    accumulator.reference_features["source_object"].append(features)
+    accumulator.reference_targets.extend(targets.tolist())
+    result = accumulator._class_structure("source_object")
+    manual_within = []
+    manual_between = []
+    for left in range(int(features.shape[0])):
+        for right in range(left + 1, int(features.shape[0])):
+            distance = float(
+                ((features[left] - features[right]).pow(2).mean().sqrt()).item()
+            )
+            target = (
+                manual_within
+                if int(targets[left]) == int(targets[right])
+                else manual_between
+            )
+            target.append(distance)
+    assert result["status"] == "observed"
+    assert result["within_pair_count"] == len(manual_within)
+    assert result["between_pair_count"] == len(manual_between)
+    assert abs(result["within_class_distance_mean"] - sum(manual_within) / len(manual_within)) < 1.0e-6
+    assert abs(result["between_class_distance_mean"] - sum(manual_between) / len(manual_between)) < 1.0e-6
 
 
 def validate_executor_smoke():
@@ -397,6 +458,7 @@ def validate_executor_smoke():
 def main():
     validate_static_intervention()
     trace = validate_trace_and_registry()
+    validate_vectorized_class_structure()
     validate_executor_smoke()
     print(json.dumps({
         "status": "passed",
@@ -411,6 +473,7 @@ def main():
             "candidate_class_identity_rejection",
             "functional_collapse_localization",
             "functional_null_direction_detection",
+            "vectorized_class_structure_equivalence",
             "trainer_executor_static_vpt_smoke",
             "trainer_executor_distributor_smoke",
             "cpu_variant_storage_contract",

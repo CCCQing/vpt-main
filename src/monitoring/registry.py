@@ -23,7 +23,18 @@ def _always(_: Any) -> bool:
 
 
 def _prompt_distribution_source_active(cfg: Any) -> bool:
-    return bool(cfg.MODEL.PROMPT.ENABLE) and str(cfg.MODEL.PROMPT.INIT_SOURCE).lower() == "distributor_mean"
+    return bool(cfg.MODEL.PROMPT.ENABLE) and (
+        str(cfg.MODEL.PROMPT.INIT_SOURCE).lower() == "distributor_mean"
+        or bool(cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ENABLE)
+    )
+
+
+def _deep_prompt_residual_source_active(cfg: Any) -> bool:
+    return bool(
+        cfg.MODEL.PROMPT.ENABLE
+        and cfg.MODEL.PROMPT.DEEP
+        and cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ENABLE
+    )
 
 
 def _attention_mediation_source_active(cfg: Any) -> bool:
@@ -128,7 +139,7 @@ MONITOR_SPECS: Tuple[MonitorSpec, ...] = (
         artifact="step_jsonl",
         sampling="global_step",
         description="instance-conditioned prompt distribution summaries",
-        source_requirement="MODEL.PROMPT.ENABLE and INIT_SOURCE=distributor_mean",
+        source_requirement="distributor_mean input Prompt or deterministic Deep Prompt residual",
         is_requested=lambda cfg: bool(cfg.MONITOR.PROMPT.ENABLE),
         is_source_active=_prompt_distribution_source_active,
     ),
@@ -141,6 +152,16 @@ MONITOR_SPECS: Tuple[MonitorSpec, ...] = (
         source_requirement="MODEL.PROMPT.ENABLE with trainable prompt parameters",
         is_requested=lambda cfg: bool(cfg.MONITOR.PROMPT_PARAMETER.ENABLE),
         is_source_active=lambda cfg: bool(cfg.MODEL.PROMPT.ENABLE),
+    ),
+    MonitorSpec(
+        namespace="deep_prompt_residual",
+        cadence="step",
+        artifact="step_jsonl",
+        sampling="global_step",
+        description="per-layer deterministic image-conditioned Deep Prompt residual health",
+        source_requirement="MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ENABLE",
+        is_requested=lambda cfg: bool(cfg.MONITOR.PROMPT_RESIDUAL.ENABLE),
+        is_source_active=_deep_prompt_residual_source_active,
     ),
     MonitorSpec(
         namespace="semantic_token_health",
@@ -183,6 +204,16 @@ MONITOR_SPECS: Tuple[MonitorSpec, ...] = (
         is_source_active=_auxiliary_loss_source_active,
     ),
     MonitorSpec(
+        namespace="loss_component_trajectory",
+        cadence="epoch",
+        artifact="epoch_csv",
+        sampling="every_epoch",
+        description="sample-weighted raw, weighted, and share trajectories for active loss components",
+        source_requirement="completed training epoch with finite loss component stats",
+        is_requested=lambda cfg: bool(cfg.MONITOR.LOSS_COMPONENT_TRAJECTORY.ENABLE),
+        is_source_active=_always,
+    ),
+    MonitorSpec(
         namespace="classification",
         cadence="epoch",
         artifact="epoch_csv",
@@ -211,6 +242,20 @@ MONITOR_SPECS: Tuple[MonitorSpec, ...] = (
         source_requirement="completed evaluator pass",
         is_requested=lambda cfg: bool(cfg.MONITOR.CLASS_ERROR.ENABLE),
         is_source_active=_always,
+    ),
+    MonitorSpec(
+        namespace="epoch_prediction_transition",
+        cadence="epoch",
+        artifact="epoch_csv",
+        sampling="paired_consecutive_epochs",
+        description="aggregate-only correction, regression, forgetting, and prediction churn",
+        source_requirement="stable sample ids, consecutive full-split evaluator passes, and single-GPU/single-shard execution",
+        is_requested=lambda cfg: bool(cfg.MONITOR.PREDICTION_TRANSITION_TRAJECTORY.ENABLE),
+        is_source_active=lambda cfg: (
+            str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "final_gzsl"
+            and int(cfg.NUM_GPUS) == 1
+            and int(cfg.NUM_SHARDS) == 1
+        ),
     ),
     MonitorSpec(
         namespace="calibration_profile",
