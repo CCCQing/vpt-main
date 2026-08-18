@@ -430,7 +430,10 @@ class PromptParameterTracker:
         # both mixes incompatible feature spaces and can make torch.cat fail.
         token_matrices = []
         for parameter in self.parameters.values():
-            value = parameter.detach().float()
+            # This is an epoch-level diagnostic over a small table.  Running
+            # its SVD on CPU avoids old CUDA/MAGMA incompatibilities on newer
+            # GPUs and keeps the diagnostic outside the training VRAM path.
+            value = parameter.detach().float().cpu()
             if value.dim() == 3:
                 token_matrices.append(value.reshape(-1, value.shape[-1]))
         if token_matrices:
