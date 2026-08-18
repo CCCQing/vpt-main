@@ -756,8 +756,10 @@ def _comparability(run_dir: Path) -> Dict[str, Any]:
 
 
 def _stage(method: str) -> Optional[str]:
-    match = re.search(r"(?:^|[^A-Z0-9])A([012])(?:[^0-9]|$)", str(method).upper())
-    return f"A{match.group(1)}" if match else None
+    match = re.search(
+        r"(?:^|[^A-Z0-9])([AB])([012])(?:[^0-9]|$)", str(method).upper()
+    )
+    return f"{match.group(1)}{match.group(2)}" if match else None
 
 
 def _resolve_run_dir(run_dir: Path) -> Path:
@@ -1827,7 +1829,12 @@ def _gate_report(runs, paired_payload, expected_seeds):
     relation.extend(_find_mechanism_values(
         runs, "split=probe_test_unseen", "metric=semantic_visual_graph_spearman"
     ))
-    prompt_runs = [row for row in runs if row.get("stage") in {"A1", "A2"} and not row.get("failed")]
+    prompt_runs = [
+        row
+        for row in runs
+        if row.get("stage") in {"A1", "A2", "B1", "B2"}
+        and not row.get("failed")
+    ]
     prompt_update = _find_mechanism_values(prompt_runs, "domain=prompt_parameter_health", "metric=prompt_relative_update")
     prompt_zero = _find_mechanism_values(prompt_runs, "condition=prompt_zeroed", "metric=delta_true_margin")
     prompt_zero_attention_equivalence = _find_mechanism_values(

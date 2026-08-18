@@ -1,0 +1,13 @@
+_BASE_: "B-01-direct-mean-residual.yaml"
+OUTPUT_DIR: "output/prompt_distribution_b_series/B2-direct-mean-nonconditional-control"
+
+# B2 parameter-matched nonconditional control. It still executes the frozen
+# ViT prepass and the same stats MLP, but replaces each image CLS with the same
+# fixed vector before the MLP. It can learn a task-level constant delta, but
+# cannot encode which image is being classified.
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      SOURCE: "vit_cls_prepass_constant"
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "B2-direct-mean-nonconditional-control"

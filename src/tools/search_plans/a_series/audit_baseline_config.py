@@ -23,7 +23,7 @@ def parse_args():
         action="append",
         default=[],
         metavar="CONFIG",
-        help="Additional A-series config to compare for shared initialization and data-order streams.",
+        help="Additional A/B-series config to compare for shared initialization and data-order streams.",
     )
     args, opts = parser.parse_known_args()
     args.opts = opts
@@ -49,7 +49,7 @@ def resolved_stage(cfg) -> str:
         return "A1"
     if str(prompt.BACKEND).lower() == "vpt_deep" and bool(prompt.DEEP):
         return (
-            "D"
+            "B"
             if bool(prompt.DISTRIBUTOR.DEEP_RESIDUAL.ENABLE)
             else "A2"
         )
@@ -69,7 +69,7 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         "MODEL.PROMPT.INIT_SOURCE": (str(cfg.MODEL.PROMPT.INIT_SOURCE).lower(), "learned"),
         "MODEL.PROMPT.DISTRIBUTOR.ENABLE": (
             bool(cfg.MODEL.PROMPT.DISTRIBUTOR.ENABLE),
-            stage == "D",
+            stage == "B",
         ),
         "MODEL.SEMANTIC_TOKENS.ENABLE": (bool(cfg.MODEL.SEMANTIC_TOKENS.ENABLE), False),
         "MODEL.AFFINITY.ENABLE": (bool(cfg.MODEL.AFFINITY.ENABLE), False),
@@ -229,27 +229,27 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
 
     if stage == "invalid":
         failures.append("prompt configuration is not one of A0/A1/A2/D")
-    if stage == "D":
+    if stage == "B":
         dist_cfg = cfg.MODEL.PROMPT.DISTRIBUTOR
         if str(dist_cfg.SOURCE).lower() not in {
             "vit_cls_prepass",
             "vit_cls_prepass_constant",
         }:
             failures.append(
-                "D direct-mean stage requires vit_cls_prepass or its constant control"
+                "B-series direct-mean stage requires vit_cls_prepass or its constant control"
             )
         if int(dist_cfg.INSTANCE_TOKENS) != 16 or int(dist_cfg.DOMAIN_TOKENS) != 0:
             failures.append(
-                "D direct-mean stage requires 16 instance delta Prompt slots and 0 domain slots"
+                "B-series direct-mean stage requires 16 instance delta Prompt slots and 0 domain slots"
             )
         if not bool(cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_ZERO):
-            failures.append("D direct-mean stage requires DEEP_RESIDUAL_ZERO=true")
+            failures.append("B-series direct-mean stage requires DEEP_RESIDUAL_ZERO=true")
         if not bool(cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_SWAP):
-            failures.append("D direct-mean stage requires DEEP_RESIDUAL_SWAP=true")
+            failures.append("B-series direct-mean stage requires DEEP_RESIDUAL_SWAP=true")
     if int(cfg.MODEL.PROMPT.NUM_TOKENS) != 16:
-        failures.append("MODEL.PROMPT.NUM_TOKENS must be 16 for the current A-series protocol")
+        failures.append("MODEL.PROMPT.NUM_TOKENS must be 16 for the current A/B-series protocol")
     if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
-        failures.append("DATA.XLSA.PROTOCOL_MODE must be 'final_gzsl' for the A-series")
+        failures.append("DATA.XLSA.PROTOCOL_MODE must be 'final_gzsl' for the A/B-series")
     if int(cfg.MONITOR.TRAIN_EVAL.EVERY_N) <= 0:
         failures.append("MONITOR.TRAIN_EVAL.EVERY_N must be positive")
     transition_splits = [
@@ -292,17 +292,17 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
                 "MILESTONE_PROBE.RUN_FIXED_PROBE requires MONITOR.PROBE.ENABLE"
             )
     if cfg.SEED is None:
-        failures.append("SEED must be set for the A-series reproducibility protocol")
+        failures.append("SEED must be set for the A/B-series reproducibility protocol")
     if int(cfg.NUM_GPUS) != 1:
-        failures.append("NUM_GPUS must be 1 for the current A-series single-GPU contract")
+        failures.append("NUM_GPUS must be 1 for the current A/B-series single-GPU contract")
     if int(cfg.NUM_SHARDS) != 1:
-        failures.append("NUM_SHARDS must be 1 for the current A-series single-GPU contract")
+        failures.append("NUM_SHARDS must be 1 for the current A/B-series single-GPU contract")
     if int(cfg.DATA.NUM_WORKERS) != 4:
-        failures.append("DATA.NUM_WORKERS must be 4 for the current A-series deterministic multi-worker loader")
+        failures.append("DATA.NUM_WORKERS must be 4 for the current A/B-series deterministic multi-worker loader")
     if int(cfg.MONITOR.PROBE.NUM_WORKERS) < 0:
         failures.append("MONITOR.PROBE.NUM_WORKERS must be non-negative")
     if bool(cfg.CUDNN_BENCHMARK):
-        failures.append("CUDNN_BENCHMARK must be false for the current A-series single-GPU contract")
+        failures.append("CUDNN_BENCHMARK must be false for the current A/B-series single-GPU contract")
     probe_selection_seeds = [int(cfg.MONITOR.PROBE.SELECTION_SEED)] + [
         int(item) for item in cfg.MONITOR.PROBE.ROBUSTNESS_SELECTION_SEEDS
     ]
@@ -394,7 +394,7 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         )
     if bool(object_cfg.EXPORT_SAMPLE_VECTORS):
         failures.append(
-            "A-series common config must not export Bayesian object sample vectors"
+            "A/B-series common config must not export Bayesian object sample vectors"
         )
     streams = seed_streams(cfg.SEED)
     if any(streams[name] is None for name in ("classifier_init", "prompt_init", "data_order")):
@@ -421,7 +421,7 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
         failures.append("semantic-token parameters remain trainable")
     if any("attention_mediation" in name for name in trainable):
         failures.append("attention-mediation parameters remain trainable")
-    if stage != "D" and any("prompt_init_provider" in name for name in trainable):
+    if stage != "B" and any("prompt_init_provider" in name for name in trainable):
         failures.append("prompt-distributor parameters remain trainable")
 
     prompt_names = [name for name in trainable if "prompt_embeddings" in name]
@@ -432,16 +432,16 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
         failures.append("A1 must train input prompt embeddings only")
     if stage == "A2" and (not prompt_names or not deep_names):
         failures.append("A2 must train both input and deep prompt embeddings")
-    if stage == "D" and (not prompt_names or not deep_names):
-        failures.append("D must retain both static input and deep prompt embeddings")
-    if stage == "D" and not any(
+    if stage == "B" and (not prompt_names or not deep_names):
+        failures.append("B-series must retain both static input and deep prompt embeddings")
+    if stage == "B" and not any(
         "prompt_init_provider.stats_head" in name for name in trainable
     ):
-        failures.append("D must train the existing Prompt Distributor stats MLP")
-    if stage == "D" and not any(
+        failures.append("B-series must train the existing Prompt Distributor stats MLP")
+    if stage == "B" and not any(
         name.endswith("deep_prompt_residual.layer_gate") for name in trainable
     ):
-        failures.append("D must train one direct-mean residual gate per layer")
+        failures.append("B-series must train one direct-mean residual gate per layer")
     allowed_prefixes = {
         "A0": ("r_similarity_head.prototype_proj.",),
         "A1": ("enc.transformer.prompt_embeddings", "r_similarity_head.prototype_proj."),
@@ -450,7 +450,7 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
             "enc.transformer.deep_prompt_embeddings",
             "r_similarity_head.prototype_proj.",
         ),
-        "D": (
+        "B": (
             "enc.transformer.prompt_embeddings",
             "enc.transformer.deep_prompt_embeddings",
             "enc.transformer.prompt_init_provider.stats_head",
@@ -468,7 +468,7 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
 
 
 def cross_config_stream_checks(configs) -> List[str]:
-    """Check the A-series random streams that must stay aligned across stages."""
+    """Check the A/B-series random streams that must stay aligned across stages."""
     failures = []
     records = [
         {
@@ -482,7 +482,7 @@ def cross_config_stream_checks(configs) -> List[str]:
         values = {record["streams"][stream_name] for record in records}
         if len(values) != 1:
             failures.append(
-                "{} must match across compared A-series configs: {}".format(
+                "{} must match across compared A/B-series configs: {}".format(
                     stream_name,
                     ", ".join(
                         "{}={}".format(Path(record["path"]).name, record["streams"][stream_name])
@@ -491,7 +491,7 @@ def cross_config_stream_checks(configs) -> List[str]:
                 )
             )
     prompt_records = [
-        record for record in records if record["stage"] in {"A1", "A2", "D"}
+        record for record in records if record["stage"] in {"A1", "A2", "B"}
     ]
     if len(prompt_records) >= 2:
         prompt_values = {record["streams"]["prompt_init"] for record in prompt_records}
@@ -548,7 +548,7 @@ def main():
         for failure in failures:
             print(f"FAIL: {failure}")
         raise SystemExit(1)
-    print("PASS: configuration satisfies the A-series CE baseline gate")
+    print("PASS: configuration satisfies the A/B-series CE baseline gate")
 
 
 if __name__ == "__main__":

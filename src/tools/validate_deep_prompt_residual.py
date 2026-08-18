@@ -138,19 +138,19 @@ def validate_nonconditional_control() -> None:
     assert torch.equal(first["mu"][0], first["mu"][1])
     cfg = get_cfg()
     cfg.merge_from_file(
-        "configs/baseline_rebuild/D-02-direct-mean-nonconditional-control.yaml"
+        "configs/baseline_rebuild/B-02-direct-mean-nonconditional-control.yaml"
     )
     assert cfg.MODEL.PROMPT.DISTRIBUTOR.SOURCE == "vit_cls_prepass_constant"
     assert (
         cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ARCHITECTURE_ID
-        == "D-direct-mean-nonconditional-control"
+        == "B2-direct-mean-nonconditional-control"
     )
 
 
 def validate_full_vit_config_and_trace() -> None:
     cfg = get_cfg()
     cfg.merge_from_file(
-        "configs/baseline_rebuild/D-01-direct-mean-residual.yaml"
+        "configs/baseline_rebuild/B-01-direct-mean-residual.yaml"
     )
     cfg.freeze()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

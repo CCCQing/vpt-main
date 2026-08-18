@@ -1,9 +1,9 @@
 _BASE_: "A-04-A2-vpt-deep-ce.yaml"
-OUTPUT_DIR: "output/baseline_rebuild/D-01-direct-mean-residual"
+OUTPUT_DIR: "output/prompt_distribution_b_series/B1-direct-mean-residual"
 
-# Deterministic bridge from the existing Prompt Distributor to A2 Deep Prompt:
+# B1 deterministic bridge from the existing Prompt Distributor to A2 Deep Prompt:
 # frozen ViT CLS -> existing stats MLP -> mu -> repeat to all 16 Prompt slots ->
-# static Prompt_l + gate_l * delta Prompt(x).  logvar is recorded but not sampled
+# static Prompt_l + gate_l * delta Prompt(x). logvar is recorded but not sampled
 # and its final output channels receive no direct task gradient while all
 # variance-dependent losses stay off (shared hidden layers can still drift).
 MODEL:
@@ -18,7 +18,7 @@ MODEL:
       USE_SLOT_EMBED: false
       DEEP_RESIDUAL:
         ENABLE: true
-        ARCHITECTURE_ID: "D-direct-mean"
+        ARCHITECTURE_ID: "B1-direct-mean-residual"
         GATE_INIT: 0.0
 
 SOLVER:

@@ -78,6 +78,7 @@ from src.tools.search_plans.a_series.summarize_baseline_monitoring import (
     _probe_robustness_summaries,
     _summarize_generalization_trajectory,
     _summary,
+    _stage,
     load_run,
 )
 from src.tools.search_plans.a_series.summarize_cross_experiment_robustness import (
@@ -2563,6 +2564,8 @@ def _validate_cross_seed_mechanism_summary():
 
 def main():
     _validate_lossless_artifact_compaction()
+    assert _stage("B1") == "B1"
+    assert _stage("B2-direct-mean-nonconditional-control") == "B2"
     assert _is_gate_representation_metric(
         "condition=normal|domain=representation_geometry|metric=fisher_ratio"
     )
