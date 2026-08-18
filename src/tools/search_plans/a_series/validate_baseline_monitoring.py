@@ -1673,6 +1673,12 @@ def _validate_deep_prompt_parameter_health():
     deep_model.register_parameter(
         "deep_prompt_embeddings", torch.nn.Parameter(torch.randn(2, 3, 4))
     )
+    # Prompt-related MLP weights belong to overall parameter health, but must
+    # not be interpreted as Prompt tokens when computing token geometry.
+    deep_model.prompt_init_provider = torch.nn.Sequential(
+        torch.nn.Linear(4, 3),
+        torch.nn.Linear(3, 8),
+    )
     tracker = PromptParameterTracker(deep_model)
     loss = sum(parameter.pow(2).sum() for parameter in deep_model.parameters())
     loss.backward()

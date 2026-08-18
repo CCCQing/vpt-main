@@ -424,10 +424,14 @@ class PromptParameterTracker:
             ),
             "prompt_parameter_tensor_count": float(len(self.parameters)),
         }
+        # Token geometry is defined only for Prompt tables.  Prompt-related
+        # modules can also contain MLP weights (for example [64, 768] and
+        # [1536, 64]) and scalar gates.  Treating those matrices as token rows
+        # both mixes incompatible feature spaces and can make torch.cat fail.
         token_matrices = []
         for parameter in self.parameters.values():
             value = parameter.detach().float()
-            if value.dim() >= 2:
+            if value.dim() == 3:
                 token_matrices.append(value.reshape(-1, value.shape[-1]))
         if token_matrices:
             tokens = torch.cat(token_matrices, dim=0)
