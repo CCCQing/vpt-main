@@ -4599,6 +4599,8 @@ class Trainer():
             return list(specs)
         core_names = {
             "prompt_zeroed",
+            "deep_prompt_residual_zeroed",
+            "deep_prompt_residual_swapped",
             "prompt_read_blocked",
             "prompt_write_blocked",
             "prompt_patch_selection_uniform",

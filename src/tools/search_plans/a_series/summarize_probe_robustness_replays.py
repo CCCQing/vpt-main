@@ -19,7 +19,7 @@ except ImportError:  # Direct script execution.
     from probe_evidence import is_probe_mechanism_evidence
 
 
-METHODS = ("A0", "A1", "A2")
+DEFAULT_METHODS = ("A0", "A1", "A2")
 SPLITS = ("probe_train_seen", "probe_test_seen", "probe_test_unseen")
 RUN_SUFFIX = Path("CUB/sup_vitb16_224/lr0.0006_wd1e-05/run1")
 
@@ -27,12 +27,19 @@ RUN_SUFFIX = Path("CUB/sup_vitb16_224/lr0.0006_wd1e-05/run1")
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Audit additional A-series probe-selection replays and summarize "
+            "Audit additional fixed-probe selection replays and summarize "
             "within-checkpoint probe-selection variability without inflating training n."
         )
     )
     parser.add_argument("--source-root", required=True)
-    parser.add_argument("--primary-gap-root", required=True)
+    parser.add_argument(
+        "--primary-gap-root",
+        help=(
+            "Optional checkpoint-only gap-replay root to merge into the primary "
+            "selection seed. Omit when the source runs already contain the complete "
+            "primary fixed-probe evidence."
+        ),
+    )
     parser.add_argument("--replay-root", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--primary-selection-seed", type=int, default=424242)
@@ -40,6 +47,7 @@ def parse_args():
         "--robustness-selection-seeds", default="424243,424244"
     )
     parser.add_argument("--training-seeds", default="0,1,2")
+    parser.add_argument("--methods", default=",".join(DEFAULT_METHODS))
     return parser.parse_args()
 
 
@@ -47,6 +55,15 @@ def _parse_int_list(value):
     items = [int(item.strip()) for item in str(value).split(",") if item.strip()]
     if not items or any(item < 0 for item in items) or len(set(items)) != len(items):
         raise ValueError(f"invalid unique non-negative integer list: {value}")
+    return items
+
+
+def _parse_name_list(value):
+    items = [item.strip() for item in str(value).split(",") if item.strip()]
+    if not items or len(set(items)) != len(items):
+        raise ValueError(f"invalid unique method list: {value}")
+    if any("/" in item or "\\" in item or item in {".", ".."} for item in items):
+        raise ValueError(f"method names must be path components: {value}")
     return items
 
 
@@ -289,12 +306,15 @@ def _write_scientific_csv(path, scientific):
 def main():
     args = parse_args()
     source_root = Path(args.source_root).resolve()
-    primary_gap_root = Path(args.primary_gap_root).resolve()
+    primary_gap_root = (
+        Path(args.primary_gap_root).resolve() if args.primary_gap_root else None
+    )
     replay_root = Path(args.replay_root).resolve()
     output_dir = Path(args.output_dir).resolve()
     primary_seed = int(args.primary_selection_seed)
     robustness_seeds = _parse_int_list(args.robustness_selection_seeds)
     training_seeds = _parse_int_list(args.training_seeds)
+    methods = _parse_name_list(args.methods)
     if primary_seed in robustness_seeds:
         raise ValueError("primary selection seed must not appear in robustness seeds")
     selection_seeds = [primary_seed, *robustness_seeds]
@@ -304,15 +324,21 @@ def main():
     manifest_hashes = defaultdict(lambda: defaultdict(set))
     checkpoint_consistency = []
 
-    for method in METHODS:
+    for method in methods:
         for training_seed in training_seeds:
             source_run = _run_dir(source_root, method, training_seed)
-            gap_run = _run_dir(primary_gap_root, method, training_seed)
             source_record = _manifest_record(source_run)
-            gap_summary_path = gap_run / "monitor_gap_replay_summary.json"
-            gap_valid = gap_summary_path.is_file() and bool(
-                _read_json(gap_summary_path).get("valid", False)
+            gap_run = (
+                _run_dir(primary_gap_root, method, training_seed)
+                if primary_gap_root is not None
+                else None
             )
+            gap_valid = True
+            if gap_run is not None:
+                gap_summary_path = gap_run / "monitor_gap_replay_summary.json"
+                gap_valid = gap_summary_path.is_file() and bool(
+                    _read_json(gap_summary_path).get("valid", False)
+                )
             primary_valid = (
                 source_record["runtime_status"] == "completed"
                 and all(source_record["valid_by_split"].values())
@@ -323,7 +349,11 @@ def main():
                     "method": method,
                     "training_seed": training_seed,
                     "selection_seed": primary_seed,
-                    "source_kind": "primary_unified_source_plus_gap_replay",
+                    "source_kind": (
+                        "primary_unified_source_plus_gap_replay"
+                        if gap_run is not None
+                        else "primary_unified_source"
+                    ),
                     "run_dir": str(source_run),
                     "valid": primary_valid,
                     **source_record,
@@ -335,10 +365,11 @@ def main():
             source_metrics = _load_selected_metrics(
                 source_run / "diagnostics" / "probe_metrics.csv", primary_seed
             )
-            gap_metrics = _load_selected_metrics(
-                gap_run / "diagnostics" / "probe_metrics.csv", primary_seed
-            )
-            source_metrics.update(gap_metrics)
+            if gap_run is not None:
+                gap_metrics = _load_selected_metrics(
+                    gap_run / "diagnostics" / "probe_metrics.csv", primary_seed
+                )
+                source_metrics.update(gap_metrics)
             for identity, value in source_metrics.items():
                 metric_matrix[method][identity][training_seed][primary_seed] = value
 
@@ -397,7 +428,7 @@ def main():
         for selection_seed, split_payload in sorted(manifest_hashes.items())
     }
     technical_valid = (
-        len(technical_rows) == len(METHODS) * len(training_seeds) * len(selection_seeds)
+        len(technical_rows) == len(methods) * len(training_seeds) * len(selection_seeds)
         and all(bool(row["valid"]) for row in technical_rows)
         and all(item["match"] for item in checkpoint_consistency)
         and all(
@@ -417,18 +448,26 @@ def main():
     total_metric_count = sum(len(item) for item in scientific.values())
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    legacy_a_series_mode = (
+        tuple(methods) == DEFAULT_METHODS and primary_gap_root is not None
+    )
     aggregate = {
-        "format": "a_series_probe_robustness_aggregate_v1",
+        "format": (
+            "a_series_probe_robustness_aggregate_v1"
+            if legacy_a_series_mode
+            else "probe_robustness_aggregate_v2"
+        ),
         "status": "valid" if technical_valid else "invalid",
         "source_root": str(source_root),
-        "primary_gap_root": str(primary_gap_root),
+        "primary_gap_root": str(primary_gap_root) if primary_gap_root else None,
         "replay_root": str(replay_root),
+        "methods": methods,
         "training_seeds": training_seeds,
         "probe_selection_seeds": selection_seeds,
         "independent_training_seed_count_per_method": len(training_seeds),
         "probe_selection_seed_count_per_checkpoint": len(selection_seeds),
         "independent_sample_size_inflated": False,
-        "expected_run_probe_cells": len(METHODS)
+        "expected_run_probe_cells": len(methods)
         * len(training_seeds)
         * len(selection_seeds),
         "observed_run_probe_cells": len(technical_rows),
