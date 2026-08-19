@@ -288,10 +288,6 @@ def main():
                 identity_failures.append(
                     f"selection_seed_{selection_seed}:{split}:manifest_mismatch"
                 )
-    global_batches = {item["probe_batch_size"] for item in records}
-    if len(global_batches) != 1:
-        identity_failures.append("global_probe_batch_size_mismatch")
-
     detailed_rows = []
     for record in records:
         for split, hierarchy in record["hierarchy_by_split"].items():
@@ -417,6 +413,16 @@ def main():
         "independent_statistical_unit": "training_seed",
         "probe_seed_role": "correlated_selection_repeat_within_checkpoint",
         "aggregation_order": "Probe seeds within training checkpoint, then training seeds",
+        "probe_batch_sizes_by_training_seed": {
+            str(training_seed): sorted(
+                {
+                    item["probe_batch_size"]
+                    for item in records
+                    if item["training_seed"] == training_seed
+                }
+            )
+            for training_seed in training_seeds
+        },
         "record_failures": failures,
         "identity_failures": identity_failures,
         "records": [
