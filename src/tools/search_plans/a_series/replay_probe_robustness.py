@@ -48,6 +48,16 @@ def parse_args():
     parser.add_argument("--output-run", required=True)
     parser.add_argument("--selection-seed", required=True, type=int)
     parser.add_argument(
+        "--execution-profile",
+        choices=("final_full", "robustness_core"),
+        default="final_full",
+        help=(
+            "Fixed-Probe profile for the replay. final_full is the strict "
+            "three-Probe default; robustness_core is only for explicitly "
+            "labelled exploratory or smoke runs."
+        ),
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         help="Optional fixed-probe batch-size override; defaults to the source resolved config.",
@@ -56,7 +66,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def _load_cfg(source_run, output_run, selection_seed, batch_size):
+def _load_cfg(
+    source_run,
+    output_run,
+    selection_seed,
+    batch_size,
+    execution_profile="final_full",
+):
     config_path = source_run / "resolved_config.yaml"
     if not config_path.is_file():
         raise FileNotFoundError(str(config_path))
@@ -73,7 +89,7 @@ def _load_cfg(source_run, output_run, selection_seed, batch_size):
     cfg.MONITOR.OUTPUT_POLICY = "error_if_exists"
     cfg.MONITOR.PROBE.SELECTION_SEED = int(selection_seed)
     cfg.MONITOR.PROBE.ROBUSTNESS_SELECTION_SEEDS = []
-    cfg.MONITOR.PROBE.EXECUTION_PROFILE = "robustness_core"
+    cfg.MONITOR.PROBE.EXECUTION_PROFILE = str(execution_profile)
     if batch_size is not None:
         if int(batch_size) < 1:
             raise ValueError("--batch-size must be positive")
@@ -280,10 +296,15 @@ def _validate_replay(output_run, source, cfg, selection_seed):
         or not bool(cfg.MONITOR.PROBE.SEMANTIC_INTERVENTION.ENABLE)
         or runtime.get("semantic_intervention_pass") is True
     )
+    expected_splits = (
+        list(SPLITS)
+        if execution_profile == "final_full"
+        else ["probe_test_unseen"]
+    )
     overall_valid = (
         runtime.get("status") == "completed"
-        and execution_profile == "robustness_core"
-        and required_splits == ["probe_test_unseen"]
+        and execution_profile == str(cfg.MONITOR.PROBE.EXECUTION_PROFILE)
+        and required_splits == expected_splits
         and int(runtime.get("probe_count", 0)) == len(required_splits)
         and int(runtime.get("metric_row_count", 0)) > 0
         and bool(validity.get("valid", False))
@@ -335,6 +356,7 @@ def main():
         output_run,
         selection_seed=int(args.selection_seed),
         batch_size=args.batch_size,
+        execution_profile=args.execution_profile,
     )
     source = _source_identity(source_run, cfg)
     if int(args.selection_seed) == int(source["selection_seed"]):

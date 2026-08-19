@@ -7478,11 +7478,11 @@ class Trainer():
             base_prefix = str(artifact_prefix or "").strip("/")
             for index, current_seed in enumerate(selection_seeds):
                 suffix = "" if index == 0 else f"fixed_probe_robustness/selection_seed_{current_seed}"
-                current_profile = (
-                    "robustness_core"
-                    if index > 0 and execution_profile == "final_full"
-                    else execution_profile
-                )
+                # Every declared Probe selection seed must execute the same
+                # scientific profile.  A reduced profile is still available
+                # when it is requested explicitly, but additional selection
+                # seeds must not be silently downgraded from ``final_full``.
+                current_profile = execution_profile
                 current_prefix = "/".join(
                     item for item in (base_prefix, suffix) if item
                 )

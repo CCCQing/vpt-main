@@ -1905,8 +1905,8 @@ def _validate_fixed_probe_seed_dispatch():
     DispatchHarness()._run_fixed_probes(None, None, None, checkpoint_epoch=1)
     assert calls == [
         (17, "", "final_full"),
-        (18, "fixed_probe_robustness/selection_seed_18", "robustness_core"),
-        (19, "fixed_probe_robustness/selection_seed_19", "robustness_core"),
+        (18, "fixed_probe_robustness/selection_seed_18", "final_full"),
+        (19, "fixed_probe_robustness/selection_seed_19", "final_full"),
     ]
     assert artifacts[0][0] == "probe_robustness_manifest.json"
     assert artifacts[0][1]["selection_seeds"] == [17, 18, 19]

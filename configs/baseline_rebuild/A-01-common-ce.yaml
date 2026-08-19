@@ -103,7 +103,9 @@ MONITOR:
     ENABLE: true
     EXECUTION_PROFILE: final_full
     SELECTION_SEED: 424242
-    ROBUSTNESS_SELECTION_SEEDS: []
+    # Formal shortlist/final evidence uses three correlated Probe selections.
+    # These do not increase the independent training-seed sample size.
+    ROBUSTNESS_SELECTION_SEEDS: [424243, 424244]
     NUM_WORKERS: 0
     PIN_MEMORY: false
     REQUIRE_FULL_CLASS_COVERAGE: true

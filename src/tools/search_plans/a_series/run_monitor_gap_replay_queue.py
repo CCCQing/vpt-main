@@ -24,7 +24,10 @@ def parse_args():
         required=True,
         help="METHOD:SEED, for example A1:2",
     )
-    parser.add_argument("--scope", choices=("gaps", "full"), default="gaps")
+    parser.add_argument(
+        "--scope", choices=("gaps", "object_map", "full"), default="gaps"
+    )
+    parser.add_argument("--selection-seed", type=int)
     parser.add_argument("--batch-size", type=int, default=8)
     return parser.parse_args()
 
@@ -77,6 +80,9 @@ def main():
         "source_root": str(source_root),
         "output_root": str(output_root),
         "scope": str(args.scope),
+        "selection_seed": (
+            int(args.selection_seed) if args.selection_seed is not None else None
+        ),
         "batch_size": int(args.batch_size),
         "runs": [],
     }
@@ -86,8 +92,17 @@ def main():
         for spec in args.run:
             method, seed = _parse_run(spec)
             source_run = source_root / method / f"seed{seed}" / RUN_SUFFIX
-            output_run = output_root / method / f"seed{seed}" / RUN_SUFFIX
-            replay_summary_path = output_run / "monitor_gap_replay_summary.json"
+            scoped_root = (
+                output_root / f"selection_seed_{int(args.selection_seed)}"
+                if args.selection_seed is not None
+                else output_root
+            )
+            output_run = scoped_root / method / f"seed{seed}" / RUN_SUFFIX
+            replay_summary_path = output_run / (
+                "bayesian_object_map_replay_summary.json"
+                if args.scope == "object_map"
+                else "monitor_gap_replay_summary.json"
+            )
             item = {
                 "method": method,
                 "seed": seed,
@@ -126,6 +141,8 @@ def main():
                 "--batch-size",
                 str(args.batch_size),
             ]
+            if args.selection_seed is not None:
+                command.extend(["--selection-seed", str(int(args.selection_seed))])
             with log_path.open("w", encoding="utf-8") as handle:
                 completed = subprocess.run(
                     command,

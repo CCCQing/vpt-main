@@ -51,6 +51,14 @@ def parse_args():
     parser.add_argument(
         "--scope", choices=("gaps", "object_map", "full"), default="gaps"
     )
+    parser.add_argument(
+        "--selection-seed",
+        type=int,
+        help=(
+            "Optional Probe selection seed. The source seed is reused when "
+            "omitted; object-map strict three-Probe replays pass it explicitly."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     return parser.parse_args()
 
@@ -130,7 +138,13 @@ def _configure_object_map_scope(cfg):
     cfg.MONITOR.MODULE_EFFECT.ENABLE = False
 
 
-def _load_cfg(source_run, output_run, scope, batch_size):
+def _load_cfg(
+    source_run,
+    output_run,
+    scope,
+    batch_size,
+    selection_seed=None,
+):
     config_path = source_run / "resolved_config.yaml"
     if not config_path.is_file():
         raise FileNotFoundError(str(config_path))
@@ -144,6 +158,10 @@ def _load_cfg(source_run, output_run, scope, batch_size):
     cfg.MONITOR.OUTPUT_POLICY = "error_if_exists"
     cfg.MONITOR.PROBE.BATCH_SIZE = max(1, int(batch_size))
     cfg.MONITOR.PROBE.ROBUSTNESS_SELECTION_SEEDS = []
+    if selection_seed is not None:
+        if int(selection_seed) < 0:
+            raise ValueError("--selection-seed must be non-negative")
+        cfg.MONITOR.PROBE.SELECTION_SEED = int(selection_seed)
     cfg.MONITOR.NUMERICAL_GUARD.ENABLE = False
     cfg.MONITOR.OPTIMIZER_SANITY.ENABLE = False
     cfg.MONITOR.PREDICTION_HEALTH.ENABLE = False
@@ -349,7 +367,12 @@ def _validate_replay(output_run, source, cfg):
     }
 
 
-def _validate_object_map_replay(output_run, source, cfg):
+def _validate_object_map_replay(
+    output_run,
+    source,
+    cfg,
+    selection_seed,
+):
     runtime = _read_json(output_run / "diagnostics" / "probe_runtime_summary.json")
     manifest = _read_json(output_run / "diagnostics" / "probe_manifest.json")
     actual_hashes = {
@@ -366,15 +389,21 @@ def _validate_object_map_replay(output_run, source, cfg):
         "source_session_id_match": checkpoint.get("source_session_id")
         == source["checkpoint"]["source_session_id"],
     }
-    manifest_checks = {
-        split: {
-            "source_sha256": source["probe_manifest_sha256_by_split"][split],
-            "replay_sha256": actual_hashes.get(split),
-            "match": actual_hashes.get(split)
-            == source["probe_manifest_sha256_by_split"][split],
+    manifest_checks = {}
+    for split in SPLITS:
+        probe = manifest.get("probes", {}).get(split, {})
+        split_validity = manifest.get("validity", {}).get(split, {})
+        passed = bool(
+            int(probe.get("selection_seed", -1)) == int(selection_seed)
+            and actual_hashes.get(split)
+            and split_validity.get("valid", False)
+        )
+        manifest_checks[split] = {
+            "selection_seed": probe.get("selection_seed"),
+            "manifest_sha256": actual_hashes.get(split),
+            "valid": bool(split_validity.get("valid", False)),
+            "pass": passed,
         }
-        for split in SPLITS
-    }
     selected_layers = sorted(
         int(item) for item in cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION.LAYERS
     )
@@ -444,13 +473,15 @@ def _validate_object_map_replay(output_run, source, cfg):
         }
     overall_valid = bool(
         runtime.get("status") == "completed"
+        and int(runtime.get("selection_seed", -1)) == int(selection_seed)
         and all(checkpoint_checks.values())
-        and all(item["match"] for item in manifest_checks.values())
+        and all(item["pass"] for item in manifest_checks.values())
         and all(item["pass"] for item in split_checks.values())
     )
     return {
         "format": "a_series_bayesian_object_map_replay_v1",
         "status": "valid" if overall_valid else "invalid",
+        "selection_seed": int(selection_seed),
         "scope": "layerwise_prompt_functional_interface_map",
         "training_performed": False,
         "optimizer_step_performed": False,
@@ -471,8 +502,24 @@ def main():
     if not source_run.is_dir():
         raise FileNotFoundError(str(source_run))
     _require_new_output(source_run, output_run)
-    cfg = _load_cfg(source_run, output_run, args.scope, args.batch_size)
+    cfg = _load_cfg(
+        source_run,
+        output_run,
+        args.scope,
+        args.batch_size,
+        selection_seed=args.selection_seed,
+    )
     source = _source_identity(source_run, cfg)
+    selection_seed = (
+        int(args.selection_seed)
+        if args.selection_seed is not None
+        else int(source["selection_seed"])
+    )
+    if args.scope != "object_map" and selection_seed != int(source["selection_seed"]):
+        raise ValueError(
+            "a non-source --selection-seed is currently supported only for object_map; "
+            "use replay_probe_robustness.py for a complete fixed-Probe replay"
+        )
 
     output_run.mkdir(parents=True, exist_ok=True)
     logging.setup_logging(
@@ -517,10 +564,15 @@ def main():
             test_seen_loader,
             test_unseen_loader,
             checkpoint_epoch=checkpoint_epoch,
-            selection_seed=source["selection_seed"],
+            selection_seed=selection_seed,
         )
         replay_summary = (
-            _validate_object_map_replay(output_run, source, cfg)
+            _validate_object_map_replay(
+                output_run,
+                source,
+                cfg,
+                selection_seed,
+            )
             if args.scope == "object_map"
             else _validate_replay(output_run, source, cfg)
         )

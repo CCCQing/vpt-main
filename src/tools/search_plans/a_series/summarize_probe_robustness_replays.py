@@ -138,7 +138,7 @@ def _identity(row):
 
 
 def _include_scientific_row(row):
-    if str(row.get("split")) != "probe_test_unseen":
+    if str(row.get("split")) not in SPLITS:
         return False
     if not is_probe_mechanism_evidence(row):
         return False
@@ -318,6 +318,10 @@ def main():
     if primary_seed in robustness_seeds:
         raise ValueError("primary selection seed must not appear in robustness seeds")
     selection_seeds = [primary_seed, *robustness_seeds]
+    if len(selection_seeds) != 3:
+        raise ValueError(
+            "strict fixed-Probe evidence requires exactly three selection seeds"
+        )
 
     technical_rows = []
     metric_matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
@@ -430,6 +434,11 @@ def main():
     technical_valid = (
         len(technical_rows) == len(methods) * len(training_seeds) * len(selection_seeds)
         and all(bool(row["valid"]) for row in technical_rows)
+        and all(
+            str(row.get("execution_profile")) == "final_full"
+            and list(row.get("required_splits") or []) == list(SPLITS)
+            for row in technical_rows
+        )
         and all(item["match"] for item in checkpoint_consistency)
         and all(
             item["pass"]
@@ -466,6 +475,12 @@ def main():
         "probe_selection_seeds": selection_seeds,
         "independent_training_seed_count_per_method": len(training_seeds),
         "probe_selection_seed_count_per_checkpoint": len(selection_seeds),
+        "strict_three_probe_contract": {
+            "required_selection_seed_count": 3,
+            "required_execution_profile": "final_full",
+            "required_splits": list(SPLITS),
+            "pass": technical_valid,
+        },
         "independent_sample_size_inflated": False,
         "expected_run_probe_cells": len(methods)
         * len(training_seeds)

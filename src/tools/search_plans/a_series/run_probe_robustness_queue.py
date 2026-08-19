@@ -18,6 +18,11 @@ def parse_args():
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--selection-seed", required=True, type=int)
+    parser.add_argument(
+        "--execution-profile",
+        choices=("final_full", "robustness_core"),
+        default="final_full",
+    )
     parser.add_argument("--queue-name", required=True)
     parser.add_argument(
         "--run",
@@ -89,6 +94,7 @@ def main():
         "source_root": str(source_root),
         "output_root": str(output_root),
         "selection_seed": int(args.selection_seed),
+        "execution_profile": str(args.execution_profile),
         "batch_size_override": (
             int(args.batch_size) if args.batch_size is not None else None
         ),
@@ -147,6 +153,8 @@ def main():
                 str(output_run),
                 "--selection-seed",
                 str(int(args.selection_seed)),
+                "--execution-profile",
+                str(args.execution_profile),
             ]
             if args.batch_size is not None:
                 command.extend(["--batch-size", str(int(args.batch_size))])

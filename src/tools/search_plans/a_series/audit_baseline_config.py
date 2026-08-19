@@ -310,6 +310,15 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
         failures.append("fixed-probe selection seeds must be non-negative")
     if len(set(probe_selection_seeds)) != len(probe_selection_seeds):
         failures.append("fixed-probe primary and robustness selection seeds must be unique")
+    if (
+        bool(cfg.MONITOR.PROBE.ENABLE)
+        and str(cfg.MONITOR.PROBE.EXECUTION_PROFILE).lower() == "final_full"
+        and len(probe_selection_seeds) != 3
+    ):
+        failures.append(
+            "formal final_full fixed-Probe evidence requires exactly three "
+            "selection seeds (one primary plus two robustness seeds)"
+        )
     if int(cfg.MONITOR.PROBE.TARGET_RELEVANCE.BATCH_SIZE) <= 0:
         failures.append("MONITOR.PROBE.TARGET_RELEVANCE.BATCH_SIZE must be positive")
     if bool(cfg.MONITOR.PROBE.EXPLANATION_VALIDITY.ENABLE):
