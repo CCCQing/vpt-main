@@ -24,6 +24,17 @@ except ImportError:  # Direct script execution.
 DEFAULT_METHODS = ("A0", "A1", "A2")
 SPLITS = ("probe_train_seen", "probe_test_seen", "probe_test_unseen")
 RUN_SUFFIX = Path("CUB/sup_vitb16_224/lr0.0006_wd1e-05/run1")
+TARGET_RELEVANCE_DOMAIN = "target_relevance_reference"
+TARGET_RELEVANCE_AGGREGATE_PATHS = {
+    "cls_to_patch",
+    "cls_to_prompt",
+    "patch_to_cls",
+    "patch_to_patch",
+    "patch_to_prompt",
+    "prompt_to_cls",
+    "prompt_to_patch",
+    "prompt_to_prompt",
+}
 
 
 def parse_args():
@@ -135,16 +146,20 @@ def _manifest_record(run_dir):
 
 
 def _identity(row):
+    objective = str(row.get("objective", ""))
+    if not objective and str(row.get("domain", "")) == TARGET_RELEVANCE_DOMAIN:
+        # probe_metrics.csv exports the backward-compatible primary objective.
+        objective = "true_class_margin"
     return "|".join(
-        str(row.get(name, ""))
-        for name in (
-            "split",
-            "condition",
-            "domain",
-            "entity_type",
-            "entity_id",
-            "metric",
-        )
+        [
+            str(row.get("split", "")),
+            str(row.get("condition", "")),
+            str(row.get("domain", "")),
+            objective,
+            str(row.get("entity_type", "")),
+            str(row.get("entity_id", "")),
+            str(row.get("metric", "")),
+        ]
     )
 
 
@@ -177,12 +192,16 @@ def _include_scientific_row(row):
 
 def _load_selected_metrics(path, expected_selection_seed):
     selected = {}
+    has_target_relevance = False
     with open_text_artifact(
         Path(path), "r", encoding="utf-8", newline=""
     ) as handle:
         for row in csv.DictReader(handle):
             if not _include_scientific_row(row):
                 continue
+            has_target_relevance = has_target_relevance or (
+                str(row.get("domain")) == TARGET_RELEVANCE_DOMAIN
+            )
             if int(row.get("selection_seed", -1)) != int(expected_selection_seed):
                 raise ValueError(
                     f"unexpected selection_seed in {path}: {row.get('selection_seed')}"
@@ -194,6 +213,89 @@ def _load_selected_metrics(path, expected_selection_seed):
             if not math.isfinite(value):
                 continue
             selected[_identity(row)] = value
+    if has_target_relevance:
+        selected.update(
+            _load_predicted_target_relevance_metrics(
+                Path(path).parent,
+                expected_selection_seed,
+            )
+        )
+    return selected
+
+
+def _load_predicted_target_relevance_metrics(
+    diagnostics_dir, expected_selection_seed
+):
+    """Load the second target-relevance objective without merging objectives.
+
+    The backward-compatible probe CSV contains the primary true-class objective.
+    The predicted-class objective is stored in each target-relevance summary JSON.
+    Only aggregate token-type paths are promoted into the cross-Probe matrix; the
+    much wider per-Prompt entities remain in the source artifact for traceability.
+    """
+    diagnostics_dir = Path(diagnostics_dir)
+    runtime = _read_json(diagnostics_dir / "probe_runtime_summary.json")
+    checkpoint_id = str(
+        (runtime.get("checkpoint") or {}).get("checkpoint_id") or ""
+    )
+    if not checkpoint_id:
+        raise ValueError(
+            f"missing checkpoint id for target relevance in {diagnostics_dir}"
+        )
+
+    selected = {}
+    for split in SPLITS:
+        summary_path = (
+            diagnostics_dir
+            / "target_relevance"
+            / checkpoint_id
+            / f"{split}_summary.json"
+        )
+        if not summary_path.is_file():
+            raise ValueError(
+                f"missing target relevance summary for {split}: {summary_path}"
+            )
+        summary = _read_json(summary_path)
+        if int(summary.get("selection_seed", -1)) != int(expected_selection_seed):
+            raise ValueError(
+                "unexpected target relevance selection seed in "
+                f"{summary_path}: {summary.get('selection_seed')}"
+            )
+        result = dict(
+            (summary.get("objective_results") or {}).get(
+                "predicted_class_margin"
+            )
+            or {}
+        )
+        if result.get("applicability") != "applicable" or not bool(
+            result.get("valid", False)
+        ):
+            raise ValueError(
+                "predicted-class target relevance is not valid/applicable in "
+                f"{summary_path}"
+            )
+
+        for layer, paths in (result.get("by_layer") or {}).items():
+            for path_name, metrics in (paths or {}).items():
+                if path_name not in TARGET_RELEVANCE_AGGREGATE_PATHS:
+                    continue
+                for metric, raw_value in (metrics or {}).items():
+                    try:
+                        value = float(raw_value)
+                    except (TypeError, ValueError):
+                        continue
+                    if not math.isfinite(value):
+                        continue
+                    row = {
+                        "split": split,
+                        "condition": "normal",
+                        "domain": TARGET_RELEVANCE_DOMAIN,
+                        "objective": "predicted_class_margin",
+                        "entity_type": "layer_path",
+                        "entity_id": f"layer_{layer}/{path_name}",
+                        "metric": metric,
+                    }
+                    selected[_identity(row)] = value
     return selected
 
 
@@ -282,13 +384,22 @@ def _write_scientific_csv(path, scientific):
     rows = []
     for method, identities in sorted(scientific.items()):
         for identity, payload in sorted(identities.items()):
-            split, condition, domain, entity_type, entity_id, metric = identity.split("|", 5)
+            (
+                split,
+                condition,
+                domain,
+                objective,
+                entity_type,
+                entity_id,
+                metric,
+            ) = identity.split("|", 6)
             summary = payload["training_seed_mean_summary"]
             row = {
                 "method": method,
                 "split": split,
                 "condition": condition,
                 "domain": domain,
+                "objective": objective,
                 "entity_type": entity_type,
                 "entity_id": entity_id,
                 "metric": metric,
@@ -518,9 +629,9 @@ def main():
     )
     aggregate = {
         "format": (
-            "a_series_probe_robustness_aggregate_v1"
+            "a_series_probe_robustness_aggregate_v2"
             if legacy_a_series_mode
-            else "probe_robustness_aggregate_v2"
+            else "probe_robustness_aggregate_v3"
         ),
         "status": "valid" if technical_valid else "invalid",
         "source_root": str(source_root),
@@ -545,6 +656,22 @@ def main():
         "technical_rows": technical_rows,
         "checkpoint_consistency": checkpoint_consistency,
         "manifest_identity_checks": manifest_checks,
+        "scientific_identity_fields": [
+            "split",
+            "condition",
+            "domain",
+            "objective",
+            "entity_type",
+            "entity_id",
+            "metric",
+        ],
+        "target_relevance_objective_aggregation": {
+            "true_class_margin": "probe_metrics_primary_objective",
+            "predicted_class_margin": (
+                "objective_results_aggregate_token_type_paths"
+            ),
+            "per_prompt_predicted_objective": "source_artifact_only",
+        },
         "scientific_metric_identity_count": total_metric_count,
         "complete_scientific_metric_identity_count": complete_metric_count,
         "technical_valid": technical_valid,
