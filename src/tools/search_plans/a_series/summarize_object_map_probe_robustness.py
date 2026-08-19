@@ -116,6 +116,8 @@ def _nested_float(payload, keys):
         if not isinstance(current, dict) or key not in current:
             raise KeyError("/".join(keys))
         current = current[key]
+    if current is None:
+        return None
     value = float(current)
     if not math.isfinite(value):
         raise ValueError(f"non-finite value for {'/'.join(keys)}")
@@ -299,6 +301,7 @@ def main():
             ]
             for layer_name, payload in stages:
                 for metric, keys in METRICS.items():
+                    value = _nested_float(payload, keys)
                     detailed_rows.append(
                         {
                             "training_seed": record["training_seed"],
@@ -306,7 +309,8 @@ def main():
                             "split": split,
                             "layer": layer_name,
                             "metric": metric,
-                            "value": _nested_float(payload, keys),
+                            "value": value,
+                            "available": value is not None,
                         }
                     )
 
@@ -315,6 +319,34 @@ def main():
         grouped[(row["split"], row["layer"], row["metric"])].append(row)
     summary_rows = []
     for (split, layer, metric), rows in sorted(grouped.items()):
+        payload = {
+            "split": split,
+            "layer": layer,
+            "metric": metric,
+            "available": all(row["value"] is not None for row in rows),
+            "missing_cell_count": sum(
+                row["value"] is None for row in rows
+            ),
+            "training_seed_mean": None,
+            "training_seed_min": None,
+            "training_seed_max": None,
+            "training_seed_sign_pattern": "unavailable",
+            "max_probe_range_within_training_seed": None,
+        }
+        for training_seed in training_seeds:
+            for key in (
+                "probe_mean",
+                "probe_min",
+                "probe_max",
+                "probe_range",
+                "probe_sign_pattern",
+            ):
+                payload[f"training_seed_{training_seed}_{key}"] = None
+        for selection_seed in selection_seeds:
+            payload[f"probe_seed_{selection_seed}_mean"] = None
+        if not payload["available"]:
+            summary_rows.append(payload)
+            continue
         by_training = {}
         for training_seed in training_seeds:
             values = [
@@ -337,18 +369,17 @@ def main():
             by_training[training_seed]["probe_mean"]
             for training_seed in training_seeds
         ]
-        payload = {
-            "split": split,
-            "layer": layer,
-            "metric": metric,
-            "training_seed_mean": sum(training_means) / len(training_means),
-            "training_seed_min": min(training_means),
-            "training_seed_max": max(training_means),
-            "training_seed_sign_pattern": _sign_pattern(training_means),
-            "max_probe_range_within_training_seed": max(
-                item["probe_range"] for item in by_training.values()
-            ),
-        }
+        payload.update(
+            {
+                "training_seed_mean": sum(training_means) / len(training_means),
+                "training_seed_min": min(training_means),
+                "training_seed_max": max(training_means),
+                "training_seed_sign_pattern": _sign_pattern(training_means),
+                "max_probe_range_within_training_seed": max(
+                    item["probe_range"] for item in by_training.values()
+                ),
+            }
+        )
         for training_seed in training_seeds:
             for key, value in by_training[training_seed].items():
                 payload[f"training_seed_{training_seed}_{key}"] = value
