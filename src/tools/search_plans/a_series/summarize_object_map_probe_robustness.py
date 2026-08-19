@@ -256,11 +256,21 @@ def main():
     identity_failures = []
     for training_seed in training_seeds:
         group = [item for item in records if item["training_seed"] == training_seed]
-        checkpoint_hashes = {item["checkpoint_sha256"] for item in group}
+        checkpoint_identities = {
+            (
+                item["checkpoint_sha256"],
+                item["checkpoint_global_step"],
+                item["source_run_id"],
+                item["source_session_id"],
+            )
+            for item in group
+        }
         batches = {item["probe_batch_size"] for item in group}
-        if len(checkpoint_hashes) != 1 or None in checkpoint_hashes:
+        if len(checkpoint_identities) != 1 or any(
+            value is None for value in next(iter(checkpoint_identities), ())
+        ):
             identity_failures.append(
-                f"training_seed_{training_seed}:checkpoint_sha256_mismatch"
+                f"training_seed_{training_seed}:checkpoint_identity_mismatch"
             )
         if len(batches) != 1:
             identity_failures.append(
@@ -276,6 +286,9 @@ def main():
                 identity_failures.append(
                     f"selection_seed_{selection_seed}:{split}:manifest_mismatch"
                 )
+    global_batches = {item["probe_batch_size"] for item in records}
+    if len(global_batches) != 1:
+        identity_failures.append("global_probe_batch_size_mismatch")
 
     detailed_rows = []
     for record in records:
