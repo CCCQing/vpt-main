@@ -110,11 +110,11 @@ def _replay_run_dir(root, selection_seed, method, training_seed):
 def _manifest_record(run_dir):
     runtime = _read_json(run_dir / "diagnostics" / "probe_runtime_summary.json")
     manifest = _read_json(run_dir / "diagnostics" / "probe_manifest.json")
+    config = yaml.safe_load(
+        (run_dir / "resolved_config.yaml").read_text(encoding="utf-8")
+    )
     probe_loader = dict(runtime.get("probe_loader") or {})
     if "batch_size" not in probe_loader:
-        config = yaml.safe_load(
-            (run_dir / "resolved_config.yaml").read_text(encoding="utf-8")
-        )
         probe_loader["batch_size"] = int(
             config["MONITOR"]["PROBE"]["BATCH_SIZE"]
         )
@@ -142,6 +142,79 @@ def _manifest_record(run_dir):
             split: bool(manifest.get("validity", {}).get(split, {}).get("valid", False))
             for split in required_splits
         },
+        "target_relevance": _target_relevance_validity_record(
+            run_dir,
+            runtime,
+            config,
+            required_splits,
+        ),
+    }
+
+
+def _target_relevance_validity_record(
+    run_dir, runtime, config, required_splits
+):
+    requested = bool(
+        (((config.get("MONITOR") or {}).get("PROBE") or {}).get(
+            "TARGET_RELEVANCE"
+        ) or {}).get("ENABLE", False)
+    )
+    if not requested:
+        return {
+            "requested": False,
+            "pass": True,
+            "by_split": {},
+        }
+
+    checkpoint_id = str(
+        (runtime.get("checkpoint") or {}).get("checkpoint_id") or ""
+    )
+    by_split = {}
+    for split in required_splits:
+        summary_path = (
+            Path(run_dir)
+            / "diagnostics"
+            / "target_relevance"
+            / checkpoint_id
+            / f"{split}_summary.json"
+        )
+        if not summary_path.is_file():
+            by_split[split] = {
+                "valid": False,
+                "reason": "missing_summary",
+                "path": str(summary_path),
+            }
+            continue
+        summary = _read_json(summary_path)
+        objective_results = summary.get("objective_results") or {}
+        objectives = {}
+        for objective in ("true_class_margin", "predicted_class_margin"):
+            result = dict(objective_results.get(objective) or {})
+            applicability = str(result.get("applicability") or "missing")
+            objective_valid = (
+                applicability == "not_applicable"
+                or (
+                    applicability == "applicable"
+                    and bool(result.get("valid", False))
+                )
+            )
+            objectives[objective] = {
+                "applicability": applicability,
+                "valid": objective_valid,
+            }
+        by_split[split] = {
+            "valid": bool(summary.get("valid", False))
+            and all(item["valid"] for item in objectives.values()),
+            "objectives": objectives,
+            "path": str(summary_path),
+        }
+    return {
+        "requested": True,
+        "pass": bool(checkpoint_id)
+        and len(by_split) == len(required_splits)
+        and all(item["valid"] for item in by_split.values()),
+        "checkpoint_id": checkpoint_id,
+        "by_split": by_split,
     }
 
 
@@ -192,16 +265,12 @@ def _include_scientific_row(row):
 
 def _load_selected_metrics(path, expected_selection_seed):
     selected = {}
-    has_target_relevance = False
     with open_text_artifact(
         Path(path), "r", encoding="utf-8", newline=""
     ) as handle:
         for row in csv.DictReader(handle):
             if not _include_scientific_row(row):
                 continue
-            has_target_relevance = has_target_relevance or (
-                str(row.get("domain")) == TARGET_RELEVANCE_DOMAIN
-            )
             if int(row.get("selection_seed", -1)) != int(expected_selection_seed):
                 raise ValueError(
                     f"unexpected selection_seed in {path}: {row.get('selection_seed')}"
@@ -213,25 +282,27 @@ def _load_selected_metrics(path, expected_selection_seed):
             if not math.isfinite(value):
                 continue
             selected[_identity(row)] = value
-    if has_target_relevance:
+    diagnostics_dir = Path(path).parent
+    if (diagnostics_dir / "target_relevance").is_dir():
         selected.update(
-            _load_predicted_target_relevance_metrics(
-                Path(path).parent,
+            _load_target_relevance_objective_metrics(
+                diagnostics_dir,
                 expected_selection_seed,
             )
         )
     return selected
 
 
-def _load_predicted_target_relevance_metrics(
+def _load_target_relevance_objective_metrics(
     diagnostics_dir, expected_selection_seed
 ):
-    """Load the second target-relevance objective without merging objectives.
+    """Load objective-aware aggregate target-relevance paths from JSON.
 
     The backward-compatible probe CSV contains the primary true-class objective.
-    The predicted-class objective is stored in each target-relevance summary JSON.
+    Older unified A-series CSV files may omit even that export although the valid
+    JSON exists. Both objectives are therefore read from the source-of-truth JSON.
     Only aggregate token-type paths are promoted into the cross-Probe matrix; the
-    much wider per-Prompt entities remain in the source artifact for traceability.
+    much wider per-Prompt entities remain in source artifacts for traceability.
     """
     diagnostics_dir = Path(diagnostics_dir)
     runtime = _read_json(diagnostics_dir / "probe_runtime_summary.json")
@@ -261,41 +332,36 @@ def _load_predicted_target_relevance_metrics(
                 "unexpected target relevance selection seed in "
                 f"{summary_path}: {summary.get('selection_seed')}"
             )
-        result = dict(
-            (summary.get("objective_results") or {}).get(
-                "predicted_class_margin"
-            )
-            or {}
-        )
-        if result.get("applicability") != "applicable" or not bool(
-            result.get("valid", False)
-        ):
-            raise ValueError(
-                "predicted-class target relevance is not valid/applicable in "
-                f"{summary_path}"
-            )
-
-        for layer, paths in (result.get("by_layer") or {}).items():
-            for path_name, metrics in (paths or {}).items():
-                if path_name not in TARGET_RELEVANCE_AGGREGATE_PATHS:
-                    continue
-                for metric, raw_value in (metrics or {}).items():
-                    try:
-                        value = float(raw_value)
-                    except (TypeError, ValueError):
+        objective_results = summary.get("objective_results") or {}
+        for objective in ("true_class_margin", "predicted_class_margin"):
+            result = dict(objective_results.get(objective) or {})
+            if result.get("applicability") != "applicable":
+                continue
+            if not bool(summary.get("valid", False)) or not bool(
+                result.get("valid", False)
+            ):
+                continue
+            for layer, paths in (result.get("by_layer") or {}).items():
+                for path_name, metrics in (paths or {}).items():
+                    if path_name not in TARGET_RELEVANCE_AGGREGATE_PATHS:
                         continue
-                    if not math.isfinite(value):
-                        continue
-                    row = {
-                        "split": split,
-                        "condition": "normal",
-                        "domain": TARGET_RELEVANCE_DOMAIN,
-                        "objective": "predicted_class_margin",
-                        "entity_type": "layer_path",
-                        "entity_id": f"layer_{layer}/{path_name}",
-                        "metric": metric,
-                    }
-                    selected[_identity(row)] = value
+                    for metric, raw_value in (metrics or {}).items():
+                        try:
+                            value = float(raw_value)
+                        except (TypeError, ValueError):
+                            continue
+                        if not math.isfinite(value):
+                            continue
+                        row = {
+                            "split": split,
+                            "condition": "normal",
+                            "domain": TARGET_RELEVANCE_DOMAIN,
+                            "objective": objective,
+                            "entity_type": "layer_path",
+                            "entity_id": f"layer_{layer}/{path_name}",
+                            "metric": metric,
+                        }
+                        selected[_identity(row)] = value
     return selected
 
 
@@ -482,15 +548,24 @@ def main():
                 else None
             )
             gap_valid = True
+            gap_record = None
             if gap_run is not None:
                 gap_summary_path = gap_run / "monitor_gap_replay_summary.json"
                 gap_valid = gap_summary_path.is_file() and bool(
                     _read_json(gap_summary_path).get("valid", False)
                 )
+                if gap_valid:
+                    gap_record = _manifest_record(gap_run)
+            effective_target_relevance = (
+                gap_record["target_relevance"]
+                if gap_record is not None
+                else source_record["target_relevance"]
+            )
             primary_valid = (
                 source_record["runtime_status"] == "completed"
                 and all(source_record["valid_by_split"].values())
                 and gap_valid
+                and bool(effective_target_relevance.get("pass", False))
             )
             technical_rows.append(
                 {
@@ -504,6 +579,10 @@ def main():
                     ),
                     "run_dir": str(source_run),
                     "valid": primary_valid,
+                    "source_target_relevance": source_record[
+                        "target_relevance"
+                    ],
+                    "effective_target_relevance": effective_target_relevance,
                     **source_record,
                 }
             )
@@ -531,7 +610,9 @@ def main():
                 )
                 replay_summary = _read_json(replay_summary_path)
                 replay_record = _manifest_record(replay_run)
-                replay_valid = bool(replay_summary.get("valid", False))
+                replay_valid = bool(replay_summary.get("valid", False)) and bool(
+                    replay_record["target_relevance"].get("pass", False)
+                )
                 technical_rows.append(
                     {
                         "method": method,
@@ -666,7 +747,9 @@ def main():
             "metric",
         ],
         "target_relevance_objective_aggregation": {
-            "true_class_margin": "probe_metrics_primary_objective",
+            "true_class_margin": (
+                "probe_metrics_full_plus_objective_results_aggregate_token_type_paths"
+            ),
             "predicted_class_margin": (
                 "objective_results_aggregate_token_type_paths"
             ),
