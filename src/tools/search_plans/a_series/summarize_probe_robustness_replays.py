@@ -297,10 +297,32 @@ def _write_scientific_csv(path, scientific):
                 "probe_selection_seed_count": payload["probe_selection_seed_count"],
                 "training_seed_mean": summary.get("mean"),
                 "training_seed_std": summary.get("std"),
+                "training_seed_min": summary.get("min"),
+                "training_seed_max": summary.get("max"),
+                "training_seed_range": summary.get("range"),
                 "max_within_training_seed_probe_range": payload.get(
                     "max_within_training_seed_probe_range"
                 ),
             }
+            training_values = list(
+                (summary.get("training_seed_values") or {}).values()
+            )
+            training_signs = {
+                1 if value > 0 else -1 if value < 0 else 0
+                for value in training_values
+            }
+            row["training_seed_sign_consistent"] = len(training_signs) <= 1
+            for training_seed, probe_payload in payload[
+                "within_training_seed_probe_variability"
+            ].items():
+                prefix = f"training_seed_{training_seed}_probe"
+                row[f"{prefix}_mean"] = probe_payload.get("mean")
+                row[f"{prefix}_min"] = probe_payload.get("min")
+                row[f"{prefix}_max"] = probe_payload.get("max")
+                row[f"{prefix}_range"] = probe_payload.get("range")
+                row[f"{prefix}_sign_consistent"] = probe_payload.get(
+                    "sign_consistent"
+                )
             for probe_seed, probe_payload in payload["by_probe_selection_seed"].items():
                 row[f"probe_seed_{probe_seed}_mean"] = probe_payload.get("mean")
                 row[f"probe_seed_{probe_seed}_std_across_training"] = probe_payload.get("std")
