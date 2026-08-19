@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -63,6 +64,15 @@ def parse_args():
         help="Optional fixed-probe batch-size override; defaults to the source resolved config.",
     )
     parser.add_argument("--cpu-threads", type=int)
+    parser.add_argument(
+        "--validate-existing",
+        action="store_true",
+        help=(
+            "Re-run identity and validity checks for an existing replay without "
+            "executing model inference. This is intended for validator-only "
+            "repairs when the scientific artifacts already exist."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -252,6 +262,27 @@ def _validate_replay(output_run, source, cfg, selection_seed):
     checkpoint_id = str(
         checkpoint.get("checkpoint_id", f"final_epoch_{int(cfg.SOLVER.TOTAL_EPOCH):04d}")
     )
+    runtime_probe_loader = dict(runtime.get("probe_loader") or {})
+    source_probe_loader = dict(source.get("probe_loader") or {})
+    replay_config_batch_size = int(cfg.MONITOR.PROBE.BATCH_SIZE)
+    replay_config_path = output_run / "resolved_config.yaml"
+    if replay_config_path.is_file():
+        replay_config = yaml.safe_load(
+            replay_config_path.read_text(encoding="utf-8")
+        )
+        replay_config_batch_size = int(
+            replay_config["MONITOR"]["PROBE"]["BATCH_SIZE"]
+        )
+    replay_batch_size = int(
+        runtime_probe_loader.get(
+            "batch_size", replay_config_batch_size
+        )
+    )
+    source_batch_size = int(
+        source_probe_loader.get(
+            "batch_size", int(cfg.MONITOR.PROBE.BATCH_SIZE)
+        )
+    )
     checkpoint_checks = {
         "diagnostic_replay": checkpoint.get("diagnostic_replay") is True,
         "checkpoint_sha256_match": checkpoint.get("checkpoint_sha256")
@@ -260,10 +291,7 @@ def _validate_replay(output_run, source, cfg, selection_seed):
         == source["checkpoint"]["source_run_id"],
         "source_session_id_match": checkpoint.get("source_session_id")
         == source["checkpoint"]["source_session_id"],
-        "probe_batch_size_match": int(
-            (runtime.get("probe_loader") or {}).get("batch_size", -1)
-        )
-        == int((source.get("probe_loader") or {}).get("batch_size", -2)),
+        "probe_batch_size_match": replay_batch_size == source_batch_size,
     }
     seed_checks = {
         "runtime": int(runtime.get("selection_seed", -1)) == int(selection_seed),
@@ -331,6 +359,11 @@ def _validate_replay(output_run, source, cfg, selection_seed):
         "runtime_status": runtime.get("status"),
         "metric_row_count": int(runtime.get("metric_row_count", 0)),
         "checkpoint_checks": checkpoint_checks,
+        "probe_loader_identity": {
+            "source_batch_size": source_batch_size,
+            "replay_batch_size": replay_batch_size,
+            "match": replay_batch_size == source_batch_size,
+        },
         "selection_seed_checks": seed_checks,
         "probe_manifest_checks": manifest_checks,
         "normal_forward_equivalence_checks": normal_equivalence,
@@ -354,7 +387,6 @@ def main():
     output_run = Path(args.output_run)
     if not source_run.is_dir():
         raise FileNotFoundError(str(source_run))
-    _require_new_output(source_run, output_run)
     cfg = _load_cfg(
         source_run,
         output_run,
@@ -367,6 +399,31 @@ def main():
         raise ValueError(
             "probe robustness replay requires a selection seed different from the source primary seed"
         )
+
+    replay_summary_path = output_run / "probe_robustness_replay_summary.json"
+    if args.validate_existing:
+        if not output_run.is_dir():
+            raise FileNotFoundError(str(output_run))
+        existing = (
+            _read_json(replay_summary_path)
+            if replay_summary_path.is_file()
+            else {}
+        )
+        replay_summary = _validate_replay(
+            output_run, source, cfg, int(args.selection_seed)
+        )
+        for key in ("cpu_threads", "fixed_probe_result"):
+            if key in existing:
+                replay_summary[key] = existing[key]
+        _write_json(replay_summary_path, replay_summary)
+        if not replay_summary["valid"]:
+            raise RuntimeError(
+                "existing probe robustness replay failed identity or validity gates"
+            )
+        print(f"Validated existing probe robustness replay: {output_run}")
+        return
+
+    _require_new_output(source_run, output_run)
 
     output_run.mkdir(parents=True, exist_ok=True)
     logging.setup_logging(

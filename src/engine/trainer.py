@@ -4620,6 +4620,7 @@ class Trainer():
         if num_workers < 0:
             raise ValueError("MONITOR.PROBE.NUM_WORKERS must be non-negative")
         return {
+            "batch_size": int(self.cfg.MONITOR.PROBE.BATCH_SIZE),
             "num_workers": num_workers,
             "pin_memory": bool(self.cfg.MONITOR.PROBE.PIN_MEMORY),
         }
