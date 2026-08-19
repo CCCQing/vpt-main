@@ -8,6 +8,8 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+import yaml
+
 try:
     from .artifact_io import open_text_artifact
 except ImportError:
@@ -97,6 +99,14 @@ def _replay_run_dir(root, selection_seed, method, training_seed):
 def _manifest_record(run_dir):
     runtime = _read_json(run_dir / "diagnostics" / "probe_runtime_summary.json")
     manifest = _read_json(run_dir / "diagnostics" / "probe_manifest.json")
+    probe_loader = dict(runtime.get("probe_loader") or {})
+    if "batch_size" not in probe_loader:
+        config = yaml.safe_load(
+            (run_dir / "resolved_config.yaml").read_text(encoding="utf-8")
+        )
+        probe_loader["batch_size"] = int(
+            config["MONITOR"]["PROBE"]["BATCH_SIZE"]
+        )
     execution_profile = str(runtime.get("execution_profile") or "final_full")
     required_splits = list(runtime.get("required_splits") or SPLITS)
     return {
@@ -105,6 +115,7 @@ def _manifest_record(run_dir):
         "required_splits": required_splits,
         "selection_seed": int(runtime.get("selection_seed", -1)),
         "metric_row_count": int(runtime.get("metric_row_count", 0)),
+        "probe_loader": probe_loader,
         "checkpoint": dict(runtime.get("checkpoint") or {}),
         "manifest_sha256_by_split": {
             split: manifest.get("probes", {}).get(split, {}).get("manifest_sha256")
@@ -412,6 +423,26 @@ def main():
                         "source_checkpoint_sha256": source_checkpoint_sha,
                         "replay_checkpoint_sha256": replay_checkpoint_sha,
                         "match": source_checkpoint_sha == replay_checkpoint_sha,
+                        "source_probe_batch_size": int(
+                            (source_record.get("probe_loader") or {}).get(
+                                "batch_size", -1
+                            )
+                        ),
+                        "replay_probe_batch_size": int(
+                            (replay_record.get("probe_loader") or {}).get(
+                                "batch_size", -2
+                            )
+                        ),
+                        "probe_batch_size_match": int(
+                            (source_record.get("probe_loader") or {}).get(
+                                "batch_size", -1
+                            )
+                        )
+                        == int(
+                            (replay_record.get("probe_loader") or {}).get(
+                                "batch_size", -2
+                            )
+                        ),
                     }
                 )
                 replay_metrics = _load_selected_metrics(
@@ -439,7 +470,10 @@ def main():
             and list(row.get("required_splits") or []) == list(SPLITS)
             for row in technical_rows
         )
-        and all(item["match"] for item in checkpoint_consistency)
+        and all(
+            item["match"] and item["probe_batch_size_match"]
+            for item in checkpoint_consistency
+        )
         and all(
             item["pass"]
             for split_payload in manifest_checks.values()

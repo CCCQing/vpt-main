@@ -127,7 +127,14 @@ def main():
                 _write_json(queue_summary_path, summary)
                 continue
 
-            log_path = queue_dir / f"{method}_seed{seed}.log"
+            selection_prefix = (
+                f"selection_seed_{int(args.selection_seed)}_"
+                if args.selection_seed is not None
+                else ""
+            )
+            log_path = queue_dir / (
+                f"{selection_prefix}{method}_seed{seed}.log"
+            )
             command = [
                 sys.executable,
                 "-u",

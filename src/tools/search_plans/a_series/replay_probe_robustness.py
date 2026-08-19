@@ -260,6 +260,10 @@ def _validate_replay(output_run, source, cfg, selection_seed):
         == source["checkpoint"]["source_run_id"],
         "source_session_id_match": checkpoint.get("source_session_id")
         == source["checkpoint"]["source_session_id"],
+        "probe_batch_size_match": int(
+            (runtime.get("probe_loader") or {}).get("batch_size", -1)
+        )
+        == int((source.get("probe_loader") or {}).get("batch_size", -2)),
     }
     seed_checks = {
         "runtime": int(runtime.get("selection_seed", -1)) == int(selection_seed),

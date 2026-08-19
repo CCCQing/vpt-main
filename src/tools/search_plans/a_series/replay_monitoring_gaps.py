@@ -215,10 +215,13 @@ def _source_identity(source_run, cfg):
     missing = sorted(set(SPLITS).difference(source_hashes))
     if missing:
         raise ValueError(f"source probe manifest is missing splits: {missing}")
+    probe_loader = dict(runtime.get("probe_loader") or {})
+    probe_loader.setdefault("batch_size", int(cfg.MONITOR.PROBE.BATCH_SIZE))
     return {
         "runtime_path": str(runtime_path),
         "manifest_path": str(manifest_path),
         "selection_seed": int(runtime["selection_seed"]),
+        "probe_loader": probe_loader,
         "probe_manifest_sha256_by_split": source_hashes,
         "checkpoint": {
             "checkpoint_path": str(checkpoint_path),
