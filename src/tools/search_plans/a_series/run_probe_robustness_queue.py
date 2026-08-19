@@ -59,7 +59,7 @@ def _write_json(path, payload):
 def _parse_run(spec):
     method, separator, seed_text = str(spec).partition(":")
     method = method.strip().upper()
-    if not separator or method not in {"A0", "A1", "A2"}:
+    if not separator or method not in {"A0", "A1", "A2", "B1", "B2"}:
         raise ValueError(f"invalid --run value: {spec}")
     seed = int(seed_text)
     if seed < 0:
