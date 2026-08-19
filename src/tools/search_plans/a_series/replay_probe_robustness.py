@@ -173,6 +173,12 @@ def _module_effect_checks(output_run, checkpoint_id, cfg, required_splits):
     conditions = [
         str(item) for item in manifest.get("conditions", []) if str(item) != "normal"
     ]
+    required_conditions = set()
+    if bool(cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_ZERO):
+        required_conditions.add("deep_prompt_residual_zeroed")
+    if bool(cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_SWAP):
+        required_conditions.add("deep_prompt_residual_swapped")
+    missing_required_conditions = sorted(required_conditions.difference(conditions))
     root = output_run / "diagnostics" / "module_effect" / checkpoint_id
     condition_checks = {}
     for condition in conditions:
@@ -201,11 +207,14 @@ def _module_effect_checks(output_run, checkpoint_id, cfg, required_splits):
         "applicable": True,
         "manifest_path": str(manifest_path),
         "requested_conditions": list(manifest.get("requested_conditions", [])),
+        "required_conditions": sorted(required_conditions),
+        "missing_required_conditions": missing_required_conditions,
         "not_applicable_conditions": dict(
             manifest.get("not_applicable_conditions", {})
         ),
         "conditions": condition_checks,
         "pass": bool(conditions)
+        and not missing_required_conditions
         and all(
             item["pass"]
             for split_checks in condition_checks.values()
