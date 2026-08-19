@@ -29,7 +29,13 @@ def parse_args():
         "--scope", choices=("gaps", "object_map", "full"), default="gaps"
     )
     parser.add_argument("--selection-seed", type=int)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help=(
+            "Optional fixed-Probe batch-size override; defaults to each source resolved config."
+        ),
+    )
     parser.add_argument(
         "--cpu-threads",
         type=int,
@@ -70,6 +76,8 @@ def _parse_run(spec):
 
 def main():
     args = parse_args()
+    if args.batch_size is not None and int(args.batch_size) < 1:
+        raise ValueError("--batch-size must be positive")
     if args.cpu_threads is not None and int(args.cpu_threads) < 1:
         raise ValueError("--cpu-threads must be positive")
     source_root = Path(args.source_root).resolve()
@@ -93,7 +101,9 @@ def main():
         "selection_seed": (
             int(args.selection_seed) if args.selection_seed is not None else None
         ),
-        "batch_size": int(args.batch_size),
+        "batch_size_override": (
+            int(args.batch_size) if args.batch_size is not None else None
+        ),
         "cpu_threads": (
             int(args.cpu_threads) if args.cpu_threads is not None else None
         ),
@@ -158,9 +168,9 @@ def main():
                 str(output_run),
                 "--scope",
                 str(args.scope),
-                "--batch-size",
-                str(args.batch_size),
             ]
+            if args.batch_size is not None:
+                command.extend(["--batch-size", str(int(args.batch_size))])
             if args.selection_seed is not None:
                 command.extend(["--selection-seed", str(int(args.selection_seed))])
             if args.cpu_threads is not None:

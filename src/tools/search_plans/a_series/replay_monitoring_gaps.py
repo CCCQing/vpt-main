@@ -59,7 +59,13 @@ def parse_args():
             "omitted; object-map strict three-Probe replays pass it explicitly."
         ),
     )
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help=(
+            "Optional fixed-Probe batch-size override; defaults to the source resolved config."
+        ),
+    )
     parser.add_argument(
         "--cpu-threads",
         type=int,
@@ -161,7 +167,10 @@ def _load_cfg(
     cfg.DATA.NUM_WORKERS = 0
     cfg.DATA.PIN_MEMORY = False
     cfg.MONITOR.OUTPUT_POLICY = "error_if_exists"
-    cfg.MONITOR.PROBE.BATCH_SIZE = max(1, int(batch_size))
+    if batch_size is not None:
+        if int(batch_size) < 1:
+            raise ValueError("--batch-size must be positive")
+        cfg.MONITOR.PROBE.BATCH_SIZE = int(batch_size)
     cfg.MONITOR.PROBE.ROBUSTNESS_SELECTION_SEEDS = []
     if selection_seed is not None:
         if int(selection_seed) < 0:
