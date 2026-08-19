@@ -60,6 +60,11 @@ def parse_args():
         ),
     )
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        help="Limit PyTorch CPU threads for replay-only diagnostics.",
+    )
     return parser.parse_args()
 
 
@@ -500,6 +505,11 @@ def _validate_object_map_replay(
 
 def main():
     args = parse_args()
+    if args.cpu_threads is not None:
+        if int(args.cpu_threads) < 1:
+            raise ValueError("--cpu-threads must be positive")
+        torch.set_num_threads(int(args.cpu_threads))
+        torch.set_num_interop_threads(max(1, min(2, int(args.cpu_threads))))
     source_run = Path(args.source_run)
     output_run = Path(args.output_run)
     if not source_run.is_dir():
@@ -580,6 +590,10 @@ def main():
             else _validate_replay(output_run, source, cfg)
         )
         replay_summary["fixed_probe_result"] = result
+        replay_summary["cpu_threads"] = {
+            "intra_op": int(torch.get_num_threads()),
+            "inter_op": int(torch.get_num_interop_threads()),
+        }
         summary_name = (
             "bayesian_object_map_replay_summary.json"
             if args.scope == "object_map"

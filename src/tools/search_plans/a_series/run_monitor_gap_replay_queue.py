@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -29,6 +30,13 @@ def parse_args():
     )
     parser.add_argument("--selection-seed", type=int)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        help=(
+            "Limit each replay process and its BLAS backends to this many CPU threads."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -62,6 +70,8 @@ def _parse_run(spec):
 
 def main():
     args = parse_args()
+    if args.cpu_threads is not None and int(args.cpu_threads) < 1:
+        raise ValueError("--cpu-threads must be positive")
     source_root = Path(args.source_root).resolve()
     output_root = Path(args.output_root).resolve()
     queue_dir = output_root / "_launcher_logs"
@@ -84,6 +94,9 @@ def main():
             int(args.selection_seed) if args.selection_seed is not None else None
         ),
         "batch_size": int(args.batch_size),
+        "cpu_threads": (
+            int(args.cpu_threads) if args.cpu_threads is not None else None
+        ),
         "runs": [],
     }
     _write_json(queue_summary_path, summary)
@@ -150,6 +163,18 @@ def main():
             ]
             if args.selection_seed is not None:
                 command.extend(["--selection-seed", str(int(args.selection_seed))])
+            if args.cpu_threads is not None:
+                command.extend(["--cpu-threads", str(int(args.cpu_threads))])
+            process_env = dict(os.environ)
+            if args.cpu_threads is not None:
+                thread_text = str(int(args.cpu_threads))
+                for variable in (
+                    "OMP_NUM_THREADS",
+                    "MKL_NUM_THREADS",
+                    "OPENBLAS_NUM_THREADS",
+                    "NUMEXPR_NUM_THREADS",
+                ):
+                    process_env[variable] = thread_text
             with log_path.open("w", encoding="utf-8") as handle:
                 completed = subprocess.run(
                     command,
@@ -157,6 +182,7 @@ def main():
                     stderr=subprocess.STDOUT,
                     cwd=str(replay_script.parents[4]),
                     check=False,
+                    env=process_env,
                 )
                 handle.write(f"EXIT_CODE={completed.returncode}\n")
             valid = replay_summary_path.is_file() and bool(
