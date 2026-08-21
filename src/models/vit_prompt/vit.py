@@ -771,6 +771,20 @@ class PromptedTransformer(Transformer):
                     prompt_len=num_tokens,
                     num_layers=num_layers,
                     gate_init=float(self.deep_residual_cfg.GATE_INIT),
+                    content_mode=str(self.deep_residual_cfg.CONTENT_MODE),
+                    slot_rank=int(self.deep_residual_cfg.SLOT_RANK),
+                    sample_gate_mode=str(
+                        self.deep_residual_cfg.SAMPLE_GATE_MODE
+                    ),
+                    sample_gate_input=str(
+                        self.deep_residual_cfg.SAMPLE_GATE_INPUT
+                    ),
+                    sample_gate_hidden_dim=int(
+                        self.deep_residual_cfg.SAMPLE_GATE_HIDDEN_DIM
+                    ),
+                    sample_gate_init=float(
+                        self.deep_residual_cfg.SAMPLE_GATE_INIT
+                    ),
                 )
 
         if self.attention_mediation_enable:

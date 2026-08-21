@@ -230,6 +230,11 @@ class Trainer():
             self.affinity_cfg = None
             self.affinity_vis = False
 
+        self._initialization_checkpoint_manifest = (
+            self._load_trainable_initialization_checkpoint()
+        )
+        self._frozen_reference_state = self._capture_b1_frozen_reference_state()
+
         # solver related
         # ================== optimizer / scheduler / loss ==================
         # GraphProbPrior 的 prior head / 可学习温度等参数也挂在 loss module 内，需要交给 optimizer。
@@ -299,6 +304,16 @@ class Trainer():
             self.monitor_manager,
             is_writer=is_monitor_writer,
         )
+        if self._initialization_checkpoint_manifest is not None:
+            self.monitor_manager.write_evidence(
+                "initialization_checkpoint_manifest.json",
+                self._initialization_checkpoint_manifest,
+            )
+        if self._frozen_reference_state:
+            self.monitor_manager.write_evidence(
+                "residual_freeze_contract_initial.json",
+                self._residual_freeze_contract_payload(final=False),
+            )
         guarded_modules = (("model", self._model_ref(self.model)), ("cls_criterion", self.cls_criterion))
         self.numerical_guard = NumericalGuard(guarded_modules)
         self._optimizer_sanity_enabled = bool(
@@ -471,6 +486,192 @@ class Trainer():
     @staticmethod
     def _model_ref(model):
         return model.module if hasattr(model, "module") else model
+
+    def _load_trainable_initialization_checkpoint(self):
+        checkpoint_path = str(
+            self.cfg.SOLVER.INIT_TRAINABLE_CHECKPOINT
+        ).strip()
+        if not checkpoint_path:
+            return None
+        if str(self.cfg.MODEL.WEIGHT_PATH).strip():
+            raise ValueError(
+                "SOLVER.INIT_TRAINABLE_CHECKPOINT cannot be combined with "
+                "MODEL.WEIGHT_PATH because the later pretrained load would "
+                "overwrite the controlled initialization"
+            )
+        checkpoint_path = os.path.abspath(os.path.expanduser(checkpoint_path))
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(checkpoint_path)
+        payload = torch.load(checkpoint_path, map_location="cpu")
+        supported_formats = {
+            "vpt_trainable_v1",
+            "vpt_trainable_milestone_v1",
+        }
+        if str(payload.get("format", "")) not in supported_formats:
+            raise ValueError(
+                "unsupported trainable initialization checkpoint format: {}".format(
+                    payload.get("format")
+                )
+            )
+        checkpoint_seed = payload.get("seed")
+        if (
+            bool(
+                self.cfg.SOLVER.INIT_TRAINABLE_CHECKPOINT_REQUIRE_SEED_MATCH
+            )
+            and checkpoint_seed is not None
+            and self.cfg.SEED is not None
+            and int(checkpoint_seed) != int(self.cfg.SEED)
+        ):
+            raise ValueError(
+                "initialization checkpoint seed {} does not match run seed {}".format(
+                    checkpoint_seed, self.cfg.SEED
+                )
+            )
+        checkpoint_protocol = str(payload.get("protocol_mode", ""))
+        if checkpoint_protocol and checkpoint_protocol != str(
+            self.cfg.DATA.XLSA.PROTOCOL_MODE
+        ):
+            raise ValueError(
+                "initialization checkpoint protocol {} does not match {}".format(
+                    checkpoint_protocol, self.cfg.DATA.XLSA.PROTOCOL_MODE
+                )
+            )
+        state = payload.get("model_state")
+        if not isinstance(state, dict) or not state:
+            raise ValueError(
+                "trainable initialization checkpoint has no model_state"
+            )
+        incompatible = self._model_ref(self.model).load_state_dict(
+            state, strict=False
+        )
+        if incompatible.unexpected_keys:
+            raise ValueError(
+                "unexpected initialization checkpoint keys: {}".format(
+                    ", ".join(incompatible.unexpected_keys[:20])
+                )
+            )
+        current_state = self._model_ref(self.model).state_dict()
+        loaded_names = sorted(name for name in state if name in current_state)
+        if len(loaded_names) != len(state):
+            raise RuntimeError(
+                "not all trainable initialization tensors were loaded"
+            )
+        allowed_missing_prefixes = tuple(
+            str(value)
+            for value in self.cfg.SOLVER.INIT_TRAINABLE_CHECKPOINT_ALLOWED_MISSING_PREFIXES
+        )
+        new_trainable = sorted(
+            name
+            for name, parameter in self._model_ref(self.model).named_parameters()
+            if parameter.requires_grad and name not in state
+        )
+        disallowed_new_trainable = [
+            name
+            for name in new_trainable
+            if not any(name.startswith(prefix) for prefix in allowed_missing_prefixes)
+        ]
+        if disallowed_new_trainable:
+            raise ValueError(
+                "initialization checkpoint leaves unexpected trainable parameters uninitialized: {}".format(
+                    ", ".join(disallowed_new_trainable[:20])
+                )
+            )
+        return {
+            "format": "trainable_initialization_manifest_v1",
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_sha256": checkpoint_sha256(checkpoint_path),
+            "checkpoint_format": payload.get("format"),
+            "checkpoint_seed": checkpoint_seed,
+            "run_seed": self.cfg.SEED,
+            "protocol_mode": checkpoint_protocol,
+            "loaded_tensor_count": len(loaded_names),
+            "new_trainable_parameter_names": new_trainable,
+            "allowed_missing_prefixes": list(allowed_missing_prefixes),
+            "seed_match_required": bool(
+                self.cfg.SOLVER.INIT_TRAINABLE_CHECKPOINT_REQUIRE_SEED_MATCH
+            ),
+            "optimizer_state_reused": False,
+            "scheduler_state_reused": False,
+            "continuation_policy": "checkpoint_weights_with_fresh_matched_optimizer_scheduler",
+        }
+
+    def _capture_b1_frozen_reference_state(self):
+        residual_cfg = self.cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL
+        freeze_static = bool(residual_cfg.FREEZE_STATIC_PROMPT)
+        freeze_classifier = bool(residual_cfg.FREEZE_CLASSIFIER)
+        if not freeze_static and not freeze_classifier:
+            return {}
+        state = {}
+        for name, parameter in self._model_ref(self.model).named_parameters():
+            selected = (
+                freeze_static
+                and (
+                    name.endswith("prompt_embeddings")
+                    or name.endswith("deep_prompt_embeddings")
+                )
+            ) or (freeze_classifier and name.startswith("r_similarity_head."))
+            if not selected:
+                continue
+            if parameter.requires_grad:
+                raise RuntimeError(
+                    "residual freeze contract parameter remains trainable: {}".format(name)
+                )
+            state[name] = parameter.detach().cpu().clone()
+        if not state:
+            raise RuntimeError("residual freeze contract selected no parameters")
+        return state
+
+    def _residual_freeze_contract_payload(self, *, final):
+        if not self._frozen_reference_state:
+            return None
+        named = dict(self._model_ref(self.model).named_parameters())
+        optimizer_ids = {
+            id(parameter)
+            for group in self.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        rows = []
+        passed = True
+        for name, reference in self._frozen_reference_state.items():
+            parameter = named[name]
+            drift = float(
+                (parameter.detach().cpu() - reference).abs().max().item()
+            )
+            gradient_max = (
+                float(parameter.grad.detach().abs().max().item())
+                if parameter.grad is not None
+                else 0.0
+            )
+            row_pass = (
+                not parameter.requires_grad
+                and id(parameter) not in optimizer_ids
+                and drift == 0.0
+                and gradient_max == 0.0
+            )
+            passed = passed and row_pass
+            rows.append(
+                {
+                    "parameter": name,
+                    "requires_grad": bool(parameter.requires_grad),
+                    "in_optimizer": id(parameter) in optimizer_ids,
+                    "max_abs_drift": drift,
+                    "gradient_max_abs": gradient_max,
+                    "pass": row_pass,
+                }
+            )
+        return {
+            "format": "residual_freeze_contract_v1",
+            "stage": "final" if final else "initial",
+            "freeze_static_prompt": bool(
+                self.cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.FREEZE_STATIC_PROMPT
+            ),
+            "freeze_classifier": bool(
+                self.cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.FREEZE_CLASSIFIER
+            ),
+            "parameter_count": len(rows),
+            "parameters": rows,
+            "pass": passed,
+        }
 
     ### 2. ==================================result / record==========================================
     def _pick_primary_metric(self, metric_dict):
@@ -9889,6 +10090,13 @@ class Trainer():
                 "MONITOR.MODULE_EFFECT.ENABLE requires SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT=True"
             )
         if du.get_rank() == 0:
+            if self._frozen_reference_state:
+                freeze_contract = self._residual_freeze_contract_payload(final=True)
+                self.monitor_manager.write_evidence(
+                    "residual_freeze_contract_final.json", freeze_contract
+                )
+                if not bool(freeze_contract["pass"]):
+                    raise RuntimeError("residual freeze contract failed")
             if bool(self.cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT):
                 self._final_trainable_checkpoint_path = self._save_trainable_final_checkpoint(total_epoch)
             self._run_fixed_probes(

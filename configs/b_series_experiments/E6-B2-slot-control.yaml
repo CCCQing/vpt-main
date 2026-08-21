@@ -1,0 +1,10 @@
+_BASE_: "E6-B1-slot.yaml"
+OUTPUT_DIR: "output/b_series_experiments/E6-B2-slot-control"
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      SOURCE: "vit_cls_prepass_constant"
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "E6-B2-slot-control-rank8"
+

@@ -1,0 +1,9 @@
+_BASE_: "E7-G3-sample-layerwise.yaml"
+OUTPUT_DIR: "output/b_series_experiments/E7-G3-B2-gate-control"
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      SOURCE: "vit_cls_prepass_constant"
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "E7-G3-B2-gate-control"

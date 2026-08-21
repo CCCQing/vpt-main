@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+import json
+import tempfile
+from pathlib import Path
+
+import numpy as np
 import torch
 
 from src.models.prompting.prompt_distribution import (
@@ -10,12 +15,28 @@ from src.models.prompting.prompt_distribution import (
     PreViTPromptDistributor,
 )
 from src.monitoring.adapters import deep_prompt_residual_metrics
+from src.monitoring.deep_prompt_residual_experiments import (
+    deterministic_donor_indices,
+    layer_scales,
+    residual_static_geometry,
+    summarize_geometry,
+)
 from src.monitoring.module_effect import (
+    deep_prompt_residual_layer_scales_intervention,
+    deep_prompt_residual_replace_intervention,
     deep_prompt_residual_swap_intervention,
     deep_prompt_residual_zero_intervention,
 )
 from src.configs.config import get_cfg
+from src.engine.evaluator import Evaluator
+from src.engine.trainer import Trainer
 from src.models.vit_models import ViT
+from src.tools.search_plans.b_series.summarize_b_series_replays import (
+    nested_scientific_summary,
+)
+from src.tools.search_plans.b_series.run_b_series_training import (
+    _validate_e7_preconditions,
+)
 
 
 class _ResidualHolder(torch.nn.Module):
@@ -82,6 +103,120 @@ def validate_controls_and_metrics() -> None:
     normal.square().mean().backward()
     assert latent.grad is not None
     assert float(latent.grad.abs().sum().item()) > 0.0
+
+
+def validate_experiment_interventions_and_geometry() -> None:
+    torch.manual_seed(19)
+    module = MeanConditionedDeepPromptResidual(
+        dim=8,
+        prompt_len=3,
+        num_layers=4,
+        gate_init=1.0,
+    )
+    holder = _ResidualHolder(module)
+    latent = torch.randn(5, 8)
+    base = torch.randn(5, 3, 8)
+    normal, normal_trace = module.forward_layer(latent, 2)
+    with deep_prompt_residual_layer_scales_intervention(
+        holder, scales=layer_scales(4, selected_scale=0.5)
+    ):
+        half, half_trace = module.forward_layer(latent, 2)
+    assert torch.allclose(half, normal * 0.5)
+    assert torch.allclose(half_trace["runtime_scale"], torch.full((5,), 0.5))
+    replacement = torch.flip(latent, dims=(0,))
+    with deep_prompt_residual_replace_intervention(
+        holder, replacement=replacement
+    ):
+        replaced, replace_trace = module.forward_layer(latent, 2)
+    assert torch.equal(replaced[:, 0], replacement)
+    assert float(replace_trace["mean_replace_distance"].sum().item()) > 0.0
+    geometry = residual_static_geometry(
+        [
+            {
+                **normal_trace,
+                "base_prompt": base,
+            }
+        ]
+    )
+    assert tuple(geometry["residual_static_cosine"].shape) == (5, 1)
+    assert np.allclose(geometry["slot_shift_effective_rank"], 1.0)
+    grouped = summarize_geometry(
+        geometry,
+        groups={"first_two": np.asarray([1, 1, 0, 0, 0], dtype=bool)},
+    )
+    assert grouped["groups"]["first_two"]["sample_count"] == 2
+
+
+def validate_slot_and_sample_gate_modes() -> None:
+    torch.manual_seed(21)
+    latent = torch.randn(6, 10)
+    shared = MeanConditionedDeepPromptResidual(
+        dim=10,
+        prompt_len=4,
+        num_layers=3,
+        gate_init=1.0,
+    )
+    assert set(dict(shared.named_parameters())) == {"layer_gate"}
+    slot = MeanConditionedDeepPromptResidual(
+        dim=10,
+        prompt_len=4,
+        num_layers=3,
+        gate_init=1.0,
+        content_mode="slot_low_rank",
+        slot_rank=3,
+    )
+    slot_delta, slot_trace = slot.forward_layer(latent, 1)
+    assert tuple(slot_delta.shape) == (6, 4, 10)
+    assert float(slot_delta.var(dim=1, unbiased=False).sum().item()) > 0.0
+    slot_metrics = deep_prompt_residual_metrics(
+        [{**slot_trace, "base_prompt": torch.ones_like(slot_delta)}]
+    )
+    assert slot_metrics["layer_1.raw_delta_slot_effective_rank"] > 1.0
+
+    conditional = MeanConditionedDeepPromptResidual(
+        dim=10,
+        prompt_len=4,
+        num_layers=3,
+        gate_init=1.0,
+        sample_gate_mode="shared",
+        sample_gate_input="residual_source",
+        sample_gate_init=0.8,
+    )
+    fixed = MeanConditionedDeepPromptResidual(
+        dim=10,
+        prompt_len=4,
+        num_layers=3,
+        gate_init=1.0,
+        sample_gate_mode="shared",
+        sample_gate_input="constant",
+        sample_gate_init=0.8,
+    )
+    assert {
+        name: tuple(value.shape) for name, value in conditional.named_parameters()
+    } == {name: tuple(value.shape) for name, value in fixed.named_parameters()}
+    _, conditional_trace = conditional.forward_layer(latent, 0)
+    _, fixed_trace = fixed.forward_layer(latent, 0)
+    assert torch.allclose(
+        conditional_trace["sample_gate"], torch.full((6,), 0.8), atol=1e-6
+    )
+    assert torch.allclose(
+        fixed_trace["sample_gate"], torch.full((6,), 0.8), atol=1e-6
+    )
+
+
+def validate_donor_contracts() -> None:
+    sample_ids = ["a0", "a1", "b0", "b1", "c0", "c1"]
+    labels = [0, 0, 1, 1, 2, 2]
+    same = deterministic_donor_indices(
+        sample_ids, labels, relation="same_class", seed=31
+    )
+    different = deterministic_donor_indices(
+        sample_ids, labels, relation="different_class", seed=31
+    )
+    label_array = np.asarray(labels)
+    assert np.all(same != np.arange(len(sample_ids)))
+    assert np.all(label_array[same] == label_array)
+    assert np.all(label_array[different] != label_array)
 
 
 def validate_parameter_only_provider_is_rng_neutral() -> None:
@@ -208,13 +343,131 @@ def validate_full_vit_config_and_trace() -> None:
     assert "contextualized_prompt/layer_11" in object_ids
 
 
+def validate_a2_initialization_and_freeze_contract() -> None:
+    with tempfile.TemporaryDirectory(dir=".") as temporary:
+        root = Path(temporary).resolve()
+        attributes = torch.zeros(200, 312)
+        source_cfg = get_cfg()
+        source_cfg.merge_from_file(
+            "configs/baseline_rebuild/A-04-A2-vpt-deep-ce.yaml"
+        )
+        source_cfg.defrost()
+        source_cfg.SEED = 0
+        source_cfg.freeze()
+        source = ViT(source_cfg, load_pretrain=False).eval()
+        source.attach_r_similarity_head(attributes)
+        trainable_names = [
+            name for name, parameter in source.named_parameters() if parameter.requires_grad
+        ]
+        state = source.state_dict()
+        checkpoint_path = root / "a2_trainable.pth"
+        torch.save(
+            {
+                "format": "vpt_trainable_v1",
+                "model_state": {name: state[name] for name in trainable_names},
+                "trainable_parameter_names": trainable_names,
+                "seed": 0,
+                "protocol_mode": str(source_cfg.DATA.XLSA.PROTOCOL_MODE),
+                "total_epoch": int(source_cfg.SOLVER.TOTAL_EPOCH),
+            },
+            str(checkpoint_path),
+        )
+
+        target_cfg = get_cfg()
+        target_cfg.merge_from_file("configs/b_series_experiments/E5-B1-freeze.yaml")
+        target_cfg.defrost()
+        target_cfg.SEED = 0
+        target_cfg.NUM_GPUS = 1
+        target_cfg.OUTPUT_DIR = str(root / "freeze_run")
+        target_cfg.SOLVER.INIT_TRAINABLE_CHECKPOINT = str(checkpoint_path)
+        target_cfg.freeze()
+        target = ViT(target_cfg, load_pretrain=False).eval()
+        target.attach_r_similarity_head(attributes)
+        trainer = Trainer(
+            target_cfg,
+            target,
+            Evaluator(task_type="gzsl"),
+            torch.device("cpu"),
+        )
+        manifest = trainer._initialization_checkpoint_manifest
+        assert manifest["checkpoint_seed"] == 0
+        assert manifest["new_trainable_parameter_names"]
+        freeze = trainer._residual_freeze_contract_payload(final=False)
+        assert freeze["pass"] is True
+        assert all(row["in_optimizer"] is False for row in freeze["parameters"])
+        trainer.diagnostic_manager.finalize(status="completed")
+        trainer.monitor_manager.finalize(status="completed")
+
+
+def validate_nested_probe_summary() -> None:
+    cells = []
+    for training_seed, values in ((0, (1.0, 2.0, 3.0)), (1, (3.0, 4.0, 5.0))):
+        for value in values:
+            cells.append(
+                {
+                    "method": "B1",
+                    "training_seed": training_seed,
+                    "metrics": {"condition.metric": value},
+                }
+            )
+    payload, rows = nested_scientific_summary(cells, scope="probe")
+    within_seed0 = payload["within_checkpoint"]["B1|seed0"]["condition.metric"]
+    assert within_seed0["count"] == 3
+    assert within_seed0["mean"] == 2.0
+    across = payload["across_training_seed"]["B1"]["condition.metric"]
+    assert across["count"] == 2
+    assert across["mean"] == 3.0
+    assert across["within_checkpoint_range_mean"] == 2.0
+    assert len(rows) == 1
+
+
+def validate_e7_precondition_evidence_gate() -> None:
+    with tempfile.TemporaryDirectory(dir=".") as temporary:
+        root = Path(temporary).resolve()
+        evidence = root / "evidence.json"
+        evidence.write_text("{}\n", encoding="utf-8")
+        manifest = root / "preconditions.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "E7": {
+                        "eligible": True,
+                        "max_gate_stage": "G1",
+                        "checks": {
+                            "bidirectional_nontrivial_response": True,
+                            "predictable_without_test_leakage": True,
+                            "pseudo_unseen_better_than_constant": True,
+                        },
+                        "evidence_paths": [evidence.name],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = _validate_e7_preconditions(manifest, ("E7-G1",))
+        assert result["pass"] is True
+        evidence.unlink()
+        try:
+            _validate_e7_preconditions(manifest, ("E7-G1",))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("missing E7 evidence file was accepted")
+
+
 def main() -> None:
     checks = (
         validate_zero_gate_and_gradient,
         validate_controls_and_metrics,
+        validate_experiment_interventions_and_geometry,
+        validate_slot_and_sample_gate_modes,
+        validate_donor_contracts,
         validate_parameter_only_provider_is_rng_neutral,
         validate_nonconditional_control,
         validate_full_vit_config_and_trace,
+        validate_a2_initialization_and_freeze_contract,
+        validate_nested_probe_summary,
+        validate_e7_precondition_evidence_gate,
     )
     for check in checks:
         check()

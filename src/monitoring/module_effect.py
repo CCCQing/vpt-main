@@ -164,7 +164,12 @@ class PromptDistributionIntervention(AbstractContextManager):
 
 
 class DeepPromptResidualIntervention(AbstractContextManager):
-    VALID_MODES = {"delta_zero", "mean_swap"}
+    VALID_MODES = {
+        "delta_zero",
+        "mean_swap",
+        "mean_replace",
+        "layer_scales",
+    }
 
     def __init__(self, model: torch.nn.Module, mode: str, **payload: Any) -> None:
         if str(mode) not in self.VALID_MODES:
@@ -318,6 +323,33 @@ def deep_prompt_residual_swap_intervention(
         model,
         "mean_swap",
         permutation=permutation,
+    )
+
+
+def deep_prompt_residual_replace_intervention(
+    model: torch.nn.Module,
+    *,
+    replacement: torch.Tensor,
+) -> DeepPromptResidualIntervention:
+    return DeepPromptResidualIntervention(
+        model,
+        "mean_replace",
+        replacement=replacement,
+    )
+
+
+def deep_prompt_residual_layer_scales_intervention(
+    model: torch.nn.Module,
+    *,
+    scales: Sequence[float],
+) -> DeepPromptResidualIntervention:
+    values = tuple(float(value) for value in scales)
+    if not values:
+        raise ValueError("Deep Prompt residual layer scales must not be empty")
+    return DeepPromptResidualIntervention(
+        model,
+        "layer_scales",
+        scales=values,
     )
 
 

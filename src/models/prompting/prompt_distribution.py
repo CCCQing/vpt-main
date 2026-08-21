@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import os
 from urllib.parse import urlparse
-from typing import Dict, Optional, Tuple
+import math
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -32,16 +33,24 @@ _ALLOWED_SOURCES = {
 
 
 class MeanConditionedDeepPromptResidual(nn.Module):
-    """Add the Distributor mean directly to every static Deep Prompt layer.
+    """Build a deterministic Distributor-mean correction for static Deep Prompt.
 
-    ``mu(x)`` is repeated across the requested Prompt slots without a learned
-    decoder.  The static A2 Prompt still differentiates slots and layers; this
-    module only supplies a sample-conditioned additive correction.  Each layer
-    owns one scalar gate, so a zero gate is exactly equivalent to the static
-    Deep Prompt baseline and does not consume sampling RNG.
+    The historical ``shared`` mode repeats ``mu(x)`` over Prompt slots and is
+    parameter-compatible with the original B1 implementation.  Optional
+    ``slot_low_rank`` content and sample-adaptive gates are constructed only by
+    explicit follow-up configs.  A zero layer gate remains exactly equivalent
+    to the static Deep Prompt baseline and consumes no sampling RNG.
     """
 
-    _INTERVENTION_MODES = {"delta_zero", "mean_swap"}
+    _INTERVENTION_MODES = {
+        "delta_zero",
+        "mean_swap",
+        "mean_replace",
+        "layer_scales",
+    }
+    _CONTENT_MODES = {"shared", "slot_low_rank"}
+    _SAMPLE_GATE_MODES = {"none", "shared", "grouped", "layerwise"}
+    _SAMPLE_GATE_INPUTS = {"residual_source", "constant"}
 
     def __init__(
         self,
@@ -50,6 +59,12 @@ class MeanConditionedDeepPromptResidual(nn.Module):
         prompt_len: int,
         num_layers: int,
         gate_init: float = 0.0,
+        content_mode: str = "shared",
+        slot_rank: int = 8,
+        sample_gate_mode: str = "none",
+        sample_gate_input: str = "residual_source",
+        sample_gate_hidden_dim: int = 32,
+        sample_gate_init: float = 0.95,
     ) -> None:
         super().__init__()
         self.dim = int(dim)
@@ -57,9 +72,77 @@ class MeanConditionedDeepPromptResidual(nn.Module):
         self.num_layers = int(num_layers)
         if self.dim <= 0 or self.prompt_len <= 0 or self.num_layers <= 0:
             raise ValueError("Deep Prompt residual dimensions must be positive")
+        self.content_mode = str(content_mode).strip().lower()
+        if self.content_mode not in self._CONTENT_MODES:
+            raise ValueError(
+                "Unsupported Deep Prompt residual CONTENT_MODE={!r}".format(
+                    content_mode
+                )
+            )
+        self.slot_rank = int(slot_rank)
+        if self.slot_rank <= 0:
+            raise ValueError("Deep Prompt residual SLOT_RANK must be positive")
+        self.sample_gate_mode = str(sample_gate_mode).strip().lower()
+        if self.sample_gate_mode not in self._SAMPLE_GATE_MODES:
+            raise ValueError(
+                "Unsupported Deep Prompt residual SAMPLE_GATE_MODE={!r}".format(
+                    sample_gate_mode
+                )
+            )
+        self.sample_gate_input = str(sample_gate_input).strip().lower()
+        if self.sample_gate_input not in self._SAMPLE_GATE_INPUTS:
+            raise ValueError(
+                "Unsupported Deep Prompt residual SAMPLE_GATE_INPUT={!r}".format(
+                    sample_gate_input
+                )
+            )
+        self.sample_gate_hidden_dim = int(sample_gate_hidden_dim)
+        if self.sample_gate_hidden_dim <= 0:
+            raise ValueError(
+                "Deep Prompt residual SAMPLE_GATE_HIDDEN_DIM must be positive"
+            )
+        self.sample_gate_init = float(sample_gate_init)
+        if not 0.0 < self.sample_gate_init < 1.0:
+            raise ValueError(
+                "Deep Prompt residual SAMPLE_GATE_INIT must be inside (0, 1)"
+            )
         self.layer_gate = nn.Parameter(
             torch.full((self.num_layers,), float(gate_init))
         )
+        self.slot_coefficients = None
+        self.slot_basis = None
+        if self.content_mode == "slot_low_rank":
+            self.slot_coefficients = nn.ModuleList(
+                nn.Linear(
+                    self.dim,
+                    self.prompt_len * self.slot_rank,
+                    bias=True,
+                )
+                for _ in range(self.num_layers)
+            )
+            self.slot_basis = nn.Parameter(
+                torch.empty(self.num_layers, self.slot_rank, self.dim)
+            )
+            nn.init.xavier_uniform_(self.slot_basis)
+
+        self.sample_gate_head = None
+        if self.sample_gate_mode != "none":
+            output_dim = {
+                "shared": 1,
+                "grouped": 3,
+                "layerwise": self.num_layers,
+            }[self.sample_gate_mode]
+            self.sample_gate_head = nn.Sequential(
+                nn.Linear(self.dim, self.sample_gate_hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.sample_gate_hidden_dim, output_dim),
+            )
+            final = self.sample_gate_head[-1]
+            nn.init.zeros_(final.weight)
+            nn.init.constant_(
+                final.bias,
+                math.log(self.sample_gate_init / (1.0 - self.sample_gate_init)),
+            )
         self._runtime_intervention = None
 
     def _effective_mean(self, mean: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -88,7 +171,69 @@ class MeanConditionedDeepPromptResidual(nn.Module):
                     permutation
                     == torch.arange(int(source.shape[0]), device=permutation.device)
                 ).to(source.dtype)
+            elif mode == "mean_replace":
+                replacement = intervention.get("replacement")
+                if not torch.is_tensor(replacement):
+                    raise ValueError("mean_replace requires a replacement tensor")
+                replacement = replacement.to(device=source.device, dtype=source.dtype)
+                if tuple(replacement.shape) != tuple(source.shape):
+                    raise ValueError(
+                        "mean_replace tensor has incompatible shape: {} != {}".format(
+                            tuple(replacement.shape), tuple(source.shape)
+                        )
+                    )
+                stats["mean_replace_distance"] = (
+                    replacement - source
+                ).float().norm(dim=-1)
+                source = replacement
         return source, stats
+
+    def _raw_delta(self, source: torch.Tensor, layer_id: int) -> torch.Tensor:
+        if self.content_mode == "shared":
+            return source[:, None, :].expand(-1, self.prompt_len, -1)
+        coefficients = self.slot_coefficients[layer_id](source).reshape(
+            int(source.shape[0]), self.prompt_len, self.slot_rank
+        )
+        basis = self.slot_basis[layer_id].to(
+            device=source.device, dtype=source.dtype
+        )
+        return torch.matmul(coefficients, basis)
+
+    def _sample_gate(self, source: torch.Tensor, layer_id: int) -> torch.Tensor:
+        if self.sample_gate_head is None:
+            return source.new_ones(int(source.shape[0]))
+        gate_input = (
+            source
+            if self.sample_gate_input == "residual_source"
+            else torch.ones_like(source)
+        )
+        values = torch.sigmoid(self.sample_gate_head(gate_input))
+        if self.sample_gate_mode == "shared":
+            index = 0
+        elif self.sample_gate_mode == "grouped":
+            index = min(2, (int(layer_id) * 3) // self.num_layers)
+        else:
+            index = int(layer_id)
+        return values[:, index]
+
+    def _runtime_layer_scale(self, layer_id: int, reference: torch.Tensor) -> torch.Tensor:
+        intervention = self._runtime_intervention
+        if not isinstance(intervention, dict):
+            return reference.new_tensor(1.0)
+        mode = str(intervention.get("mode", ""))
+        if mode == "delta_zero":
+            return reference.new_tensor(0.0)
+        if mode != "layer_scales":
+            return reference.new_tensor(1.0)
+        scales: Sequence[float] = intervention.get("scales", ())
+        if len(scales) != self.num_layers:
+            raise ValueError(
+                "layer_scales requires exactly {} values".format(self.num_layers)
+            )
+        value = float(scales[int(layer_id)])
+        if not math.isfinite(value):
+            raise ValueError("layer_scales values must be finite")
+        return reference.new_tensor(value)
 
     def forward_layer(
         self,
@@ -101,18 +246,28 @@ class MeanConditionedDeepPromptResidual(nn.Module):
                 f"Deep Prompt residual layer_id={layer_id} outside [0,{self.num_layers - 1}]"
             )
         source, intervention_stats = self._effective_mean(mean)
-        raw_delta = source[:, None, :].expand(-1, self.prompt_len, -1)
-        gate = self.layer_gate[layer_id].to(device=raw_delta.device, dtype=raw_delta.dtype)
-        applied_delta = gate * raw_delta
-        intervention = self._runtime_intervention
-        if isinstance(intervention, dict) and str(intervention.get("mode", "")) == "delta_zero":
-            applied_delta = torch.zeros_like(applied_delta)
+        raw_delta = self._raw_delta(source, layer_id)
+        layer_gate = self.layer_gate[layer_id].to(
+            device=raw_delta.device, dtype=raw_delta.dtype
+        )
+        sample_gate = self._sample_gate(source, layer_id).to(
+            device=raw_delta.device, dtype=raw_delta.dtype
+        )
+        runtime_scale = self._runtime_layer_scale(layer_id, raw_delta)
+        effective_gate = layer_gate * sample_gate * runtime_scale
+        applied_delta = effective_gate[:, None, None] * raw_delta
         stats = {
             "layer_id": layer_id,
             "source_mu": source,
             "raw_delta": raw_delta,
             "applied_delta": applied_delta,
-            "gate": gate.expand(int(raw_delta.shape[0])),
+            "gate": effective_gate,
+            "layer_gate": layer_gate.expand(int(raw_delta.shape[0])),
+            "sample_gate": sample_gate,
+            "runtime_scale": runtime_scale.expand(int(raw_delta.shape[0])),
+            "content_mode": self.content_mode,
+            "sample_gate_mode": self.sample_gate_mode,
+            "sample_gate_input": self.sample_gate_input,
         }
         stats.update(intervention_stats)
         return applied_delta, stats

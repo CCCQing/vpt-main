@@ -1,0 +1,9 @@
+_BASE_: "E7-G3-sample-layerwise.yaml"
+OUTPUT_DIR: "output/b_series_experiments/E7-G3-fixed-input-control"
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "E7-G3-fixed-input-control"
+        SAMPLE_GATE_INPUT: "constant"

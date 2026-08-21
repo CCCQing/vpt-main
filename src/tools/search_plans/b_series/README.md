@@ -15,3 +15,7 @@ python src/tools/search_plans/b_series/run_prompt_distribution_series.py --metho
 ```
 
 Each task is single-GPU. Existing completed tasks are skipped; incomplete non-empty task directories are never overwritten.
+
+The additional experiments remain part of the B series and use the neutral atomic labels `E1` through `E7`. Their commands and validity contracts are defined in [B_SERIES_EXPERIMENT_PROTOCOL.md](B_SERIES_EXPERIMENT_PROTOCOL.md).
+
+After replay cells finish, `summarize_b_series_replays.py` enforces atomic-cell completeness and summarizes three Probe selections within each checkpoint before aggregating independent training seeds.

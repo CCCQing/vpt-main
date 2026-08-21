@@ -1,0 +1,11 @@
+_BASE_: "../baseline_rebuild/B-01-direct-mean-residual.yaml"
+OUTPUT_DIR: "output/b_series_experiments/E6-B1-slot"
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "E6-B1-slot-rank8"
+        CONTENT_MODE: "slot_low_rank"
+        SLOT_RANK: 8
+

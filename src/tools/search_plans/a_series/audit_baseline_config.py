@@ -229,8 +229,16 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
 
     if stage == "invalid":
         failures.append("prompt configuration is not one of A0/A1/A2/D")
+    if (
+        str(cfg.SOLVER.INIT_TRAINABLE_CHECKPOINT).strip()
+        and str(cfg.MODEL.WEIGHT_PATH).strip()
+    ):
+        failures.append(
+            "INIT_TRAINABLE_CHECKPOINT and MODEL.WEIGHT_PATH cannot both be set"
+        )
     if stage == "B":
         dist_cfg = cfg.MODEL.PROMPT.DISTRIBUTOR
+        residual_cfg = dist_cfg.DEEP_RESIDUAL
         if str(dist_cfg.SOURCE).lower() not in {
             "vit_cls_prepass",
             "vit_cls_prepass_constant",
@@ -246,6 +254,20 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
             failures.append("B-series direct-mean stage requires DEEP_RESIDUAL_ZERO=true")
         if not bool(cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_SWAP):
             failures.append("B-series direct-mean stage requires DEEP_RESIDUAL_SWAP=true")
+        if str(residual_cfg.CONTENT_MODE).lower() not in {"shared", "slot_low_rank"}:
+            failures.append("B-series residual CONTENT_MODE must be shared or slot_low_rank")
+        if int(residual_cfg.SLOT_RANK) <= 0:
+            failures.append("B-series residual SLOT_RANK must be positive")
+        if str(residual_cfg.SAMPLE_GATE_MODE).lower() not in {
+            "none", "shared", "grouped", "layerwise"
+        }:
+            failures.append("B-series residual SAMPLE_GATE_MODE is invalid")
+        if str(residual_cfg.SAMPLE_GATE_INPUT).lower() not in {
+            "residual_source", "constant"
+        }:
+            failures.append("B-series residual SAMPLE_GATE_INPUT is invalid")
+        if not 0.0 < float(residual_cfg.SAMPLE_GATE_INIT) < 1.0:
+            failures.append("B-series residual SAMPLE_GATE_INIT must lie in (0, 1)")
     if int(cfg.MODEL.PROMPT.NUM_TOKENS) != 16:
         failures.append("MODEL.PROMPT.NUM_TOKENS must be 16 for the current A/B-series protocol")
     if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
@@ -424,8 +446,20 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
     trainable = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     failures = []
 
-    if not any(name.startswith("r_similarity_head.prototype_proj") for name in trainable):
+    freeze_classifier = bool(
+        cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.FREEZE_CLASSIFIER
+    )
+    freeze_static_prompt = bool(
+        cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.FREEZE_STATIC_PROMPT
+    )
+    if not freeze_classifier and not any(
+        name.startswith("r_similarity_head.prototype_proj") for name in trainable
+    ):
         failures.append("R-similarity prototype projection is not trainable")
+    if freeze_classifier and any(
+        name.startswith("r_similarity_head.") for name in trainable
+    ):
+        failures.append("freeze-classifier config left classifier parameters trainable")
     if any("semantic_token" in name for name in trainable):
         failures.append("semantic-token parameters remain trainable")
     if any("attention_mediation" in name for name in trainable):
@@ -441,8 +475,10 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
         failures.append("A1 must train input prompt embeddings only")
     if stage == "A2" and (not prompt_names or not deep_names):
         failures.append("A2 must train both input and deep prompt embeddings")
-    if stage == "B" and (not prompt_names or not deep_names):
+    if stage == "B" and not freeze_static_prompt and (not prompt_names or not deep_names):
         failures.append("B-series must retain both static input and deep prompt embeddings")
+    if stage == "B" and freeze_static_prompt and (prompt_names or deep_names):
+        failures.append("freeze-static config left static Prompt parameters trainable")
     if stage == "B" and not any(
         "prompt_init_provider.stats_head" in name for name in trainable
     ):
@@ -463,7 +499,7 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
             "enc.transformer.prompt_embeddings",
             "enc.transformer.deep_prompt_embeddings",
             "enc.transformer.prompt_init_provider.stats_head",
-            "enc.transformer.deep_prompt_residual.layer_gate",
+            "enc.transformer.deep_prompt_residual.",
             "r_similarity_head.prototype_proj.",
         ),
     }

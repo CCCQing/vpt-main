@@ -1,0 +1,13 @@
+{
+  "format": "b_series_e7_preconditions_v1",
+  "E7": {
+    "eligible": false,
+    "max_gate_stage": "G1",
+    "checks": {
+      "bidirectional_nontrivial_response": false,
+      "predictable_without_test_leakage": false,
+      "pseudo_unseen_better_than_constant": false
+    },
+    "evidence_paths": []
+  }
+}

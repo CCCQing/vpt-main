@@ -1,0 +1,9 @@
+_BASE_: "../baseline_rebuild/B-01-direct-mean-residual.yaml"
+OUTPUT_DIR: "output/b_series_experiments/E5-B1-joint-matched"
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "E5-B1-joint-matched"
+

@@ -104,6 +104,7 @@ def deep_prompt_residual_metrics(trace: Any) -> Dict[str, float]:
     result: Dict[str, float] = {}
     ratios = []
     gates = []
+    sample_gates = []
     for item in trace:
         if not isinstance(item, Mapping):
             continue
@@ -115,6 +116,9 @@ def deep_prompt_residual_metrics(trace: Any) -> Dict[str, float]:
         raw = item.get("raw_delta")
         applied = item.get("applied_delta")
         gate = item.get("gate")
+        sample_gate = item.get("sample_gate")
+        layer_gate = item.get("layer_gate")
+        runtime_scale = item.get("runtime_scale")
         if torch.is_tensor(base):
             base_norm = float(base.detach().float().norm(dim=-1).mean().item())
             result[f"{prefix}.base_prompt_norm"] = base_norm
@@ -127,6 +131,39 @@ def deep_prompt_residual_metrics(trace: Any) -> Dict[str, float]:
             if raw.dim() == 3 and raw.shape[1] > 0:
                 result[f"{prefix}.raw_delta_slot_variance"] = float(
                     raw.detach().float().var(dim=1, unbiased=False).mean().item()
+                )
+                raw_value = raw.detach().float()
+                if str(item.get("content_mode", "shared")) == "shared":
+                    effective_rank = (
+                        raw_value.norm(dim=(-2, -1)) > 1.0e-12
+                    ).float()
+                else:
+                    gram = torch.matmul(raw_value, raw_value.transpose(-1, -2))
+                    eigenvalues = (
+                        torch.linalg.eigvalsh(gram)
+                        if hasattr(torch.linalg, "eigvalsh")
+                        else torch.symeig(gram, eigenvectors=False).eigenvalues
+                    )
+                    singular = eigenvalues.clamp_min(0.0).sqrt()
+                    singular = torch.where(
+                        singular
+                        > singular.max(dim=-1, keepdim=True).values.clamp_min(1.0e-12)
+                        * 1.0e-3,
+                        singular,
+                        torch.zeros_like(singular),
+                    )
+                    singular_total = singular.sum(dim=-1, keepdim=True)
+                    probability = singular / singular_total.clamp_min(1.0e-12)
+                    effective_rank = torch.exp(
+                        -(probability * probability.clamp_min(1.0e-12).log()).sum(dim=-1)
+                    )
+                    effective_rank = torch.where(
+                        singular_total.squeeze(-1) > 1.0e-12,
+                        effective_rank,
+                        torch.zeros_like(effective_rank),
+                    )
+                result[f"{prefix}.raw_delta_slot_effective_rank"] = float(
+                    effective_rank.mean().item()
                 )
             if raw.shape[0] > 1:
                 result[f"{prefix}.raw_delta_between_instance_variance"] = float(
@@ -144,12 +181,36 @@ def deep_prompt_residual_metrics(trace: Any) -> Dict[str, float]:
             gate_value = float(gate.detach().float().mean().item())
             result[f"{prefix}.gate"] = gate_value
             gates.append(gate_value)
+        if torch.is_tensor(layer_gate):
+            result[f"{prefix}.layer_gate"] = float(
+                layer_gate.detach().float().mean().item()
+            )
+        if torch.is_tensor(sample_gate):
+            sample_value = sample_gate.detach().float()
+            result[f"{prefix}.sample_gate_mean"] = float(sample_value.mean().item())
+            result[f"{prefix}.sample_gate_std"] = float(
+                sample_value.std(unbiased=False).item()
+            )
+            result[f"{prefix}.sample_gate_low_saturation_rate"] = float(
+                (sample_value <= 0.05).float().mean().item()
+            )
+            result[f"{prefix}.sample_gate_high_saturation_rate"] = float(
+                (sample_value >= 0.95).float().mean().item()
+            )
+            sample_gates.extend(sample_value.cpu().tolist())
+        if torch.is_tensor(runtime_scale):
+            result[f"{prefix}.runtime_scale"] = float(
+                runtime_scale.detach().float().mean().item()
+            )
     if ratios:
         result["layers_mean.applied_delta_to_base_ratio"] = float(np.mean(ratios))
         result["layers_max.applied_delta_to_base_ratio"] = float(np.max(ratios))
     if gates:
         result["layers_mean.gate"] = float(np.mean(gates))
         result["layers_max_abs.gate"] = float(np.max(np.abs(gates)))
+    if sample_gates:
+        result["layers_samples.sample_gate_mean"] = float(np.mean(sample_gates))
+        result["layers_samples.sample_gate_std"] = float(np.std(sample_gates))
     return result
 
 

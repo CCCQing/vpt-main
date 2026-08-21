@@ -1,0 +1,10 @@
+_BASE_: "E7-G1-sample-shared.yaml"
+OUTPUT_DIR: "output/b_series_experiments/E7-G3-sample-layerwise"
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "E7-G3-sample-layerwise"
+        SAMPLE_GATE_MODE: "layerwise"
+

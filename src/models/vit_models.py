@@ -116,6 +116,27 @@ class ViT(nn.Module):
             if deep
             else "static-shallow"
         )
+        residual_content_mode = (
+            str(
+                self.cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.CONTENT_MODE
+            ).lower()
+            if residual
+            else "none"
+        )
+        residual_sample_gate_mode = (
+            str(
+                self.cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.SAMPLE_GATE_MODE
+            ).lower()
+            if residual
+            else "none"
+        )
+        residual_sample_gate_input = (
+            str(
+                self.cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.SAMPLE_GATE_INPUT
+            ).lower()
+            if residual
+            else "none"
+        )
 
         def object_state(
             object_id,
@@ -146,6 +167,9 @@ class ViT(nn.Module):
                 "supports_intervention": True,
                 "reference_definition": "same_checkpoint_unperturbed_forward",
                 "downstream_consumer": downstream_consumer,
+                "residual_content_mode": residual_content_mode,
+                "sample_gate_mode": residual_sample_gate_mode,
+                "sample_gate_input": residual_sample_gate_input,
             }
 
         objects = []
@@ -314,6 +338,13 @@ class ViT(nn.Module):
             if not any(key in k for key in trainable_keys):
                 p.requires_grad = False
 
+        if bool(cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.FREEZE_STATIC_PROMPT):
+            for name, parameter in self.enc.named_parameters():
+                if name.endswith("prompt_embeddings") or name.endswith(
+                    "deep_prompt_embeddings"
+                ):
+                    parameter.requires_grad = False
+
         # 鍙€夛細鎵撳嵃鍙缁冨弬鏁扮粺璁★紝渚夸簬纭鍐荤粨绛栫暐鏄惁绗﹀悎棰勬湡
     def _log_trainable_parameters(self):
         log_trainable_parameters(self, logger, max_examples_per_group=10)
@@ -345,6 +376,11 @@ class ViT(nn.Module):
                 cfg=self.cfg,
             )
         self.r_similarity_head = head.to(device)
+        if bool(
+            self.cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.FREEZE_CLASSIFIER
+        ):
+            for parameter in self.r_similarity_head.parameters():
+                parameter.requires_grad = False
         if self.cfg.MODEL.LOG_TRAINABLE or self.cfg.SOLVER.DBG_TRAINABLE:
             self._log_trainable_parameters()
 

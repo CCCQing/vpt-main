@@ -1,0 +1,10 @@
+_BASE_: "E5-B1-freeze.yaml"
+OUTPUT_DIR: "output/b_series_experiments/E5-B2-freeze"
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      SOURCE: "vit_cls_prepass_constant"
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "E5-B2-freeze"
+

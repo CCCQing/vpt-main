@@ -1,0 +1,11 @@
+_BASE_: "../baseline_rebuild/B-01-direct-mean-residual.yaml"
+OUTPUT_DIR: "output/b_series_experiments/E7-G1-sample-shared"
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "E7-G1-sample-shared"
+        SAMPLE_GATE_MODE: "shared"
+        SAMPLE_GATE_INPUT: "residual_source"
+
