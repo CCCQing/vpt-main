@@ -140,6 +140,18 @@ def validate_experiment_interventions_and_geometry() -> None:
     )
     assert tuple(geometry["residual_static_cosine"].shape) == (5, 1)
     assert np.allclose(geometry["slot_shift_effective_rank"], 1.0)
+    rank_one = torch.randn(32, 1, 768).repeat(1, 16, 1) * 1.0e4
+    stress_geometry = residual_static_geometry(
+        [
+            {
+                "layer_id": 0,
+                "base_prompt": torch.randn_like(rank_one),
+                "applied_delta": rank_one,
+            }
+        ]
+    )
+    assert np.isfinite(stress_geometry["slot_shift_effective_rank"]).all()
+    assert np.allclose(stress_geometry["slot_shift_effective_rank"], 1.0)
     grouped = summarize_geometry(
         geometry,
         groups={"first_two": np.asarray([1, 1, 0, 0, 0], dtype=bool)},

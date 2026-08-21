@@ -38,7 +38,7 @@ class MeanConditionedDeepPromptResidual(nn.Module):
     The historical ``shared`` mode repeats ``mu(x)`` over Prompt slots and is
     parameter-compatible with the original B1 implementation.  Optional
     ``slot_low_rank`` content and sample-adaptive gates are constructed only by
-    explicit follow-up configs.  A zero layer gate remains exactly equivalent
+    explicit experiment configs.  A zero layer gate remains exactly equivalent
     to the static Deep Prompt baseline and consumes no sampling RNG.
     """
 

@@ -269,7 +269,7 @@ def main() -> None:
     _write_json(output_dir / "b_series_replay_aggregate.json", payload)
     _write_csv(output_dir / "b_series_replay_scientific_summary.csv", rows)
     print(
-        "B1 follow-up aggregate status={} valid_cells={}/{} metrics={}".format(
+        "B-series aggregate status={} valid_cells={}/{} metrics={}".format(
             payload["status"], len(cells), expected_count, len(rows)
         )
     )

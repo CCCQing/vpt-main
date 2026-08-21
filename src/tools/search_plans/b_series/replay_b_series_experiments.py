@@ -115,7 +115,7 @@ def _load_cfg(run_dir: Path, batch_size: Optional[int], num_workers: int):
         cfg.DATA.BATCH_SIZE = max(1, int(batch_size))
     cfg.freeze()
     if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
-        raise ValueError("B1 follow-up replay requires final_gzsl")
+        raise ValueError("B-series replay requires final_gzsl")
     if bool(cfg.MODEL.SEMANTIC_TOKENS.ENABLE):
         raise ValueError("B-series replay expects the semantic-token-free protocol")
     if not bool(cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ENABLE):
@@ -581,7 +581,7 @@ def main() -> None:
         raise FileNotFoundError(str(source_run))
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(
-            "refusing to mix B1 follow-up replay into non-empty output: {}".format(
+            "refusing to mix B-series replay into non-empty output: {}".format(
                 output_dir
             )
         )
@@ -805,7 +805,7 @@ def main() -> None:
         summary["status"] = "completed" if summary["valid"] else "invalid"
         _atomic_json(output_dir / "b_series_replay_summary.json", _json_safe(summary))
         if not summary["valid"]:
-            raise RuntimeError("B1 follow-up replay completed with invalid conditions")
+            raise RuntimeError("B-series replay completed with invalid conditions")
     except Exception:
         _atomic_json(
             output_dir / "b_series_replay_failure.json",

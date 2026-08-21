@@ -41,26 +41,39 @@ def layer_scales(
 
 
 def _slot_effective_rank(values: torch.Tensor, eps: float) -> torch.Tensor:
-    gram = torch.matmul(values, values.transpose(-1, -2))
-    eigenvalues = (
-        torch.linalg.eigvalsh(gram)
-        if hasattr(torch.linalg, "eigvalsh")
-        else torch.symeig(gram, eigenvectors=False).eigenvalues
+    if values.dim() != 3:
+        raise ValueError("slot effective rank expects [B,P,D]")
+
+    # This is a detached monitoring statistic over a small P x P matrix.  CUDA
+    # MAGMA can fail to converge for the nearly rank-one Gram matrices produced
+    # by shared residuals, especially in the server's older PyTorch build.
+    # Compute the eigenspectrum on CPU in float64 so the diagnostic cannot abort
+    # an otherwise valid replay; no model tensor or prediction is modified.
+    matrix = values.detach().to(device="cpu", dtype=torch.float64).numpy()
+    if not np.isfinite(matrix).all():
+        raise ValueError("slot effective rank received non-finite residual values")
+    gram = np.matmul(matrix, np.swapaxes(matrix, -1, -2))
+    gram = 0.5 * (gram + np.swapaxes(gram, -1, -2))
+    try:
+        eigenvalues = np.linalg.eigvalsh(gram)
+        singular = np.sqrt(np.clip(eigenvalues, 0.0, None))
+    except np.linalg.LinAlgError:
+        # Direct SVD avoids squaring the condition number if LAPACK still
+        # rejects an exceptionally ill-conditioned Gram matrix.
+        singular = np.linalg.svd(matrix, full_matrices=False, compute_uv=False)
+
+    maximum = np.maximum(singular.max(axis=-1, keepdims=True), float(eps))
+    singular = np.where(singular > maximum * 1.0e-3, singular, 0.0)
+    total = singular.sum(axis=-1, keepdims=True)
+    probability = singular / np.maximum(total, float(eps))
+    entropy_terms = np.where(
+        probability > 0.0,
+        probability * np.log(np.maximum(probability, float(eps))),
+        0.0,
     )
-    singular = eigenvalues.clamp_min(0.0).sqrt()
-    singular = torch.where(
-        singular
-        > singular.max(dim=-1, keepdim=True).values.clamp_min(float(eps))
-        * 1.0e-3,
-        singular,
-        torch.zeros_like(singular),
-    )
-    total = singular.sum(dim=-1, keepdim=True)
-    probability = singular / total.clamp_min(float(eps))
-    rank = torch.exp(
-        -(probability * probability.clamp_min(float(eps)).log()).sum(dim=-1)
-    )
-    return torch.where(total.squeeze(-1) > float(eps), rank, torch.zeros_like(rank))
+    rank = np.exp(-entropy_terms.sum(axis=-1))
+    rank = np.where(total[:, 0] > float(eps), rank, 0.0)
+    return torch.from_numpy(rank.astype(np.float32, copy=False))
 
 
 def residual_static_geometry(
