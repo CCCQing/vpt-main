@@ -1,0 +1,10 @@
+_BASE_: "B3-R2I-class-consistent.yaml"
+OUTPUT_DIR: "output/b3_series/B3-R2N-class-consistent-control"
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      SOURCE: "vit_cls_prepass_constant"
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "B3-R2N-class-consistent-control"
+

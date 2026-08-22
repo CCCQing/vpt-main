@@ -1,0 +1,27 @@
+_BASE_: "../baseline_rebuild/B-01-direct-mean-residual.yaml"
+OUTPUT_DIR: "output/b3_series/B3-R1I-bounded-deep"
+
+DATA:
+  XLSA:
+    PROTOCOL_MODE: "b3_pseudo_gzsl"
+    B3_PSEUDO_MANIFEST: ""
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      SOURCE: "vit_cls_prepass"
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "B3-R1I-bounded-deep"
+        AMPLITUDE_MODE: "bounded_ratio"
+        ACTIVE_LAYERS: [8, 9, 10, 11]
+        BOUNDED_MAX_RATIO: 0.25
+        BOUNDED_INIT_RATIO: 0.125
+        CONTENT_MODE: "shared"
+        SAMPLE_GATE_MODE: "none"
+        FREEZE_STATIC_PROMPT: true
+        FREEZE_CLASSIFIER: true
+
+SOLVER:
+  B3_CLASS_CONSISTENCY:
+    ENABLE: false
+

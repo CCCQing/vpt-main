@@ -1,0 +1,15 @@
+_BASE_: "../baseline_rebuild/A-04-A2-vpt-deep-ce.yaml"
+OUTPUT_DIR: "output/b3_series/B3-P0-A2-pseudo"
+
+# The runner must inject one generated manifest path. Leaving it empty makes a
+# direct, accidental launch fail before data are read.
+DATA:
+  XLSA:
+    PROTOCOL_MODE: "b3_pseudo_gzsl"
+    B3_PSEUDO_MANIFEST: ""
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "B3-P0-A2-pseudo"

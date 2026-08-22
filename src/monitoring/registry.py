@@ -22,6 +22,13 @@ def _always(_: Any) -> bool:
     return True
 
 
+def _gzsl_protocol_active(cfg: Any) -> bool:
+    return str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() in {
+        "final_gzsl",
+        "b3_pseudo_gzsl",
+    }
+
+
 def _prompt_distribution_source_active(cfg: Any) -> bool:
     return bool(cfg.MODEL.PROMPT.ENABLE) and (
         str(cfg.MODEL.PROMPT.INIT_SOURCE).lower() == "distributor_mean"
@@ -65,6 +72,12 @@ def _auxiliary_loss_source_active(cfg: Any) -> bool:
         cfg.SOLVER.LOSS_ATTR_WEIGHT,
         cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT,
         cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT,
+        cfg.SOLVER.B3_CLASS_CONSISTENCY.INTRA_WEIGHT
+        if bool(cfg.SOLVER.B3_CLASS_CONSISTENCY.ENABLE)
+        else 0.0,
+        cfg.SOLVER.B3_CLASS_CONSISTENCY.INTER_WEIGHT
+        if bool(cfg.SOLVER.B3_CLASS_CONSISTENCY.ENABLE)
+        else 0.0,
     )
     return any(float(value) > 0.0 for value in scalar_weights)
 
@@ -231,7 +244,7 @@ MONITOR_SPECS: Tuple[MonitorSpec, ...] = (
         description="compact joint-space bias, decision quality, and error confidence",
         source_requirement="completed joint-logit evaluator pass",
         is_requested=lambda cfg: bool(cfg.MONITOR.PREDICTION_HEALTH.ENABLE),
-        is_source_active=lambda cfg: str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "final_gzsl",
+        is_source_active=_gzsl_protocol_active,
     ),
     MonitorSpec(
         namespace="class_error",
@@ -252,7 +265,7 @@ MONITOR_SPECS: Tuple[MonitorSpec, ...] = (
         source_requirement="stable sample ids, consecutive full-split evaluator passes, and single-GPU/single-shard execution",
         is_requested=lambda cfg: bool(cfg.MONITOR.PREDICTION_TRANSITION_TRAJECTORY.ENABLE),
         is_source_active=lambda cfg: (
-            str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "final_gzsl"
+            _gzsl_protocol_active(cfg)
             and int(cfg.NUM_GPUS) == 1
             and int(cfg.NUM_SHARDS) == 1
         ),
@@ -262,10 +275,10 @@ MONITOR_SPECS: Tuple[MonitorSpec, ...] = (
         cadence="epoch",
         artifact="epoch_csv",
         sampling="every_epoch",
-        description="compact fixed-grid final_gzsl bias-gap and curve-quality summary",
+        description="compact fixed-grid GZSL bias-gap and curve-quality summary",
         source_requirement="same-epoch test_seen and test_unseen joint logits",
         is_requested=lambda cfg: bool(cfg.MONITOR.CALIBRATION.ENABLE),
-        is_source_active=lambda cfg: str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "final_gzsl",
+        is_source_active=_gzsl_protocol_active,
     ),
     MonitorSpec(
         namespace="checkpoint_selection_debug",
@@ -275,7 +288,7 @@ MONITOR_SPECS: Tuple[MonitorSpec, ...] = (
         description="historical independent-best upper bound, never a formal result",
         source_requirement="same run has seen and unseen evaluation history",
         is_requested=_always,
-        is_source_active=lambda cfg: str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "final_gzsl",
+        is_source_active=_gzsl_protocol_active,
     ),
     MonitorSpec(
         namespace="monitor_initialized",

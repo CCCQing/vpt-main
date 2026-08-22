@@ -68,7 +68,7 @@ def _dataset_record(dataset) -> Dict[str, object]:
     class_attributes = getattr(dataset, "class_attributes", None)
     if class_attributes is None:
         raise ValueError("Dataset manifest requires class_attributes.")
-    return {
+    record = {
         "dataset_name": str(dataset.name),
         "protocol_mode": str(dataset.protocol_mode),
         "split": str(dataset.split_name),
@@ -82,6 +82,12 @@ def _dataset_record(dataset) -> Dict[str, object]:
             "sha256": _tensor_sha256(class_attributes),
         },
     }
+    b3_path = getattr(dataset, "b3_pseudo_manifest_path", None)
+    if b3_path:
+        record["b3_pseudo_manifest"] = {
+            "sha256": str(dataset.b3_pseudo_manifest_sha256),
+        }
+    return record
 
 
 def _assert_shared_global_space(dataset_records: Mapping[str, Dict[str, object]]) -> None:
@@ -112,6 +118,17 @@ def _atomic_json_dump(path: str, payload: Dict[str, object]) -> None:
     os.replace(temporary_path, path)
 
 
+def _atomic_copy_file(source: str, target: str) -> None:
+    with open(source, "rb") as handle:
+        data = handle.read()
+    directory = os.path.dirname(target)
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = "{}.tmp.{}".format(target, os.getpid())
+    with open(temporary_path, "wb") as handle:
+        handle.write(data)
+    os.replace(temporary_path, target)
+
+
 def write_xlsa_dataset_manifest(cfg, datasets: Mapping[str, Optional[object]]) -> Optional[str]:
     if get_rank() != 0:
         return None
@@ -137,6 +154,21 @@ def write_xlsa_dataset_manifest(cfg, datasets: Mapping[str, Optional[object]]) -
         },
         "datasets": records,
     }
+    b3_manifest_path = str(cfg.DATA.XLSA.B3_PSEUDO_MANIFEST).strip()
+    if b3_manifest_path:
+        manifest["source_files"]["b3_pseudo_manifest"] = _file_record(
+            b3_manifest_path
+        )
+        portable_path = os.path.join(
+            str(cfg.OUTPUT_DIR), "b3_pseudo_manifest.json"
+        )
+        _atomic_copy_file(b3_manifest_path, portable_path)
+        if _sha256_file(portable_path) != _sha256_file(b3_manifest_path):
+            raise RuntimeError("portable B3 manifest copy failed hash verification")
+        manifest["portable_b3_pseudo_manifest"] = {
+            "path": "b3_pseudo_manifest.json",
+            "sha256": _sha256_file(portable_path),
+        }
     manifest_path = os.path.join(str(cfg.OUTPUT_DIR), "dataset_manifest.json")
     _atomic_json_dump(manifest_path, manifest)
     return manifest_path

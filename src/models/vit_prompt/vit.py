@@ -785,6 +785,22 @@ class PromptedTransformer(Transformer):
                     sample_gate_init=float(
                         self.deep_residual_cfg.SAMPLE_GATE_INIT
                     ),
+                    amplitude_mode=str(
+                        self.deep_residual_cfg.AMPLITUDE_MODE
+                    ),
+                    active_layers=tuple(
+                        int(value)
+                        for value in self.deep_residual_cfg.ACTIVE_LAYERS
+                    ),
+                    bounded_max_ratio=float(
+                        self.deep_residual_cfg.BOUNDED_MAX_RATIO
+                    ),
+                    bounded_init_ratio=float(
+                        self.deep_residual_cfg.BOUNDED_INIT_RATIO
+                    ),
+                    bounded_norm_eps=float(
+                        self.deep_residual_cfg.BOUNDED_NORM_EPS
+                    ),
                 )
 
         if self.attention_mediation_enable:
@@ -980,6 +996,7 @@ class PromptedTransformer(Transformer):
         delta, residual_stats = self.deep_prompt_residual.forward_layer(
             self._current_deep_residual_mean,
             int(layer_id),
+            base_prompt=base_prompt,
         )
         if tuple(delta.shape) != tuple(base_prompt.shape):
             raise RuntimeError(

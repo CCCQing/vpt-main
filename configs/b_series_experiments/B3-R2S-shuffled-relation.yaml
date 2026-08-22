@@ -1,0 +1,15 @@
+_BASE_: "B3-R2I-class-consistent.yaml"
+OUTPUT_DIR: "output/b3_series/B3-R2S-shuffled-relation"
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "B3-R2S-shuffled-relation"
+
+SOLVER:
+  B3_CLASS_CONSISTENCY:
+    RELATION_MODE: "sample_hash"
+    SAMPLE_HASH_SEED: 73129
+    SAMPLE_HASH_GROUPS: 200
+

@@ -487,6 +487,24 @@ class Trainer():
     def _model_ref(model):
         return model.module if hasattr(model, "module") else model
 
+    def _b3_pseudo_manifest_identity(self):
+        """Bind pseudo-GZSL checkpoints to the exact class/sample partition."""
+        if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "b3_pseudo_gzsl":
+            return None
+        manifest_path = os.path.abspath(
+            os.path.expanduser(str(self.cfg.DATA.XLSA.B3_PSEUDO_MANIFEST).strip())
+        )
+        if not os.path.isfile(manifest_path):
+            raise FileNotFoundError(
+                "b3_pseudo_gzsl requires DATA.XLSA.B3_PSEUDO_MANIFEST: {}".format(
+                    manifest_path
+                )
+            )
+        return {
+            "path": manifest_path,
+            "sha256": checkpoint_sha256(manifest_path),
+        }
+
     def _load_trainable_initialization_checkpoint(self):
         checkpoint_path = str(
             self.cfg.SOLVER.INIT_TRAINABLE_CHECKPOINT
@@ -536,6 +554,19 @@ class Trainer():
                     checkpoint_protocol, self.cfg.DATA.XLSA.PROTOCOL_MODE
                 )
             )
+        current_b3_manifest = self._b3_pseudo_manifest_identity()
+        checkpoint_b3_manifest = payload.get("b3_pseudo_manifest")
+        if current_b3_manifest is not None:
+            if not isinstance(checkpoint_b3_manifest, dict):
+                raise ValueError(
+                    "pseudo-GZSL initialization checkpoint does not record its B3 manifest"
+                )
+            if str(checkpoint_b3_manifest.get("sha256", "")) != str(
+                current_b3_manifest["sha256"]
+            ):
+                raise ValueError(
+                    "pseudo-GZSL initialization checkpoint uses a different B3 manifest"
+                )
         state = payload.get("model_state")
         if not isinstance(state, dict) or not state:
             raise ValueError(
@@ -584,6 +615,7 @@ class Trainer():
             "checkpoint_seed": checkpoint_seed,
             "run_seed": self.cfg.SEED,
             "protocol_mode": checkpoint_protocol,
+            "b3_pseudo_manifest": current_b3_manifest,
             "loaded_tensor_count": len(loaded_names),
             "new_trainable_parameter_names": new_trainable,
             "allowed_missing_prefixes": list(allowed_missing_prefixes),
@@ -709,19 +741,19 @@ class Trainer():
                 raise ValueError("val_unseen is only valid under dev protocol, got '{}'".format(protocol_mode))
             return "dev_unseen"
         if split == "test_seen":
-            if protocol_mode != "final_gzsl":
-                raise ValueError("test_seen is only valid under final_gzsl protocol, got '{}'".format(protocol_mode))
+            if protocol_mode not in {"final_gzsl", "b3_pseudo_gzsl"}:
+                raise ValueError("test_seen is only valid under a GZSL protocol, got '{}'".format(protocol_mode))
             return "gzsl_seen"
         if split == "test_unseen":
             if protocol_mode == "final_zsl":
                 return "zsl_unseen"
-            if protocol_mode == "final_gzsl":
+            if protocol_mode in {"final_gzsl", "b3_pseudo_gzsl"}:
                 return "gzsl_unseen"
-            raise ValueError("test_unseen is only valid under final_zsl/final_gzsl, got '{}'".format(protocol_mode))
+            raise ValueError("test_unseen is only valid under final_zsl/GZSL, got '{}'".format(protocol_mode))
         if split == "train_eval_seen":
-            if protocol_mode != "final_gzsl":
+            if protocol_mode not in {"final_gzsl", "b3_pseudo_gzsl"}:
                 raise ValueError(
-                    "train_eval_seen is only valid under final_gzsl, got '{}'".format(
+                    "train_eval_seen is only valid under a GZSL protocol, got '{}'".format(
                         protocol_mode
                     )
                 )
@@ -1127,6 +1159,27 @@ class Trainer():
             return ""
         return "\n\t[graph-prob-prior-monitor] " + " ".join(parts)
 
+    def _optimizer_lr_metrics(self):
+        groups = list(self.optimizer.param_groups)
+        if not groups:
+            return {"lr": None}
+        normalized = [
+            float(group["lr"]) / float(group.get("lr_multiplier", 1.0))
+            for group in groups
+        ]
+        base_lr = float(sum(normalized) / len(normalized))
+        if max(normalized) - min(normalized) > 1.0e-12:
+            raise RuntimeError("optimizer groups no longer share one base LR schedule")
+        return {
+            "lr": base_lr,
+            "lr_group_min": min(float(group["lr"]) for group in groups),
+            "lr_group_max": max(float(group["lr"]) for group in groups),
+            "static_prompt_lr": base_lr
+            * float(self.cfg.SOLVER.STATIC_PROMPT_LR_MULTIPLIER),
+            "classifier_lr": base_lr
+            * float(self.cfg.SOLVER.CLASSIFIER_LR_MULTIPLIER),
+        }
+
     def _log_train_loader_summary(self, protocol_name: str, train_loader, total_data: int, log_interval: int) -> None:
         dataset = getattr(train_loader, "dataset", None)
         try:
@@ -1212,12 +1265,11 @@ class Trainer():
         if not self.monitor_manager.should_sample_step("train"):
             return
         loss_value = float(train_loss.detach().item()) if torch.is_tensor(train_loss) else float(train_loss)
+        train_metrics = self._optimizer_lr_metrics()
+        train_metrics["loss"] = loss_value
         self.monitor_manager.record_step(
             "train",
-            {
-                "loss": loss_value,
-                "lr": float(self.optimizer.param_groups[0]["lr"]) if self.optimizer.param_groups else None,
-            },
+            train_metrics,
         )
         train_debug = train_debug_metrics(self._last_train_debug)
         self.monitor_manager.record_step("train_debug", train_debug)
@@ -2177,7 +2229,15 @@ class Trainer():
         return inputs, labels, attributes
 
     ## 7. ================================main entry===============================
-    def forward_one_batch(self, inputs, targets, is_train, attributes=None, dataset=None):
+    def forward_one_batch(
+        self,
+        inputs,
+        targets,
+        is_train,
+        attributes=None,
+        dataset=None,
+        sample_ids=None,
+    ):
         """Train a single (full) epoch on the model using the given data loader.
        这是 Trainer 最核心的单 batch 执行函数。
 
@@ -2383,6 +2443,11 @@ class Trainer():
                 # 属性重建辅助损失使用 batch 真实类别属性 a_y 作为监督目标。
                 # attributes 来自 xlsa_dataset.__getitem__ 返回的 class_attributes[label]。
                 "target_attributes": attributes.to(self.device, non_blocking=True).float() if torch.is_tensor(attributes) else None,
+                "sample_ids": (
+                    [str(value) for value in list(sample_ids)]
+                    if sample_ids is not None
+                    else None
+                ),
             }
             # 常规分类损失（如 SoftmaxLoss），只需 outputs / targets / class_weights。
             loss = self.cls_criterion(
@@ -2663,7 +2728,7 @@ class Trainer():
         if hasattr(sampler, "set_epoch"):
             sampler.set_epoch(int(epoch))
 
-        lr = self.optimizer.param_groups[0]["lr"] if self.optimizer.param_groups else 0.0
+        lr = self._optimizer_lr_metrics()["lr"] or 0.0
         logger.info("Training {} / {} epoch, with learning rate {}".format(epoch + 1, effective_total_epoch, lr))
 
         self.model.train()
@@ -2694,6 +2759,11 @@ class Trainer():
                     True,
                     attributes=attributes,
                     dataset=train_loader.dataset,
+                    sample_ids=(
+                        input_data.get("sample_id")
+                        if isinstance(input_data, dict)
+                        else None
+                    ),
                 )
 
                 losses.update(train_loss.item(), X.shape[0])
@@ -2768,18 +2838,23 @@ class Trainer():
             global_step=int(self._trace_global_step),
             graph_prob_prior_forward=int(self._graph_prob_prior_forward),
         )
+        train_epoch_metrics = {
+            "loss": epoch_metrics["loss"],
+            "batch_time_sec": epoch_metrics["batch_time_sec"],
+            "data_time_sec": epoch_metrics["data_time_sec"],
+            **self._optimizer_lr_metrics(),
+        }
         self.monitor_manager.record_epoch(
             "train",
             "train_epoch",
-            {
-                "loss": epoch_metrics["loss"],
-                "batch_time_sec": epoch_metrics["batch_time_sec"],
-                "data_time_sec": epoch_metrics["data_time_sec"],
-                "lr": float(self.optimizer.param_groups[0]["lr"]) if self.optimizer.param_groups else None,
-            },
+            train_epoch_metrics,
             reducer={
                 "loss": "sample_mean",
                 "lr": "last",
+                "lr_group_min": "last",
+                "lr_group_max": "last",
+                "static_prompt_lr": "last",
+                "classifier_lr": "last",
                 "batch_time_sec": "mean",
                 "data_time_sec": "mean",
             },
@@ -7842,7 +7917,8 @@ class Trainer():
                 continue
             candidate_class_ids = (
                 list(dataset.seen_classes) + list(dataset.unseen_classes)
-                if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "final_gzsl"
+                if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower()
+                in {"final_gzsl", "b3_pseudo_gzsl"}
                 else list(dataset.eval_local_classes)
             )
             manifest = build_probe_manifest(
@@ -10126,8 +10202,11 @@ class Trainer():
         cfg = self.cfg.MONITOR.MILESTONE_PROBE
         if not bool(cfg.ENABLE):
             return []
-        if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
-            raise ValueError("MONITOR.MILESTONE_PROBE is only supported for final_gzsl")
+        if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower() not in {
+            "final_gzsl",
+            "b3_pseudo_gzsl",
+        }:
+            raise ValueError("MONITOR.MILESTONE_PROBE requires a GZSL protocol")
         if int(self.cfg.NUM_GPUS) != 1 or int(self.cfg.NUM_SHARDS) != 1:
             raise ValueError(
                 "MONITOR.MILESTONE_PROBE currently requires single-GPU, single-shard execution"
@@ -10155,19 +10234,29 @@ class Trainer():
     def _trainable_model_state(self):
         model_ref = self._model_ref(self.model)
         trainable_names = [name for name, param in model_ref.named_parameters() if param.requires_grad]
+        auxiliary_names = (
+            [str(name) for name in model_ref.b3_checkpoint_state_names()]
+            if hasattr(model_ref, "b3_checkpoint_state_names")
+            else []
+        )
+        # A frozen tensor can still be part of the inherited experiment state.
+        # R1/R2 must carry P0's static Prompt/classifier into R3 even though
+        # those tensors were intentionally excluded from their optimizers.
+        auxiliary_names.extend(str(name) for name in self._frozen_reference_state)
         state = model_ref.state_dict()
+        checkpoint_names = list(dict.fromkeys(trainable_names + auxiliary_names))
         trainable_state = {
             name: state[name].detach().cpu()
-            for name in trainable_names
+            for name in checkpoint_names
             if name in state
         }
-        missing = sorted(set(trainable_names).difference(trainable_state))
+        missing = sorted(set(checkpoint_names).difference(trainable_state))
         if missing:
             raise RuntimeError("Trainable checkpoint is missing model state keys: {}".format(missing[:20]))
-        return trainable_names, trainable_state
+        return trainable_names, auxiliary_names, trainable_state
 
     def _save_trainable_final_checkpoint(self, total_epoch):
-        trainable_names, trainable_state = self._trainable_model_state()
+        trainable_names, auxiliary_names, trainable_state = self._trainable_model_state()
 
         checkpoint_name = str(self.cfg.SOLVER.TRAINABLE_FINAL_CHECKPOINT_NAME).strip()
         if not checkpoint_name or os.path.basename(checkpoint_name) != checkpoint_name:
@@ -10179,9 +10268,11 @@ class Trainer():
                 "format": "vpt_trainable_v1",
                 "model_state": trainable_state,
                 "trainable_parameter_names": trainable_names,
+                "auxiliary_state_names": auxiliary_names,
                 "seed": int(self.cfg.SEED) if self.cfg.SEED is not None else None,
                 "cell_id": str(self.cfg.SOLVER.STAGE2_CHECKPOINT_CELL_ID),
                 "protocol_mode": str(self.cfg.DATA.XLSA.PROTOCOL_MODE),
+                "b3_pseudo_manifest": self._b3_pseudo_manifest_identity(),
                 "total_epoch": int(total_epoch),
                 "config": str(self.cfg),
             },
@@ -10196,7 +10287,7 @@ class Trainer():
         return checkpoint_path
 
     def _save_trainable_milestone_checkpoint(self, checkpoint_epoch, total_epoch):
-        trainable_names, trainable_state = self._trainable_model_state()
+        trainable_names, auxiliary_names, trainable_state = self._trainable_model_state()
         checkpoint_dir = os.path.join(str(self.cfg.OUTPUT_DIR), "milestone_checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
         checkpoint_path = os.path.join(
@@ -10207,9 +10298,11 @@ class Trainer():
                 "format": "vpt_trainable_milestone_v1",
                 "model_state": trainable_state,
                 "trainable_parameter_names": trainable_names,
+                "auxiliary_state_names": auxiliary_names,
                 "seed": int(self.cfg.SEED) if self.cfg.SEED is not None else None,
                 "cell_id": str(self.cfg.SOLVER.STAGE2_CHECKPOINT_CELL_ID),
                 "protocol_mode": str(self.cfg.DATA.XLSA.PROTOCOL_MODE),
+                "b3_pseudo_manifest": self._b3_pseudo_manifest_identity(),
                 "checkpoint_epoch": int(checkpoint_epoch),
                 "planned_total_epoch": int(total_epoch),
                 "checkpoint_selection_rule": "predeclared_training_milestone",

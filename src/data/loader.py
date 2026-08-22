@@ -131,8 +131,11 @@ def construct_trainval_loader(cfg):
 
 
 def construct_train_eval_loader(cfg):
-    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
-        raise ValueError("train-eval monitoring is only defined for final_gzsl")
+    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() not in {
+        "final_gzsl",
+        "b3_pseudo_gzsl",
+    }:
+        raise ValueError("train-eval monitoring is only defined for GZSL protocols")
     return _construct_loader(
         cfg=cfg,
         split="trainval",

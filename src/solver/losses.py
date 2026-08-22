@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import hashlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -512,6 +513,125 @@ class PromptKLAuxLoss(nn.Module):
         return _compute_prompt_kl_aux_loss(kwargs)
 
 
+class B3ClassConsistencyAuxLoss(nn.Module):
+    def __init__(self, cfg=None):
+        super().__init__()
+        self.name = "b3_class_consistency_loss"
+        self.requires_affinity_aux = False
+        self.cfg = cfg.SOLVER.B3_CLASS_CONSISTENCY
+        self.intra_weight = float(self.cfg.INTRA_WEIGHT)
+        self.inter_weight = float(self.cfg.INTER_WEIGHT)
+        self._last_loss_stats: Dict[str, float] = {}
+        if self.intra_weight < 0.0 or self.inter_weight < 0.0:
+            raise ValueError("B3 class-consistency weights must be non-negative")
+        if self.intra_weight + self.inter_weight <= 0.0:
+            raise ValueError(
+                "enabled B3 class consistency requires a positive loss weight"
+            )
+        if str(self.cfg.RELATION_MODE).lower() not in {
+            "true_class",
+            "sample_hash",
+        }:
+            raise ValueError(
+                "B3 class-consistency RELATION_MODE must be true_class or sample_hash"
+            )
+        if int(self.cfg.SAMPLE_HASH_GROUPS) <= 1:
+            raise ValueError("B3 SAMPLE_HASH_GROUPS must be greater than one")
+
+    @property
+    def weight(self) -> float:
+        return 1.0
+
+    def _group_ids(self, targets_global, sample_ids, device):
+        mode = str(self.cfg.RELATION_MODE).lower()
+        if mode == "true_class":
+            if targets_global is None:
+                raise RuntimeError(
+                    "B3 true_class relation requires global training targets"
+                )
+            return torch.as_tensor(
+                targets_global, device=device, dtype=torch.long
+            ).reshape(-1)
+        if sample_ids is None:
+            raise RuntimeError(
+                "B3 sample_hash relation control requires training sample_ids"
+            )
+        identifiers = [str(value) for value in list(sample_ids)]
+        groups = []
+        for identifier in identifiers:
+            digest = hashlib.sha256(
+                "{}|{}".format(
+                    int(self.cfg.SAMPLE_HASH_SEED), identifier
+                ).encode("utf-8")
+            ).digest()
+            groups.append(
+                int.from_bytes(digest[:8], byteorder="little")
+                % int(self.cfg.SAMPLE_HASH_GROUPS)
+            )
+        return torch.as_tensor(groups, device=device, dtype=torch.long)
+
+    def forward(
+        self,
+        pred_logits,
+        targets,
+        per_cls_weights,
+        kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        if not isinstance(kwargs, dict) or "model" not in kwargs:
+            raise RuntimeError("B3 class consistency requires loss kwargs and model")
+        logits, _ = _extract_logits_and_aux(pred_logits, kwargs)
+        if not torch.is_tensor(logits):
+            raise RuntimeError("B3 class consistency requires tensor logits")
+        if not bool(kwargs.get("is_train", self.training)):
+            self._last_loss_stats = {"b3_class_consistency_eval_skipped": 1.0}
+            return logits.new_zeros(())
+        model = kwargs["model"]
+        if not hasattr(model, "get_runtime_prompt_distribution_stats") or not hasattr(
+            model, "compute_b3_class_consistency"
+        ):
+            raise RuntimeError("model does not expose B3 class-consistency state")
+        stats = model.get_runtime_prompt_distribution_stats()
+        if not isinstance(stats, dict) or not torch.is_tensor(stats.get("mu")):
+            raise RuntimeError("B3 class consistency requires runtime mu")
+        mu = stats["mu"]
+        groups = self._group_ids(
+            kwargs.get("targets_global"), kwargs.get("sample_ids"), mu.device
+        )
+        result = model.compute_b3_class_consistency(
+            mu,
+            groups,
+            momentum=float(self.cfg.EMA_MOMENTUM),
+            margin=float(self.cfg.INTER_MARGIN),
+            update=True,
+        )
+        intra = result["intra_loss"]
+        inter = result["inter_loss"]
+        total = self.intra_weight * intra + self.inter_weight * inter
+        self._last_loss_stats = {
+            "b3_intra_loss.raw": float(intra.detach().item()),
+            "b3_intra_loss.weight": self.intra_weight,
+            "b3_intra_loss.weighted": self.intra_weight
+            * float(intra.detach().item()),
+            "b3_inter_loss.raw": float(inter.detach().item()),
+            "b3_inter_loss.weight": self.inter_weight,
+            "b3_inter_loss.weighted": self.inter_weight
+            * float(inter.detach().item()),
+            "b3_positive_cosine": float(
+                result["positive_cosine"].detach().item()
+            ),
+            "b3_hardest_negative_cosine": float(
+                result["hardest_negative_cosine"].detach().item()
+            ),
+            "b3_present_group_count": float(
+                result["present_group_count"].detach().item()
+            ),
+            "b3_initialized_group_count": float(
+                result["initialized_group_count"].detach().item()
+            ),
+        }
+        return total
+
+
 class GraphProbPriorAuxLoss(nn.Module):
     """
     Graph-GP 辅助损失接入口。
@@ -670,8 +790,9 @@ class CompositeLoss(nn.Module):
             stats[f"{aux_loss.name}.weight"] = weight
             stats[f"{aux_loss.name}.weighted"] = weight * raw_value
             component_names.append(str(aux_loss.name))
+            if hasattr(aux_loss, "_last_loss_stats"):
+                stats.update(dict(aux_loss._last_loss_stats))
             if isinstance(aux_loss, GraphProbPriorAuxLoss):
-                stats.update(aux_loss._last_loss_stats)
                 stats.update(
                     loss_scale_monitor(
                         main_loss=main_loss_value,
@@ -821,6 +942,10 @@ def _graph_prob_prior_enabled(cfg) -> bool:
     )
 
 
+def _b3_class_consistency_enabled(cfg) -> bool:
+    return bool(cfg.SOLVER.B3_CLASS_CONSISTENCY.ENABLE)
+
+
 def _build_aux_losses(cfg):
     """
     根据各辅助损失权重构建辅助损失列表。
@@ -839,6 +964,8 @@ def _build_aux_losses(cfg):
         aux_losses.append(PromptKLAuxLoss(cfg))
     if _graph_prob_prior_enabled(cfg):
         aux_losses.append(GraphProbPriorAuxLoss(cfg))
+    if _b3_class_consistency_enabled(cfg):
+        aux_losses.append(B3ClassConsistencyAuxLoss(cfg))
     return aux_losses
 
 

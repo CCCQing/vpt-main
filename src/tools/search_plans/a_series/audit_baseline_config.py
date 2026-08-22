@@ -19,6 +19,14 @@ def parse_args():
     parser.add_argument("config_file")
     parser.add_argument("--build-model", action="store_true")
     parser.add_argument(
+        "--allow-b3-template",
+        action="store_true",
+        help=(
+            "Allow an empty B3 pseudo manifest in a reusable YAML template. "
+            "The B3 runner must inject the locked manifest before training."
+        ),
+    )
+    parser.add_argument(
         "--compare-config",
         action="append",
         default=[],
@@ -56,9 +64,18 @@ def resolved_stage(cfg) -> str:
     return "invalid"
 
 
-def static_checks(cfg) -> Tuple[str, List[str]]:
+def static_checks(
+    cfg, *, allow_b3_template: bool = False
+) -> Tuple[str, List[str]]:
     stage = resolved_stage(cfg)
     failures = []
+    protocol_mode = str(cfg.DATA.XLSA.PROTOCOL_MODE).lower()
+    architecture_id = str(
+        cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ARCHITECTURE_ID
+    )
+    is_b3 = protocol_mode == "b3_pseudo_gzsl" or architecture_id.startswith(
+        "B3-"
+    )
 
     expected = {
         "MODEL.CLASSIFIER": (str(cfg.MODEL.CLASSIFIER).lower(), "r_similarity"),
@@ -268,9 +285,58 @@ def static_checks(cfg) -> Tuple[str, List[str]]:
             failures.append("B-series residual SAMPLE_GATE_INPUT is invalid")
         if not 0.0 < float(residual_cfg.SAMPLE_GATE_INIT) < 1.0:
             failures.append("B-series residual SAMPLE_GATE_INIT must lie in (0, 1)")
+    if is_b3:
+        residual_cfg = cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL
+        consistency_cfg = cfg.SOLVER.B3_CLASS_CONSISTENCY
+        if protocol_mode not in {"b3_pseudo_gzsl", "final_gzsl"}:
+            failures.append("B3 requires b3_pseudo_gzsl or locked final_gzsl")
+        if protocol_mode == "b3_pseudo_gzsl" and not allow_b3_template and not str(
+            cfg.DATA.XLSA.B3_PSEUDO_MANIFEST
+        ).strip():
+            failures.append("B3 pseudo-GZSL requires a non-empty manifest path")
+        if stage == "B":
+            if str(residual_cfg.AMPLITUDE_MODE).lower() != "bounded_ratio":
+                failures.append("B3 residual stages require AMPLITUDE_MODE=bounded_ratio")
+            if [int(value) for value in residual_cfg.ACTIVE_LAYERS] != [8, 9, 10, 11]:
+                failures.append("B3 residual stages must isolate active layers 8-11")
+            if str(residual_cfg.CONTENT_MODE).lower() != "shared":
+                failures.append("B3 residual stages use the isolated shared residual only")
+            if str(residual_cfg.SAMPLE_GATE_MODE).lower() != "none":
+                failures.append("B3 residual stages must not enable a sample gate")
+            maximum = float(residual_cfg.BOUNDED_MAX_RATIO)
+            initial = float(residual_cfg.BOUNDED_INIT_RATIO)
+            if not 0.0 < initial <= maximum <= 1.0:
+                failures.append("B3 bounded residual ratios must satisfy 0 < init <= max <= 1")
+            if not bool(residual_cfg.FREEZE_CLASSIFIER):
+                failures.append("B3 residual stages must freeze the classifier")
+        consistency_expected = architecture_id.startswith(("B3-R2", "B3-R3I"))
+        if bool(consistency_cfg.ENABLE) != consistency_expected:
+            failures.append(
+                "B3 class-consistency enablement does not match the R1/R2/R3 role"
+            )
+        relation_mode = str(consistency_cfg.RELATION_MODE).lower()
+        expected_relation = (
+            "sample_hash" if architecture_id.startswith("B3-R2S") else "true_class"
+        )
+        if bool(consistency_cfg.ENABLE) and relation_mode != expected_relation:
+            failures.append(
+                "B3 class-consistency relation mode must match the declared control"
+            )
+        if int(consistency_cfg.SAMPLE_HASH_GROUPS) > int(cfg.DATA.NUMBER_CLASSES):
+            failures.append("B3 sample-hash groups exceed allocated center state")
+        partial_unfreeze = architecture_id.startswith(("B3-R3I", "B3-R3A"))
+        expected_static_multiplier = 0.1 if partial_unfreeze else 1.0
+        if float(cfg.SOLVER.STATIC_PROMPT_LR_MULTIPLIER) != expected_static_multiplier:
+            failures.append(
+                "B3 static Prompt LR multiplier must be {}".format(
+                    expected_static_multiplier
+                )
+            )
+        if float(cfg.SOLVER.CLASSIFIER_LR_MULTIPLIER) != 1.0:
+            failures.append("B3 classifier LR multiplier must remain 1.0 while frozen")
     if int(cfg.MODEL.PROMPT.NUM_TOKENS) != 16:
         failures.append("MODEL.PROMPT.NUM_TOKENS must be 16 for the current A/B-series protocol")
-    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
+    if not is_b3 and protocol_mode != "final_gzsl":
         failures.append("DATA.XLSA.PROTOCOL_MODE must be 'final_gzsl' for the A/B-series")
     if int(cfg.MONITOR.TRAIN_EVAL.EVERY_N) <= 0:
         failures.append("MONITOR.TRAIN_EVAL.EVERY_N must be positive")
@@ -555,11 +621,15 @@ def cross_config_stream_checks(configs) -> List[str]:
 def main():
     args = parse_args()
     cfg = load_cfg(args.config_file, args.opts)
-    stage, failures = static_checks(cfg)
+    stage, failures = static_checks(
+        cfg, allow_b3_template=bool(args.allow_b3_template)
+    )
     compared_configs = [(args.config_file, cfg)]
     for config_file in args.compare_config:
         compared_cfg = load_cfg(config_file, [])
-        compared_stage, compared_failures = static_checks(compared_cfg)
+        compared_stage, compared_failures = static_checks(
+            compared_cfg, allow_b3_template=bool(args.allow_b3_template)
+        )
         failures.extend(
             "{}: {}".format(Path(config_file).name, failure)
             for failure in compared_failures

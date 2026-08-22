@@ -16,6 +16,7 @@ from src.models.prompting.prompt_distribution import (
 )
 from src.monitoring.adapters import deep_prompt_residual_metrics
 from src.monitoring.deep_prompt_residual_experiments import (
+    deterministic_donor_groups,
     deterministic_donor_indices,
     layer_scales,
     residual_static_geometry,
@@ -31,6 +32,8 @@ from src.configs.config import get_cfg
 from src.engine.evaluator import Evaluator
 from src.engine.trainer import Trainer
 from src.models.vit_models import ViT
+from src.solver.losses import build_loss
+from src.solver.optimizer import make_optimizer
 from src.tools.search_plans.b_series.summarize_b_series_replays import (
     nested_scientific_summary,
 )
@@ -230,6 +233,137 @@ def validate_donor_contracts() -> None:
     assert np.all(label_array[same] == label_array)
     assert np.all(label_array[different] != label_array)
 
+    dense_ids = ["a{}".format(index) for index in range(6)] + [
+        "b{}".format(index) for index in range(6)
+    ]
+    dense_labels = [0] * 6 + [1] * 6
+    k4 = deterministic_donor_groups(
+        dense_ids, dense_labels, relation="same_class", seed=31, k=4
+    )
+    loo = deterministic_donor_groups(
+        dense_ids, dense_labels, relation="same_class", seed=31, k=None
+    )
+    assert all(group.size == 4 and np.unique(group).size == 4 for group in k4)
+    assert all(group.size == 5 and np.unique(group).size == 5 for group in loo)
+
+
+def validate_bounded_deep_residual_contract() -> None:
+    torch.manual_seed(37)
+    module = MeanConditionedDeepPromptResidual(
+        dim=8,
+        prompt_len=3,
+        num_layers=12,
+        amplitude_mode="bounded_ratio",
+        active_layers=(8, 9, 10, 11),
+        bounded_max_ratio=0.25,
+        bounded_init_ratio=0.125,
+    )
+    latent = torch.randn(5, 8, requires_grad=True)
+    base = torch.randn(5, 3, 8)
+    inactive, inactive_trace = module.forward_layer(latent, 7, base_prompt=base)
+    active, active_trace = module.forward_layer(latent, 8, base_prompt=base)
+    assert torch.equal(inactive, torch.zeros_like(inactive))
+    assert torch.equal(
+        inactive_trace["applied_ratio"],
+        torch.zeros_like(inactive_trace["applied_ratio"]),
+    )
+    assert torch.allclose(
+        active_trace["applied_ratio"],
+        torch.full((5,), 0.125),
+        atol=2.0e-6,
+    )
+    assert float(active_trace["budget_exceed"].sum().item()) == 0.0
+    active.square().mean().backward()
+    assert module.layer_gate.grad is not None
+    assert float(module.layer_gate.grad[8].abs().item()) > 0.0
+
+
+class _B3ConsistencyHolder(torch.nn.Module):
+    def __init__(self, class_count: int, dim: int):
+        super().__init__()
+        self.feat_dim = int(dim)
+        self.b3_class_consistency_enabled = True
+        self.register_buffer("b3_class_centers", torch.zeros(class_count, dim))
+        self.register_buffer("b3_class_center_counts", torch.zeros(class_count))
+        self._runtime_prompt_distribution_stats = None
+
+    compute_b3_class_consistency = ViT.compute_b3_class_consistency
+
+    def get_runtime_prompt_distribution_stats(self):
+        return self._runtime_prompt_distribution_stats
+
+
+def validate_b3_class_consistency_state() -> None:
+    torch.manual_seed(41)
+    holder = _B3ConsistencyHolder(class_count=4, dim=6)
+    mu = torch.randn(8, 6, requires_grad=True)
+    groups = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
+    result = holder.compute_b3_class_consistency(
+        mu,
+        groups,
+        momentum=0.9,
+        margin=0.2,
+        update=True,
+    )
+    loss = result["intra_loss"] + result["inter_loss"]
+    loss.backward()
+    assert mu.grad is not None and float(mu.grad.abs().sum().item()) > 0.0
+    assert torch.equal(holder.b3_class_center_counts, torch.full((4,), 2.0))
+    assert torch.isfinite(holder.b3_class_centers).all()
+
+    cfg = get_cfg()
+    cfg.merge_from_file(
+        "configs/b_series_experiments/B3-R2I-class-consistent.yaml"
+    )
+    criterion = build_loss(cfg)
+    second_mu = torch.randn(8, 6, requires_grad=True)
+    holder._runtime_prompt_distribution_stats = {"mu": second_mu}
+    logits = torch.randn(8, 4, requires_grad=True)
+    total = criterion(
+        logits,
+        groups,
+        [1.0] * 4,
+        kwargs={
+            "model": holder,
+            "targets_global": groups,
+            "sample_ids": ["sample{}".format(index) for index in range(8)],
+            "is_train": True,
+        },
+    )
+    total.backward()
+    assert second_mu.grad is not None
+    assert "b3_intra_loss.weighted" in criterion._last_loss_stats
+
+
+class _OptimizerMultiplierHolder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.prompt_embeddings = torch.nn.Parameter(torch.ones(2, 3))
+        self.deep_prompt_embeddings = torch.nn.Parameter(torch.ones(2, 2, 3))
+        self.residual_projection = torch.nn.Linear(3, 3, bias=False)
+        self.r_similarity_head = torch.nn.Linear(3, 2, bias=False)
+
+
+def validate_b3_optimizer_multipliers() -> None:
+    cfg = get_cfg()
+    cfg.defrost()
+    cfg.SOLVER.OPTIMIZER = "adamw"
+    cfg.SOLVER.BASE_LR = 6.0e-4
+    cfg.SOLVER.STATIC_PROMPT_LR_MULTIPLIER = 0.1
+    cfg.SOLVER.CLASSIFIER_LR_MULTIPLIER = 1.0
+    cfg.freeze()
+    model = _OptimizerMultiplierHolder()
+    optimizer = make_optimizer([model], cfg.SOLVER)
+    lr_by_parameter = {
+        id(parameter): float(group["lr"])
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert abs(lr_by_parameter[id(model.prompt_embeddings)] - 6.0e-5) < 1.0e-12
+    assert abs(lr_by_parameter[id(model.deep_prompt_embeddings)] - 6.0e-5) < 1.0e-12
+    assert abs(lr_by_parameter[id(model.residual_projection.weight)] - 6.0e-4) < 1.0e-12
+    assert abs(lr_by_parameter[id(model.r_similarity_head.weight)] - 6.0e-4) < 1.0e-12
+
 
 def validate_parameter_only_provider_is_rng_neutral() -> None:
     torch.manual_seed(23)
@@ -355,6 +489,49 @@ def validate_full_vit_config_and_trace() -> None:
     assert "contextualized_prompt/layer_11" in object_ids
 
 
+def validate_b3_full_vit_isolation() -> None:
+    cfg = get_cfg()
+    cfg.merge_from_file(
+        "configs/b_series_experiments/B3-R1I-bounded-deep.yaml"
+    )
+    cfg.freeze()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(43)
+    model = ViT(cfg, load_pretrain=False).to(device).eval()
+    model.attach_r_similarity_head(torch.zeros(200, 312, device=device))
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert not any(name.endswith("prompt_embeddings") for name in trainable)
+    assert not any(name.startswith("r_similarity_head.") for name in trainable)
+    assert any("prompt_init_provider.stats_head" in name for name in trainable)
+    assert "enc.transformer.deep_prompt_residual.layer_gate" in trainable
+    image = torch.randn(
+        1,
+        3,
+        int(cfg.DATA.CROPSIZE),
+        int(cfg.DATA.CROPSIZE),
+        device=device,
+    )
+    with torch.no_grad():
+        model(image, return_feature=True)
+    trace = model.enc.transformer._last_deep_prompt_residual_trace
+    assert len(trace) == 12
+    for item in trace:
+        layer_id = int(item["layer_id"])
+        if layer_id < 8:
+            assert torch.equal(
+                item["applied_delta"], torch.zeros_like(item["applied_delta"])
+            )
+        else:
+            assert float(item["budget_exceed"].sum().item()) == 0.0
+            assert torch.allclose(
+                item["applied_ratio"],
+                torch.full_like(item["applied_ratio"], 0.125),
+                atol=2.0e-6,
+            )
+
+
 def validate_a2_initialization_and_freeze_contract() -> None:
     with tempfile.TemporaryDirectory(dir=".") as temporary:
         root = Path(temporary).resolve()
@@ -407,6 +584,9 @@ def validate_a2_initialization_and_freeze_contract() -> None:
         freeze = trainer._residual_freeze_contract_payload(final=False)
         assert freeze["pass"] is True
         assert all(row["in_optimizer"] is False for row in freeze["parameters"])
+        _, auxiliary_names, checkpoint_state = trainer._trainable_model_state()
+        assert any(name.endswith("prompt_embeddings") for name in auxiliary_names)
+        assert all(name in checkpoint_state for name in auxiliary_names)
         trainer.diagnostic_manager.finalize(status="completed")
         trainer.monitor_manager.finalize(status="completed")
 
@@ -474,9 +654,13 @@ def main() -> None:
         validate_experiment_interventions_and_geometry,
         validate_slot_and_sample_gate_modes,
         validate_donor_contracts,
+        validate_bounded_deep_residual_contract,
+        validate_b3_class_consistency_state,
+        validate_b3_optimizer_multipliers,
         validate_parameter_only_provider_is_rng_neutral,
         validate_nonconditional_control,
         validate_full_vit_config_and_trace,
+        validate_b3_full_vit_isolation,
         validate_a2_initialization_and_freeze_contract,
         validate_nested_probe_summary,
         validate_e7_precondition_evidence_gate,

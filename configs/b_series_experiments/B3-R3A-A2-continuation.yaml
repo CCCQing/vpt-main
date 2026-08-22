@@ -1,0 +1,18 @@
+_BASE_: "../baseline_rebuild/A-04-A2-vpt-deep-ce.yaml"
+OUTPUT_DIR: "output/b3_series/B3-R3A-A2-continuation"
+
+DATA:
+  XLSA:
+    PROTOCOL_MODE: "b3_pseudo_gzsl"
+    B3_PSEUDO_MANIFEST: ""
+
+MODEL:
+  PROMPT:
+    DISTRIBUTOR:
+      DEEP_RESIDUAL:
+        ARCHITECTURE_ID: "B3-R3A-A2-continuation"
+        FREEZE_CLASSIFIER: true
+
+SOLVER:
+  STATIC_PROMPT_LR_MULTIPLIER: 0.1
+

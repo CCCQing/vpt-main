@@ -37,8 +37,10 @@ class Job:
 def _parse_run(value: str):
     method, separator, seed_text = str(value).partition(":")
     method = method.strip().upper()
-    if not separator or method not in {"B1", "B2"}:
-        raise ValueError("--run must use B1:SEED or B2:SEED")
+    if not separator or (
+        method not in {"B1", "B2"} and not method.startswith("B3-")
+    ):
+        raise ValueError("--run must use B1:SEED, B2:SEED, or B3-METHOD:SEED")
     seed = int(seed_text)
     if seed < 0:
         raise ValueError("training seed must be non-negative")
@@ -129,7 +131,7 @@ def _command(job: Job, args) -> List[str]:
         "--output-dir",
         str(job.output_dir),
         "--method-name",
-        str(job.method),
+        "B3" if job.method.startswith("B3-") else str(job.method),
         "--experiments",
         str(args.experiments),
         "--scope",
@@ -180,7 +182,7 @@ def _run(job: Job, args, gpu: str) -> Dict[str, object]:
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Run E1..E4 replay jobs in parallel.")
+    parser = argparse.ArgumentParser(description="Run E1..E4 or B3-D1 replay jobs in parallel.")
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--run", action="append", required=True)
@@ -202,6 +204,14 @@ def _parse_args():
 def main() -> None:
     args = _parse_args()
     seeds = _selection_seeds(args.selection_seeds, args.scope)
+    if "B3D1" in {
+        value.strip().upper()
+        for value in str(args.experiments).split(",")
+        if value.strip()
+    } and args.scope == "probe" and tuple(seeds) != (424242, 424243, 424244):
+        raise SystemExit(
+            "B3D1 Probe evidence requires selection seeds 424242,424243,424244"
+        )
     gpus = _gpu_groups(args.gpu_groups)
     if args.max_workers <= 0 or args.max_workers > len(gpus):
         raise SystemExit("--max-workers must be positive and no larger than GPU count")

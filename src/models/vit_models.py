@@ -6,6 +6,7 @@ Note: models return logits instead of prob
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .build_vit_backbone import (build_vit_sup_models)
 from ..utils import logging
 logger = logging.get_logger("visual_prompt")
@@ -41,6 +42,21 @@ class ViT(nn.Module):
         adapter_cfg = None
 
         self.build_backbone(prompt_cfg, cfg, adapter_cfg, load_pretrain, vis=vis)
+        self.b3_class_consistency_cfg = cfg.SOLVER.B3_CLASS_CONSISTENCY
+        self.b3_class_consistency_enabled = bool(
+            self.b3_class_consistency_cfg.ENABLE
+        )
+        if self.b3_class_consistency_enabled:
+            self.register_buffer(
+                "b3_class_centers",
+                torch.zeros(int(cfg.DATA.NUMBER_CLASSES), int(self.feat_dim)),
+                persistent=True,
+            )
+            self.register_buffer(
+                "b3_class_center_counts",
+                torch.zeros(int(cfg.DATA.NUMBER_CLASSES)),
+                persistent=True,
+            )
         self.r_similarity_head = None
         self.debug_trace_once = cfg.SOLVER.DEBUG_TRACE_ONCE
         self._debug_head_route_logged = False
@@ -96,6 +112,116 @@ class ViT(nn.Module):
     def get_runtime_attention_mediation_stats(self):
         """Return detached scalar summaries from the latest attention-mediation forward."""
         return self._runtime_attention_mediation_stats
+
+    def b3_checkpoint_state_names(self):
+        if not self.b3_class_consistency_enabled:
+            return []
+        return ["b3_class_centers", "b3_class_center_counts"]
+
+    def compute_b3_class_consistency(
+        self,
+        mu,
+        group_ids,
+        *,
+        momentum,
+        margin,
+        update,
+    ):
+        if not self.b3_class_consistency_enabled:
+            raise RuntimeError("B3 class-consistency state is not enabled")
+        if not torch.is_tensor(mu) or mu.dim() != 2 or mu.shape[1] != self.feat_dim:
+            raise ValueError("B3 class consistency expects mu [B,D]")
+        groups = torch.as_tensor(
+            group_ids, device=mu.device, dtype=torch.long
+        ).reshape(-1)
+        if groups.shape[0] != mu.shape[0]:
+            raise ValueError("B3 group ids do not match the current batch")
+        if groups.numel() == 0 or groups.min().item() < 0 or groups.max().item() >= int(
+            self.b3_class_centers.shape[0]
+        ):
+            raise ValueError("B3 group id is outside the configured class space")
+        momentum = float(momentum)
+        margin = float(margin)
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError("B3 EMA momentum must lie in [0, 1)")
+        if margin < 0.0:
+            raise ValueError("B3 inter-class margin must be non-negative")
+
+        normalized = F.normalize(mu, dim=-1)
+        class_count = int(self.b3_class_centers.shape[0])
+        sums = normalized.detach().new_zeros(class_count, self.feat_dim)
+        counts = normalized.detach().new_zeros(class_count)
+        sums.index_add_(0, groups, normalized.detach())
+        counts.index_add_(0, groups, counts.new_ones(groups.shape[0]))
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(sums)
+            torch.distributed.all_reduce(counts)
+        present = counts > 0
+        batch_centers = sums / counts[:, None].clamp_min(1.0)
+        batch_centers = F.normalize(batch_centers, dim=-1)
+        stored = self.b3_class_centers.to(device=mu.device, dtype=mu.dtype)
+        initialized = self.b3_class_center_counts.to(device=mu.device) > 0
+        reference_centers = stored.clone()
+        cold_start = present & (~initialized)
+        reference_centers[cold_start] = batch_centers[cold_start].to(mu.dtype)
+        positive = reference_centers.index_select(0, groups).detach()
+        positive_cosine = (normalized * positive).sum(dim=-1)
+        intra = (1.0 - positive_cosine).mean()
+
+        candidate_mask = initialized | present
+        candidate_ids = candidate_mask.nonzero(as_tuple=False).reshape(-1)
+        if candidate_ids.numel() > 1:
+            candidates = reference_centers.index_select(0, candidate_ids).detach()
+            similarities = normalized @ candidates.transpose(0, 1)
+            own = groups[:, None] == candidate_ids[None, :]
+            similarities = similarities.masked_fill(own, float("-inf"))
+            hardest_negative = similarities.max(dim=1).values
+            valid_negative = torch.isfinite(hardest_negative)
+            inter = F.relu(
+                margin + hardest_negative[valid_negative] - positive_cosine[valid_negative]
+            ).mean() if bool(valid_negative.any().item()) else mu.new_zeros(())
+            negative_cosine = (
+                hardest_negative[valid_negative].mean()
+                if bool(valid_negative.any().item())
+                else mu.new_zeros(())
+            )
+        else:
+            inter = mu.new_zeros(())
+            negative_cosine = mu.new_zeros(())
+
+        if bool(update):
+            with torch.no_grad():
+                centers = self.b3_class_centers
+                old_initialized = self.b3_class_center_counts > 0
+                new_ids = (present & (~old_initialized)).nonzero(
+                    as_tuple=False
+                ).reshape(-1)
+                old_ids = (present & old_initialized).nonzero(
+                    as_tuple=False
+                ).reshape(-1)
+                if new_ids.numel() > 0:
+                    centers[new_ids] = batch_centers[new_ids].to(centers.dtype)
+                if old_ids.numel() > 0:
+                    updated = (
+                        momentum * centers[old_ids]
+                        + (1.0 - momentum)
+                        * batch_centers[old_ids].to(centers.dtype)
+                    )
+                    centers[old_ids] = F.normalize(updated, dim=-1)
+                self.b3_class_center_counts.add_(
+                    counts.to(self.b3_class_center_counts.dtype)
+                )
+
+        return {
+            "intra_loss": intra,
+            "inter_loss": inter,
+            "positive_cosine": positive_cosine.mean(),
+            "hardest_negative_cosine": negative_cosine,
+            "present_group_count": present.float().sum(),
+            "initialized_group_count": (
+                self.b3_class_center_counts > 0
+            ).float().sum(),
+        }
 
     def get_bayesian_candidate_registry(self):
         """Describe architecture objects by role instead of a fixed ranking list."""

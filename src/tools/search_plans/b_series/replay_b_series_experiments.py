@@ -25,7 +25,7 @@ from src.data import loader as data_loader
 from src.data.transforms import get_transforms
 from src.monitoring.deep_prompt_residual_experiments import (
     DEPTH_GROUPS,
-    deterministic_donor_indices,
+    deterministic_donor_groups,
     layer_scales,
     residual_static_geometry,
     summarize_geometry,
@@ -35,7 +35,7 @@ from src.monitoring.eval_metrics import (
     classification_metrics,
     prediction_health_metrics,
 )
-from src.monitoring.logit_geometry import analyze_logit_geometry
+from src.monitoring.logit_geometry import analyze_logit_geometry, analyze_vector_geometry
 from src.monitoring.module_effect import (
     checkpoint_sha256,
     deep_prompt_residual_layer_scales_intervention,
@@ -59,15 +59,15 @@ TEST_SPLITS = ("test_seen", "test_unseen")
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run E1 through E4 checkpoint-only residual diagnostics."
+        description="Run E1-E4 or the isolated B3-D1 checkpoint-only diagnostics."
     )
     parser.add_argument("--source-run", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--method-name", choices=("B1", "B2"), default="B1")
+    parser.add_argument("--method-name", choices=("B1", "B2", "B3"), default="B1")
     parser.add_argument(
         "--experiments",
         default="E1,E2,E3,E4",
-        help="Comma-separated subset of E1,E2,E3,E4.",
+        help="Comma-separated subset of E1,E2,E3,E4,B3D1.",
     )
     parser.add_argument("--scope", choices=("full", "probe"), default="probe")
     parser.add_argument("--selection-seed", type=int, default=424242)
@@ -111,11 +111,21 @@ def _load_cfg(run_dir: Path, batch_size: Optional[int], num_workers: int):
     cfg.NUM_GPUS = 1 if torch.cuda.is_available() else 0
     cfg.DATA.NUM_WORKERS = max(0, int(num_workers))
     cfg.DATA.PIN_MEMORY = bool(torch.cuda.is_available())
+    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "b3_pseudo_gzsl":
+        configured_manifest = Path(
+            str(cfg.DATA.XLSA.B3_PSEUDO_MANIFEST)
+        ).expanduser()
+        portable_manifest = run_dir / "b3_pseudo_manifest.json"
+        if not configured_manifest.is_file() and portable_manifest.is_file():
+            cfg.DATA.XLSA.B3_PSEUDO_MANIFEST = str(portable_manifest.resolve())
     if batch_size is not None:
         cfg.DATA.BATCH_SIZE = max(1, int(batch_size))
     cfg.freeze()
-    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
-        raise ValueError("B-series replay requires final_gzsl")
+    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() not in {
+        "final_gzsl",
+        "b3_pseudo_gzsl",
+    }:
+        raise ValueError("B-series replay requires a GZSL protocol")
     if bool(cfg.MODEL.SEMANTIC_TOKENS.ENABLE):
         raise ValueError("B-series replay expects the semantic-token-free protocol")
     if not bool(cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ENABLE):
@@ -127,11 +137,11 @@ def _parse_experiments(raw: str) -> tuple[str, ...]:
     values = tuple(
         value.strip().upper() for value in str(raw).split(",") if value.strip()
     )
-    allowed = {"E1", "E2", "E3", "E4"}
+    allowed = {"E1", "E2", "E3", "E4", "B3D1"}
     if not values or len(set(values)) != len(values) or any(
         value not in allowed for value in values
     ):
-        raise ValueError("--experiments must be a unique subset of E1,E2,E3,E4")
+        raise ValueError("--experiments must be a unique subset of E1,E2,E3,E4,B3D1")
     return values
 
 
@@ -157,7 +167,14 @@ def _candidate_class_ids(dataset) -> list[int]:
     ]
 
 
-def _build_loaders(cfg, full_test_loaders, scope: str, selection_seed: int):
+def _build_loaders(
+    cfg,
+    full_test_loaders,
+    scope: str,
+    selection_seed: int,
+    *,
+    per_class_override: Optional[int] = None,
+):
     if scope == "full":
         return {name: full_test_loaders[name] for name in TEST_SPLITS}, {}
     train_loader = data_loader.construct_trainval_loader(cfg)
@@ -171,11 +188,24 @@ def _build_loaders(cfg, full_test_loaders, scope: str, selection_seed: int):
     manifests = {}
     for split, source_loader in source_loaders.items():
         dataset = source_loader.dataset
+        per_class = (
+            max(1, int(per_class_override))
+            if per_class_override is not None
+            else int(cfg.MONITOR.PROBE.PER_CLASS)
+        )
+        max_samples = (
+            max(
+                int(cfg.MONITOR.PROBE.MAX_SAMPLES),
+                per_class * int(cfg.DATA.NUMBER_CLASSES),
+            )
+            if per_class_override is not None
+            else int(cfg.MONITOR.PROBE.MAX_SAMPLES)
+        )
         manifest = build_probe_manifest(
             dataset,
             split="probe_{}".format(split),
-            per_class=int(cfg.MONITOR.PROBE.PER_CLASS),
-            max_samples=int(cfg.MONITOR.PROBE.MAX_SAMPLES),
+            per_class=per_class,
+            max_samples=max_samples,
             selection_seed=int(selection_seed),
             candidate_class_ids=_candidate_class_ids(dataset),
         )
@@ -514,32 +544,58 @@ def _run_condition(model, device, loaders, **kwargs):
     }
 
 
-def _donor_payload(normal_split: Mapping[str, Any], relation: str, seed: int):
-    indices = deterministic_donor_indices(
+def _donor_payload(
+    normal_split: Mapping[str, Any],
+    relation: str,
+    seed: int,
+    *,
+    k: Optional[int] = 1,
+):
+    groups = deterministic_donor_groups(
         normal_split["sample_ids"],
         normal_split["targets_global"],
         relation=relation,
         seed=seed,
+        k=k,
     )
     means = normal_split["source_mu"]
     donor_by_id = {
-        sample_id: means[int(donor_index)]
-        for sample_id, donor_index in zip(normal_split["sample_ids"], indices.tolist())
+        sample_id: means[donor_group].mean(axis=0)
+        for sample_id, donor_group in zip(normal_split["sample_ids"], groups)
     }
     manifest = []
-    for target_index, donor_index in enumerate(indices.tolist()):
-        manifest.append(
-            {
-                "target_id": normal_split["sample_ids"][target_index],
-                "target_class": int(normal_split["targets_global"][target_index]),
-                "donor_id": normal_split["sample_ids"][donor_index],
-                "donor_class": int(normal_split["targets_global"][donor_index]),
-                "self_pair": bool(target_index == donor_index),
-                "donor_residual_distance": float(
-                    np.linalg.norm(means[donor_index] - means[target_index])
-                ),
-            }
-        )
+    for target_index, donor_group in enumerate(groups):
+        aggregate = means[donor_group].mean(axis=0)
+        row = {
+            "target_id": normal_split["sample_ids"][target_index],
+            "target_class": int(normal_split["targets_global"][target_index]),
+            "donor_ids": [
+                normal_split["sample_ids"][int(index)] for index in donor_group
+            ],
+            "donor_classes": [
+                int(normal_split["targets_global"][int(index)])
+                for index in donor_group
+            ],
+            "donor_count": int(donor_group.size),
+            "self_pair": False,
+            "aggregate_residual_distance": float(
+                np.linalg.norm(aggregate - means[target_index])
+            ),
+        }
+        if donor_group.size == 1:
+            donor_index = int(donor_group[0])
+            row.update(
+                {
+                    "donor_id": normal_split["sample_ids"][donor_index],
+                    "donor_class": int(
+                        normal_split["targets_global"][donor_index]
+                    ),
+                    "donor_residual_distance": row[
+                        "aggregate_residual_distance"
+                    ],
+                }
+            )
+        manifest.append(row)
     return donor_by_id, manifest
 
 
@@ -570,6 +626,31 @@ def _geometry_report(normal, zero):
     return result, arrays
 
 
+def _b3_source_object_geometry(normal):
+    report = {
+        "format": "b3_source_mu_class_geometry_v1",
+        "object": "shared_mu",
+        "splits": {},
+    }
+    arrays = {}
+    for split, output in normal.items():
+        expected_classes = sorted(
+            int(value) for value in np.unique(output["targets_global"]).tolist()
+        )
+        metrics, split_arrays, validity = analyze_vector_geometry(
+            output["source_mu"],
+            output["targets_global"],
+            expected_classes,
+        )
+        report["splits"][split] = {
+            "metrics": metrics,
+            "validity": validity,
+        }
+        for name, values in split_arrays.items():
+            arrays["{}__{}".format(split, name)] = values
+    return report, arrays
+
+
 def main() -> None:
     args = _parse_args()
     experiments = _parse_experiments(args.experiments)
@@ -591,13 +672,26 @@ def main() -> None:
     np.random.seed(int(cfg.SEED))
     random.seed(int(cfg.SEED))
     identity, checkpoint = _source_identity(source_run, cfg)
+    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "b3_pseudo_gzsl":
+        manifest_path = Path(str(cfg.DATA.XLSA.B3_PSEUDO_MANIFEST)).resolve()
+        recorded_manifest = checkpoint.get("b3_pseudo_manifest")
+        if not manifest_path.is_file() or not isinstance(recorded_manifest, dict):
+            raise ValueError("B3 replay source has no verifiable pseudo manifest")
+        if str(recorded_manifest.get("sha256", "")) != checkpoint_sha256(
+            str(manifest_path)
+        ):
+            raise ValueError("B3 replay manifest does not match the source checkpoint")
     model, device, full_test_loaders = _load_model_and_loaders(
         source_run, cfg, checkpoint
     )
     num_layers = _model_num_layers(model)
     shortlist = _parse_shortlist(args.shortlist_layers, num_layers)
     loaders, probe_manifests = _build_loaders(
-        cfg, full_test_loaders, args.scope, args.selection_seed
+        cfg,
+        full_test_loaders,
+        args.scope,
+        args.selection_seed,
+        per_class_override=6 if "B3D1" in experiments else None,
     )
     summary: Dict[str, Any] = {
         "format": "b_series_experiments_checkpoint_replay_v1",
@@ -787,6 +881,74 @@ def main() -> None:
                 "self_pair_allowed": False,
                 "same_class_contract": "same label and different sample id",
                 "different_class_contract": "different label",
+            }
+
+        if "B3D1" in experiments:
+            object_geometry, object_geometry_arrays = _b3_source_object_geometry(
+                normal
+            )
+            _atomic_json(
+                output_dir / "B3-source-mu-class-geometry.json",
+                _json_safe(object_geometry),
+            )
+            np.savez_compressed(
+                output_dir / "B3-source-mu-class-geometry.npz",
+                **object_geometry_arrays,
+            )
+            variants = (
+                ("same_single", "same_class", 1),
+                ("same_k2", "same_class", 2),
+                ("same_k4", "same_class", 4),
+                ("same_loo", "same_class", None),
+                ("different_single", "different_class", 1),
+            )
+            donor_manifests = {}
+            condition_names = []
+            for variant, relation, donor_count in variants:
+                donor_maps = {}
+                for split, output in normal.items():
+                    donor_map, manifest = _donor_payload(
+                        output,
+                        relation,
+                        int(args.donor_seed),
+                        k=donor_count,
+                    )
+                    donor_maps[split] = donor_map
+                    donor_manifests.setdefault(split, {})[variant] = manifest
+                outputs = {
+                    split: _predict(
+                        model,
+                        device,
+                        loader,
+                        donor_mean_by_id=donor_maps[split],
+                    )
+                    for split, loader in loaders.items()
+                }
+                condition_name = "B3D1_{}".format(variant)
+                condition_names.append(condition_name)
+                summary["conditions"][condition_name] = _condition_summary(
+                    outputs, normal, cfg, is_normal=False
+                )
+            _atomic_json(
+                output_dir / "B3D1-donor-manifest.json",
+                {
+                    "format": "b3_d1_donor_aggregation_manifest_v1",
+                    "donor_seed": int(args.donor_seed),
+                    "sampling": "without_replacement",
+                    "aggregation": "arithmetic_mean_of_source_mu",
+                    "splits": donor_manifests,
+                },
+            )
+            summary["B3D1"] = {
+                "condition_names": condition_names,
+                "donor_manifest_path": "B3D1-donor-manifest.json",
+                "required_probe_per_class": 6 if args.scope == "probe" else None,
+                "same_class_grid": ["single", "k2", "k4", "leave_one_out"],
+                "negative_control": "different_class_single",
+                "self_pair_allowed": False,
+                "replacement_allowed": False,
+                "source_mu_geometry_path": "B3-source-mu-class-geometry.json",
+                "source_mu_geometry_arrays_path": "B3-source-mu-class-geometry.npz",
             }
 
         if args.save_logits:

@@ -119,6 +119,9 @@ def deep_prompt_residual_metrics(trace: Any) -> Dict[str, float]:
         sample_gate = item.get("sample_gate")
         layer_gate = item.get("layer_gate")
         runtime_scale = item.get("runtime_scale")
+        applied_ratio_tensor = item.get("applied_ratio")
+        budget_exceed = item.get("budget_exceed")
+        active_layer = item.get("active_layer")
         if torch.is_tensor(base):
             base_norm = float(base.detach().float().norm(dim=-1).mean().item())
             result[f"{prefix}.base_prompt_norm"] = base_norm
@@ -177,6 +180,29 @@ def deep_prompt_residual_metrics(trace: Any) -> Dict[str, float]:
             ratio = applied_norm / max(base_norm, 1.0e-12)
             result[f"{prefix}.applied_delta_to_base_ratio"] = ratio
             ratios.append(ratio)
+        if torch.is_tensor(applied_ratio_tensor):
+            ratio_value = applied_ratio_tensor.detach().float().reshape(-1)
+            if ratio_value.numel() > 0:
+                result[f"{prefix}.applied_ratio_mean"] = float(
+                    ratio_value.mean().item()
+                )
+                result[f"{prefix}.applied_ratio_p90"] = float(
+                    torch.quantile(ratio_value, 0.9).item()
+                )
+                result[f"{prefix}.applied_ratio_max"] = float(
+                    ratio_value.max().item()
+                )
+        if (
+            str(item.get("amplitude_mode", "legacy_gate")) == "bounded_ratio"
+            and torch.is_tensor(budget_exceed)
+        ):
+            result[f"{prefix}.budget_exceed_rate"] = float(
+                budget_exceed.detach().float().mean().item()
+            )
+        if torch.is_tensor(active_layer):
+            result[f"{prefix}.active_layer"] = float(
+                active_layer.detach().float().mean().item()
+            )
         if torch.is_tensor(gate):
             gate_value = float(gate.detach().float().mean().item())
             result[f"{prefix}.gate"] = gate_value

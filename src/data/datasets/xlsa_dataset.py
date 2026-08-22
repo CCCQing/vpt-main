@@ -3,6 +3,8 @@
 """Convert the .mat protocol files of XLSA17 / xlsa17 (res101.mat att_splits.mat)
 into Dataset objects that can be directly used by the current training pipeline."""
 
+import hashlib
+import json
 import os
 from collections import Counter
 from typing import Dict, List, Optional, Sequence
@@ -107,6 +109,8 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
 
         self.protocol_mode = None
         self.split_source_keys = []
+        self.b3_pseudo_manifest_path = None
+        self.b3_pseudo_manifest_sha256 = None
 
         self.split_classes = None
         self.local_classes = None
@@ -167,6 +171,75 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
         ids = torch.as_tensor(list(class_ids), dtype=torch.long)
         mapping[ids] = torch.arange(ids.numel(), dtype=torch.long)
         return mapping
+
+    def _load_b3_pseudo_manifest(
+        self,
+        labels_all: np.ndarray,
+        expected_source_indices: np.ndarray,
+    ):
+        path = os.path.abspath(
+            os.path.expanduser(str(self.cfg.DATA.XLSA.B3_PSEUDO_MANIFEST).strip())
+        )
+        if not path or not os.path.isfile(path):
+            raise FileNotFoundError(
+                "b3_pseudo_gzsl requires DATA.XLSA.B3_PSEUDO_MANIFEST"
+            )
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        payload = json.loads(raw.decode("utf-8"))
+        if str(payload.get("format", "")) != "b3_class_disjoint_manifest_v1":
+            raise ValueError("unsupported B3 pseudo-GZSL manifest format")
+        if str(payload.get("dataset", "")).upper() != str(self.name).upper():
+            raise ValueError("B3 pseudo-GZSL manifest dataset mismatch")
+        seen_classes = sorted(int(value) for value in payload["train_class_ids"])
+        unseen_classes = sorted(
+            int(value) for value in payload["pseudo_unseen_class_ids"]
+        )
+        if not seen_classes or not unseen_classes or set(seen_classes).intersection(
+            unseen_classes
+        ):
+            raise ValueError("B3 pseudo-GZSL class partition is invalid")
+        if len(set(seen_classes + unseen_classes)) != len(
+            seen_classes + unseen_classes
+        ):
+            raise ValueError("B3 pseudo-GZSL class ids are not unique")
+        index_fields = {
+            "trainval": "train_source_indices",
+            "test_seen": "seen_eval_source_indices",
+            "test_unseen": "pseudo_unseen_source_indices",
+        }
+        indices_by_split = {}
+        all_indices = []
+        for split_name, field in index_fields.items():
+            values = np.asarray(payload.get(field, ()), dtype=np.int64).reshape(-1)
+            if values.size == 0 or np.unique(values).size != values.size:
+                raise ValueError("B3 manifest {} is empty or duplicated".format(field))
+            if values.min() < 0 or values.max() >= labels_all.size:
+                raise ValueError("B3 manifest {} contains out-of-range indices".format(field))
+            expected = seen_classes if split_name != "test_unseen" else unseen_classes
+            observed = sorted(int(value) for value in np.unique(labels_all[values]).tolist())
+            if observed != expected:
+                raise ValueError(
+                    "B3 manifest {} class coverage mismatch".format(field)
+                )
+            indices_by_split[split_name] = values
+            all_indices.extend(values.tolist())
+        if len(set(all_indices)) != len(all_indices):
+            raise ValueError("B3 pseudo-GZSL sample partitions overlap")
+        expected_source = {
+            int(value)
+            for value in np.asarray(expected_source_indices, dtype=np.int64).reshape(-1)
+        }
+        if set(all_indices) != expected_source:
+            raise ValueError(
+                "B3 pseudo-GZSL sample partitions do not exactly cover trainval_loc"
+            )
+        declared = sorted(int(value) for value in payload.get("source_class_ids", ()))
+        if declared and declared != sorted(seen_classes + unseen_classes):
+            raise ValueError("B3 manifest source_class_ids mismatch")
+        self.b3_pseudo_manifest_path = path
+        self.b3_pseudo_manifest_sha256 = hashlib.sha256(raw).hexdigest()
+        return payload, seen_classes, unseen_classes, indices_by_split
 
     def _finalize_protocol_meta(self, *, num_classes: int, split_labels: np.ndarray, split_source_keys: Sequence[str], local_classes: Sequence[int], eval_local_classes: Sequence[int],) -> None:
         """
@@ -253,9 +326,11 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
         test_unseen_keys = ("test_unseen_loc",)
         test_seen_keys = ("test_seen_loc",)
         protocol_mode = str(xlsa_cfg.PROTOCOL_MODE).lower()
-        if protocol_mode not in {"dev", "final_zsl", "final_gzsl"}:
+        if protocol_mode not in {"dev", "final_zsl", "final_gzsl", "b3_pseudo_gzsl"}:
             raise ValueError("Unsupported DATA.XLSA.PROTOCOL_MODE='{}'".format(xlsa_cfg.PROTOCOL_MODE))
         self.protocol_mode = protocol_mode
+        b3_manifest = None
+        b3_indices_by_split = None
 
         if protocol_mode == "dev":
             seen_keys = train_keys
@@ -267,9 +342,22 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
             unseen_keys = test_unseen_keys
             eval_mode = "zsl"
             allowed_splits = {"trainval", "test_unseen"}
-        else:
+        elif protocol_mode == "final_gzsl":
             seen_keys = trainval_keys
             unseen_keys = test_unseen_keys
+            eval_mode = "gzsl"
+            allowed_splits = {"trainval", "test_seen", "test_unseen"}
+        else:
+            b3_manifest, b3_seen, b3_unseen, b3_indices_by_split = (
+                self._load_b3_pseudo_manifest(
+                    labels_all,
+                    self._select_split_indices(
+                        split_mat, trainval_keys, "B3 trainval source"
+                    ),
+                )
+            )
+            seen_keys = ("b3_train_source_indices",)
+            unseen_keys = ("b3_pseudo_unseen_source_indices",)
             eval_mode = "gzsl"
             allowed_splits = {"trainval", "test_seen", "test_unseen"}
 
@@ -280,11 +368,21 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
                 )
             )
 
-        seen_indices = self._select_split_indices(split_mat, seen_keys, "seen-classes")
-        unseen_indices = self._select_split_indices(split_mat, unseen_keys, "unseen-classes")
-
-        self.seen_classes = sorted(int(x) for x in np.unique(labels_all[seen_indices]).tolist())
-        self.unseen_classes = sorted(int(x) for x in np.unique(labels_all[unseen_indices]).tolist())
+        if protocol_mode == "b3_pseudo_gzsl":
+            seen_indices = np.concatenate(
+                (
+                    b3_indices_by_split["trainval"],
+                    b3_indices_by_split["test_seen"],
+                )
+            )
+            unseen_indices = b3_indices_by_split["test_unseen"]
+            self.seen_classes = list(b3_seen)
+            self.unseen_classes = list(b3_unseen)
+        else:
+            seen_indices = self._select_split_indices(split_mat, seen_keys, "seen-classes")
+            unseen_indices = self._select_split_indices(split_mat, unseen_keys, "unseen-classes")
+            self.seen_classes = sorted(int(x) for x in np.unique(labels_all[seen_indices]).tolist())
+            self.unseen_classes = sorted(int(x) for x in np.unique(labels_all[unseen_indices]).tolist())
 
         # 5. Load all class names from att_splits.mat and attach human-readable names
         if "allclasses_names" not in split_mat:
@@ -312,7 +410,7 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
             else:
                 split_indices = self._select_split_indices(split_mat, test_unseen_keys, "test_unseen")
                 split_source_keys = test_unseen_keys
-        else:
+        elif protocol_mode == "final_gzsl":
             if self._split == "trainval":
                 split_indices = self._select_split_indices(split_mat, trainval_keys, "trainval")
                 split_source_keys = trainval_keys
@@ -322,6 +420,13 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
             else:
                 split_indices = self._select_split_indices(split_mat, test_unseen_keys, "test_unseen")
                 split_source_keys = test_unseen_keys
+        else:
+            split_indices = b3_indices_by_split[self._split]
+            split_source_keys = (
+                "{}::{}".format(
+                    os.path.basename(self.b3_pseudo_manifest_path), self._split
+                ),
+            )
 
         split_indices = split_indices.astype(np.int64)
         split_labels = labels_all[split_indices]
@@ -346,7 +451,7 @@ class XLSADataset(XLSAAttributeMixin, torch.utils.data.Dataset):
             raise ValueError("dev protocol requires val_unseen local_classes to match unseen_classes")
         if protocol_mode == "final_zsl" and self._split == "test_unseen" and local_classes != list(self.unseen_classes):
             raise ValueError("final_zsl protocol requires test_unseen local_classes to match unseen_classes")
-        if protocol_mode == "final_gzsl":
+        if protocol_mode in {"final_gzsl", "b3_pseudo_gzsl"}:
             if self._split == "test_seen" and local_classes != list(self.seen_classes):
                 raise ValueError("final_gzsl protocol requires test_seen local_classes to match seen_classes")
             if self._split == "test_unseen" and local_classes != list(self.unseen_classes):

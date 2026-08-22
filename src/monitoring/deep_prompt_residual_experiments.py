@@ -181,6 +181,30 @@ def deterministic_donor_indices(
     relation: str,
     seed: int,
 ) -> np.ndarray:
+    groups = deterministic_donor_groups(
+        sample_ids,
+        labels,
+        relation=relation,
+        seed=seed,
+        k=1,
+    )
+    return np.asarray([int(group[0]) for group in groups], dtype=np.int64)
+
+
+def deterministic_donor_groups(
+    sample_ids: Sequence[str],
+    labels: Sequence[int],
+    *,
+    relation: str,
+    seed: int,
+    k: Optional[int],
+) -> list[np.ndarray]:
+    """Select deterministic, no-replacement donor sets for mean aggregation.
+
+    ``k=None`` means leave-one-out over every eligible same/different-class
+    donor.  The hash order depends on both target and candidate identity, so
+    selection is stable without depending on input row order.
+    """
     identifiers = [str(value) for value in sample_ids]
     target_labels = np.asarray(labels, dtype=np.int64).reshape(-1)
     if len(identifiers) != target_labels.size or not identifiers:
@@ -190,11 +214,13 @@ def deterministic_donor_indices(
     relation = str(relation).strip().lower()
     if relation not in {"same_class", "different_class"}:
         raise ValueError("relation must be same_class or different_class")
+    if k is not None and int(k) <= 0:
+        raise ValueError("donor group size k must be positive or None")
     by_class: Dict[int, list[int]] = {}
     for index, class_id in enumerate(target_labels.tolist()):
         by_class.setdefault(int(class_id), []).append(index)
     all_indices = np.arange(target_labels.size, dtype=np.int64)
-    donors = np.empty(target_labels.size, dtype=np.int64)
+    donor_groups = []
     for target_index, (sample_id, class_id) in enumerate(
         zip(identifiers, target_labels.tolist())
     ):
@@ -208,15 +234,33 @@ def deterministic_donor_indices(
             raise ValueError(
                 "no {} donor exists for sample {}".format(relation, sample_id)
             )
-        digest = hashlib.sha256(
-            "{}|{}|{}".format(int(seed), relation, sample_id).encode("utf-8")
-        ).digest()
-        donors[target_index] = candidates[
-            int.from_bytes(digest[:8], byteorder="little") % len(candidates)
-        ]
-    if relation == "same_class":
-        if np.any(donors == all_indices) or np.any(target_labels[donors] != target_labels):
+        ordered = sorted(
+            candidates,
+            key=lambda donor_index: hashlib.sha256(
+                "{}|{}|{}|{}".format(
+                    int(seed), relation, sample_id, identifiers[int(donor_index)]
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        take = len(ordered) if k is None else int(k)
+        if len(ordered) < take:
+            raise ValueError(
+                "{} eligible donors are fewer than requested k={} for sample {}".format(
+                    relation, take, sample_id
+                )
+            )
+        selected = np.asarray(ordered[:take], dtype=np.int64)
+        if np.unique(selected).size != selected.size:
+            raise RuntimeError("donor sampling unexpectedly used replacement")
+        if np.any(selected == target_index):
+            raise RuntimeError("donor group contains the target sample")
+        if relation == "same_class" and np.any(
+            target_labels[selected] != int(class_id)
+        ):
             raise RuntimeError("same-class donor contract failed")
-    elif np.any(target_labels[donors] == target_labels):
-        raise RuntimeError("different-class donor contract failed")
-    return donors
+        if relation == "different_class" and np.any(
+            target_labels[selected] == int(class_id)
+        ):
+            raise RuntimeError("different-class donor contract failed")
+        donor_groups.append(selected)
+    return donor_groups

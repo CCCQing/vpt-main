@@ -19,6 +19,16 @@ from ..utils import logging
 logger = logging.get_logger("visual_prompt")
 
 
+def _parameter_lr_multiplier(name: str, train_params: CfgNode) -> float:
+    if name.endswith("prompt_embeddings") or name.endswith(
+        "deep_prompt_embeddings"
+    ):
+        return float(train_params.STATIC_PROMPT_LR_MULTIPLIER)
+    if name.startswith("r_similarity_head."):
+        return float(train_params.CLASSIFIER_LR_MULTIPLIER)
+    return 1.0
+
+
 def _build_adamw_param_groups(
     params: List[Tuple[str, torch.nn.Parameter]],
     models: List[Any],
@@ -57,6 +67,7 @@ def _build_adamw_param_groups(
     no_decay_params = []
     decay_names = []
     no_decay_names = []
+    scaled_groups = {}
     seen_ids = set()
 
     for name, param in params:
@@ -77,6 +88,14 @@ def _build_adamw_param_groups(
         else:
             decay_params.append(param)
             decay_names.append(name)
+        multiplier = _parameter_lr_multiplier(name, train_params)
+        if multiplier <= 0.0 or not math.isfinite(multiplier):
+            raise ValueError(
+                "parameter learning-rate multipliers must be positive and finite"
+            )
+        scaled_groups.setdefault((bool(is_no_decay), float(multiplier)), []).append(
+            param
+        )
 
     total_grouped = len(decay_params) + len(no_decay_params)
     if total_grouped != len(seen_ids):
@@ -98,17 +117,30 @@ def _build_adamw_param_groups(
     # AdamW uses two groups only (decay/no_decay), so no per-bias standalone lr group here.
     no_decay_lr = base_lr
 
+    if all(multiplier == 1.0 for _, multiplier in scaled_groups):
+        return [
+            {
+                "params": decay_params,
+                "weight_decay": train_params.WEIGHT_DECAY,
+                "lr": base_lr,
+            },
+            {
+                "params": no_decay_params,
+                "weight_decay": 0.0,
+                "lr": no_decay_lr,
+            },
+        ]
     return [
         {
-            "params": decay_params,
-            "weight_decay": train_params.WEIGHT_DECAY,
-            "lr": base_lr,
-        },
-        {
-            "params": no_decay_params,
-            "weight_decay": 0.0,
-            "lr": no_decay_lr,
-        },
+            "params": values,
+            "weight_decay": 0.0 if no_decay else train_params.WEIGHT_DECAY,
+            "lr": base_lr * multiplier,
+            "lr_multiplier": multiplier,
+        }
+        for (no_decay, multiplier), values in sorted(
+            scaled_groups.items(), key=lambda item: (item[0][0], item[0][1])
+        )
+        if values
     ]
 
 
@@ -116,6 +148,13 @@ def make_optimizer(
     models: List[Any], train_params: CfgNode
 ) -> Optimizer:
     params = []
+    if train_params.OPTIMIZER != "adamw" and (
+        float(train_params.STATIC_PROMPT_LR_MULTIPLIER) != 1.0
+        or float(train_params.CLASSIFIER_LR_MULTIPLIER) != 1.0
+    ):
+        raise ValueError(
+            "module learning-rate multipliers currently require SOLVER.OPTIMIZER='adamw'"
+        )
     for model in models:
         # only include learnable params
         if train_params.DBG_TRAINABLE:

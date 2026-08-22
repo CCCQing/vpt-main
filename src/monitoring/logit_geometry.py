@@ -163,6 +163,30 @@ def _class_geometry(
     return metrics, arrays, validity
 
 
+def analyze_vector_geometry(
+    values,
+    targets,
+    expected_classes: Sequence[int],
+    *,
+    eps: float = 1.0e-8,
+):
+    """Public class-geometry contract for any sample-level vector space."""
+    matrix = np.asarray(values, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] == 0:
+        raise ValueError("vector geometry requires a non-empty [samples, dim] matrix")
+    if not np.isfinite(matrix).all():
+        raise ValueError("vector geometry contains non-finite values")
+    target_array = np.asarray(targets, dtype=np.int64).reshape(-1)
+    if target_array.size != matrix.shape[0]:
+        raise ValueError("vector geometry target count does not match samples")
+    return _class_geometry(
+        matrix,
+        target_array,
+        expected_classes,
+        float(eps),
+    )
+
+
 def _factor_context(factorized: Mapping[str, np.ndarray]) -> Dict[str, float]:
     bias = np.asarray(factorized["domain_bias"], dtype=np.float64)
     scale = np.asarray(factorized["domain_scale"], dtype=np.float64)

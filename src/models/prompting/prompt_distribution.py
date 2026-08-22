@@ -51,6 +51,7 @@ class MeanConditionedDeepPromptResidual(nn.Module):
     _CONTENT_MODES = {"shared", "slot_low_rank"}
     _SAMPLE_GATE_MODES = {"none", "shared", "grouped", "layerwise"}
     _SAMPLE_GATE_INPUTS = {"residual_source", "constant"}
+    _AMPLITUDE_MODES = {"legacy_gate", "bounded_ratio"}
 
     def __init__(
         self,
@@ -65,6 +66,11 @@ class MeanConditionedDeepPromptResidual(nn.Module):
         sample_gate_input: str = "residual_source",
         sample_gate_hidden_dim: int = 32,
         sample_gate_init: float = 0.95,
+        amplitude_mode: str = "legacy_gate",
+        active_layers: Sequence[int] = (),
+        bounded_max_ratio: float = 0.5,
+        bounded_init_ratio: float = 0.25,
+        bounded_norm_eps: float = 1.0e-6,
     ) -> None:
         super().__init__()
         self.dim = int(dim)
@@ -106,8 +112,44 @@ class MeanConditionedDeepPromptResidual(nn.Module):
             raise ValueError(
                 "Deep Prompt residual SAMPLE_GATE_INIT must be inside (0, 1)"
             )
+        self.amplitude_mode = str(amplitude_mode).strip().lower()
+        if self.amplitude_mode not in self._AMPLITUDE_MODES:
+            raise ValueError(
+                "Unsupported Deep Prompt residual AMPLITUDE_MODE={!r}".format(
+                    amplitude_mode
+                )
+            )
+        active_layer_ids = tuple(int(value) for value in active_layers)
+        if len(set(active_layer_ids)) != len(active_layer_ids) or any(
+            value < 0 or value >= self.num_layers for value in active_layer_ids
+        ):
+            raise ValueError("Deep Prompt residual ACTIVE_LAYERS are invalid")
+        if not active_layer_ids:
+            active_layer_ids = tuple(range(self.num_layers))
+        active_mask = torch.zeros(self.num_layers, dtype=torch.bool)
+        active_mask[list(active_layer_ids)] = True
+        self.register_buffer("active_layer_mask", active_mask, persistent=True)
+        self.bounded_max_ratio = float(bounded_max_ratio)
+        self.bounded_init_ratio = float(bounded_init_ratio)
+        self.bounded_norm_eps = float(bounded_norm_eps)
+        if self.bounded_norm_eps <= 0.0:
+            raise ValueError("Deep Prompt residual BOUNDED_NORM_EPS must be positive")
+        if self.amplitude_mode == "bounded_ratio":
+            if not self.bounded_max_ratio > 0.0:
+                raise ValueError(
+                    "Deep Prompt residual BOUNDED_MAX_RATIO must be positive"
+                )
+            if not 0.0 < self.bounded_init_ratio < self.bounded_max_ratio:
+                raise ValueError(
+                    "Deep Prompt residual BOUNDED_INIT_RATIO must lie inside "
+                    "(0, BOUNDED_MAX_RATIO)"
+                )
+            fraction = self.bounded_init_ratio / self.bounded_max_ratio
+            layer_gate_init = math.log(fraction / (1.0 - fraction))
+        else:
+            layer_gate_init = float(gate_init)
         self.layer_gate = nn.Parameter(
-            torch.full((self.num_layers,), float(gate_init))
+            torch.full((self.num_layers,), float(layer_gate_init))
         )
         self.slot_coefficients = None
         self.slot_basis = None
@@ -239,6 +281,7 @@ class MeanConditionedDeepPromptResidual(nn.Module):
         self,
         mean: torch.Tensor,
         layer_id: int,
+        base_prompt: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         layer_id = int(layer_id)
         if layer_id < 0 or layer_id >= self.num_layers:
@@ -254,8 +297,54 @@ class MeanConditionedDeepPromptResidual(nn.Module):
             device=raw_delta.device, dtype=raw_delta.dtype
         )
         runtime_scale = self._runtime_layer_scale(layer_id, raw_delta)
-        effective_gate = layer_gate * sample_gate * runtime_scale
-        applied_delta = effective_gate[:, None, None] * raw_delta
+        active = self.active_layer_mask[layer_id].to(
+            device=raw_delta.device, dtype=raw_delta.dtype
+        )
+        if self.amplitude_mode == "bounded_ratio":
+            if not torch.is_tensor(base_prompt) or tuple(base_prompt.shape) != tuple(
+                raw_delta.shape
+            ):
+                raise ValueError(
+                    "bounded_ratio requires base_prompt aligned with raw_delta"
+                )
+            raw_rms = raw_delta.float().square().mean(dim=(-2, -1)).sqrt().to(
+                dtype=raw_delta.dtype
+            )
+            base_rms = (
+                base_prompt.detach().float().square().mean(dim=(-2, -1)).sqrt()
+            ).to(device=raw_delta.device, dtype=raw_delta.dtype)
+            direction = raw_delta / raw_rms[:, None, None].clamp_min(
+                self.bounded_norm_eps
+            )
+            bounded_ratio = self.bounded_max_ratio * torch.sigmoid(layer_gate)
+            effective_gate = bounded_ratio * sample_gate * runtime_scale * active
+            applied_delta = (
+                effective_gate[:, None, None]
+                * base_rms[:, None, None]
+                * direction
+            )
+            applied_rms = applied_delta.float().square().mean(dim=(-2, -1)).sqrt()
+            applied_ratio = applied_rms / base_rms.float().clamp_min(
+                self.bounded_norm_eps
+            )
+        else:
+            raw_rms = raw_delta.float().square().mean(dim=(-2, -1)).sqrt().to(
+                dtype=raw_delta.dtype
+            )
+            base_rms = (
+                base_prompt.detach().float().square().mean(dim=(-2, -1)).sqrt().to(
+                    device=raw_delta.device, dtype=raw_delta.dtype
+                )
+                if torch.is_tensor(base_prompt)
+                and tuple(base_prompt.shape) == tuple(raw_delta.shape)
+                else raw_delta.new_zeros(int(raw_delta.shape[0]))
+            )
+            effective_gate = layer_gate * sample_gate * runtime_scale * active
+            applied_delta = effective_gate[:, None, None] * raw_delta
+            applied_rms = applied_delta.float().square().mean(dim=(-2, -1)).sqrt()
+            applied_ratio = applied_rms / base_rms.float().clamp_min(
+                self.bounded_norm_eps
+            )
         stats = {
             "layer_id": layer_id,
             "source_mu": source,
@@ -265,6 +354,18 @@ class MeanConditionedDeepPromptResidual(nn.Module):
             "layer_gate": layer_gate.expand(int(raw_delta.shape[0])),
             "sample_gate": sample_gate,
             "runtime_scale": runtime_scale.expand(int(raw_delta.shape[0])),
+            "active_layer": active.expand(int(raw_delta.shape[0])),
+            "amplitude_mode": self.amplitude_mode,
+            "raw_delta_rms": raw_rms,
+            "base_prompt_rms": base_rms,
+            "applied_ratio": applied_ratio.to(dtype=raw_delta.dtype),
+            "bounded_max_ratio": raw_delta.new_full(
+                (int(raw_delta.shape[0]),), self.bounded_max_ratio
+            ),
+            "budget_exceed": (
+                applied_ratio
+                > self.bounded_max_ratio + max(self.bounded_norm_eps, 1.0e-7)
+            ).to(dtype=raw_delta.dtype),
             "content_mode": self.content_mode,
             "sample_gate_mode": self.sample_gate_mode,
             "sample_gate_input": self.sample_gate_input,

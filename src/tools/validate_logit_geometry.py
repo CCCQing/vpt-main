@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.monitoring.eval_metrics import class_geometry_trace_metrics
-from src.monitoring.logit_geometry import analyze_logit_geometry
+from src.monitoring.logit_geometry import analyze_logit_geometry, analyze_vector_geometry
 from src.monitoring.probe import StreamingRepresentationAccumulator
 
 
@@ -135,9 +135,24 @@ def _validate_logit_geometry() -> None:
                 )
 
 
+def _validate_generic_vector_geometry() -> None:
+    values = np.asarray(
+        [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]],
+        dtype=np.float64,
+    )
+    targets = np.asarray([10, 10, 20, 20], dtype=np.int64)
+    metrics, arrays, validity = analyze_vector_geometry(
+        values, targets, expected_classes=[10, 20]
+    )
+    assert validity["valid"]
+    assert metrics["leave_one_out_center_accuracy"] == 1.0
+    assert arrays["class_ids"].tolist() == [10, 20]
+
+
 def main() -> None:
     _validate_standardized_fisher()
     _validate_logit_geometry()
+    _validate_generic_vector_geometry()
     print("logit geometry validation passed")
 
 
