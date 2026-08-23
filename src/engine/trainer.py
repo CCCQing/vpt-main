@@ -146,6 +146,16 @@ from ..utils.vis_pipeline import (
 logger = logging.get_logger("visual_prompt")
 
 
+def _atomic_json_file(path, payload):
+    path = os.path.abspath(str(path))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = "{}.tmp.{}".format(path, os.getpid())
+    with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, path)
+
+
 class _StreamingProbeMetricRows:
     def __init__(self, diagnostic_manager, flush_rows=16384):
         self.diagnostic_manager = diagnostic_manager
@@ -4895,11 +4905,33 @@ class Trainer():
         num_workers = int(self.cfg.MONITOR.PROBE.NUM_WORKERS)
         if num_workers < 0:
             raise ValueError("MONITOR.PROBE.NUM_WORKERS must be non-negative")
+        cache_transformed_images = bool(
+            self.cfg.MONITOR.PROBE.CACHE_TRANSFORMED_IMAGES
+        )
+        if cache_transformed_images and num_workers != 0:
+            raise ValueError(
+                "MONITOR.PROBE.CACHE_TRANSFORMED_IMAGES requires "
+                "MONITOR.PROBE.NUM_WORKERS=0 so one process owns the cache"
+            )
         return {
             "batch_size": int(self.cfg.MONITOR.PROBE.BATCH_SIZE),
             "num_workers": num_workers,
             "pin_memory": bool(self.cfg.MONITOR.PROBE.PIN_MEMORY),
+            "cache_transformed_images": cache_transformed_images,
+            "cache_vit_cls_prepass": bool(
+                self.cfg.MONITOR.PROBE.CACHE_VIT_CLS_PREPASS
+            ),
         }
+
+    def _fixed_probe_dataset(self, dataset, manifest, transform):
+        return FixedProbeDataset(
+            dataset,
+            manifest,
+            transform,
+            cache_transformed_images=bool(
+                self.cfg.MONITOR.PROBE.CACHE_TRANSFORMED_IMAGES
+            ),
+        )
 
     def _build_fixed_probe_loader(self, dataset, batch_size):
         settings = self._fixed_probe_loader_settings()
@@ -5388,6 +5420,21 @@ class Trainer():
             inputs, targets_global, attributes = self.get_input(input_data)
             inputs = inputs.to(self.device, non_blocking=True)
             targets_global = targets_global.to(self.device, non_blocking=True)
+            batch_sample_ids = input_data.get("sample_id")
+            if batch_sample_ids is None:
+                batch_sample_ids = ["batch{}-row{}".format(batch_index, index) for index in range(int(inputs.shape[0]))]
+            else:
+                batch_sample_ids = [str(item) for item in list(batch_sample_ids)]
+            prepass_cache_enabled = bool(
+                self.cfg.MONITOR.PROBE.CACHE_VIT_CLS_PREPASS
+            )
+            prepass_cache_key = "{}|{}".format(
+                str(split), "|".join(batch_sample_ids)
+            )
+            if prepass_cache_enabled and hasattr(
+                model_ref, "begin_runtime_vit_cls_prepass_cache"
+            ):
+                model_ref.begin_runtime_vit_cls_prepass_cache(prepass_cache_key)
             target_global_list = [int(item) for item in targets_global.detach().cpu().tolist()]
             target_local = np.asarray([global_to_local[item] for item in target_global_list], dtype=np.int64)
             semantics = self._prepare_semantics_for_stage(
@@ -5672,6 +5719,12 @@ class Trainer():
                 )
                 if flip_accumulator is not None:
                     flipped_inputs = torch.flip(inputs, dims=[-1])
+                    if prepass_cache_enabled and hasattr(
+                        model_ref, "select_runtime_vit_cls_prepass_cache_key"
+                    ):
+                        model_ref.select_runtime_vit_cls_prepass_cache_key(
+                            prepass_cache_key + "|horizontal_flip"
+                        )
                     flipped_output = model_ref.forward_with_affinity(
                         flipped_inputs,
                         affinity_cfg,
@@ -5680,6 +5733,12 @@ class Trainer():
                         class_ids=candidate_class_ids,
                         runtime_targets=None,
                     )
+                    if prepass_cache_enabled and hasattr(
+                        model_ref, "select_runtime_vit_cls_prepass_cache_key"
+                    ):
+                        model_ref.select_runtime_vit_cls_prepass_cache_key(
+                            prepass_cache_key
+                        )
                     if use_attention:
                         (
                             flipped_logits,
@@ -6006,6 +6065,10 @@ class Trainer():
                 del transport_intervention_batch
             if transport_batch_reference is not None:
                 del transport_batch_reference
+            if prepass_cache_enabled and hasattr(
+                model_ref, "end_runtime_vit_cls_prepass_cache"
+            ):
+                model_ref.end_runtime_vit_cls_prepass_cache()
 
         normal = normal_accumulator.finalize()
         normal_accumulator.representation.release_covariance()
@@ -7997,8 +8060,11 @@ class Trainer():
 
         for split, dataset, candidate_class_ids, manifest in prepared_probes:
             probe_timing_by_split[split] = {}
+            fixed_probe_dataset = self._fixed_probe_dataset(
+                dataset, manifest, deterministic_transform
+            )
             probe_loader = self._build_fixed_probe_loader(
-                FixedProbeDataset(dataset, manifest, deterministic_transform),
+                fixed_probe_dataset,
                 self.cfg.MONITOR.PROBE.BATCH_SIZE,
             )
             bundle, stage_timing = self._execute_timed_probe_stage(
@@ -8016,7 +8082,7 @@ class Trainer():
                 self.cfg.MONITOR.PROBE.BAYESIAN_OBJECT_SELECTION.ENABLE
             ):
                 object_loader = self._build_fixed_probe_loader(
-                    FixedProbeDataset(dataset, manifest, deterministic_transform),
+                    fixed_probe_dataset,
                     self.cfg.MONITOR.PROBE.BATCH_SIZE,
                 )
                 object_result, stage_timing = self._execute_timed_probe_stage(
@@ -8116,7 +8182,7 @@ class Trainer():
                 ))
             if bool(self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.ENABLE):
                 relevance_loader = self._build_fixed_probe_loader(
-                    FixedProbeDataset(dataset, manifest, deterministic_transform),
+                    fixed_probe_dataset,
                     self.cfg.MONITOR.PROBE.TARGET_RELEVANCE.BATCH_SIZE,
                 )
                 target_relevance, stage_timing = self._execute_timed_probe_stage(
@@ -10165,6 +10231,25 @@ class Trainer():
             raise ValueError(
                 "MONITOR.MODULE_EFFECT.ENABLE requires SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT=True"
             )
+        final_probe_mode = str(
+            self.cfg.MONITOR.PROBE.FINAL_EXECUTION_MODE
+        ).strip().lower()
+        if final_probe_mode not in {"integrated", "deferred"}:
+            raise ValueError(
+                "MONITOR.PROBE.FINAL_EXECUTION_MODE must be integrated or deferred"
+            )
+        if final_probe_mode == "deferred" and not bool(
+            self.cfg.MONITOR.PROBE.ENABLE
+        ):
+            raise ValueError(
+                "deferred fixed Probe execution requires MONITOR.PROBE.ENABLE=True"
+            )
+        if final_probe_mode == "deferred" and not bool(
+            self.cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT
+        ):
+            raise ValueError(
+                "deferred fixed Probe execution requires a final trainable checkpoint"
+            )
         if du.get_rank() == 0:
             if self._frozen_reference_state:
                 freeze_contract = self._residual_freeze_contract_payload(final=True)
@@ -10175,12 +10260,15 @@ class Trainer():
                     raise RuntimeError("residual freeze contract failed")
             if bool(self.cfg.SOLVER.SAVE_TRAINABLE_FINAL_CHECKPOINT):
                 self._final_trainable_checkpoint_path = self._save_trainable_final_checkpoint(total_epoch)
-            self._run_fixed_probes(
-                train_loader,
-                test_seen_loader,
-                test_unseen_loader,
-                checkpoint_epoch=total_epoch,
-            )
+            if final_probe_mode == "deferred":
+                self._write_deferred_fixed_probe_marker(total_epoch)
+            else:
+                self._run_fixed_probes(
+                    train_loader,
+                    test_seen_loader,
+                    test_unseen_loader,
+                    checkpoint_epoch=total_epoch,
+                )
             if self._milestone_probe_epochs:
                 self.diagnostic_manager.record_probe_artifact(
                     "milestone_probe_manifest.json",
@@ -10285,6 +10373,93 @@ class Trainer():
             sum(int(t.numel()) for t in trainable_state.values()),
         )
         return checkpoint_path
+
+    def _write_deferred_fixed_probe_marker(self, total_epoch):
+        checkpoint_path = self._final_trainable_checkpoint_path
+        if not checkpoint_path or not os.path.isfile(checkpoint_path):
+            raise RuntimeError(
+                "deferred fixed Probe execution requires a saved final trainable checkpoint"
+            )
+        selection_seeds = [int(self.cfg.MONITOR.PROBE.SELECTION_SEED)]
+        selection_seeds.extend(
+            int(item)
+            for item in self.cfg.MONITOR.PROBE.ROBUSTNESS_SELECTION_SEEDS
+        )
+        selection_seeds = list(dict.fromkeys(selection_seeds))
+        if any(seed < 0 for seed in selection_seeds):
+            raise ValueError("fixed-Probe selection seeds must be non-negative")
+        output_dir = os.path.abspath(str(self.cfg.OUTPUT_DIR))
+
+        def file_identity(name):
+            path = os.path.join(output_dir, name)
+            return {
+                "path": name,
+                "sha256": checkpoint_sha256(path) if os.path.isfile(path) else None,
+            }
+
+        marker = {
+            "format": "deferred_fixed_probe_checkpoint_ready_v1",
+            "status": "checkpoint_ready",
+            "training_performed": True,
+            "fixed_probe_performed": False,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "run_id": str(self.monitor_manager.run_id),
+            "session_id": str(self.monitor_manager.session_id),
+            "training_seed": (
+                int(self.cfg.SEED) if self.cfg.SEED is not None else None
+            ),
+            "protocol_mode": str(self.cfg.DATA.XLSA.PROTOCOL_MODE),
+            "b3_pseudo_manifest": self._b3_pseudo_manifest_identity(),
+            "checkpoint": {
+                "checkpoint_id": "final_epoch_{:04d}".format(int(total_epoch)),
+                "checkpoint_path": os.path.basename(checkpoint_path),
+                "checkpoint_sha256": checkpoint_sha256(checkpoint_path),
+                "checkpoint_epoch": int(total_epoch),
+                "checkpoint_global_step": int(self._trace_global_step),
+                "checkpoint_selection_rule": "predeclared_final_epoch",
+                "source_run_id": str(self.monitor_manager.run_id),
+                "source_session_id": str(self.monitor_manager.session_id),
+            },
+            "fixed_probe_contract": {
+                "execution_profile": str(
+                    self.cfg.MONITOR.PROBE.EXECUTION_PROFILE
+                ),
+                "selection_seeds": selection_seeds,
+                "probe_loader": self._fixed_probe_loader_settings(),
+                "cache_contract": {
+                    "transformed_images": bool(
+                        self.cfg.MONITOR.PROBE.CACHE_TRANSFORMED_IMAGES
+                    ),
+                    "vit_cls_prepass": bool(
+                        self.cfg.MONITOR.PROBE.CACHE_VIT_CLS_PREPASS
+                    ),
+                    "prompt_conditioned_features_cached": False,
+                    "attention_or_logits_cached": False,
+                },
+            },
+            "identity_files": {
+                "resolved_config": file_identity("resolved_config.yaml"),
+                "dataset_manifest": file_identity("dataset_manifest.json"),
+                "reproducibility_manifest": file_identity(
+                    "reproducibility_manifest.json"
+                ),
+            },
+        }
+        marker_path = os.path.join(output_dir, "training_checkpoint_ready.json")
+        _atomic_json_file(marker_path, marker)
+        logger.info(
+            "Deferred final fixed Probes; wrote checkpoint-ready marker: %s",
+            marker_path,
+        )
+        self._write_progress_state(
+            force=True,
+            status="running",
+            phase="training_checkpoint_ready",
+            epoch=int(total_epoch),
+            completed_epochs=int(total_epoch),
+            total_epochs=int(total_epoch),
+        )
+        return marker_path
 
     def _save_trainable_milestone_checkpoint(self, checkpoint_epoch, total_epoch):
         trainable_names, auxiliary_names, trainable_state = self._trainable_model_state()

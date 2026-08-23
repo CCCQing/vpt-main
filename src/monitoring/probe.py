@@ -151,19 +151,36 @@ def validate_probe_manifest(
 
 
 class FixedProbeDataset(torch.utils.data.Dataset):
-    def __init__(self, source_dataset: Any, manifest: Mapping[str, Any], transform: Any) -> None:
+    def __init__(
+        self,
+        source_dataset: Any,
+        manifest: Mapping[str, Any],
+        transform: Any,
+        *,
+        cache_transformed_images: bool = False,
+    ) -> None:
         self.source_dataset = source_dataset
         self.manifest = dict(manifest)
         self.rows = list(manifest.get("samples", []))
         self.transform = transform
+        self.cache_transformed_images = bool(cache_transformed_images)
+        self._transformed_image_cache: Dict[int, torch.Tensor] = {}
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        row = self.rows[int(index)]
-        image = tv.datasets.folder.default_loader(str(row["image_path"]))
-        image = self.transform(image)
+        index = int(index)
+        row = self.rows[index]
+        image = self._transformed_image_cache.get(index)
+        if image is None:
+            image = tv.datasets.folder.default_loader(str(row["image_path"]))
+            image = self.transform(image)
+            if self.cache_transformed_images:
+                # Fixed-Probe transforms are deterministic.  The cached CPU
+                # tensor is read-only from the dataset's perspective and is
+                # reused only within this process/checkpoint execution.
+                self._transformed_image_cache[index] = image
         label = int(row["global_label"])
         return {
             "image": image,

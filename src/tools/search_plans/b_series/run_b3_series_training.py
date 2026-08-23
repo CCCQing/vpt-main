@@ -211,7 +211,30 @@ def _completed(output_root: Path) -> bool:
     completed = []
     for path in summaries:
         try:
-            if str(_read_json(path).get("status", "")).lower() == "completed":
+            if str(_read_json(path).get("status", "")).lower() != "completed":
+                continue
+            run_dir = path.parent
+            deferred_collection = run_dir / "b3_fixed_probe_collection.json"
+            if deferred_collection.is_file() and bool(
+                _read_json(deferred_collection).get("valid", False)
+            ):
+                completed.append(path)
+                continue
+            robustness = run_dir / "diagnostics" / "probe_robustness_manifest.json"
+            if not robustness.is_file():
+                continue
+            payload = _read_json(robustness)
+            seeds = [int(item) for item in payload.get("selection_seeds", [])]
+            executions = list(payload.get("executions") or [])
+            if (
+                seeds == [424242, 424243, 424244]
+                and len(executions) == 3
+                and all(
+                    isinstance(item, dict)
+                    and str(item.get("execution_profile")) == "final_full"
+                    for item in executions
+                )
+            ):
                 completed.append(path)
         except (OSError, ValueError):
             continue

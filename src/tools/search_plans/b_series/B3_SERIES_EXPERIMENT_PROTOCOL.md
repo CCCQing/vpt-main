@@ -38,6 +38,50 @@ Formal stages always use training seeds `0/1/2`. Each training run inherits the
 common strict three-Probe contract (`424242/424243/424244`). Existing non-empty
 incomplete output is never overwritten.
 
+### 2.1 Long fixed-Probe runs: train once, then replay three selections
+
+For a large B3 queue, prefer the deferred runner.  It saves the same final
+trainable checkpoint, writes `training_checkpoint_ready.json`, and runs each
+selection seed as an independent checkpoint-only process.  A run is not
+scientifically complete merely because training returned successfully: all
+three replay validators must pass and `b3_fixed_probe_collection.json` must be
+valid.
+
+The first production use must be gated by one same-checkpoint equivalence run:
+
+```bash
+python -m src.tools.search_plans.a_series.replay_probe_robustness \
+  --source-run <completed-reference-run> \
+  --output-run <equivalence-replay-run> \
+  --selection-seed 424242 --source-kind completed_probe \
+  --execution-profile final_full --cpu-threads 8 \
+  --cache-transformed-images --cache-vit-cls-prepass
+
+python -m src.tools.validate_fixed_probe_replay_equivalence \
+  --reference-run <completed-reference-run> \
+  --replay-run <equivalence-replay-run> \
+  --output <equivalence-summary.json>
+```
+
+Only after that summary reports `valid=true` may the resumable R1 queue start:
+
+```bash
+python -m src.tools.search_plans.b_series.run_b3_deferred_probe_queue \
+  --stages R1 \
+  --manifest-suite output/b3_series/manifests/b3_pseudo_split_suite.json \
+  --out-root output/b3_series/training --max-ratios 0.25,0.50 \
+  --gpu-groups '0;3;4;5;6;7' --max-workers 6 \
+  --probe-cpu-threads 8 \
+  --equivalence-summary <equivalence-summary.json>
+```
+
+The image cache stores only deterministic transformed CPU tensors.  The ViT
+cache stores only the frozen, no-Prompt CLS prepass for repeated forwards of
+the same batch.  Prompt-conditioned CLS, Attention, relevance and logits are
+always recomputed for every condition.  Partial integrated Probe artifacts are
+preserved but explicitly excluded when a validated deferred collection
+supersedes them.
+
 ## 3. Calibrate, then freeze, the R2 loss weights
 
 The pilot is explicitly non-formal: first pseudo split, training seed 0, and one

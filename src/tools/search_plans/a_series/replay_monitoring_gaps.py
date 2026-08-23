@@ -194,9 +194,15 @@ def _load_cfg(
 
 
 def _construct_loaders(cfg, logger):
-    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
-        raise ValueError("A-series monitoring replay requires DATA.XLSA.PROTOCOL_MODE=final_gzsl")
-    logger.info("Loading final train/test datasets for fixed-probe replay")
+    protocol_mode = str(cfg.DATA.XLSA.PROTOCOL_MODE).lower()
+    if protocol_mode not in {"final_gzsl", "b3_pseudo_gzsl"}:
+        raise ValueError(
+            "fixed-Probe replay requires final_gzsl or b3_pseudo_gzsl"
+        )
+    logger.info(
+        "Loading train/test datasets for fixed-probe replay protocol=%s",
+        protocol_mode,
+    )
     train_loader = data_loader.construct_trainval_loader(cfg)
     test_seen_loader = data_loader.construct_test_seen_loader(cfg)
     test_unseen_loader = data_loader.construct_test_unseen_loader(cfg)

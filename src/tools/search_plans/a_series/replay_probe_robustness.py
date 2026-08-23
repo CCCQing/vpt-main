@@ -49,6 +49,15 @@ def parse_args():
     parser.add_argument("--output-run", required=True)
     parser.add_argument("--selection-seed", required=True, type=int)
     parser.add_argument(
+        "--source-kind",
+        choices=("auto", "completed_probe", "training_checkpoint"),
+        default="auto",
+        help=(
+            "auto uses training_checkpoint_ready.json when present and otherwise "
+            "uses the historical completed fixed-Probe identity."
+        ),
+    )
+    parser.add_argument(
         "--execution-profile",
         choices=("final_full", "robustness_core"),
         default="final_full",
@@ -64,6 +73,16 @@ def parse_args():
         help="Optional fixed-probe batch-size override; defaults to the source resolved config.",
     )
     parser.add_argument("--cpu-threads", type=int)
+    parser.add_argument(
+        "--cache-transformed-images",
+        action="store_true",
+        help="Cache deterministic fixed-Probe image tensors in the replay process.",
+    )
+    parser.add_argument(
+        "--cache-vit-cls-prepass",
+        action="store_true",
+        help="Reuse the frozen no-Prompt ViT CLS prepass within each Probe batch.",
+    )
     parser.add_argument(
         "--validate-existing",
         action="store_true",
@@ -82,6 +101,8 @@ def _load_cfg(
     selection_seed,
     batch_size,
     execution_profile="final_full",
+    cache_transformed_images=False,
+    cache_vit_cls_prepass=False,
 ):
     config_path = source_run / "resolved_config.yaml"
     if not config_path.is_file():
@@ -96,10 +117,21 @@ def _load_cfg(
     cfg.NUM_GPUS = 1 if torch.cuda.is_available() else 0
     cfg.DATA.NUM_WORKERS = 0
     cfg.DATA.PIN_MEMORY = False
+    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "b3_pseudo_gzsl":
+        configured_manifest = Path(
+            str(cfg.DATA.XLSA.B3_PSEUDO_MANIFEST)
+        ).expanduser()
+        portable_manifest = source_run / "b3_pseudo_manifest.json"
+        if not configured_manifest.is_file() and portable_manifest.is_file():
+            cfg.DATA.XLSA.B3_PSEUDO_MANIFEST = str(portable_manifest.resolve())
     cfg.MONITOR.OUTPUT_POLICY = "error_if_exists"
     cfg.MONITOR.PROBE.SELECTION_SEED = int(selection_seed)
     cfg.MONITOR.PROBE.ROBUSTNESS_SELECTION_SEEDS = []
     cfg.MONITOR.PROBE.EXECUTION_PROFILE = str(execution_profile)
+    cfg.MONITOR.PROBE.CACHE_TRANSFORMED_IMAGES = bool(
+        cache_transformed_images
+    )
+    cfg.MONITOR.PROBE.CACHE_VIT_CLS_PREPASS = bool(cache_vit_cls_prepass)
     if batch_size is not None:
         if int(batch_size) < 1:
             raise ValueError("--batch-size must be positive")
@@ -118,6 +150,70 @@ def _load_cfg(
     cfg.MONITOR.AUXILIARY_LOSS.ENABLE = False
     cfg.freeze()
     return cfg
+
+
+def _training_checkpoint_source_identity(source_run, cfg):
+    marker_path = source_run / "training_checkpoint_ready.json"
+    if not marker_path.is_file():
+        raise FileNotFoundError(str(marker_path))
+    marker = _read_json(marker_path)
+    if (
+        marker.get("format") != "deferred_fixed_probe_checkpoint_ready_v1"
+        or marker.get("status") != "checkpoint_ready"
+    ):
+        raise ValueError("invalid deferred fixed-Probe checkpoint marker")
+    checkpoint = dict(marker.get("checkpoint") or {})
+    checkpoint_path = Path(str(checkpoint.get("checkpoint_path", "")))
+    if not checkpoint_path.is_absolute():
+        checkpoint_path = (source_run / checkpoint_path).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(str(checkpoint_path))
+    from src.monitoring.module_effect import checkpoint_sha256
+
+    actual_sha256 = checkpoint_sha256(str(checkpoint_path))
+    if actual_sha256 != checkpoint.get("checkpoint_sha256"):
+        raise RuntimeError("deferred source checkpoint hash mismatch")
+    identity_files = dict(marker.get("identity_files") or {})
+    for name, record in identity_files.items():
+        expected = (record or {}).get("sha256")
+        relative = str((record or {}).get("path") or "")
+        if expected is None:
+            continue
+        path = (source_run / relative).resolve()
+        if not path.is_file() or checkpoint_sha256(str(path)) != expected:
+            raise RuntimeError(
+                "deferred source identity mismatch for {}".format(name)
+            )
+    contract = dict(marker.get("fixed_probe_contract") or {})
+    selection_seeds = [int(item) for item in contract.get("selection_seeds", [])]
+    if not selection_seeds:
+        raise ValueError("deferred source marker has no fixed-Probe selection seeds")
+    return {
+        "source_kind": "training_checkpoint",
+        "marker_path": str(marker_path),
+        "selection_seed": int(selection_seeds[0]),
+        "selection_seeds": selection_seeds,
+        "probe_loader": dict(contract.get("probe_loader") or {}),
+        "checkpoint": {
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_sha256": actual_sha256,
+            "checkpoint_global_step": int(
+                checkpoint.get("checkpoint_global_step", 0)
+            ),
+            "checkpoint_selection_rule": checkpoint.get(
+                "checkpoint_selection_rule", "predeclared_final_epoch"
+            ),
+            "source_run_id": checkpoint.get(
+                "source_run_id", marker.get("run_id")
+            ),
+            "source_session_id": checkpoint.get(
+                "source_session_id", marker.get("session_id")
+            ),
+            "checkpoint_epoch": int(
+                checkpoint.get("checkpoint_epoch", cfg.SOLVER.TOTAL_EPOCH)
+            ),
+        },
+    }
 
 
 def _normal_equivalence_checks(output_run, checkpoint_id, required_splits):
@@ -393,11 +489,27 @@ def main():
         selection_seed=int(args.selection_seed),
         batch_size=args.batch_size,
         execution_profile=args.execution_profile,
+        cache_transformed_images=bool(args.cache_transformed_images),
+        cache_vit_cls_prepass=bool(args.cache_vit_cls_prepass),
     )
-    source = _source_identity(source_run, cfg)
-    if int(args.selection_seed) == int(source["selection_seed"]):
+    source_kind = str(args.source_kind)
+    if source_kind == "auto":
+        source_kind = (
+            "training_checkpoint"
+            if (source_run / "training_checkpoint_ready.json").is_file()
+            else "completed_probe"
+        )
+    source = (
+        _training_checkpoint_source_identity(source_run, cfg)
+        if source_kind == "training_checkpoint"
+        else _source_identity(source_run, cfg)
+    )
+    source.setdefault("source_kind", source_kind)
+    if source_kind == "training_checkpoint" and int(args.selection_seed) not in set(
+        int(item) for item in source.get("selection_seeds", [])
+    ):
         raise ValueError(
-            "probe robustness replay requires a selection seed different from the source primary seed"
+            "selection seed is not declared by the deferred fixed-Probe contract"
         )
 
     replay_summary_path = output_run / "probe_robustness_replay_summary.json"

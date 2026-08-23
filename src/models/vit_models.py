@@ -398,6 +398,21 @@ class ViT(nn.Module):
         if hasattr(transformer, "clear_runtime_prompt_distribution_override"):
             transformer.clear_runtime_prompt_distribution_override()
 
+    def begin_runtime_vit_cls_prepass_cache(self, cache_key):
+        transformer = self.enc.transformer
+        if hasattr(transformer, "begin_runtime_vit_cls_prepass_cache"):
+            transformer.begin_runtime_vit_cls_prepass_cache(cache_key)
+
+    def select_runtime_vit_cls_prepass_cache_key(self, cache_key):
+        transformer = self.enc.transformer
+        if hasattr(transformer, "select_runtime_vit_cls_prepass_cache_key"):
+            transformer.select_runtime_vit_cls_prepass_cache_key(cache_key)
+
+    def end_runtime_vit_cls_prepass_cache(self):
+        transformer = self.enc.transformer
+        if hasattr(transformer, "end_runtime_vit_cls_prepass_cache"):
+            transformer.end_runtime_vit_cls_prepass_cache()
+
     def build_backbone(self, prompt_cfg, cfg, adapter_cfg, load_pretrain, vis):
 
         self.enc, self.feat_dim = build_vit_sup_models(

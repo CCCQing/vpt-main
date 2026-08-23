@@ -703,6 +703,9 @@ class PromptedTransformer(Transformer):
         self._current_deep_residual_mean = None
         self._last_attention_mediation_stats = []
         self._runtime_prompt_distribution_override = None
+        self._runtime_vit_cls_prepass_cache_enabled = False
+        self._runtime_vit_cls_prepass_cache_key = None
+        self._runtime_vit_cls_prepass_cache = {}
 
         if prompt_init is not None:
             raise ValueError("Static prompt initialization has been removed; prompt_init must be None.")
@@ -886,6 +889,12 @@ class PromptedTransformer(Transformer):
         得到的 CLS 只作为 prompt distributor 的视觉统计输入；
         全程 no_grad，不让这次 prepass 参与主训练反传。
         """
+        cache_key = self._runtime_vit_cls_prepass_cache_key
+        if self._runtime_vit_cls_prepass_cache_enabled and cache_key is not None:
+            cached = self._runtime_vit_cls_prepass_cache.get(str(cache_key))
+            if torch.is_tensor(cached):
+                return cached.to(device=x_base.device, dtype=x_base.dtype)
+
         was_training = self.encoder.training
         self.encoder.eval()
         with torch.no_grad():
@@ -900,7 +909,23 @@ class PromptedTransformer(Transformer):
         if was_training:
             self.encoder.train(True)
         del encoded
+        if self._runtime_vit_cls_prepass_cache_enabled and cache_key is not None:
+            self._runtime_vit_cls_prepass_cache[str(cache_key)] = cls.detach().clone()
         return cls
+
+    def begin_runtime_vit_cls_prepass_cache(self, cache_key: str) -> None:
+        self._runtime_vit_cls_prepass_cache_enabled = True
+        self._runtime_vit_cls_prepass_cache_key = str(cache_key)
+
+    def select_runtime_vit_cls_prepass_cache_key(self, cache_key: str) -> None:
+        if not self._runtime_vit_cls_prepass_cache_enabled:
+            raise RuntimeError("ViT CLS prepass cache has not been enabled")
+        self._runtime_vit_cls_prepass_cache_key = str(cache_key)
+
+    def end_runtime_vit_cls_prepass_cache(self) -> None:
+        self._runtime_vit_cls_prepass_cache_enabled = False
+        self._runtime_vit_cls_prepass_cache_key = None
+        self._runtime_vit_cls_prepass_cache.clear()
 
     def _call_prompt_init_provider(self, raw_image: torch.Tensor, patch_tokens: torch.Tensor, x_base: torch.Tensor):
         """
