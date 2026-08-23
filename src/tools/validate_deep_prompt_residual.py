@@ -513,6 +513,25 @@ def validate_b3_full_vit_isolation() -> None:
         int(cfg.DATA.CROPSIZE),
         device=device,
     )
+    transformer = model.enc.transformer
+    encoder_forward = transformer.encoder.forward
+    encoder_call_count = {"value": 0}
+
+    def counted_encoder_forward(*args, **kwargs):
+        encoder_call_count["value"] += 1
+        return encoder_forward(*args, **kwargs)
+
+    transformer.encoder.forward = counted_encoder_forward
+    with torch.no_grad():
+        model.begin_runtime_vit_cls_prepass_cache("same-fixed-probe-batch")
+        first_feature, _ = model(image, return_feature=True)
+        second_feature, _ = model(image, return_feature=True)
+        model.end_runtime_vit_cls_prepass_cache()
+    transformer.encoder.forward = encoder_forward
+    assert torch.equal(first_feature, second_feature)
+    # First forward = frozen prepass + prompted main path.  The second forward
+    # reuses only the prepass and still executes its prompted main path.
+    assert encoder_call_count["value"] == 3
     with torch.no_grad():
         model(image, return_feature=True)
     trace = model.enc.transformer._last_deep_prompt_residual_trace
