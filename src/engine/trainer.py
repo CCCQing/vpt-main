@@ -3660,6 +3660,25 @@ class Trainer():
             inputs, targets_global, attributes = self.get_input(input_data)
             inputs = inputs.to(self.device, non_blocking=True)
             targets_global = targets_global.to(self.device, non_blocking=True)
+            batch_sample_ids = input_data.get("sample_id")
+            if batch_sample_ids is None:
+                batch_sample_ids = [
+                    "batch{}-row{}".format(batch_index, index)
+                    for index in range(int(inputs.shape[0]))
+                ]
+            else:
+                batch_sample_ids = [str(item) for item in list(batch_sample_ids)]
+            prepass_cache_enabled = bool(
+                self.cfg.MONITOR.PROBE.CACHE_VIT_CLS_PREPASS
+            )
+            if prepass_cache_enabled and hasattr(
+                model_ref, "begin_runtime_vit_cls_prepass_cache"
+            ):
+                model_ref.begin_runtime_vit_cls_prepass_cache(
+                    "target_relevance|{}|{}".format(
+                        str(split), "|".join(batch_sample_ids)
+                    )
+                )
             target_global_list = [
                 int(item) for item in targets_global.detach().cpu().tolist()
             ]
@@ -3914,6 +3933,10 @@ class Trainer():
                     del reference_logits_cpu, true_relevance_by_layer
 
             model_ref.clear_runtime_state()
+            if prepass_cache_enabled and hasattr(
+                model_ref, "end_runtime_vit_cls_prepass_cache"
+            ):
+                model_ref.end_runtime_vit_cls_prepass_cache()
             del reference_logits, relevance_output, relevance_logits
             del attention_layers, affinities, gradient_inputs, inputs
             del targets_global, target_local, semantics, true_margins, correct
