@@ -529,9 +529,10 @@ def validate_b3_full_vit_isolation() -> None:
         model.end_runtime_vit_cls_prepass_cache()
     transformer.encoder.forward = encoder_forward
     assert torch.equal(first_feature, second_feature)
-    # First forward = frozen prepass + prompted main path.  The second forward
-    # reuses only the prepass and still executes its prompted main path.
-    assert encoder_call_count["value"] == 3
+    # Prompted Deep-VPT executes blocks directly; only the frozen no-Prompt
+    # prepass enters encoder.forward().  Two prompted forwards with one cache
+    # key therefore require exactly one encoder.forward() prepass call.
+    assert encoder_call_count["value"] == 1
     with torch.no_grad():
         model(image, return_feature=True)
     trace = model.enc.transformer._last_deep_prompt_residual_trace
