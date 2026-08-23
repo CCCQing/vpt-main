@@ -284,18 +284,21 @@ def _format(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(str(item)) for item in command)
 
 
+def _deferred_monitor_overrides() -> List[str]:
+    """Return YACS-compatible CLI values for the deferred monitoring contract."""
+    return [
+        "MONITOR.PROBE.FINAL_EXECUTION_MODE",
+        "deferred",
+        "MONITOR.PROBE.CACHE_TRANSFORMED_IMAGES",
+        "True",
+        "MONITOR.PROBE.CACHE_VIT_CLS_PREPASS",
+        "True",
+    ]
+
+
 def _run_training(job, python_bin: str, protocol: str, gpu: str):
     command = _command(job, python_bin, protocol)
-    command.extend(
-        [
-            "MONITOR.PROBE.FINAL_EXECUTION_MODE",
-            "deferred",
-            "MONITOR.PROBE.CACHE_TRANSFORMED_IMAGES",
-            "true",
-            "MONITOR.PROBE.CACHE_VIT_CLS_PREPASS",
-            "true",
-        ]
-    )
+    command.extend(_deferred_monitor_overrides())
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
     environment["PYTHONUNBUFFERED"] = "1"
@@ -639,7 +642,7 @@ def main() -> None:
     if args.dry_run:
         for index, job in enumerate(training_pending):
             command = _command(job, args.python_bin, args.protocol)
-            command.extend(["MONITOR.PROBE.FINAL_EXECUTION_MODE", "deferred"])
+            command.extend(_deferred_monitor_overrides())
             print("[train] gpu={} {}".format(gpus[index % len(gpus)], _format(command)))
         return
 
@@ -690,7 +693,7 @@ def main() -> None:
                 out_root=out_root,
                 gpu_groups=gpus,
                 max_workers=int(args.max_workers),
-                initial_completed=len(scientific_complete) + len(training_ready),
+                initial_completed=0,
                 progress_interval=2.0,
                 progress_width=120,
                 progress_enabled=not args.no_progress,

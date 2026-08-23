@@ -21,6 +21,9 @@ from src.tools.search_plans.b_series.run_b3_series_training import (
     _build_jobs,
     _load_splits,
 )
+from src.tools.search_plans.b_series.run_b3_deferred_probe_queue import (
+    _deferred_monitor_overrides,
+)
 from src.tools.search_plans.b_series.run_b_series_replays import _parse_run
 
 
@@ -135,6 +138,12 @@ def validate_b3_dataset_and_runner_contract() -> None:
         assert {job.seed for job in pilot_jobs} == {0}
         assert all(job.method.startswith("B3-R2P-") for job in pilot_jobs)
         assert _parse_run("B3-R1I-R025:2") == ("B3-R1I-R025", 2)
+
+        command_cfg = get_cfg()
+        command_cfg.merge_from_list(_deferred_monitor_overrides())
+        assert command_cfg.MONITOR.PROBE.FINAL_EXECUTION_MODE == "deferred"
+        assert command_cfg.MONITOR.PROBE.CACHE_TRANSFORMED_IMAGES is True
+        assert command_cfg.MONITOR.PROBE.CACHE_VIT_CLS_PREPASS is True
 
 
 def main() -> None:
