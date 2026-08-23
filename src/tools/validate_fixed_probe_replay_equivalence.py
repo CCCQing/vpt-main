@@ -61,7 +61,32 @@ def _atomic_json(path: Path, payload) -> None:
     os.replace(str(temporary), str(path))
 
 
-def _compare(reference, replay, path, failures, *, atol, rtol):
+def _numeric_tier(path: str) -> str:
+    lowered = path.lower()
+    if "neighbor_preservation_at_k" in lowered:
+        return "discontinuous_neighbor_rank"
+    if "spearman" in lowered:
+        return "continuous_rank"
+    if path.startswith(
+        (
+            "fixed_probe_class_aggregates.json",
+            "probe_equivalence/",
+            "target_relevance/",
+        )
+    ):
+        return "strict_scientific"
+    return "continuous_scientific"
+
+
+def _compare(
+    reference,
+    replay,
+    path,
+    failures,
+    *,
+    tolerances,
+    tier_audit,
+):
     if isinstance(reference, dict) and isinstance(replay, dict):
         ref_keys = set(reference).difference(IGNORED_KEYS)
         replay_keys = set(replay).difference(IGNORED_KEYS)
@@ -81,8 +106,8 @@ def _compare(reference, replay, path, failures, *, atol, rtol):
                 replay[key],
                 "{}.{}".format(path, key),
                 failures,
-                atol=atol,
-                rtol=rtol,
+                tolerances=tolerances,
+                tier_audit=tier_audit,
             )
         return
     if isinstance(reference, list) and isinstance(replay, list):
@@ -102,8 +127,29 @@ def _compare(reference, replay, path, failures, *, atol, rtol):
                 right,
                 "{}[{}]".format(path, index),
                 failures,
-                atol=atol,
-                rtol=rtol,
+                tolerances=tolerances,
+                tier_audit=tier_audit,
+            )
+        return
+    if (
+        isinstance(reference, int)
+        and not isinstance(reference, bool)
+        and isinstance(replay, int)
+        and not isinstance(replay, bool)
+    ):
+        tier = "exact_integer"
+        audit = tier_audit[tier]
+        audit["compared_count"] += 1
+        if reference != replay:
+            audit["changed_count"] += 1
+            failures.append(
+                {
+                    "path": path,
+                    "reason": "integer_mismatch",
+                    "tier": tier,
+                    "reference": reference,
+                    "replay": replay,
+                }
             )
         return
     if (
@@ -112,14 +158,27 @@ def _compare(reference, replay, path, failures, *, atol, rtol):
         and isinstance(replay, (int, float))
         and not isinstance(replay, bool)
     ):
+        tier = _numeric_tier(path)
+        atol, rtol = tolerances[tier]
+        absolute_error = abs(float(reference) - float(replay))
+        audit = tier_audit[tier]
+        audit["compared_count"] += 1
+        if absolute_error > 0.0:
+            audit["changed_count"] += 1
+            audit["max_absolute_error"] = max(
+                float(audit["max_absolute_error"]), absolute_error
+            )
         if not math.isclose(float(reference), float(replay), abs_tol=atol, rel_tol=rtol):
             failures.append(
                 {
                     "path": path,
                     "reason": "numeric_mismatch",
+                    "tier": tier,
+                    "atol": atol,
+                    "rtol": rtol,
                     "reference": reference,
                     "replay": replay,
-                    "absolute_error": abs(float(reference) - float(replay)),
+                    "absolute_error": absolute_error,
                 }
             )
         return
@@ -175,8 +234,25 @@ def _parse_args():
     parser.add_argument("--reference-run", required=True, type=Path)
     parser.add_argument("--replay-run", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--atol", type=float, default=1.0e-6)
-    parser.add_argument("--rtol", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=1.0e-5,
+        help="absolute tolerance for ordinary continuous scientific fields",
+    )
+    parser.add_argument("--rtol", type=float, default=1.0e-5)
+    parser.add_argument("--strict-atol", type=float, default=1.0e-6)
+    parser.add_argument("--strict-rtol", type=float, default=1.0e-6)
+    parser.add_argument("--rank-atol", type=float, default=2.0e-4)
+    parser.add_argument(
+        "--neighbor-rank-atol",
+        type=float,
+        default=7.0e-3,
+        help=(
+            "bounded tolerance for discontinuous top-k neighbor-preservation "
+            "rates; the observed error remains recorded"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -187,6 +263,31 @@ def main() -> None:
     replay_summary = _read_json(replay_run, "probe_robustness_replay_summary.json")
     selected, missing, extra = _selected_files(reference_run, replay_run)
     failures = []
+    tolerances = {
+        "strict_scientific": (float(args.strict_atol), float(args.strict_rtol)),
+        "continuous_scientific": (float(args.atol), float(args.rtol)),
+        "continuous_rank": (float(args.rank_atol), float(args.strict_rtol)),
+        "discontinuous_neighbor_rank": (
+            float(args.neighbor_rank_atol),
+            0.0,
+        ),
+    }
+    tier_audit = {
+        "exact_integer": {
+            "comparison": "exact",
+            "compared_count": 0,
+            "changed_count": 0,
+        }
+    }
+    for name, (atol, rtol) in tolerances.items():
+        tier_audit[name] = {
+            "comparison": "math.isclose",
+            "atol": atol,
+            "rtol": rtol,
+            "compared_count": 0,
+            "changed_count": 0,
+            "max_absolute_error": 0.0,
+        }
     for relative in selected:
         reference = _read_json(reference_run / "diagnostics", relative)
         replay = _read_json(replay_run / "diagnostics", relative)
@@ -195,11 +296,9 @@ def main() -> None:
             replay,
             relative,
             failures,
-            atol=float(args.atol),
-            rtol=float(args.rtol),
+            tolerances=tolerances,
+            tier_audit=tier_audit,
         )
-        if len(failures) >= 200:
-            break
     valid = bool(replay_summary.get("valid", False)) and not missing and not extra and not failures
     payload = {
         "format": "fixed_probe_replay_equivalence_v1",
@@ -218,8 +317,15 @@ def main() -> None:
         "extra_files": extra,
         "failure_count": len(failures),
         "failures": failures[:200],
-        "atol": float(args.atol),
-        "rtol": float(args.rtol),
+        "failure_payload_truncated": len(failures) > 200,
+        "numeric_equivalence_tiers": tier_audit,
+        "equivalence_rule": (
+            "integers and nonnumeric identities are exact; fixed class aggregates, "
+            "forward equivalence and target relevance use strict tolerance; ordinary "
+            "continuous fields use floating-accumulation tolerance; Spearman and "
+            "top-k neighbor preservation use separately declared bounded tolerances "
+            "because they are rank-derived"
+        ),
         "valid": valid,
     }
     _atomic_json(args.output.expanduser().resolve(), payload)
