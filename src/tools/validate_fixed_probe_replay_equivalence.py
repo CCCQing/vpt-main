@@ -18,6 +18,7 @@ IGNORED_KEYS = {
     "session_id",
     "diagnostic_execution_run_id",
     "diagnostic_execution_session_id",
+    "diagnostic_replay",
     "checkpoint_path",
     "resolved_config",
     "reproducibility_manifest",
