@@ -413,7 +413,28 @@ def _probe_output_root(out_root: Path, job, selection_seed: int) -> Path:
     )
 
 
-def _build_probe_jobs(out_root: Path, jobs) -> List[ProbeJob]:
+def _quarantine_incomplete_replay(output_run: Path) -> Path:
+    resolved = output_run.resolve()
+    deferred_roots = [
+        parent for parent in resolved.parents if parent.name == "_deferred_fixed_probes"
+    ]
+    if len(deferred_roots) != 1:
+        raise RuntimeError(
+            "refusing to quarantine replay outside _deferred_fixed_probes: {}".format(
+                resolved
+            )
+        )
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    target = output_run.with_name(
+        "{}.failed_{}_{}".format(output_run.name, timestamp, os.getpid())
+    )
+    output_run.rename(target)
+    return target
+
+
+def _build_probe_jobs(
+    out_root: Path, jobs, *, quarantine_incomplete: bool = True
+) -> List[ProbeJob]:
     result = []
     log_root = out_root / "launcher_logs" / "deferred_fixed_probes"
     for job in jobs:
@@ -427,10 +448,18 @@ def _build_probe_jobs(out_root: Path, jobs) -> List[ProbeJob]:
             if _replay_valid(output_run):
                 continue
             if output_run.is_dir() and next(output_run.iterdir(), None) is not None:
-                raise RuntimeError(
-                    "refusing to overwrite incomplete replay output {}".format(
-                        output_run
+                if not quarantine_incomplete:
+                    raise RuntimeError(
+                        "incomplete replay requires quarantine before resume: {}".format(
+                            output_run
+                        )
                     )
+                quarantined = _quarantine_incomplete_replay(output_run)
+                print(
+                    "Quarantined incomplete replay {} -> {}".format(
+                        output_run, quarantined
+                    ),
+                    flush=True,
                 )
             result.append(
                 ProbeJob(
@@ -583,7 +612,11 @@ def main() -> None:
         run_dir = _actual_run(job.output_root)
         if _integrated_complete(run_dir) or _collection_complete(run_dir):
             scientific_complete.append(job)
-        elif _recover_training_marker(run_dir):
+        elif _marker_valid(run_dir):
+            training_ready.append(job)
+        elif args.dry_run and (run_dir / "model_final_trainable.pth").is_file():
+            training_ready.append(job)
+        elif not args.dry_run and _recover_training_marker(run_dir):
             training_ready.append(job)
         elif job.output_root.is_dir() and next(job.output_root.iterdir(), None) is not None:
             raise RuntimeError(
