@@ -1,4 +1,4 @@
-"""Validate and summarize E1--E4 replay cells without inflating Probe n."""
+"""Validate and summarize B-series replay cells without inflating Probe n."""
 
 from __future__ import annotations
 
@@ -88,10 +88,22 @@ def _scientific_metrics(payload: Mapping[str, object], cell_dir: Path) -> Dict[s
                         block, "conditions.{}.{}".format(condition_name, block_name)
                     )
                 )
-    geometry_path = cell_dir / "E2-residual-static-geometry.json"
-    if geometry_path.is_file():
-        geometry = _read_json(geometry_path)
-        metrics.update(_flatten_numbers(geometry.get("splits") or {}, "E2.geometry"))
+    geometry_sources = (
+        (
+            cell_dir / "E2-residual-static-geometry.json",
+            "E2.geometry",
+        ),
+        (
+            cell_dir / "B3-source-mu-class-geometry.json",
+            "B3EVIDENCE.source_mu_geometry",
+        ),
+    )
+    for geometry_path, prefix in geometry_sources:
+        if geometry_path.is_file():
+            geometry = _read_json(geometry_path)
+            metrics.update(
+                _flatten_numbers(geometry.get("splits") or {}, prefix)
+            )
     return metrics
 
 
@@ -211,7 +223,10 @@ def main() -> None:
                         failures.append("checkpoint-only identity failed")
                     if set(payload.get("experiments") or ()) != expected_experiments:
                         failures.append("experiment set mismatch")
-                    if payload.get("method_name") != method:
+                    expected_method_name = (
+                        "B3" if method.startswith("B3-") else method
+                    )
+                    if payload.get("method_name") != expected_method_name:
                         failures.append("method identity mismatch")
                     source = payload.get("source") or {}
                     if int(source.get("seed", -1)) != training_seed:
