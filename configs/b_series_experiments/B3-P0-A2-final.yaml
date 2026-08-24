@@ -4,7 +4,6 @@ OUTPUT_DIR: "output/b3_series/B3-P0-A2-final"
 DATA:
   XLSA:
     PROTOCOL_MODE: "final_gzsl"
-    B3_PSEUDO_MANIFEST: ""
 
 MODEL:
   PROMPT:

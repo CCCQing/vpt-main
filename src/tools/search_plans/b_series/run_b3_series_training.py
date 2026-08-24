@@ -302,8 +302,6 @@ def _command(job: Job, python_bin: str, protocol: str) -> List[str]:
         "1",
         "DATA.XLSA.PROTOCOL_MODE",
         protocol,
-        "DATA.XLSA.B3_PSEUDO_MANIFEST",
-        str(job.split.manifest) if job.split.manifest is not None else "",
         "MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ARCHITECTURE_ID",
         job.method,
     ]
