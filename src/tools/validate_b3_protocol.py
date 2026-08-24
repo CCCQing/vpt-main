@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gzip
 import tempfile
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from src.tools.search_plans.b_series.run_b3_series_training import (
     _load_splits,
 )
 from src.tools.search_plans.b_series.run_b3_deferred_probe_queue import (
+    _compact_valid_replay,
     _deferred_monitor_overrides,
 )
 from src.tools.search_plans.b_series.run_b_series_replays import _parse_run
@@ -144,6 +146,21 @@ def validate_b3_dataset_and_runner_contract() -> None:
         assert command_cfg.MONITOR.PROBE.FINAL_EXECUTION_MODE == "deferred"
         assert command_cfg.MONITOR.PROBE.CACHE_TRANSFORMED_IMAGES is True
         assert command_cfg.MONITOR.PROBE.CACHE_VIT_CLS_PREPASS is True
+
+        replay_run = Path(temporary).resolve() / "valid_replay"
+        diagnostics = replay_run / "diagnostics"
+        diagnostics.mkdir(parents=True)
+        _atomic_json(
+            replay_run / "probe_robustness_replay_summary.json",
+            {"valid": True},
+        )
+        metrics_path = diagnostics / "probe_metrics.csv"
+        metrics_path.write_text("domain,value\nmechanism,1.0\n", encoding="utf-8")
+        compaction = _compact_valid_replay(replay_run)
+        assert compaction["status"] == "compacted"
+        assert not metrics_path.exists()
+        with gzip.open(str(metrics_path) + ".gz", "rt", encoding="utf-8") as handle:
+            assert handle.read() == "domain,value\nmechanism,1.0\n"
 
 
 def main() -> None:

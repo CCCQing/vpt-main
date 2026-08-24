@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+from src.tools.search_plans.a_series.artifact_io import compact_to_gzip
 from src.tools.search_plans.b_series.run_b3_series_training import (
     RUN_SUFFIX,
     STAGE_ORDER,
@@ -342,6 +343,14 @@ def _replay_valid(output_run: Path) -> bool:
         return False
 
 
+def _compact_valid_replay(output_run: Path):
+    """Losslessly compact the dominant aggregate CSV after replay validation."""
+    if not _replay_valid(output_run):
+        raise RuntimeError("refusing to compact an invalid fixed-Probe replay")
+    metrics_path = output_run / "diagnostics" / "probe_metrics.csv"
+    return compact_to_gzip(metrics_path, remove_source=True)
+
+
 def _run_probe(job: ProbeJob, python_bin: str, gpu: str, cpu_threads: int):
     replay = ROOT / "src" / "tools" / "search_plans" / "a_series" / "replay_probe_robustness.py"
     command = [
@@ -388,6 +397,7 @@ def _run_probe(job: ProbeJob, python_bin: str, gpu: str, cpu_threads: int):
             check=False,
         )
     valid = process.returncode == 0 and _replay_valid(job.output_run)
+    compaction = _compact_valid_replay(job.output_run) if valid else None
     return {
         "kind": "fixed_probe",
         "split": job.split,
@@ -401,6 +411,7 @@ def _run_probe(job: ProbeJob, python_bin: str, gpu: str, cpu_threads: int):
         "source_run": str(job.source_run),
         "output_run": str(job.output_run),
         "log_path": str(job.log_path),
+        "probe_metrics_compaction": compaction,
     }
 
 
@@ -449,6 +460,7 @@ def _build_probe_jobs(
         for selection_seed in STRICT_PROBE_SEEDS:
             output_run = _probe_output_root(out_root, job, selection_seed)
             if _replay_valid(output_run):
+                _compact_valid_replay(output_run)
                 continue
             if output_run.is_dir() and next(output_run.iterdir(), None) is not None:
                 if not quarantine_incomplete:
