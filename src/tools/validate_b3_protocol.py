@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import sys
 import tempfile
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from src.data.datasets.xlsa_dataset import CUB200Dataset
 from src.utils.dataset_manifest import write_xlsa_dataset_manifest
 from src.tools.search_plans.b_series.run_b3_series_training import (
     _build_jobs,
+    _command,
     _load_splits,
 )
 from src.tools.search_plans.b_series.run_b3_deferred_probe_queue import (
@@ -76,6 +78,8 @@ def validate_b3_final_dataset_and_runner_contract() -> None:
         assert len(jobs) == 3
         assert {job.seed for job in jobs} == {0, 1, 2}
         assert all(job.checkpoint is None for job in jobs)
+        command = _command(jobs[0], sys.executable, "final_gzsl")
+        assert "DATA.XLSA.B3_PSEUDO_MANIFEST" not in command
         pilot_jobs = _build_jobs(
             "R2",
             splits,
