@@ -336,6 +336,13 @@ def _load_replay_rows(path: Path) -> Sequence[Mapping[str, str]]:
         return tuple(csv.DictReader(handle))
 
 
+def _load_fixed_probe_rows(path: Path) -> Sequence[Mapping[str, str]]:
+    if not path.is_file():
+        return ()
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return tuple(csv.DictReader(handle))
+
+
 def _replay_metric_key(metric_path: str, scope: str) -> str:
     parts = metric_path.split(".")
     condition = "normal"
@@ -373,6 +380,7 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--evidence-full-summary", type=Path)
     parser.add_argument("--evidence-probe-summary", type=Path)
+    parser.add_argument("--fixed-probe-summary", type=Path)
     args = parser.parse_args()
 
     training_root = args.training_root.resolve()
@@ -543,6 +551,37 @@ def main() -> None:
                     "mean": float(row["mean"]),
                     "min": float(row["min"]),
                     "max": float(row["max"]),
+                }
+            )
+
+    if args.fixed_probe_summary is None:
+        evidence_status["strict_three_probe"] = "not_requested"
+    else:
+        fixed_rows = _load_fixed_probe_rows(args.fixed_probe_summary.resolve())
+        if not fixed_rows:
+            raise FileNotFoundError(str(args.fixed_probe_summary))
+        evidence_status["strict_three_probe"] = "included"
+        for row in fixed_rows:
+            method = REPORT_METHODS.get(row["method"], row["method"])
+            metric_rows.append(
+                {
+                    "evidence_role": "mechanism_evidence",
+                    "method": method,
+                    "metric_key": _metric_key(
+                        checkpoint="epoch_0015",
+                        split=row["split"],
+                        condition=row["condition"],
+                        domain=row["domain"],
+                        objective=row.get("objective", ""),
+                        entity_type=row["entity_type"],
+                        entity_id=row["entity_id"],
+                        probe_selection_seed="nested_three",
+                        metric=row["metric"],
+                    ),
+                    "count": int(row["training_seed_count"]),
+                    "mean": float(row["training_seed_mean"]),
+                    "min": float(row["training_seed_min"]),
+                    "max": float(row["training_seed_max"]),
                 }
             )
 
