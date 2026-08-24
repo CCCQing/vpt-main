@@ -182,7 +182,9 @@ def _run(job: Job, args, gpu: str) -> Dict[str, object]:
 
 
 def _parse_args():
-    parser = argparse.ArgumentParser(description="Run E1..E4 or B3-D1 replay jobs in parallel.")
+    parser = argparse.ArgumentParser(
+        description="Run E1..E4 or isolated B3 evidence replay jobs in parallel."
+    )
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
     parser.add_argument("--run", action="append", required=True)
@@ -204,13 +206,17 @@ def _parse_args():
 def main() -> None:
     args = _parse_args()
     seeds = _selection_seeds(args.selection_seeds, args.scope)
-    if "B3D1" in {
+    requested_experiments = {
         value.strip().upper()
         for value in str(args.experiments).split(",")
         if value.strip()
-    } and args.scope == "probe" and tuple(seeds) != (424242, 424243, 424244):
+    }
+    if requested_experiments.intersection({"B3EVIDENCE", "B3D1"}) and (
+        args.scope == "probe"
+        and tuple(seeds) != (424242, 424243, 424244)
+    ):
         raise SystemExit(
-            "B3D1 Probe evidence requires selection seeds 424242,424243,424244"
+            "B3 Probe evidence requires selection seeds 424242,424243,424244"
         )
     gpus = _gpu_groups(args.gpu_groups)
     if args.max_workers <= 0 or args.max_workers > len(gpus):

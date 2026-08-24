@@ -172,7 +172,7 @@ def _recover_training_marker(run_dir: Path) -> bool:
         checkpoint.get("format") != "vpt_trainable_v1"
         or int(checkpoint.get("total_epoch", -1)) != total_epoch
         or str(checkpoint.get("protocol_mode", "")).lower()
-        != "b3_pseudo_gzsl"
+        != "final_gzsl"
     ):
         raise RuntimeError(
             "refusing to recover marker from an incompatible checkpoint: {}".format(
@@ -222,8 +222,7 @@ def _recover_training_marker(run_dir: Path) -> bool:
         "run_id": run_id,
         "session_id": session_id,
         "training_seed": int(checkpoint.get("seed", config.get("SEED", 0))),
-        "protocol_mode": "b3_pseudo_gzsl",
-        "b3_pseudo_manifest": checkpoint.get("b3_pseudo_manifest"),
+        "protocol_mode": "final_gzsl",
         "checkpoint": {
             "checkpoint_id": "final_epoch_{:04d}".format(total_epoch),
             "checkpoint_path": checkpoint_path.name,
@@ -552,9 +551,14 @@ def _parse_args():
     )
     parser.add_argument("--stages", default="R1")
     parser.add_argument(
-        "--protocol", choices=("b3_pseudo_gzsl", "final_gzsl"), default="b3_pseudo_gzsl"
+        "--protocol", choices=("final_gzsl",), default="final_gzsl"
     )
-    parser.add_argument("--manifest-suite", type=Path, default=Path(""))
+    parser.add_argument(
+        "--a2-root",
+        type=Path,
+        default=Path(""),
+        help="Existing normal-GZSL A2 root used as the matched P0 source.",
+    )
     parser.add_argument("--max-ratios", default="0.25,0.50")
     parser.add_argument("--r2-pilot-weights", default="")
     parser.add_argument("--formal-intra-weight", type=float)
@@ -593,8 +597,7 @@ def main() -> None:
             raise RuntimeError(
                 "formal B3 resume requires a passing replay-equivalence summary"
             )
-    suite_path = args.manifest_suite.expanduser().resolve()
-    splits = _load_splits(args.protocol, suite_path)
+    splits = _load_splits(args.protocol)
     ratios = _ratios(args.max_ratios)
     pilot_weights = _pilot_weights(args.r2_pilot_weights)
     formal_weights = None
@@ -606,6 +609,11 @@ def main() -> None:
             float(args.formal_inter_weight),
         )
     out_root = args.out_root.expanduser().resolve()
+    a2_root = (
+        args.a2_root.expanduser().resolve()
+        if str(args.a2_root).strip() not in {"", "."}
+        else None
+    )
     all_jobs = []
     for stage in stages:
         all_jobs.extend(
@@ -616,6 +624,7 @@ def main() -> None:
                 out_root,
                 require_checkpoints=not args.dry_run,
                 pilot_weights=pilot_weights,
+                a2_root=a2_root,
                 formal_weights=formal_weights,
             )
         )

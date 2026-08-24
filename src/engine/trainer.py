@@ -103,6 +103,7 @@ from ..monitoring.module_effect import (
     transport_prompt_patch_block_intervention,
     transport_random_patch_block_intervention,
     prompt_zero_intervention,
+    prompt_zero_intervention_available,
     prompt_write_block_intervention,
 )
 from ..monitoring.prompt_analysis import (
@@ -3022,7 +3023,9 @@ class Trainer():
             return []
         prompt_length = int(prompt_length)
         prompt_available = prompt_length > 0
-        prompt_parameter_available = bool(self.prompt_parameter_tracker.active)
+        effective_prompt_zero_available = bool(
+            prompt_zero_intervention_available(self._model_ref(self.model))
+        )
         distributor_cfg = self.cfg.MODEL.PROMPT.DISTRIBUTOR
         distributor_available = bool(
             prompt_available
@@ -3077,10 +3080,12 @@ class Trainer():
             self.cfg.MONITOR.MODULE_EFFECT.PROMPT_ZERO,
             "prompt_zeroed",
             prompt_zero_intervention,
-            prompt_parameter_available,
-            "no_trainable_prompt_parameters",
+            effective_prompt_zero_available,
+            "no_effective_prompt_content",
             {
-                "zeroed_object": "trainable_prompt_parameters",
+                "zeroed_object": "static_prompt_content_and_applied_deep_residual",
+                "frozen_static_prompt_included": True,
+                "deep_residual_runtime_scale": 0.0,
                 "prompt_slots_removed": False,
                 "attention_route_retained": True,
             },

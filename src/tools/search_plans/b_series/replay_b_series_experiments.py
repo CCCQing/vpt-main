@@ -41,6 +41,7 @@ from src.monitoring.module_effect import (
     deep_prompt_residual_layer_scales_intervention,
     deep_prompt_residual_replace_intervention,
     paired_module_effect_metrics,
+    prompt_zero_intervention,
 )
 from src.monitoring.probe import (
     FixedProbeDataset,
@@ -59,7 +60,9 @@ TEST_SPLITS = ("test_seen", "test_unseen")
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run E1-E4 or the isolated B3-D1 checkpoint-only diagnostics."
+        description=(
+            "Run E1-E4 or isolated B3 checkpoint-only evidence diagnostics."
+        )
     )
     parser.add_argument("--source-run", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -67,7 +70,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--experiments",
         default="E1,E2,E3,E4",
-        help="Comma-separated subset of E1,E2,E3,E4,B3D1.",
+        help="Comma-separated subset of E1,E2,E3,E4,B3EVIDENCE,B3D1.",
     )
     parser.add_argument("--scope", choices=("full", "probe"), default="probe")
     parser.add_argument("--selection-seed", type=int, default=424242)
@@ -137,11 +140,14 @@ def _parse_experiments(raw: str) -> tuple[str, ...]:
     values = tuple(
         value.strip().upper() for value in str(raw).split(",") if value.strip()
     )
-    allowed = {"E1", "E2", "E3", "E4", "B3D1"}
+    allowed = {"E1", "E2", "E3", "E4", "B3EVIDENCE", "B3D1"}
     if not values or len(set(values)) != len(values) or any(
         value not in allowed for value in values
     ):
-        raise ValueError("--experiments must be a unique subset of E1,E2,E3,E4,B3D1")
+        raise ValueError(
+            "--experiments must be a unique subset of "
+            "E1,E2,E3,E4,B3EVIDENCE,B3D1"
+        )
     return values
 
 
@@ -257,7 +263,12 @@ def _predict(
     scales: Optional[Sequence[float]] = None,
     donor_mean_by_id: Optional[Mapping[str, np.ndarray]] = None,
     collect_geometry: bool = False,
+    effective_prompt_zero: bool = False,
 ) -> Dict[str, Any]:
+    if effective_prompt_zero and (scales is not None or donor_mean_by_id is not None):
+        raise ValueError(
+            "effective Prompt-zero cannot be combined with residual scale or donor interventions"
+        )
     dataset = _source_dataset(loader)
     candidate = _candidate_class_ids(dataset)
     eval_map = torch.as_tensor(dataset.eval_global_to_local, dtype=torch.long)
@@ -273,8 +284,12 @@ def _predict(
     intervention_contract_pass = True
     intervention_failure_reasons = []
     replacement_distances = []
+    prompt_zero_parameter_names = None
+    prompt_zero_residual_module_count = None
     requested_mode = (
-        "mean_replace"
+        "effective_prompt_zero"
+        if effective_prompt_zero
+        else "mean_replace"
         if donor_mean_by_id is not None
         else "layer_scales"
         if scales is not None
@@ -293,7 +308,9 @@ def _predict(
         if (local < 0).any():
             raise ValueError("target is outside the GZSL candidate space")
         identifiers = [str(value) for value in batch["sample_id"]]
-        if donor_mean_by_id is not None:
+        if effective_prompt_zero:
+            intervention = prompt_zero_intervention(model)
+        elif donor_mean_by_id is not None:
             replacement = torch.as_tensor(
                 np.stack([donor_mean_by_id[value] for value in identifiers], axis=0),
                 device=device,
@@ -308,7 +325,7 @@ def _predict(
             )
         else:
             intervention = nullcontext()
-        with intervention:
+        with intervention as intervention_state:
             logits = model(
                 inputs,
                 semantics=None,
@@ -333,6 +350,24 @@ def _predict(
             raise RuntimeError("Prompt Distributor mean trace is unavailable")
         if len(trace) != _model_num_layers(model):
             raise RuntimeError("Deep Prompt residual trace does not cover all layers")
+        if effective_prompt_zero:
+            current_parameter_names = tuple(
+                sorted(intervention_state.zeroed_parameter_names)
+            )
+            current_residual_count = int(
+                intervention_state.residual_module_count
+            )
+            if prompt_zero_parameter_names is None:
+                prompt_zero_parameter_names = current_parameter_names
+                prompt_zero_residual_module_count = current_residual_count
+            elif (
+                prompt_zero_parameter_names != current_parameter_names
+                or prompt_zero_residual_module_count != current_residual_count
+            ):
+                intervention_contract_pass = False
+                intervention_failure_reasons.append(
+                    "effective Prompt-zero target identity changed between batches"
+                )
         for item in trace:
             layer_id = int(item["layer_id"])
             runtime_scale = item.get("runtime_scale")
@@ -348,7 +383,9 @@ def _predict(
                 ):
                     applied_layers.add(layer_id)
                 expected_scale = (
-                    float(expected_scales[layer_id])
+                    0.0
+                    if effective_prompt_zero
+                    else float(expected_scales[layer_id])
                     if expected_scales is not None
                     else 1.0
                 )
@@ -372,6 +409,18 @@ def _predict(
                 elif layer_id == 0:
                     replacement_distances.append(
                         distance.detach().cpu().float().numpy()
+                    )
+            if effective_prompt_zero:
+                applied_delta = item.get("applied_delta")
+                if not torch.is_tensor(applied_delta) or not torch.equal(
+                    applied_delta,
+                    torch.zeros_like(applied_delta),
+                ):
+                    intervention_contract_pass = False
+                    intervention_failure_reasons.append(
+                        "layer {} effective Prompt-zero left a nonzero residual".format(
+                            layer_id
+                        )
                     )
         if collect_geometry:
             current = residual_static_geometry(trace)
@@ -426,6 +475,20 @@ def _predict(
                 float(np.concatenate(replacement_distances).max())
                 if replacement_distances
                 else None
+            ),
+            "effective_prompt_zero_parameter_names": (
+                list(prompt_zero_parameter_names or ())
+                if effective_prompt_zero
+                else []
+            ),
+            "effective_prompt_zero_residual_module_count": (
+                int(prompt_zero_residual_module_count or 0)
+                if effective_prompt_zero
+                else 0
+            ),
+            "effective_prompt_zero_slots_retained": bool(effective_prompt_zero),
+            "effective_prompt_zero_attention_route_retained": bool(
+                effective_prompt_zero
             ),
         },
     }
@@ -713,7 +776,10 @@ def main() -> None:
     _atomic_json(output_dir / "b_series_replay_running.json", _json_safe(summary))
     try:
         normal = _run_condition(
-            model, device, loaders, collect_geometry="E2" in experiments
+            model,
+            device,
+            loaders,
+            collect_geometry="E2" in experiments,
         )
         summary["conditions"]["normal"] = _condition_summary(
             normal, normal, cfg, is_normal=True
@@ -881,6 +947,48 @@ def main() -> None:
                 "self_pair_allowed": False,
                 "same_class_contract": "same label and different sample id",
                 "different_class_contract": "different label",
+            }
+
+        if "B3EVIDENCE" in experiments:
+            object_geometry, object_geometry_arrays = _b3_source_object_geometry(
+                normal
+            )
+            _atomic_json(
+                output_dir / "B3-source-mu-class-geometry.json",
+                _json_safe(object_geometry),
+            )
+            np.savez_compressed(
+                output_dir / "B3-source-mu-class-geometry.npz",
+                **object_geometry_arrays,
+            )
+            prompt_zero = _run_condition(
+                model,
+                device,
+                loaders,
+                effective_prompt_zero=True,
+            )
+            summary["conditions"]["prompt_zeroed"] = _condition_summary(
+                prompt_zero,
+                normal,
+                cfg,
+                is_normal=False,
+            )
+            summary["B3EVIDENCE"] = {
+                "prompt_zero_condition": "prompt_zeroed",
+                "prompt_zero_semantics": {
+                    "zeroed_object": (
+                        "static_prompt_content_and_applied_deep_residual"
+                    ),
+                    "frozen_static_prompt_included": True,
+                    "prompt_slots_removed": False,
+                    "attention_route_retained": True,
+                },
+                "source_mu_geometry_path": (
+                    "B3-source-mu-class-geometry.json"
+                ),
+                "source_mu_geometry_arrays_path": (
+                    "B3-source-mu-class-geometry.npz"
+                ),
             }
 
         if "B3D1" in experiments:

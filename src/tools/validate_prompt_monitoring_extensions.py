@@ -14,13 +14,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.models.prompting.prompt_distribution import PreViTPromptDistributor
+from src.models.prompting.prompt_distribution import (
+    MeanConditionedDeepPromptResidual,
+    PreViTPromptDistributor,
+)
 from src.models.vit_backbones.vit import Attention
 from src.monitoring.module_effect import (
     both_prompt_zero_intervention,
     domain_prompt_zero_intervention,
     instance_prompt_swap_intervention,
     instance_prompt_zero_intervention,
+    prompt_zero_intervention,
+    prompt_zero_intervention_available,
     prompt_value_zero_intervention,
     relevance_edge_delete_intervention,
 )
@@ -182,6 +187,62 @@ def test_prompt_distribution_interventions() -> None:
         assert torch.equal(changed[:, 2:], baseline[:, 2:])
     restored, _ = distributor.prompt_from_distribution(mu, logvar)
     assert torch.equal(restored, baseline)
+
+
+def test_effective_prompt_zero_includes_frozen_static_and_residual() -> None:
+    holder = torch.nn.Module()
+    holder.prompt_embeddings = torch.nn.Parameter(
+        torch.full((1, 2, 4), 2.0),
+        requires_grad=False,
+    )
+    holder.deep_prompt_embeddings = torch.nn.Parameter(
+        torch.full((1, 2, 4), 3.0),
+        requires_grad=False,
+    )
+    holder.deep_prompt_residual = MeanConditionedDeepPromptResidual(
+        dim=4,
+        prompt_len=2,
+        num_layers=2,
+        amplitude_mode="bounded_ratio",
+        active_layers=(1,),
+        bounded_max_ratio=0.5,
+        bounded_init_ratio=0.25,
+    )
+    mean = torch.randn(3, 4)
+    base = holder.deep_prompt_embeddings[0].unsqueeze(0).expand(3, -1, -1)
+    baseline_delta, _ = holder.deep_prompt_residual.forward_layer(
+        mean,
+        1,
+        base_prompt=base,
+    )
+    assert float(baseline_delta.abs().sum().item()) > 0.0
+    assert prompt_zero_intervention_available(holder)
+    prompt_before = holder.prompt_embeddings.detach().clone()
+    deep_before = holder.deep_prompt_embeddings.detach().clone()
+    with prompt_zero_intervention(holder) as context:
+        assert set(context.zeroed_parameter_names) == {
+            "deep_prompt_embeddings",
+            "prompt_embeddings",
+        }
+        assert context.residual_module_count == 1
+        assert float(holder.prompt_embeddings.abs().sum().item()) == 0.0
+        assert float(holder.deep_prompt_embeddings.abs().sum().item()) == 0.0
+        zero_base = holder.deep_prompt_embeddings[0].unsqueeze(0).expand(3, -1, -1)
+        zero_delta, trace = holder.deep_prompt_residual.forward_layer(
+            mean,
+            1,
+            base_prompt=zero_base,
+        )
+        assert float(zero_delta.abs().sum().item()) == 0.0
+        assert float(trace["runtime_scale"].abs().sum().item()) == 0.0
+    assert torch.equal(holder.prompt_embeddings, prompt_before)
+    assert torch.equal(holder.deep_prompt_embeddings, deep_before)
+    restored_delta, _ = holder.deep_prompt_residual.forward_layer(
+        mean,
+        1,
+        base_prompt=base,
+    )
+    assert torch.equal(restored_delta, baseline_delta)
 
 
 def test_source_decomposition() -> None:
@@ -363,6 +424,7 @@ def main() -> None:
         test_relevance_deletion,
         test_prompt_value_zero,
         test_prompt_distribution_interventions,
+        test_effective_prompt_zero_includes_frozen_static_and_residual,
         test_source_decomposition,
         test_content_and_slot_health,
         test_paired_flip,

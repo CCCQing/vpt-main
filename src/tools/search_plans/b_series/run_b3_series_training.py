@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shlex
@@ -28,11 +27,11 @@ STRICT_TRAINING_SEEDS = (0, 1, 2)
 STAGE_ORDER = ("P0", "R1", "R2", "R3")
 STAGE_SPECS = {
     "P0": (
-        ("B3-P0-A2-pseudo", "B3-P0-A2-pseudo.yaml", None),
+        ("B3-P0-A2-final", "B3-P0-A2-final.yaml", None),
     ),
     "R1": (
-        ("B3-R1I", "B3-R1I-bounded-deep.yaml", "B3-P0-A2-pseudo"),
-        ("B3-R1N", "B3-R1N-bounded-control.yaml", "B3-P0-A2-pseudo"),
+        ("B3-R1I", "B3-R1I-bounded-deep.yaml", "B3-P0-A2-final"),
+        ("B3-R1N", "B3-R1N-bounded-control.yaml", "B3-P0-A2-final"),
     ),
     "R2": (
         ("B3-R2I", "B3-R2I-class-consistent.yaml", "B3-R1I"),
@@ -41,7 +40,7 @@ STAGE_SPECS = {
     ),
     "R3": (
         ("B3-R3I", "B3-R3I-partial-unfreeze.yaml", "B3-R2I"),
-        ("B3-R3A", "B3-R3A-A2-continuation.yaml", "B3-P0-A2-pseudo"),
+        ("B3-R3A", "B3-R3A-A2-continuation.yaml", "B3-P0-A2-final"),
     ),
 }
 
@@ -66,14 +65,6 @@ class Job:
     ratio: Optional[float]
     intra_weight: Optional[float]
     inter_weight: Optional[float]
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _read_json(path: Path):
@@ -120,40 +111,10 @@ def _gpu_groups(raw: str) -> List[str]:
     return values
 
 
-def _load_splits(protocol: str, suite_path: Path) -> List[SplitIdentity]:
-    if protocol == "final_gzsl":
-        return [SplitIdentity(name="final_gzsl", manifest=None, sha256=None)]
-    if not suite_path.is_file():
-        raise FileNotFoundError("pseudo protocol requires --manifest-suite")
-    payload = _read_json(suite_path)
-    if payload.get("format") != "b3_class_disjoint_suite_v1":
-        raise ValueError("unsupported B3 manifest suite format")
-    records = list(payload.get("records") or ())
-    if len(records) != 3:
-        raise ValueError("strict B3 protocol requires exactly three pseudo splits")
-    splits = []
-    seen_names = set()
-    for record in records:
-        manifest = Path(str(record.get("path", ""))).expanduser()
-        if not manifest.is_absolute():
-            manifest = (suite_path.parent / manifest).resolve()
-        else:
-            manifest = manifest.resolve()
-        if not manifest.is_file():
-            raise FileNotFoundError(manifest)
-        expected = str(record.get("sha256", ""))
-        actual = _sha256(manifest)
-        if expected != actual:
-            raise ValueError("B3 manifest suite hash mismatch: {}".format(manifest))
-        manifest_payload = _read_json(manifest)
-        if manifest_payload.get("format") != "b3_class_disjoint_manifest_v1":
-            raise ValueError("invalid B3 manifest: {}".format(manifest))
-        name = "pseudo_seed{}".format(int(manifest_payload["class_seed"]))
-        if name in seen_names:
-            raise ValueError("duplicate B3 pseudo split {}".format(name))
-        seen_names.add(name)
-        splits.append(SplitIdentity(name=name, manifest=manifest, sha256=actual))
-    return splits
+def _load_splits(protocol: str) -> List[SplitIdentity]:
+    if protocol != "final_gzsl":
+        raise ValueError("the active B3 protocol requires normal final-GZSL classes")
+    return [SplitIdentity(name="final_gzsl", manifest=None, sha256=None)]
 
 
 def _ratio_tag(ratio: float) -> str:
@@ -178,7 +139,7 @@ def _checkpoint_path(
     seed: int,
     ratio: Optional[float],
 ) -> Path:
-    method = _resolved_method(base_method, ratio if base_method != "B3-P0-A2-pseudo" else None)
+    method = _resolved_method(base_method, ratio if base_method != "B3-P0-A2-final" else None)
     return (
         out_root
         / split.name
@@ -291,7 +252,7 @@ def _build_jobs(
                         if parent_method is not None:
                             checkpoint = (
                                 _external_a2_checkpoint(a2_root, seed)
-                                if parent_method == "B3-P0-A2-pseudo"
+                                if parent_method == "B3-P0-A2-final"
                                 and a2_root is not None
                                 else _checkpoint_path(
                                     out_root, split, parent_method, seed, ratio
@@ -402,8 +363,8 @@ def _run_job(job: Job, python_bin: str, protocol: str, gpu: str) -> Dict[str, ob
         "stage": job.stage,
         "method": job.method,
         "seed": job.seed,
-        "pseudo_split": job.split.name,
-        "pseudo_manifest_sha256": job.split.sha256,
+        "evaluation_split": job.split.name,
+        "split_manifest_sha256": job.split.sha256,
         "gpu": gpu,
         "status": "completed" if completed else "failed",
         "returncode": int(process.returncode),
@@ -498,18 +459,17 @@ def _run_stage(args, stage, splits, ratios, gpus, out_root):
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run isolated B3 pseudo-GZSL or locked-final training stages."
+        description="Run the active B3 normal Seen/Unseen GZSL training stages."
     )
     parser.add_argument("--stages", default="P0")
     parser.add_argument(
-        "--protocol", choices=("b3_pseudo_gzsl", "final_gzsl"), default="b3_pseudo_gzsl"
+        "--protocol", choices=("final_gzsl",), default="final_gzsl"
     )
-    parser.add_argument("--manifest-suite", type=Path, default=Path(""))
     parser.add_argument(
         "--a2-root",
         type=Path,
         default=Path(""),
-        help="Optional existing full-GZSL A2 root used only by locked final validation.",
+        help="Optional existing full-GZSL A2 root used as the matched P0 source.",
     )
     parser.add_argument("--max-ratios", default="0.25,0.50")
     parser.add_argument(
@@ -541,16 +501,13 @@ def main() -> None:
     gpus = _gpu_groups(args.gpu_groups)
     if args.max_workers <= 0 or args.max_workers > len(gpus):
         raise SystemExit("--max-workers must be positive and no larger than GPU count")
-    suite_path = args.manifest_suite.expanduser().resolve()
-    splits = _load_splits(args.protocol, suite_path)
+    splits = _load_splits(args.protocol)
     ratios = _ratios(args.max_ratios)
     args._a2_root = (
         args.a2_root.expanduser().resolve()
         if str(args.a2_root).strip() not in {"", "."}
         else None
     )
-    if args._a2_root is not None and args.protocol != "final_gzsl":
-        raise SystemExit("--a2-root is only allowed for locked final_gzsl validation")
     args._pilot_weights = _pilot_weights(args.r2_pilot_weights)
     if (args.formal_intra_weight is None) != (args.formal_inter_weight is None):
         raise SystemExit("formal intra/inter weights must be provided together")
@@ -566,9 +523,9 @@ def main() -> None:
     if args._pilot_weights and args._formal_weights is not None:
         raise SystemExit("pilot and formal class-consistency weights cannot be combined")
     if args._pilot_weights:
-        if stages != ["R2"] or args.protocol != "b3_pseudo_gzsl" or len(ratios) != 1:
+        if stages != ["R2"] or len(ratios) != 1:
             raise SystemExit(
-                "R2 pilot requires --stages R2, pseudo protocol, and exactly one residual ratio"
+                "R2 pilot requires --stages R2 and exactly one residual ratio"
             )
     out_root = args.out_root.expanduser().resolve()
     all_results = []
@@ -595,7 +552,7 @@ def main() -> None:
         "formal_class_consistency_weights": (
             list(args._formal_weights) if args._formal_weights else None
         ),
-        "pseudo_splits": [
+        "evaluation_splits": [
             {
                 "name": split.name,
                 "manifest": str(split.manifest) if split.manifest else None,
@@ -605,7 +562,7 @@ def main() -> None:
         ],
         "max_ratios": ratios,
         "reused_controls": {
-            "B3-R1A": "B3-P0-A2-pseudo paired by split and training seed",
+            "B3-R1A": "B3-P0-A2-final paired by training seed",
             "B3-R2B": "B3-R1I checkpoint at the same residual ratio",
             "B3-R3F": "B3-R2I checkpoint before partial unfreezing",
         },

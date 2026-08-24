@@ -1,5 +1,5 @@
 _BASE_: "../baseline_rebuild/A-04-A2-vpt-deep-ce.yaml"
-OUTPUT_DIR: "output/b3_series/B3-R3A-A2-continuation"
+OUTPUT_DIR: "output/b3_series/B3-P0-A2-final"
 
 DATA:
   XLSA:
@@ -10,8 +10,4 @@ MODEL:
   PROMPT:
     DISTRIBUTOR:
       DEEP_RESIDUAL:
-        ARCHITECTURE_ID: "B3-R3A-A2-continuation"
-        FREEZE_CLASSIFIER: true
-
-SOLVER:
-  STATIC_PROMPT_LR_MULTIPLIER: 0.1
+        ARCHITECTURE_ID: "B3-P0-A2-final"

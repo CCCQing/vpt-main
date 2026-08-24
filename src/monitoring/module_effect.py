@@ -41,6 +41,75 @@ class ParameterIntervention(AbstractContextManager):
         return False
 
 
+def _is_static_prompt_parameter(name: str) -> bool:
+    lowered = str(name).lower()
+    return (
+        lowered.endswith("prompt_embeddings")
+        and "prompt_init_provider" not in lowered
+        and "attention_mediation" not in lowered
+    )
+
+
+class EffectivePromptZeroIntervention(AbstractContextManager):
+    def __init__(self, model: torch.nn.Module) -> None:
+        self.model = model
+        self.parameter_context = ParameterIntervention(
+            model,
+            lambda name, parameter: _is_static_prompt_parameter(name),
+            value=0.0,
+        )
+        self.residual_context: Optional[DeepPromptResidualIntervention] = None
+        self.zeroed_parameter_names: Sequence[str] = ()
+        self.residual_module_count = 0
+
+    def __enter__(self):
+        self.parameter_context.__enter__()
+        self.zeroed_parameter_names = tuple(sorted(self.parameter_context.saved))
+        self.residual_module_count = sum(
+            module.__class__.__name__ == "MeanConditionedDeepPromptResidual"
+            for module in self.model.modules()
+        )
+        try:
+            if self.residual_module_count > 0:
+                self.residual_context = DeepPromptResidualIntervention(
+                    self.model,
+                    "delta_zero",
+                )
+                self.residual_context.__enter__()
+            if not self.zeroed_parameter_names and self.residual_module_count <= 0:
+                raise RuntimeError("No effective Prompt content was found")
+        except Exception:
+            self.parameter_context.__exit__(None, None, None)
+            self.zeroed_parameter_names = ()
+            self.residual_module_count = 0
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        residual_suppressed = False
+        if self.residual_context is not None:
+            residual_suppressed = bool(
+                self.residual_context.__exit__(exc_type, exc_value, traceback)
+            )
+            self.residual_context = None
+        parameter_suppressed = self.parameter_context.__exit__(
+            exc_type,
+            exc_value,
+            traceback,
+        )
+        return bool(residual_suppressed or parameter_suppressed)
+
+
+def prompt_zero_intervention_available(model: torch.nn.Module) -> bool:
+    return any(
+        _is_static_prompt_parameter(name)
+        for name, _ in model.named_parameters()
+    ) or any(
+        module.__class__.__name__ == "MeanConditionedDeepPromptResidual"
+        for module in model.modules()
+    )
+
+
 class PromptAttentionPathIntervention(AbstractContextManager):
     VALID_MODES = {
         "prompt_read_block",
@@ -200,17 +269,8 @@ class DeepPromptResidualIntervention(AbstractContextManager):
         return False
 
 
-def prompt_zero_intervention(model: torch.nn.Module) -> ParameterIntervention:
-    return ParameterIntervention(
-        model,
-        lambda name, parameter: (
-            parameter.requires_grad
-            and "prompt" in name.lower()
-            and "prompt_init_provider" not in name.lower()
-            and "attention_mediation" not in name.lower()
-        ),
-        value=0.0,
-    )
+def prompt_zero_intervention(model: torch.nn.Module) -> EffectivePromptZeroIntervention:
+    return EffectivePromptZeroIntervention(model)
 
 
 def attention_mediation_gamma_zero_intervention(model: torch.nn.Module) -> ParameterIntervention:
