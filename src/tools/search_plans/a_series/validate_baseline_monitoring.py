@@ -2131,7 +2131,9 @@ def _validate_fixed_probe_semantic_bundle():
     assert bundle["module_effects"]["prompt_zeroed"]["summary"]["delta_logits_norm"] > 0.0
     assert "delta_semantic_margin" in bundle["module_effects"]["prompt_zeroed"]["summary"]
     assert bundle["module_effects"]["prompt_zeroed"]["intervention_semantics"] == {
-        "zeroed_object": "trainable_prompt_parameters",
+        "zeroed_object": "static_prompt_content_and_applied_deep_residual",
+        "frozen_static_prompt_included": True,
+        "deep_residual_runtime_scale": 0.0,
         "prompt_slots_removed": False,
         "attention_route_retained": True,
     }
