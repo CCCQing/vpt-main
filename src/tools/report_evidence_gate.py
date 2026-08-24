@@ -513,6 +513,7 @@ def _metric_table(
     if len(set(matches)) != 1:
         return "", [f"metric table {table.get('marker_id')} source {source_id} did not resolve uniquely"]
     methods = [str(item) for item in table.get("methods", [])]
+    method_labels = {str(key): str(value) for key, value in table.get("method_labels", {}).items()}
     row_specs = table.get("rows", [])
     selected: Dict[Tuple[str, int], List[Dict[str, str]]] = defaultdict(list)
     for row, dimensions in _read_metric_rows(next(iter(set(matches)))):
@@ -540,7 +541,8 @@ def _metric_table(
             digits = int(spec.get("digits", table.get("digits", 4)))
             rendered.append(f"{mean:.{digits}f} ({low:.{digits}f}～{high:.{digits}f})")
         rendered_rows.append(rendered)
-    return _markdown_table([str(table.get("row_header", "指标"))] + methods, rendered_rows), errors
+    headers = [method_labels.get(method, method) for method in methods]
+    return _markdown_table([str(table.get("row_header", "指标"))] + headers, rendered_rows), errors
 
 
 def _block(marker: str, body: str) -> str:
