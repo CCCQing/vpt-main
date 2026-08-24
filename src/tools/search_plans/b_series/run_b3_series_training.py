@@ -106,8 +106,8 @@ def _pilot_weights(raw: str):
 
 def _gpu_groups(raw: str) -> List[str]:
     values = [value.strip() for value in str(raw).split(";") if value.strip()]
-    if not values or len(values) != len(set(values)) or any("," in value for value in values):
-        raise ValueError("GPU groups must be unique single cards separated by semicolons")
+    if not values or any("," in value for value in values):
+        raise ValueError("GPU worker slots must be single cards separated by semicolons")
     return values
 
 

@@ -15,6 +15,7 @@ from src.utils.dataset_manifest import write_xlsa_dataset_manifest
 from src.tools.search_plans.b_series.run_b3_series_training import (
     _build_jobs,
     _command,
+    _gpu_groups,
     _load_splits,
 )
 from src.tools.search_plans.b_series.run_b3_deferred_probe_queue import (
@@ -80,6 +81,7 @@ def validate_b3_final_dataset_and_runner_contract() -> None:
         assert all(job.checkpoint is None for job in jobs)
         command = _command(jobs[0], sys.executable, "final_gzsl")
         assert "DATA.XLSA.B3_PSEUDO_MANIFEST" not in command
+        assert _gpu_groups("5;5;6;6;7") == ["5", "5", "6", "6", "7"]
         pilot_jobs = _build_jobs(
             "R2",
             splits,

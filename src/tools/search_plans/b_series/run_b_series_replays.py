@@ -58,8 +58,8 @@ def _selection_seeds(raw: str, scope: str) -> List[int]:
 
 def _gpu_groups(raw: str) -> List[str]:
     values = [value.strip() for value in str(raw).split(";") if value.strip()]
-    if not values or len(set(values)) != len(values) or any("," in value for value in values):
-        raise ValueError("GPU groups must be unique single cards separated by semicolons")
+    if not values or any("," in value for value in values):
+        raise ValueError("GPU worker slots must be single cards separated by semicolons")
     return values
 
 
