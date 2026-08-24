@@ -28,6 +28,7 @@ METHOD_DIRS = {
     "R1N-0.25": "B3-R1N-R025",
     "R1N-0.50": "B3-R1N-R050",
 }
+REPORT_METHODS = {directory: method for method, directory in METHOD_DIRS.items()}
 PAIR_SPECS = {
     "R1I-0.25_minus_P0-A2": ("R1I-0.25", "P0-A2"),
     "R1I-0.50_minus_P0-A2": ("R1I-0.50", "P0-A2"),
@@ -536,7 +537,7 @@ def main() -> None:
             metric_rows.append(
                 {
                     "evidence_role": "mechanism_evidence",
-                    "method": row["method"],
+                    "method": REPORT_METHODS.get(row["method"], row["method"]),
                     "metric_key": _replay_metric_key(row["metric"], scope),
                     "count": int(row["count"]),
                     "mean": float(row["mean"]),
