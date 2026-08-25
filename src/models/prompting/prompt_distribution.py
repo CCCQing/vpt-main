@@ -47,8 +47,11 @@ class MeanConditionedDeepPromptResidual(nn.Module):
         "mean_swap",
         "mean_replace",
         "layer_scales",
+        "common_only",
+        "role_only",
+        "role_permuted",
     }
-    _CONTENT_MODES = {"shared", "slot_low_rank"}
+    _CONTENT_MODES = {"shared", "slot_scalar", "slot_low_rank"}
     _SAMPLE_GATE_MODES = {"none", "shared", "grouped", "layerwise"}
     _SAMPLE_GATE_INPUTS = {"residual_source", "constant"}
     _AMPLITUDE_MODES = {"legacy_gate", "bounded_ratio"}
@@ -62,6 +65,7 @@ class MeanConditionedDeepPromptResidual(nn.Module):
         gate_init: float = 0.0,
         content_mode: str = "shared",
         slot_rank: int = 8,
+        slot_scalar_temperature: float = 1.0,
         sample_gate_mode: str = "none",
         sample_gate_input: str = "residual_source",
         sample_gate_hidden_dim: int = 32,
@@ -88,6 +92,11 @@ class MeanConditionedDeepPromptResidual(nn.Module):
         self.slot_rank = int(slot_rank)
         if self.slot_rank <= 0:
             raise ValueError("Deep Prompt residual SLOT_RANK must be positive")
+        self.slot_scalar_temperature = float(slot_scalar_temperature)
+        if self.slot_scalar_temperature <= 0.0:
+            raise ValueError(
+                "Deep Prompt residual SLOT_SCALAR_TEMPERATURE must be positive"
+            )
         self.sample_gate_mode = str(sample_gate_mode).strip().lower()
         if self.sample_gate_mode not in self._SAMPLE_GATE_MODES:
             raise ValueError(
@@ -153,7 +162,15 @@ class MeanConditionedDeepPromptResidual(nn.Module):
         )
         self.slot_coefficients = None
         self.slot_basis = None
-        if self.content_mode == "slot_low_rank":
+        if self.content_mode == "slot_scalar":
+            self.slot_coefficients = nn.ModuleList(
+                nn.Linear(self.dim, self.prompt_len, bias=True)
+                for _ in range(self.num_layers)
+            )
+            for head in self.slot_coefficients:
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
+        elif self.content_mode == "slot_low_rank":
             self.slot_coefficients = nn.ModuleList(
                 nn.Linear(
                     self.dim,
@@ -230,16 +247,90 @@ class MeanConditionedDeepPromptResidual(nn.Module):
                 source = replacement
         return source, stats
 
-    def _raw_delta(self, source: torch.Tensor, layer_id: int) -> torch.Tensor:
+    def _raw_delta(
+        self, source: torch.Tensor, layer_id: int
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if self.content_mode == "shared":
-            return source[:, None, :].expand(-1, self.prompt_len, -1)
+            return (
+                source[:, None, :].expand(-1, self.prompt_len, -1),
+                {},
+            )
+        if self.content_mode == "slot_scalar":
+            logits = self.slot_coefficients[layer_id](source)
+            coefficients = self.prompt_len * torch.softmax(
+                logits / self.slot_scalar_temperature,
+                dim=-1,
+            )
+            return (
+                coefficients[:, :, None] * source[:, None, :],
+                {
+                    "slot_scalar_coefficients": coefficients,
+                    "slot_scalar_logits": logits,
+                },
+            )
         coefficients = self.slot_coefficients[layer_id](source).reshape(
             int(source.shape[0]), self.prompt_len, self.slot_rank
         )
         basis = self.slot_basis[layer_id].to(
             device=source.device, dtype=source.dtype
         )
-        return torch.matmul(coefficients, basis)
+        return (
+            torch.matmul(coefficients, basis),
+            {"slot_low_rank_coefficients": coefficients},
+        )
+
+    def _apply_content_intervention(
+        self,
+        raw_delta: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        common = raw_delta.mean(dim=1, keepdim=True)
+        role = raw_delta - common
+        common_full = common.expand_as(raw_delta)
+        stats = {
+            "common_component": common_full,
+            "role_component": role,
+            "common_component_rms": common_full.float().square().mean(
+                dim=(-2, -1)
+            ).sqrt(),
+            "role_component_rms": role.float().square().mean(
+                dim=(-2, -1)
+            ).sqrt(),
+        }
+        intervention = self._runtime_intervention
+        if not isinstance(intervention, dict):
+            return raw_delta, stats
+        mode = str(intervention.get("mode", ""))
+        if mode == "common_only":
+            stats["content_intervention_applied"] = raw_delta.new_ones(
+                int(raw_delta.shape[0])
+            )
+            return common_full, stats
+        if mode == "role_only":
+            stats["content_intervention_applied"] = raw_delta.new_ones(
+                int(raw_delta.shape[0])
+            )
+            return role, stats
+        if mode == "role_permuted":
+            permutation = intervention.get("permutation")
+            if not torch.is_tensor(permutation):
+                raise ValueError("role_permuted requires a permutation tensor")
+            permutation = permutation.to(
+                device=raw_delta.device, dtype=torch.long
+            )
+            if tuple(permutation.shape) != (self.prompt_len,):
+                raise ValueError(
+                    "role_permuted permutation has incompatible shape"
+                )
+            if sorted(permutation.detach().cpu().tolist()) != list(
+                range(self.prompt_len)
+            ):
+                raise ValueError("role_permuted permutation must be bijective")
+            stats["role_permutation"] = permutation
+            stats["content_intervention_applied"] = raw_delta.new_ones(
+                int(raw_delta.shape[0])
+            )
+            return common_full + role.index_select(1, permutation), stats
+        return raw_delta, stats
 
     def _sample_gate(self, source: torch.Tensor, layer_id: int) -> torch.Tensor:
         if self.sample_gate_head is None:
@@ -289,7 +380,10 @@ class MeanConditionedDeepPromptResidual(nn.Module):
                 f"Deep Prompt residual layer_id={layer_id} outside [0,{self.num_layers - 1}]"
             )
         source, intervention_stats = self._effective_mean(mean)
-        raw_delta = self._raw_delta(source, layer_id)
+        raw_delta, content_stats = self._raw_delta(source, layer_id)
+        raw_delta, content_intervention_stats = self._apply_content_intervention(
+            raw_delta
+        )
         layer_gate = self.layer_gate[layer_id].to(
             device=raw_delta.device, dtype=raw_delta.dtype
         )
@@ -371,6 +465,8 @@ class MeanConditionedDeepPromptResidual(nn.Module):
             "sample_gate_input": self.sample_gate_input,
         }
         stats.update(intervention_stats)
+        stats.update(content_stats)
+        stats.update(content_intervention_stats)
         return applied_delta, stats
 
 

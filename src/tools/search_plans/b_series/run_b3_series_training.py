@@ -24,7 +24,7 @@ from src.tools.search_plans.a_series.progress_dashboard import run_parallel_tria
 CONFIG_ROOT = ROOT / "configs" / "b_series_experiments"
 RUN_SUFFIX = Path("CUB/sup_vitb16_224/lr0.0006_wd1e-05/run1")
 STRICT_TRAINING_SEEDS = (0, 1, 2)
-STAGE_ORDER = ("P0", "R1", "R2", "R3")
+STAGE_ORDER = ("P0", "R1", "R2", "R3", "T1", "T2")
 STAGE_SPECS = {
     "P0": (
         ("B3-P0-A2-final", "B3-P0-A2-final.yaml", None),
@@ -41,6 +41,16 @@ STAGE_SPECS = {
     "R3": (
         ("B3-R3I", "B3-R3I-partial-unfreeze.yaml", "B3-R2I"),
         ("B3-R3A", "B3-R3A-A2-continuation.yaml", "B3-P0-A2-final"),
+    ),
+    "T1": (
+        ("B3-T1I-slot-scalar", "B3-T1I-slot-scalar.yaml", "B3-P0-A2-final"),
+        ("B3-T1N-slot-scalar-control", "B3-T1N-slot-scalar-control.yaml", "B3-P0-A2-final"),
+    ),
+    "T2": (
+        ("B3-T2I-rank2", "B3-T2I-slot-low-rank2.yaml", "B3-P0-A2-final"),
+        ("B3-T2N-rank2-control", "B3-T2N-slot-low-rank2-control.yaml", "B3-P0-A2-final"),
+        ("B3-T2I-rank4", "B3-T2I-slot-low-rank4.yaml", "B3-P0-A2-final"),
+        ("B3-T2N-rank4-control", "B3-T2N-slot-low-rank4-control.yaml", "B3-P0-A2-final"),
     ),
 }
 

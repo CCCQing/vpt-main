@@ -238,6 +238,9 @@ class DeepPromptResidualIntervention(AbstractContextManager):
         "mean_swap",
         "mean_replace",
         "layer_scales",
+        "common_only",
+        "role_only",
+        "role_permuted",
     }
 
     def __init__(self, model: torch.nn.Module, mode: str, **payload: Any) -> None:
@@ -410,6 +413,30 @@ def deep_prompt_residual_layer_scales_intervention(
         model,
         "layer_scales",
         scales=values,
+    )
+
+
+def deep_prompt_residual_common_only_intervention(
+    model: torch.nn.Module,
+) -> DeepPromptResidualIntervention:
+    return DeepPromptResidualIntervention(model, "common_only")
+
+
+def deep_prompt_residual_role_only_intervention(
+    model: torch.nn.Module,
+) -> DeepPromptResidualIntervention:
+    return DeepPromptResidualIntervention(model, "role_only")
+
+
+def deep_prompt_residual_role_permuted_intervention(
+    model: torch.nn.Module,
+    *,
+    permutation: torch.Tensor,
+) -> DeepPromptResidualIntervention:
+    return DeepPromptResidualIntervention(
+        model,
+        "role_permuted",
+        permutation=permutation,
     )
 
 

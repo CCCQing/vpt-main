@@ -83,6 +83,10 @@ def _synthetic_outputs():
 
 def _validate_logit_geometry() -> None:
     outputs = _synthetic_outputs()
+    outputs["train_seen"] = {
+        "logits": outputs["test_seen"]["logits"].copy(),
+        "targets_local": outputs["test_seen"]["targets_local"].copy(),
+    }
     summary, arrays = analyze_logit_geometry(
         outputs,
         candidate_class_ids=[10, 11, 20, 21],
@@ -95,7 +99,7 @@ def _validate_logit_geometry() -> None:
         "direction_normalized_logits",
         "class_pattern",
     }
-    for split in ("test_seen", "test_unseen"):
+    for split in ("train_seen", "test_seen", "test_unseen"):
         for view in summary["views"]:
             metrics = summary["splits"][split]["views"][view]
             assert NEW_FISHER_FIELDS.issubset(metrics)
@@ -117,7 +121,7 @@ def _validate_logit_geometry() -> None:
         seen_class_ids=[10, 11],
         unseen_class_ids=[20, 21],
     )
-    for split in ("test_seen", "test_unseen"):
+    for split in ("train_seen", "test_seen", "test_unseen"):
         for view in ("direction_normalized_logits", "class_pattern"):
             original_metrics = summary["splits"][split]["views"][view]
             shifted_metrics = shifted["splits"][split]["views"][view]

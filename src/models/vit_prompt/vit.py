@@ -776,6 +776,9 @@ class PromptedTransformer(Transformer):
                     gate_init=float(self.deep_residual_cfg.GATE_INIT),
                     content_mode=str(self.deep_residual_cfg.CONTENT_MODE),
                     slot_rank=int(self.deep_residual_cfg.SLOT_RANK),
+                    slot_scalar_temperature=float(
+                        self.deep_residual_cfg.SLOT_SCALAR_TEMPERATURE
+                    ),
                     sample_gate_mode=str(
                         self.deep_residual_cfg.SAMPLE_GATE_MODE
                     ),

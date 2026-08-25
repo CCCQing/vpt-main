@@ -10,6 +10,7 @@ from .decision_gain_decomposition import _domain_indices, factorize_logits
 
 
 SPLITS = ("test_seen", "test_unseen")
+OPTIONAL_SPLITS = ("train_seen",)
 VIEWS = ("centered_logits", "direction_normalized_logits", "class_pattern")
 
 
@@ -38,9 +39,14 @@ def _normalize_rows(values: np.ndarray, eps: float) -> Tuple[np.ndarray, np.ndar
 
 def _spectral_metrics(values: np.ndarray, eps: float) -> Dict[str, float]:
     centered = values - values.mean(axis=0, keepdims=True)
-    covariance = centered.T @ centered
-    eigenvalues = np.maximum(np.linalg.eigvalsh(0.5 * (covariance + covariance.T)), 0.0)
-    singular = np.sqrt(eigenvalues)[::-1]
+    if centered.shape[0] <= centered.shape[1]:
+        singular = np.linalg.svd(centered, full_matrices=False, compute_uv=False)
+    else:
+        covariance = centered.T @ centered
+        eigenvalues = np.maximum(
+            np.linalg.eigvalsh(0.5 * (covariance + covariance.T)), 0.0
+        )
+        singular = np.sqrt(eigenvalues)[::-1]
     total = float(singular.sum())
     if total <= float(eps):
         return {"effective_rank": 0.0, "top_singular_value_ratio": 0.0}
@@ -220,13 +226,20 @@ def analyze_logit_geometry(
         candidate_class_ids, seen_class_ids, unseen_class_ids
     )
     expected_by_split = {
+        "train_seen": seen_indices,
         "test_seen": seen_indices,
         "test_unseen": unseen_indices,
     }
+    analysis_splits = tuple(
+        split
+        for split in (*OPTIONAL_SPLITS, *SPLITS)
+        if split in outputs_by_split
+    )
     split_inputs = {}
     for split in SPLITS:
         if split not in outputs_by_split:
             raise ValueError("missing logit geometry split: {}".format(split))
+    for split in analysis_splits:
         logits = _as_logits(outputs_by_split[split]["logits"])
         targets = _as_targets(
             outputs_by_split[split]["targets_local"], logits.shape[0], logits.shape[1]
@@ -263,7 +276,7 @@ def analyze_logit_geometry(
     validity_checks = []
     reconstruction_errors = []
     endpoint_equivalence = {}
-    for split in SPLITS:
+    for split in analysis_splits:
         item = split_inputs[split]
         raw_prediction = item["logits"].argmax(axis=1)
         centered_prediction = item["views"]["centered_logits"].argmax(axis=1)

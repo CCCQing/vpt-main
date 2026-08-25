@@ -271,10 +271,20 @@ def static_checks(
             failures.append("B-series direct-mean stage requires DEEP_RESIDUAL_ZERO=true")
         if not bool(cfg.MONITOR.MODULE_EFFECT.DEEP_RESIDUAL_SWAP):
             failures.append("B-series direct-mean stage requires DEEP_RESIDUAL_SWAP=true")
-        if str(residual_cfg.CONTENT_MODE).lower() not in {"shared", "slot_low_rank"}:
-            failures.append("B-series residual CONTENT_MODE must be shared or slot_low_rank")
+        if str(residual_cfg.CONTENT_MODE).lower() not in {
+            "shared",
+            "slot_scalar",
+            "slot_low_rank",
+        }:
+            failures.append(
+                "B-series residual CONTENT_MODE must be shared, slot_scalar, or slot_low_rank"
+            )
         if int(residual_cfg.SLOT_RANK) <= 0:
             failures.append("B-series residual SLOT_RANK must be positive")
+        if float(residual_cfg.SLOT_SCALAR_TEMPERATURE) <= 0.0:
+            failures.append(
+                "B-series residual SLOT_SCALAR_TEMPERATURE must be positive"
+            )
         if str(residual_cfg.SAMPLE_GATE_MODE).lower() not in {
             "none", "shared", "grouped", "layerwise"
         }:
@@ -299,8 +309,17 @@ def static_checks(
                 failures.append("B3 residual stages require AMPLITUDE_MODE=bounded_ratio")
             if [int(value) for value in residual_cfg.ACTIVE_LAYERS] != [8, 9, 10, 11]:
                 failures.append("B3 residual stages must isolate active layers 8-11")
-            if str(residual_cfg.CONTENT_MODE).lower() != "shared":
-                failures.append("B3 residual stages use the isolated shared residual only")
+            expected_content_modes = (
+                {"slot_scalar"}
+                if architecture_id.startswith("B3-T1")
+                else {"slot_low_rank"}
+                if architecture_id.startswith("B3-T2")
+                else {"shared"}
+            )
+            if str(residual_cfg.CONTENT_MODE).lower() not in expected_content_modes:
+                failures.append(
+                    "B3 residual CONTENT_MODE does not match its registered architecture role"
+                )
             if str(residual_cfg.SAMPLE_GATE_MODE).lower() != "none":
                 failures.append("B3 residual stages must not enable a sample gate")
             maximum = float(residual_cfg.BOUNDED_MAX_RATIO)

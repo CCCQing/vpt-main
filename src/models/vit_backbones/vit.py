@@ -2251,6 +2251,30 @@ class Block(nn.Module):
                     monitor_attention_probs,
                     affinity_config,
                 )
+                if bool(affinity_config.get("collect_prompt_slot_states", False)):
+                    prompt_length = int(
+                        affinity_config.get("prompt_length", num_prompt_tokens)
+                    )
+                    prompt_slice = slice(1, 1 + prompt_length)
+                    detach = bool(affinity_config.get("detach", True))
+
+                    def compact(value):
+                        value = value[:, prompt_slice, :]
+                        return value.detach() if detach else value
+
+                    def compact_projection(value):
+                        value = value[:, :, prompt_slice, :]
+                        value = self.attn._merge_heads(value)
+                        return value.detach() if detach else value
+
+                    affinity.update(
+                        {
+                            "_prompt_slot_raw_input": compact(block_input),
+                            "_prompt_slot_ln_input": compact(x_norm),
+                            "_prompt_slot_key": compact_projection(k_proj),
+                            "_prompt_slot_value": compact_projection(v_proj),
+                        }
+                    )
             else:
                 # Continuity only needs compact Prompt input/output vectors.
                 # Avoid constructing full Q/K and value diagnostics for layers

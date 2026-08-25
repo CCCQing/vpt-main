@@ -19,3 +19,8 @@ Each task is single-GPU. Existing completed tasks are skipped; incomplete non-em
 The additional experiments remain part of the B series and use the neutral atomic labels `E1` through `E7`. Their commands and validity contracts are defined in [B_SERIES_EXPERIMENT_PROTOCOL.md](B_SERIES_EXPERIMENT_PROTOCOL.md).
 
 After replay cells finish, `summarize_b_series_replays.py` enforces atomic-cell completeness and summarizes three Probe selections within each checkpoint before aggregating independent training seeds.
+
+The B3 `D2G` checkpoint-only completion is documented in
+[B3_SERIES_EXPERIMENT_PROTOCOL.md](B3_SERIES_EXPERIMENT_PROTOCOL.md). Use
+`validate_b3_d2g_result.py` for each cell and `summarize_b3_d2g.py` only after
+all 24 full/strict-Probe cells exist and pass their identity contracts.

@@ -38,8 +38,11 @@ from src.monitoring.eval_metrics import (
 from src.monitoring.logit_geometry import analyze_logit_geometry, analyze_vector_geometry
 from src.monitoring.module_effect import (
     checkpoint_sha256,
+    deep_prompt_residual_common_only_intervention,
     deep_prompt_residual_layer_scales_intervention,
     deep_prompt_residual_replace_intervention,
+    deep_prompt_residual_role_only_intervention,
+    deep_prompt_residual_role_permuted_intervention,
     paired_module_effect_metrics,
     prompt_zero_intervention,
 )
@@ -180,9 +183,16 @@ def _build_loaders(
     selection_seed: int,
     *,
     per_class_override: Optional[int] = None,
+    include_train_seen: bool = False,
 ):
     if scope == "full":
-        return {name: full_test_loaders[name] for name in TEST_SPLITS}, {}
+        loaders = {name: full_test_loaders[name] for name in TEST_SPLITS}
+        if include_train_seen:
+            loaders = {
+                "train_seen": data_loader.construct_train_eval_loader(cfg),
+                **loaders,
+            }
+        return loaders, {}
     train_loader = data_loader.construct_trainval_loader(cfg)
     source_loaders = {
         "train_seen": train_loader,
@@ -263,9 +273,26 @@ def _predict(
     scales: Optional[Sequence[float]] = None,
     donor_mean_by_id: Optional[Mapping[str, np.ndarray]] = None,
     collect_geometry: bool = False,
+    collect_source_input: bool = False,
     effective_prompt_zero: bool = False,
+    residual_content_mode: Optional[str] = None,
+    slot_permutation: Optional[Sequence[int]] = None,
+    prepass_cache_mode: Optional[str] = None,
+    prepass_cache_namespace: Optional[str] = None,
 ) -> Dict[str, Any]:
-    if effective_prompt_zero and (scales is not None or donor_mean_by_id is not None):
+    if prepass_cache_mode not in {None, "populate", "reuse"}:
+        raise ValueError("prepass_cache_mode must be None, populate or reuse")
+    if prepass_cache_mode is not None and not str(
+        prepass_cache_namespace or ""
+    ).strip():
+        raise ValueError("prepass_cache_namespace is required when caching prepass CLS")
+    if residual_content_mode not in {None, "common_only", "role_only", "role_permuted"}:
+        raise ValueError("unsupported residual content intervention")
+    if effective_prompt_zero and (
+        scales is not None
+        or donor_mean_by_id is not None
+        or residual_content_mode is not None
+    ):
         raise ValueError(
             "effective Prompt-zero cannot be combined with residual scale or donor interventions"
         )
@@ -275,6 +302,7 @@ def _predict(
     logits_batches = []
     feature_batches = []
     mean_batches = []
+    source_input_batches = []
     target_local_batches = []
     target_global_batches = []
     sample_ids = []
@@ -286,6 +314,8 @@ def _predict(
     replacement_distances = []
     prompt_zero_parameter_names = None
     prompt_zero_residual_module_count = None
+    semantic_prototypes = None
+    cache_key_count = 0
     requested_mode = (
         "effective_prompt_zero"
         if effective_prompt_zero
@@ -293,6 +323,8 @@ def _predict(
         if donor_mean_by_id is not None
         else "layer_scales"
         if scales is not None
+        else residual_content_mode
+        if residual_content_mode is not None
         else "none"
     )
     expected_scales = (
@@ -301,13 +333,25 @@ def _predict(
         else None
     )
     model.eval()
-    for batch in loader:
+    module = model.module if hasattr(model, "module") else model
+    for batch_index, batch in enumerate(loader):
         inputs = batch["image"].float().to(device, non_blocking=True)
         labels = torch.as_tensor(batch["label"], dtype=torch.long)
         local = eval_map.index_select(0, labels)
         if (local < 0).any():
             raise ValueError("target is outside the GZSL candidate space")
         identifiers = [str(value) for value in batch["sample_id"]]
+        if prepass_cache_mode is not None:
+            cache_key = "{}|batch{}|{}".format(
+                str(prepass_cache_namespace),
+                int(batch_index),
+                "|".join(identifiers),
+            )
+            if prepass_cache_mode == "populate" and batch_index == 0:
+                module.begin_runtime_vit_cls_prepass_cache(cache_key)
+            else:
+                module.select_runtime_vit_cls_prepass_cache_key(cache_key)
+            cache_key_count += 1
         if effective_prompt_zero:
             intervention = prompt_zero_intervention(model)
         elif donor_mean_by_id is not None:
@@ -323,6 +367,17 @@ def _predict(
             intervention = deep_prompt_residual_layer_scales_intervention(
                 model, scales=scales
             )
+        elif residual_content_mode == "common_only":
+            intervention = deep_prompt_residual_common_only_intervention(model)
+        elif residual_content_mode == "role_only":
+            intervention = deep_prompt_residual_role_only_intervention(model)
+        elif residual_content_mode == "role_permuted":
+            permutation = torch.as_tensor(
+                slot_permutation, device=device, dtype=torch.long
+            )
+            intervention = deep_prompt_residual_role_permuted_intervention(
+                model, permutation=permutation
+            )
         else:
             intervention = nullcontext()
         with intervention as intervention_state:
@@ -336,7 +391,6 @@ def _predict(
             logits = logits[0]
         if isinstance(logits, dict):
             logits = logits["logits"]
-        module = model.module if hasattr(model, "module") else model
         classifier_state = module.get_runtime_classifier_stats()
         distribution_state = module.get_runtime_prompt_distribution_stats()
         trace = module.get_runtime_deep_prompt_residual_trace()
@@ -348,6 +402,14 @@ def _predict(
             distribution_state.get("mu")
         ):
             raise RuntimeError("Prompt Distributor mean trace is unavailable")
+        current_semantic = classifier_state.get("semantic_repr")
+        if not torch.is_tensor(current_semantic) or current_semantic.dim() != 2:
+            raise RuntimeError("projected semantic prototype trace is unavailable")
+        current_semantic = current_semantic.detach().cpu().float().numpy()
+        if semantic_prototypes is None:
+            semantic_prototypes = current_semantic.copy()
+        elif not np.array_equal(semantic_prototypes, current_semantic):
+            raise RuntimeError("projected semantic prototypes changed between batches")
         if len(trace) != _model_num_layers(model):
             raise RuntimeError("Deep Prompt residual trace does not cover all layers")
         if effective_prompt_zero:
@@ -422,6 +484,19 @@ def _predict(
                             layer_id
                         )
                     )
+            if residual_content_mode is not None:
+                applied = item.get("content_intervention_applied")
+                if not torch.is_tensor(applied) or not bool(
+                    (applied.detach().float() > 0.5).all().item()
+                ):
+                    intervention_contract_pass = False
+                    intervention_failure_reasons.append(
+                        "layer {} content intervention was not applied".format(
+                            layer_id
+                        )
+                    )
+                else:
+                    applied_layers.add(layer_id)
         if collect_geometry:
             current = residual_static_geometry(trace)
             if layer_ids is None:
@@ -436,6 +511,15 @@ def _predict(
             classifier_state["visual_input"].detach().cpu().float().numpy()
         )
         mean_batches.append(distribution_state["mu"].detach().cpu().float().numpy())
+        if collect_source_input:
+            source_input = distribution_state.get("visual_input")
+            if not torch.is_tensor(source_input) or source_input.dim() != 2:
+                raise RuntimeError(
+                    "Prompt Distributor visual_input trace is unavailable"
+                )
+            source_input_batches.append(
+                source_input.detach().cpu().float().numpy()
+            )
         target_local_batches.append(local.numpy())
         target_global_batches.append(labels.numpy())
         sample_ids.extend(identifiers)
@@ -491,6 +575,12 @@ def _predict(
                 effective_prompt_zero
             ),
         },
+        "semantic_prototypes": semantic_prototypes,
+        "prepass_cache_contract": {
+            "mode": prepass_cache_mode,
+            "namespace": prepass_cache_namespace,
+            "batch_key_count": int(cache_key_count),
+        },
     }
     if collect_geometry:
         result["geometry"] = {
@@ -498,6 +588,8 @@ def _predict(
             for name, values in geometry_batches.items()
         }
         result["geometry"]["layer_ids"] = layer_ids
+    if collect_source_input:
+        result["source_input"] = np.concatenate(source_input_batches, axis=0)
     return result
 
 

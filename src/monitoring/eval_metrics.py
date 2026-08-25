@@ -561,9 +561,20 @@ def semantic_visual_graph_metrics(
     visual_edges = visual_relation[upper]
     high_mask = semantic_edges >= float(high_semantic_threshold)
     false_high = high_mask & (visual_edges <= float(low_visual_threshold))
+    neighbor_ranking = []
+    for row in range(observed.size):
+        mask = np.arange(observed.size) != row
+        neighbor_ranking.append(
+            spearman_correlation(
+                visual_relation[row, mask], semantic_relation[row, mask]
+            )
+        )
     result = {
         "semantic_visual_graph_spearman": spearman_correlation(semantic_edges, visual_edges),
         "false_high_semantic_edge_rate": float(false_high.sum() / max(1, high_mask.sum())),
+        "neighbor_ranking_consistency": float(np.mean(neighbor_ranking))
+        if neighbor_ranking
+        else 0.0,
     }
     if logits is None:
         return result

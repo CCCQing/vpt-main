@@ -2714,7 +2714,12 @@ def main():
     )
     assert np.isfinite(neighbor_alignment["visual_semantic_distance_spearman"])
     assert semantic_graph_reference_metrics(semantic, [0, 1], [2, 3])
-    assert semantic_visual_graph_metrics(visual_seen, semantic, seen_targets, logits=seen_scores)
+    graph_metrics = semantic_visual_graph_metrics(
+        visual_seen, semantic, seen_targets, logits=seen_scores
+    )
+    assert graph_metrics
+    assert "neighbor_ranking_consistency" in graph_metrics
+    assert np.isfinite(graph_metrics["neighbor_ranking_consistency"])
     effect = paired_module_effect_metrics(
         seen_scores,
         seen_scores + rng.normal(scale=0.01, size=seen_scores.shape),

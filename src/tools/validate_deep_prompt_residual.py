@@ -23,8 +23,11 @@ from src.monitoring.deep_prompt_residual_experiments import (
     summarize_geometry,
 )
 from src.monitoring.module_effect import (
+    deep_prompt_residual_common_only_intervention,
     deep_prompt_residual_layer_scales_intervention,
     deep_prompt_residual_replace_intervention,
+    deep_prompt_residual_role_only_intervention,
+    deep_prompt_residual_role_permuted_intervention,
     deep_prompt_residual_swap_intervention,
     deep_prompt_residual_zero_intervention,
 )
@@ -188,6 +191,23 @@ def validate_slot_and_sample_gate_modes() -> None:
     )
     assert slot_metrics["layer_1.raw_delta_slot_effective_rank"] > 1.0
 
+    slot_scalar = MeanConditionedDeepPromptResidual(
+        dim=10,
+        prompt_len=4,
+        num_layers=3,
+        gate_init=1.0,
+        content_mode="slot_scalar",
+    )
+    scalar_delta, scalar_trace = slot_scalar.forward_layer(latent, 1)
+    expected_shared = latent[:, None, :].expand_as(scalar_delta)
+    assert torch.allclose(scalar_delta, expected_shared)
+    assert torch.allclose(
+        scalar_trace["slot_scalar_coefficients"],
+        torch.ones(6, 4),
+    )
+    scalar_trace["slot_scalar_coefficients"].sum().backward()
+    assert slot_scalar.slot_coefficients[1].weight.grad is not None
+
     conditional = MeanConditionedDeepPromptResidual(
         dim=10,
         prompt_len=4,
@@ -217,6 +237,46 @@ def validate_slot_and_sample_gate_modes() -> None:
     assert torch.allclose(
         fixed_trace["sample_gate"], torch.full((6,), 0.8), atol=1e-6
     )
+
+
+def validate_common_role_interventions() -> None:
+    torch.manual_seed(22)
+    module = MeanConditionedDeepPromptResidual(
+        dim=9,
+        prompt_len=4,
+        num_layers=2,
+        gate_init=1.0,
+        content_mode="slot_low_rank",
+        slot_rank=3,
+    )
+    holder = _ResidualHolder(module)
+    latent = torch.randn(5, 9)
+    normal, trace = module.forward_layer(latent, 1)
+    common = trace["common_component"]
+    role = trace["role_component"]
+    assert torch.allclose(common + role, trace["raw_delta"])
+    assert torch.allclose(role.mean(dim=1), torch.zeros_like(role.mean(dim=1)), atol=1.0e-6)
+    with deep_prompt_residual_common_only_intervention(holder):
+        common_only, common_trace = module.forward_layer(latent, 1)
+    with deep_prompt_residual_role_only_intervention(holder):
+        role_only, role_trace = module.forward_layer(latent, 1)
+    permutation = torch.tensor([2, 0, 3, 1])
+    with deep_prompt_residual_role_permuted_intervention(
+        holder, permutation=permutation
+    ):
+        permuted, permuted_trace = module.forward_layer(latent, 1)
+    assert torch.allclose(common_only, common)
+    assert torch.allclose(role_only, role)
+    assert not torch.allclose(permuted, normal)
+    assert torch.allclose(
+        permuted_trace["raw_delta"].square().sum(dim=(-2, -1)),
+        trace["raw_delta"].square().sum(dim=(-2, -1)),
+        atol=1.0e-5,
+    )
+    assert torch.equal(
+        common_trace["content_intervention_applied"], torch.ones(5)
+    )
+    assert torch.equal(role_trace["content_intervention_applied"], torch.ones(5))
 
 
 def validate_donor_contracts() -> None:
@@ -550,6 +610,27 @@ def validate_b3_full_vit_isolation() -> None:
                 torch.full_like(item["applied_ratio"], 0.125),
                 atol=2.0e-6,
             )
+    with torch.no_grad():
+        _, affinities = model.forward_with_affinity(
+            image,
+            {
+                "prompt_length": 16,
+                "semantic_length": 0,
+                "detach": True,
+                "include_visual_normalizations": False,
+                "selected_layers": [8],
+                "collect_prompt_slot_states": True,
+                "offload_diagnostics_to_cpu": True,
+            },
+        )
+    for key in (
+        "_prompt_slot_raw_input",
+        "_prompt_slot_ln_input",
+        "_prompt_slot_key",
+        "_prompt_slot_value",
+    ):
+        assert tuple(affinities[8][key].shape) == (1, 16, 768)
+        assert affinities[8][key].device.type == "cpu"
 
 
 def validate_a2_initialization_and_freeze_contract() -> None:
@@ -673,6 +754,7 @@ def main() -> None:
         validate_controls_and_metrics,
         validate_experiment_interventions_and_geometry,
         validate_slot_and_sample_gate_modes,
+        validate_common_role_interventions,
         validate_donor_contracts,
         validate_bounded_deep_residual_contract,
         validate_b3_class_consistency_state,
