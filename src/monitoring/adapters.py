@@ -122,6 +122,7 @@ def deep_prompt_residual_metrics(trace: Any) -> Dict[str, float]:
         applied_ratio_tensor = item.get("applied_ratio")
         budget_exceed = item.get("budget_exceed")
         active_layer = item.get("active_layer")
+        slot_scalar_coefficients = item.get("slot_scalar_coefficients")
         if torch.is_tensor(base):
             base_norm = float(base.detach().float().norm(dim=-1).mean().item())
             result[f"{prefix}.base_prompt_norm"] = base_norm
@@ -202,6 +203,40 @@ def deep_prompt_residual_metrics(trace: Any) -> Dict[str, float]:
         if torch.is_tensor(active_layer):
             result[f"{prefix}.active_layer"] = float(
                 active_layer.detach().float().mean().item()
+            )
+        if torch.is_tensor(slot_scalar_coefficients):
+            coefficients = slot_scalar_coefficients.detach().float()
+            if coefficients.dim() != 2 or int(coefficients.shape[1]) <= 0:
+                raise ValueError(
+                    "slot_scalar_coefficients must have shape [batch, prompt_len]"
+                )
+            probability = coefficients.clamp_min(0.0)
+            probability = probability / probability.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1.0e-12)
+            effective_count = torch.exp(
+                -(probability * probability.clamp_min(1.0e-12).log()).sum(dim=-1)
+            )
+            result[f"{prefix}.slot_scalar_coefficient_mean"] = float(
+                coefficients.mean().item()
+            )
+            result[f"{prefix}.slot_scalar_coefficient_std"] = float(
+                coefficients.std(dim=-1, unbiased=False).mean().item()
+            )
+            result[f"{prefix}.slot_scalar_coefficient_min"] = float(
+                coefficients.min(dim=-1).values.mean().item()
+            )
+            result[f"{prefix}.slot_scalar_coefficient_max"] = float(
+                coefficients.max(dim=-1).values.mean().item()
+            )
+            result[f"{prefix}.slot_scalar_effective_count"] = float(
+                effective_count.mean().item()
+            )
+            result[f"{prefix}.slot_scalar_effective_ratio"] = float(
+                (effective_count / float(coefficients.shape[1])).mean().item()
+            )
+            result[f"{prefix}.slot_scalar_between_instance_variance"] = float(
+                coefficients.var(dim=0, unbiased=False).mean().item()
             )
         if torch.is_tensor(gate):
             gate_value = float(gate.detach().float().mean().item())

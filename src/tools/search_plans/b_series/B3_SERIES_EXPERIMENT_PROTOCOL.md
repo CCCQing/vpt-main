@@ -161,12 +161,31 @@ validator enforce this boundary; missing values are never filled with zero.
 
 ## 7. T1/T2 slot-capacity training branches
 
-T1 uses `slot_scalar`: the same sample-level direction is retained, but every
-Prompt slot receives a learned sample-conditional coefficient. It initializes
-exactly as the shared residual. T2 uses a rank-2 or rank-4 slot-specific basis.
-Image-conditional and constant-input controls have matched parameter shapes.
-Both branches still load matched A2 checkpoints, freeze static Prompt and the
-classifier, and isolate layers 8-11.
+T1 uses `slot_scalar`: the source is the normalized frozen-ViT prepass CLS,
+without the statistics MLP. The same sample-level direction is retained, but
+every Prompt slot receives a learned sample-conditional coefficient. It
+initializes exactly as the direct shared S0 residual, so T1 changes only the
+carrier capacity. The matched control uses one deterministic zero-mean fixed
+direction and identical coefficient heads; it therefore measures added
+slot-scalar capacity without image conditioning. The old all-ones direct
+control is not used here because token-wise LayerNorm removes that direction.
+
+T2 remains a separate rank-2 or rank-4 slot-specific-basis branch and must not
+be mixed into the first T1 screening decision. Both branches load matched A2
+checkpoints, freeze static Prompt and the classifier, and isolate layers 8-11.
+
+The first T1 decision is a training-seed-0 screening pair only:
+
+```bash
+python -m src.tools.search_plans.b_series.run_b3_series_training \
+  --stages T1 --protocol final_gzsl --screening-seed 0 \
+  --a2-root <A-series root> --out-root <T1 screening root> \
+  --max-ratios 0.25 --gpu-groups '0;4' --max-workers 2
+```
+
+Do not schedule an additional MLP-source T1 as an equal main branch. It changes
+both source encoding and carrier capacity. Only after direct-source T1 shows a
+useful signal may an MLP-source version be added as a secondary source-ablation.
 
 ```bash
 python -m src.tools.search_plans.b_series.run_b3_series_training \
@@ -175,5 +194,6 @@ python -m src.tools.search_plans.b_series.run_b3_series_training \
   --max-ratios 0.25 --gpu-groups '0;3;4;5;6;7' --max-workers 6
 ```
 
-The command schedules strict training seeds `0/1/2`; fixed-Probe collection
-must still use `424242/424243/424244` before either branch is called complete.
+The command above is the later formal T1/T2 matrix and schedules strict
+training seeds `0/1/2`; fixed-Probe collection must still use
+`424242/424243/424244` before either branch is called complete.

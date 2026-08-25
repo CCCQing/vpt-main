@@ -261,6 +261,7 @@ def static_checks(
             "vit_cls_prepass_constant",
             "vit_cls_prepass_direct",
             "vit_cls_prepass_direct_constant",
+            "vit_cls_prepass_direct_fixed_direction",
         }:
             failures.append(
                 "B-series direct-mean stage requires vit_cls_prepass or its constant control"
@@ -345,6 +346,15 @@ def static_checks(
             if architecture_id.startswith("B3-S0N") and source_name != "vit_cls_prepass_direct_constant":
                 failures.append(
                     "B3-S0N requires SOURCE=vit_cls_prepass_direct_constant"
+                )
+            if architecture_id.startswith("B3-T1I") and source_name != "vit_cls_prepass_direct":
+                failures.append("B3-T1I requires SOURCE=vit_cls_prepass_direct")
+            if (
+                architecture_id.startswith("B3-T1N")
+                and source_name != "vit_cls_prepass_direct_fixed_direction"
+            ):
+                failures.append(
+                    "B3-T1N requires SOURCE=vit_cls_prepass_direct_fixed_direction"
                 )
         consistency_expected = architecture_id.startswith(("B3-R2", "B3-R3I"))
         if bool(consistency_cfg.ENABLE) != consistency_expected:
@@ -559,6 +569,7 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
     direct_source = source_name in {
         "vit_cls_prepass_direct",
         "vit_cls_prepass_direct_constant",
+        "vit_cls_prepass_direct_fixed_direction",
     }
     if not freeze_classifier and not any(
         name.startswith("r_similarity_head.prototype_proj") for name in trainable

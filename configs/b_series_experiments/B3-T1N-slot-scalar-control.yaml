@@ -4,7 +4,6 @@ OUTPUT_DIR: "output/b3_series/B3-T1N-slot-scalar-control"
 MODEL:
   PROMPT:
     DISTRIBUTOR:
-      SOURCE: "vit_cls_prepass_constant"
+      SOURCE: "vit_cls_prepass_direct_fixed_direction"
       DEEP_RESIDUAL:
-        ARCHITECTURE_ID: "B3-T1N-slot-scalar-control"
-
+        ARCHITECTURE_ID: "B3-T1N-direct-slot-scalar-control"

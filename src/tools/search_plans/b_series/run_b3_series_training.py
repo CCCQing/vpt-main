@@ -49,8 +49,12 @@ STAGE_SPECS = {
         ("B3-R3A", "B3-R3A-A2-continuation.yaml", "B3-P0-A2-final"),
     ),
     "T1": (
-        ("B3-T1I-slot-scalar", "B3-T1I-slot-scalar.yaml", "B3-P0-A2-final"),
-        ("B3-T1N-slot-scalar-control", "B3-T1N-slot-scalar-control.yaml", "B3-P0-A2-final"),
+        ("B3-T1I-direct-slot-scalar", "B3-T1I-slot-scalar.yaml", "B3-P0-A2-final"),
+        (
+            "B3-T1N-direct-slot-scalar-control",
+            "B3-T1N-slot-scalar-control.yaml",
+            "B3-P0-A2-final",
+        ),
     ),
     "T2": (
         ("B3-T2I-rank2", "B3-T2I-slot-low-rank2.yaml", "B3-P0-A2-final"),

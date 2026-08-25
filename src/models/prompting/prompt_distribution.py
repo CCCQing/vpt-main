@@ -27,6 +27,7 @@ _ALLOWED_SOURCES = {
     "vit_cls_prepass_constant",
     "vit_cls_prepass_direct",
     "vit_cls_prepass_direct_constant",
+    "vit_cls_prepass_direct_fixed_direction",
     "cnn_torchvision",
     "clip_frozen",
     "dinov2_small",
@@ -826,6 +827,7 @@ class PreViTPromptDistributor(nn.Module):
             "vit_cls_prepass_constant",
             "vit_cls_prepass_direct",
             "vit_cls_prepass_direct_constant",
+            "vit_cls_prepass_direct_fixed_direction",
         }
         if self.source in prepass_sources:
             if vit_cls is None:
@@ -836,10 +838,30 @@ class PreViTPromptDistributor(nn.Module):
                 "vit_cls_prepass",
                 "vit_cls_prepass_direct",
             }
-            visual_input = vit_cls if self.source in conditional_sources else torch.ones_like(vit_cls)
+            if self.source in conditional_sources:
+                visual_input = vit_cls
+            elif self.source == "vit_cls_prepass_direct_fixed_direction":
+                # A deterministic, zero-mean, non-uniform direction is used for
+                # the matched nonconditional T1 control.  An all-ones direction
+                # is removed by token-wise LayerNorm and would collapse into an
+                # unintended null intervention rather than a trainable carrier.
+                feature_ids = torch.arange(
+                    int(vit_cls.shape[-1]),
+                    device=vit_cls.device,
+                    dtype=torch.long,
+                )
+                fixed_direction = torch.where(
+                    feature_ids.remainder(2).eq(0),
+                    -torch.ones_like(feature_ids, dtype=vit_cls.dtype),
+                    torch.ones_like(feature_ids, dtype=vit_cls.dtype),
+                )
+                visual_input = fixed_direction.unsqueeze(0).expand_as(vit_cls)
+            else:
+                visual_input = torch.ones_like(vit_cls)
             if self.source in {
                 "vit_cls_prepass_direct",
                 "vit_cls_prepass_direct_constant",
+                "vit_cls_prepass_direct_fixed_direction",
             }:
                 mu = torch.nn.functional.normalize(visual_input, p=2.0, dim=-1)
                 logvar = torch.zeros_like(mu)

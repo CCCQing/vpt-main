@@ -959,6 +959,7 @@ class PromptedTransformer(Transformer):
             "vit_cls_prepass_constant",
             "vit_cls_prepass_direct",
             "vit_cls_prepass_direct_constant",
+            "vit_cls_prepass_direct_fixed_direction",
         }:
             vit_cls = self._build_vit_cls_prepass(x_base)
         provider_out = self.prompt_init_provider(
@@ -990,6 +991,7 @@ class PromptedTransformer(Transformer):
             "vit_cls_prepass_constant",
             "vit_cls_prepass_direct",
             "vit_cls_prepass_direct_constant",
+            "vit_cls_prepass_direct_fixed_direction",
         }:
             vit_cls = self._build_vit_cls_prepass(x_base)
         stats = self.prompt_init_provider.distribution_parameters(

@@ -205,6 +205,14 @@ def validate_slot_and_sample_gate_modes() -> None:
         scalar_trace["slot_scalar_coefficients"],
         torch.ones(6, 4),
     )
+    scalar_metrics = deep_prompt_residual_metrics(
+        [{**scalar_trace, "base_prompt": torch.ones_like(scalar_delta)}]
+    )
+    assert scalar_metrics["layer_1.slot_scalar_coefficient_mean"] == 1.0
+    assert scalar_metrics["layer_1.slot_scalar_coefficient_std"] == 0.0
+    assert abs(scalar_metrics["layer_1.slot_scalar_effective_count"] - 4.0) < 1.0e-6
+    assert abs(scalar_metrics["layer_1.slot_scalar_effective_ratio"] - 1.0) < 1.0e-6
+    assert scalar_metrics["layer_1.slot_scalar_between_instance_variance"] == 0.0
     scalar_trace["slot_scalar_coefficients"].sum().backward()
     assert slot_scalar.slot_coefficients[1].weight.grad is not None
 
@@ -506,8 +514,13 @@ def validate_direct_prepass_sources() -> None:
         source="vit_cls_prepass_direct_constant",
         **kwargs,
     )
+    fixed_direction = PreViTPromptDistributor(
+        source="vit_cls_prepass_direct_fixed_direction",
+        **kwargs,
+    )
     assert direct.stats_head is None
     assert constant.stats_head is None
+    assert fixed_direction.stats_head is None
     cls = torch.randn(3, 768)
     direct_stats = direct.distribution_parameters(vit_cls=cls)
     expected = torch.nn.functional.normalize(cls, p=2.0, dim=-1)
@@ -518,6 +531,18 @@ def validate_direct_prepass_sources() -> None:
     second = constant.distribution_parameters(vit_cls=cls * 17.0)
     assert torch.equal(first["mu"], second["mu"])
     assert torch.equal(first["mu"][0], first["mu"][1])
+    fixed_first = fixed_direction.distribution_parameters(vit_cls=cls)
+    fixed_second = fixed_direction.distribution_parameters(vit_cls=cls * 17.0)
+    assert torch.equal(fixed_first["mu"], fixed_second["mu"])
+    assert torch.equal(fixed_first["mu"][0], fixed_first["mu"][1])
+    assert torch.allclose(
+        fixed_first["mu"].float().mean(dim=-1),
+        torch.zeros(int(cls.shape[0])),
+        atol=1.0e-7,
+    )
+    assert bool((fixed_first["mu"] > 0).any())
+    assert bool((fixed_first["mu"] < 0).any())
+    assert not torch.equal(fixed_first["mu"], first["mu"])
 
 
 def validate_full_vit_config_and_trace() -> None:
@@ -725,6 +750,79 @@ def validate_s0_full_vit_isolation() -> None:
             assert torch.equal(source_mu[0], source_mu[1])
 
 
+def validate_t1_full_vit_isolation() -> None:
+    cases = (
+        (
+            "configs/b_series_experiments/B3-T1I-slot-scalar.yaml",
+            True,
+        ),
+        (
+            "configs/b_series_experiments/B3-T1N-slot-scalar-control.yaml",
+            False,
+        ),
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for config_path, conditional in cases:
+        cfg = get_cfg()
+        cfg.merge_from_file(config_path)
+        cfg.freeze()
+        torch.manual_seed(53)
+        model = ViT(cfg, load_pretrain=False).to(device).eval()
+        model.attach_r_similarity_head(torch.zeros(200, 312, device=device))
+        trainable = {
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        }
+        assert "enc.transformer.deep_prompt_residual.layer_gate" in trainable
+        slot_parameters = {
+            name for name in trainable if ".slot_coefficients." in name
+        }
+        assert len(slot_parameters) == 24
+        assert trainable == slot_parameters | {
+            "enc.transformer.deep_prompt_residual.layer_gate"
+        }
+        image = torch.randn(
+            2,
+            3,
+            int(cfg.DATA.CROPSIZE),
+            int(cfg.DATA.CROPSIZE),
+            device=device,
+        )
+        with torch.no_grad():
+            model(image, return_feature=True)
+        trace = model.enc.transformer._last_deep_prompt_residual_trace
+        assert len(trace) == 12
+        for item in trace:
+            layer_id = int(item["layer_id"])
+            coefficients = item["slot_scalar_coefficients"]
+            assert torch.allclose(coefficients, torch.ones_like(coefficients))
+            if layer_id < 8:
+                assert torch.equal(
+                    item["applied_delta"], torch.zeros_like(item["applied_delta"])
+                )
+            else:
+                assert torch.allclose(
+                    item["applied_ratio"],
+                    torch.full_like(item["applied_ratio"], 0.125),
+                    atol=2.0e-6,
+                )
+        source_mu = trace[8]["source_mu"]
+        assert torch.allclose(
+            source_mu.float().norm(dim=-1),
+            torch.ones(int(source_mu.shape[0]), device=source_mu.device),
+            atol=2.0e-5,
+        )
+        if conditional:
+            assert not torch.equal(source_mu[0], source_mu[1])
+        else:
+            assert torch.equal(source_mu[0], source_mu[1])
+            assert torch.allclose(
+                source_mu.float().mean(dim=-1),
+                torch.zeros(int(source_mu.shape[0]), device=source_mu.device),
+                atol=1.0e-7,
+            )
+        del model
+
+
 def validate_a2_initialization_and_freeze_contract() -> None:
     with tempfile.TemporaryDirectory(dir=".") as temporary:
         root = Path(temporary).resolve()
@@ -857,6 +955,7 @@ def main() -> None:
         validate_full_vit_config_and_trace,
         validate_b3_full_vit_isolation,
         validate_s0_full_vit_isolation,
+        validate_t1_full_vit_isolation,
         validate_a2_initialization_and_freeze_contract,
         validate_nested_probe_summary,
         validate_e7_precondition_evidence_gate,
