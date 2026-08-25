@@ -24,7 +24,7 @@ from src.tools.search_plans.a_series.progress_dashboard import run_parallel_tria
 CONFIG_ROOT = ROOT / "configs" / "b_series_experiments"
 RUN_SUFFIX = Path("CUB/sup_vitb16_224/lr0.0006_wd1e-05/run1")
 STRICT_TRAINING_SEEDS = (0, 1, 2)
-STAGE_ORDER = ("P0", "R1", "R2", "R3", "T1", "T2")
+STAGE_ORDER = ("P0", "R1", "S0", "R2", "R3", "T1", "T2")
 STAGE_SPECS = {
     "P0": (
         ("B3-P0-A2-final", "B3-P0-A2-final.yaml", None),
@@ -32,6 +32,12 @@ STAGE_SPECS = {
     "R1": (
         ("B3-R1I", "B3-R1I-bounded-deep.yaml", "B3-P0-A2-final"),
         ("B3-R1N", "B3-R1N-bounded-control.yaml", "B3-P0-A2-final"),
+    ),
+    "S0": (
+        ("B3-S0I-deep", "B3-S0I-direct-deep.yaml", "B3-P0-A2-final"),
+        ("B3-S0N-deep-control", "B3-S0N-direct-deep-control.yaml", "B3-P0-A2-final"),
+        ("B3-S0I-shallow", "B3-S0I-direct-shallow.yaml", "B3-P0-A2-final"),
+        ("B3-S0N-shallow-control", "B3-S0N-direct-shallow-control.yaml", "B3-P0-A2-final"),
     ),
     "R2": (
         ("B3-R2I", "B3-R2I-class-consistent.yaml", "B3-R1I"),
@@ -177,7 +183,7 @@ def _external_a2_checkpoint(a2_root: Path, seed: int) -> Path:
     return existing[0]
 
 
-def _completed(output_root: Path) -> bool:
+def _completed(output_root: Path, allow_checkpoint_ready: bool = False) -> bool:
     summaries = list(output_root.rglob("monitor_runtime_summary.json")) if output_root.is_dir() else []
     completed = []
     for path in summaries:
@@ -185,6 +191,19 @@ def _completed(output_root: Path) -> bool:
             if str(_read_json(path).get("status", "")).lower() != "completed":
                 continue
             run_dir = path.parent
+            checkpoint_ready = run_dir / "training_checkpoint_ready.json"
+            if allow_checkpoint_ready and checkpoint_ready.is_file():
+                marker = _read_json(checkpoint_ready)
+                checkpoint = marker.get("checkpoint") or {}
+                checkpoint_path = run_dir / str(checkpoint.get("checkpoint_path", ""))
+                if (
+                    str(marker.get("status", "")).lower() == "checkpoint_ready"
+                    and bool(marker.get("training_performed", False))
+                    and not bool(marker.get("fixed_probe_performed", True))
+                    and checkpoint_path.is_file()
+                ):
+                    completed.append(path)
+                    continue
             deferred_collection = run_dir / "b3_fixed_probe_collection.json"
             if deferred_collection.is_file() and bool(
                 _read_json(deferred_collection).get("valid", False)
@@ -227,6 +246,7 @@ def _build_jobs(
     pilot_weights=(),
     a2_root: Optional[Path] = None,
     formal_weights=None,
+    screening_seed: Optional[int] = None,
 ) -> List[Job]:
     jobs = []
     pilot_mode = bool(pilot_weights)
@@ -248,7 +268,13 @@ def _build_jobs(
                             _ratio_tag(ratio),
                             _weight_tag(intra_weight, inter_weight),
                         )
-                    training_seeds = (0,) if pilot_mode else STRICT_TRAINING_SEEDS
+                    training_seeds = (
+                        (0,)
+                        if pilot_mode
+                        else (int(screening_seed),)
+                        if screening_seed is not None
+                        else STRICT_TRAINING_SEEDS
+                    )
                     for seed in training_seeds:
                         job_intra_weight = intra_weight
                         job_inter_weight = inter_weight
@@ -344,7 +370,13 @@ def _format(command: Sequence[str]) -> str:
     return " ".join(shlex.quote(str(value)) for value in command)
 
 
-def _run_job(job: Job, python_bin: str, protocol: str, gpu: str) -> Dict[str, object]:
+def _run_job(
+    job: Job,
+    python_bin: str,
+    protocol: str,
+    gpu: str,
+    allow_checkpoint_ready: bool = False,
+) -> Dict[str, object]:
     command = _command(job, python_bin, protocol)
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -366,7 +398,9 @@ def _run_job(job: Job, python_bin: str, protocol: str, gpu: str) -> Dict[str, ob
             text=True,
             check=False,
         )
-    completed = process.returncode == 0 and _completed(job.output_root)
+    completed = process.returncode == 0 and _completed(
+        job.output_root, allow_checkpoint_ready=allow_checkpoint_ready
+    )
     return {
         "stage": job.stage,
         "method": job.method,
@@ -393,6 +427,7 @@ def _run_stage(args, stage, splits, ratios, gpus, out_root):
         pilot_weights=args._pilot_weights,
         a2_root=args._a2_root,
         formal_weights=args._formal_weights,
+        screening_seed=args.screening_seed,
     )
     missing_configs = sorted(
         {str(job.config_file) for job in jobs if not job.config_file.is_file()}
@@ -401,8 +436,11 @@ def _run_stage(args, stage, splits, ratios, gpus, out_root):
         raise FileNotFoundError(", ".join(missing_configs))
     pending = []
     skipped = []
+    allow_checkpoint_ready = args.screening_seed is not None
     for job in jobs:
-        if _completed(job.output_root) and not args.no_resume:
+        if _completed(
+            job.output_root, allow_checkpoint_ready=allow_checkpoint_ready
+        ) and not args.no_resume:
             skipped.append(job)
         elif _has_contents(job.output_root):
             raise RuntimeError("refusing to overwrite incomplete output {}".format(job.output_root))
@@ -451,7 +489,11 @@ def _run_stage(args, stage, splits, ratios, gpus, out_root):
             progress_width=120,
             progress_enabled=not args.no_progress,
             run_item=lambda job, gpu: _run_job(
-                job, args.python_bin, args.protocol, gpu
+                job,
+                args.python_bin,
+                args.protocol,
+                gpu,
+                allow_checkpoint_ready=allow_checkpoint_ready,
             ),
             item_name=lambda job: "{} {} seed={}".format(
                 job.split.name, job.method, job.seed
@@ -493,6 +535,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-groups", default="0;1;2")
     parser.add_argument("--max-workers", type=int, default=3)
     parser.add_argument("--python-bin", default=sys.executable)
+    parser.add_argument(
+        "--screening-seed",
+        type=int,
+        help="Run one declared training seed as non-formal screening evidence.",
+    )
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
@@ -530,6 +577,10 @@ def main() -> None:
         raise SystemExit("formal B3 class-consistency weights are invalid")
     if args._pilot_weights and args._formal_weights is not None:
         raise SystemExit("pilot and formal class-consistency weights cannot be combined")
+    if args.screening_seed is not None and args.screening_seed < 0:
+        raise SystemExit("--screening-seed must be non-negative")
+    if args.screening_seed is not None and args._pilot_weights:
+        raise SystemExit("--screening-seed cannot be combined with the R2 pilot")
     if args._pilot_weights:
         if stages != ["R2"] or len(ratios) != 1:
             raise SystemExit(
@@ -553,9 +604,14 @@ def main() -> None:
         "external_a2_root": str(args._a2_root) if args._a2_root else None,
         "stages": stages,
         "training_seeds": (
-            [0] if args._pilot_weights else list(STRICT_TRAINING_SEEDS)
+            [0]
+            if args._pilot_weights
+            else [int(args.screening_seed)]
+            if args.screening_seed is not None
+            else list(STRICT_TRAINING_SEEDS)
         ),
-        "formal_evidence": not bool(args._pilot_weights),
+        "formal_evidence": not bool(args._pilot_weights) and args.screening_seed is None,
+        "screening_seed": args.screening_seed,
         "r2_pilot_weights": [list(pair) for pair in args._pilot_weights],
         "formal_class_consistency_weights": (
             list(args._formal_weights) if args._formal_weights else None

@@ -259,6 +259,8 @@ def static_checks(
         if str(dist_cfg.SOURCE).lower() not in {
             "vit_cls_prepass",
             "vit_cls_prepass_constant",
+            "vit_cls_prepass_direct",
+            "vit_cls_prepass_direct_constant",
         }:
             failures.append(
                 "B-series direct-mean stage requires vit_cls_prepass or its constant control"
@@ -307,8 +309,17 @@ def static_checks(
         if stage == "B":
             if str(residual_cfg.AMPLITUDE_MODE).lower() != "bounded_ratio":
                 failures.append("B3 residual stages require AMPLITUDE_MODE=bounded_ratio")
-            if [int(value) for value in residual_cfg.ACTIVE_LAYERS] != [8, 9, 10, 11]:
-                failures.append("B3 residual stages must isolate active layers 8-11")
+            expected_active_layers = (
+                [0, 1, 2, 3]
+                if architecture_id.startswith("B3-S0") and "shallow" in architecture_id.lower()
+                else [8, 9, 10, 11]
+            )
+            if [int(value) for value in residual_cfg.ACTIVE_LAYERS] != expected_active_layers:
+                failures.append(
+                    "B3 residual active layers must match architecture role {}".format(
+                        expected_active_layers
+                    )
+                )
             expected_content_modes = (
                 {"slot_scalar"}
                 if architecture_id.startswith("B3-T1")
@@ -328,6 +339,13 @@ def static_checks(
                 failures.append("B3 bounded residual ratios must satisfy 0 < init <= max <= 1")
             if not bool(residual_cfg.FREEZE_CLASSIFIER):
                 failures.append("B3 residual stages must freeze the classifier")
+            source_name = str(cfg.MODEL.PROMPT.DISTRIBUTOR.SOURCE).lower()
+            if architecture_id.startswith("B3-S0I") and source_name != "vit_cls_prepass_direct":
+                failures.append("B3-S0I requires SOURCE=vit_cls_prepass_direct")
+            if architecture_id.startswith("B3-S0N") and source_name != "vit_cls_prepass_direct_constant":
+                failures.append(
+                    "B3-S0N requires SOURCE=vit_cls_prepass_direct_constant"
+                )
         consistency_expected = architecture_id.startswith(("B3-R2", "B3-R3I"))
         if bool(consistency_cfg.ENABLE) != consistency_expected:
             failures.append(

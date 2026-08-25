@@ -488,6 +488,38 @@ def validate_nonconditional_control() -> None:
     )
 
 
+def validate_direct_prepass_sources() -> None:
+    kwargs = dict(
+        dim=768,
+        prompt_len=2,
+        hidden_dim=8,
+        instance_tokens=2,
+        domain_tokens=0,
+        eval_sample_mode="mean",
+        use_slot_embed=False,
+    )
+    direct = PreViTPromptDistributor(
+        source="vit_cls_prepass_direct",
+        **kwargs,
+    )
+    constant = PreViTPromptDistributor(
+        source="vit_cls_prepass_direct_constant",
+        **kwargs,
+    )
+    assert direct.stats_head is None
+    assert constant.stats_head is None
+    cls = torch.randn(3, 768)
+    direct_stats = direct.distribution_parameters(vit_cls=cls)
+    expected = torch.nn.functional.normalize(cls, p=2.0, dim=-1)
+    assert torch.allclose(direct_stats["mu"], expected)
+    assert torch.equal(direct_stats["logvar"], torch.zeros_like(expected))
+    assert not torch.equal(direct_stats["mu"][0], direct_stats["mu"][1])
+    first = constant.distribution_parameters(vit_cls=cls)
+    second = constant.distribution_parameters(vit_cls=cls * 17.0)
+    assert torch.equal(first["mu"], second["mu"])
+    assert torch.equal(first["mu"][0], first["mu"][1])
+
+
 def validate_full_vit_config_and_trace() -> None:
     cfg = get_cfg()
     cfg.merge_from_file(
@@ -761,6 +793,7 @@ def main() -> None:
         validate_b3_optimizer_multipliers,
         validate_parameter_only_provider_is_rng_neutral,
         validate_nonconditional_control,
+        validate_direct_prepass_sources,
         validate_full_vit_config_and_trace,
         validate_b3_full_vit_isolation,
         validate_a2_initialization_and_freeze_contract,

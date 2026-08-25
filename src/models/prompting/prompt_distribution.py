@@ -25,6 +25,8 @@ from torch import nn
 _ALLOWED_SOURCES = {
     "vit_cls_prepass",
     "vit_cls_prepass_constant",
+    "vit_cls_prepass_direct",
+    "vit_cls_prepass_direct_constant",
     "cnn_torchvision",
     "clip_frozen",
     "dinov2_small",
@@ -819,16 +821,29 @@ class PreViTPromptDistributor(nn.Module):
         - visual_input: 原始统计输入，供 debug/后续诊断保存；  patch_tokens不含 CLS，不含 position embedding image_tokens含 position embedding
         - stats_out: [B, 2*768]，前半是 mu，后半是 logvar。
         """
-        if self.source in {"vit_cls_prepass", "vit_cls_prepass_constant"}:
+        prepass_sources = {
+            "vit_cls_prepass",
+            "vit_cls_prepass_constant",
+            "vit_cls_prepass_direct",
+            "vit_cls_prepass_direct_constant",
+        }
+        if self.source in prepass_sources:
             if vit_cls is None:
                 raise ValueError(
                     f"SOURCE='{self.source}' requires vit_cls from PromptedTransformer prepass."
                 )
-            visual_input = (
-                vit_cls
-                if self.source == "vit_cls_prepass"
-                else torch.ones_like(vit_cls)
-            )
+            conditional_sources = {
+                "vit_cls_prepass",
+                "vit_cls_prepass_direct",
+            }
+            visual_input = vit_cls if self.source in conditional_sources else torch.ones_like(vit_cls)
+            if self.source in {
+                "vit_cls_prepass_direct",
+                "vit_cls_prepass_direct_constant",
+            }:
+                mu = torch.nn.functional.normalize(visual_input, p=2.0, dim=-1)
+                logvar = torch.zeros_like(mu)
+                return visual_input, torch.cat((mu, logvar), dim=-1)
             return visual_input, self.stats_head(visual_input)
 
         if self.source == "cnn_torchvision":
