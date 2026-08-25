@@ -665,6 +665,66 @@ def validate_b3_full_vit_isolation() -> None:
         assert affinities[8][key].device.type == "cpu"
 
 
+def validate_s0_full_vit_isolation() -> None:
+    cases = (
+        (
+            "configs/b_series_experiments/B3-S0I-direct-deep.yaml",
+            {8, 9, 10, 11},
+            True,
+        ),
+        (
+            "configs/b_series_experiments/B3-S0N-direct-shallow-control.yaml",
+            {0, 1, 2, 3},
+            False,
+        ),
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for config_path, active_layers, conditional in cases:
+        cfg = get_cfg()
+        cfg.merge_from_file(config_path)
+        cfg.freeze()
+        torch.manual_seed(47)
+        model = ViT(cfg, load_pretrain=False).to(device).eval()
+        model.attach_r_similarity_head(torch.zeros(200, 312, device=device))
+        trainable = {
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        }
+        assert trainable == {"enc.transformer.deep_prompt_residual.layer_gate"}
+        image = torch.randn(
+            2,
+            3,
+            int(cfg.DATA.CROPSIZE),
+            int(cfg.DATA.CROPSIZE),
+            device=device,
+        )
+        with torch.no_grad():
+            model(image, return_feature=True)
+        trace = model.enc.transformer._last_deep_prompt_residual_trace
+        assert len(trace) == 12
+        for item in trace:
+            layer_id = int(item["layer_id"])
+            if layer_id in active_layers:
+                assert torch.allclose(
+                    item["applied_ratio"],
+                    torch.full_like(item["applied_ratio"], 0.125),
+                    atol=2.0e-6,
+                )
+            else:
+                assert torch.equal(
+                    item["applied_delta"], torch.zeros_like(item["applied_delta"])
+                )
+        source_mu = trace[min(active_layers)]["source_mu"]
+        assert torch.allclose(
+            source_mu.float().norm(dim=-1),
+            torch.ones(int(source_mu.shape[0]), device=source_mu.device),
+            atol=2.0e-5,
+        )
+        if conditional:
+            assert not torch.equal(source_mu[0], source_mu[1])
+        else:
+            assert torch.equal(source_mu[0], source_mu[1])
+
+
 def validate_a2_initialization_and_freeze_contract() -> None:
     with tempfile.TemporaryDirectory(dir=".") as temporary:
         root = Path(temporary).resolve()
@@ -796,6 +856,7 @@ def main() -> None:
         validate_direct_prepass_sources,
         validate_full_vit_config_and_trace,
         validate_b3_full_vit_isolation,
+        validate_s0_full_vit_isolation,
         validate_a2_initialization_and_freeze_contract,
         validate_nested_probe_summary,
         validate_e7_precondition_evidence_gate,
