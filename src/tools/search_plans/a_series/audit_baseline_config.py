@@ -555,6 +555,11 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
     freeze_static_prompt = bool(
         cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.FREEZE_STATIC_PROMPT
     )
+    source_name = str(cfg.MODEL.PROMPT.DISTRIBUTOR.SOURCE).lower()
+    direct_source = source_name in {
+        "vit_cls_prepass_direct",
+        "vit_cls_prepass_direct_constant",
+    }
     if not freeze_classifier and not any(
         name.startswith("r_similarity_head.prototype_proj") for name in trainable
     ):
@@ -582,10 +587,14 @@ def constructed_model_checks(cfg, stage: str) -> Tuple[List[str], List[str]]:
         failures.append("B-series must retain both static input and deep prompt embeddings")
     if stage == "B" and freeze_static_prompt and (prompt_names or deep_names):
         failures.append("freeze-static config left static Prompt parameters trainable")
-    if stage == "B" and not any(
+    if stage == "B" and not direct_source and not any(
         "prompt_init_provider.stats_head" in name for name in trainable
     ):
         failures.append("B-series must train the existing Prompt Distributor stats MLP")
+    if stage == "B" and direct_source and any(
+        "prompt_init_provider.stats_head" in name for name in trainable
+    ):
+        failures.append("direct-source S0 must bypass the Prompt Distributor stats MLP")
     if stage == "B" and not any(
         name.endswith("deep_prompt_residual.layer_gate") for name in trainable
     ):
