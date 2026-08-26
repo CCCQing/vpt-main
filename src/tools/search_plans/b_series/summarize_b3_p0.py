@@ -70,11 +70,11 @@ def _aggregate_p02(root: Path):
             probe[str(selection)] = {
                 condition: {
                     "test_unseen_delta_true_margin": _stats(
-                        item["conditions"][condition]["paired_vs_residual_zero"]["test_unseen"]["delta_true_margin"]
+                        item["conditions"][condition]["paired_vs_residual_zero"]["test_unseen"]["summary"]["delta_true_margin"]
                         for item in rows
                     ),
                     "test_unseen_prediction_flip": _stats(
-                        item["conditions"][condition]["paired_vs_residual_zero"]["test_unseen"]["prediction_flip_rate"]
+                        item["conditions"][condition]["paired_vs_residual_zero"]["test_unseen"]["summary"]["prediction_flip_rate"]
                         for item in rows
                     ),
                 }
