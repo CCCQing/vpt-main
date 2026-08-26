@@ -499,6 +499,7 @@ def _predict_a2(model, device, loader) -> Dict[str, Any]:
     candidate = _candidate_class_ids(dataset)
     eval_map = torch.as_tensor(dataset.eval_global_to_local, dtype=torch.long)
     logits_batches = []
+    reconstructed_dot_batches = []
     feature_batches = []
     local_batches = []
     global_batches = []
@@ -525,12 +526,25 @@ def _predict_a2(model, device, loader) -> Dict[str, Any]:
         prototypes = state.get("semantic_repr") if isinstance(state, dict) else None
         if not torch.is_tensor(features) or not torch.is_tensor(prototypes):
             raise RuntimeError("A2 classifier runtime trace is unavailable")
+        score_mode = str(getattr(module.r_similarity_head, "score_mode", ""))
+        if score_mode != "dot":
+            raise RuntimeError(
+                "P0-4 current-semantic-dot reconstruction requires score_mode=dot"
+            )
+        # Reconstruct on the same device, dtype and PyTorch matmul path used by
+        # RSimilarityClassifier.forward.  Reconstructing later from exported
+        # NumPy float64 arrays can move boundary logits by about 1e-4 and very
+        # rarely change an argmax even though the mathematical formula matches.
+        reconstructed_dot = features @ prototypes.t()
         current_semantic = prototypes.detach().cpu().float().numpy()
         if semantic is None:
             semantic = current_semantic
         elif not np.array_equal(semantic, current_semantic):
             raise RuntimeError("A2 projected semantic prototypes changed between batches")
         logits_batches.append(logits.detach().cpu().float().numpy())
+        reconstructed_dot_batches.append(
+            reconstructed_dot.detach().cpu().float().numpy()
+        )
         feature_batches.append(features.detach().cpu().float().numpy())
         local_batches.append(local.numpy())
         global_batches.append(labels.numpy())
@@ -539,6 +553,9 @@ def _predict_a2(model, device, loader) -> Dict[str, Any]:
             module.clear_runtime_state()
     return {
         "logits": np.concatenate(logits_batches, axis=0),
+        "classifier_dot_reconstruction": np.concatenate(
+            reconstructed_dot_batches, axis=0
+        ),
         "features": np.concatenate(feature_batches, axis=0),
         "targets_local": np.concatenate(local_batches, axis=0),
         "targets_global": np.concatenate(global_batches, axis=0),
@@ -740,10 +757,12 @@ def _run_p04(outputs, cfg, projected_semantic, shuffle_seeds) -> Dict[str, Any]:
         np.linalg.norm(candidate_semantic, axis=1, keepdims=True), 1.0e-8
     )
     semantic_cosine = {}
-    recomputed_dot = {}
+    recomputed_dot = {
+        split: outputs[split]["classifier_dot_reconstruction"]
+        for split in TEST_SPLITS
+    }
     for split in TEST_SPLITS:
         features = outputs[split]["features"].astype(np.float64)
-        recomputed_dot[split] = features @ candidate_semantic.T
         feature_normalized = features / np.maximum(
             np.linalg.norm(features, axis=1, keepdims=True), 1.0e-8
         )
@@ -829,6 +848,9 @@ def _run_p04(outputs, cfg, projected_semantic, shuffle_seeds) -> Dict[str, Any]:
         "deployable": False,
         "formal_score": False,
         "conditions": conditions,
+        "current_semantic_dot_reconstruction_method": (
+            "same_forward_torch_runtime_visual_input_matmul_semantic_repr_transpose"
+        ),
         "current_semantic_dot_reconstruction": dot_errors,
         "oracle_contract": oracle_contract,
         "centroid_shuffled_controls": shuffled_controls,
