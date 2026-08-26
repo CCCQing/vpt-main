@@ -241,6 +241,7 @@ class DeepPromptResidualIntervention(AbstractContextManager):
         "common_only",
         "role_only",
         "role_permuted",
+        "subspace_projection",
     }
 
     def __init__(self, model: torch.nn.Module, mode: str, **payload: Any) -> None:
@@ -437,6 +438,29 @@ def deep_prompt_residual_role_permuted_intervention(
         model,
         "role_permuted",
         permutation=permutation,
+    )
+
+
+def deep_prompt_residual_subspace_intervention(
+    model: torch.nn.Module,
+    *,
+    basis_by_layer: Sequence[torch.Tensor],
+    component: str,
+    norm_match: bool,
+) -> DeepPromptResidualIntervention:
+    """Keep either the A2-span or orthogonal part of the applied residual."""
+    component_name = str(component).strip().lower()
+    if component_name not in {"span", "orthogonal"}:
+        raise ValueError("component must be span or orthogonal")
+    bases = tuple(basis_by_layer)
+    if not bases or any(not torch.is_tensor(value) for value in bases):
+        raise ValueError("basis_by_layer must contain tensors")
+    return DeepPromptResidualIntervention(
+        model,
+        "subspace_projection",
+        basis_by_layer=bases,
+        component=component_name,
+        norm_match=bool(norm_match),
     )
 
 

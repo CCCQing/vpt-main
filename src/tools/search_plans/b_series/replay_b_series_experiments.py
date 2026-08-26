@@ -43,6 +43,7 @@ from src.monitoring.module_effect import (
     deep_prompt_residual_replace_intervention,
     deep_prompt_residual_role_only_intervention,
     deep_prompt_residual_role_permuted_intervention,
+    deep_prompt_residual_subspace_intervention,
     paired_module_effect_metrics,
     prompt_zero_intervention,
 )
@@ -279,6 +280,9 @@ def _predict(
     slot_permutation: Optional[Sequence[int]] = None,
     prepass_cache_mode: Optional[str] = None,
     prepass_cache_namespace: Optional[str] = None,
+    residual_subspace: Optional[Mapping[str, Any]] = None,
+    collect_prompt_slot_states: bool = False,
+    prompt_state_layers: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     if prepass_cache_mode not in {None, "populate", "reuse"}:
         raise ValueError("prepass_cache_mode must be None, populate or reuse")
@@ -292,9 +296,18 @@ def _predict(
         scales is not None
         or donor_mean_by_id is not None
         or residual_content_mode is not None
+        or residual_subspace is not None
     ):
         raise ValueError(
             "effective Prompt-zero cannot be combined with residual scale or donor interventions"
+        )
+    if residual_subspace is not None and (
+        scales is not None
+        or donor_mean_by_id is not None
+        or residual_content_mode is not None
+    ):
+        raise ValueError(
+            "residual subspace projection cannot be combined with other residual interventions"
         )
     dataset = _source_dataset(loader)
     candidate = _candidate_class_ids(dataset)
@@ -312,9 +325,11 @@ def _predict(
     intervention_contract_pass = True
     intervention_failure_reasons = []
     replacement_distances = []
+    projection_stat_batches: Dict[int, Dict[str, list[np.ndarray]]] = {}
     prompt_zero_parameter_names = None
     prompt_zero_residual_module_count = None
     semantic_prototypes = None
+    prompt_state_batches: Dict[int, Dict[str, list[np.ndarray]]] = {}
     cache_key_count = 0
     requested_mode = (
         "effective_prompt_zero"
@@ -325,6 +340,8 @@ def _predict(
         if scales is not None
         else residual_content_mode
         if residual_content_mode is not None
+        else "subspace_projection"
+        if residual_subspace is not None
         else "none"
     )
     expected_scales = (
@@ -378,15 +395,52 @@ def _predict(
             intervention = deep_prompt_residual_role_permuted_intervention(
                 model, permutation=permutation
             )
+        elif residual_subspace is not None:
+            intervention = deep_prompt_residual_subspace_intervention(
+                model,
+                basis_by_layer=residual_subspace["basis_by_layer"],
+                component=str(residual_subspace["component"]),
+                norm_match=bool(residual_subspace.get("norm_match", False)),
+            )
         else:
             intervention = nullcontext()
+        affinities = None
         with intervention as intervention_state:
-            logits = model(
-                inputs,
-                semantics=None,
-                class_ids=candidate,
-                runtime_targets=None,
-            )
+            if collect_prompt_slot_states:
+                selected_layers = tuple(
+                    int(value)
+                    for value in (
+                        prompt_state_layers
+                        if prompt_state_layers is not None
+                        else range(_model_num_layers(model))
+                    )
+                )
+                output = model.forward_with_affinity(
+                    inputs,
+                    {
+                        "prompt_length": int(
+                            (model.module if hasattr(model, "module") else model)
+                            .enc.transformer.deep_prompt_residual.prompt_len
+                        ),
+                        "semantic_length": 0,
+                        "detach": True,
+                        "include_visual_normalizations": False,
+                        "selected_layers": list(selected_layers),
+                        "collect_prompt_slot_states": True,
+                        "offload_diagnostics_to_cpu": True,
+                    },
+                    semantics=None,
+                    class_ids=candidate,
+                    runtime_targets=None,
+                )
+                logits, affinities = output[0], output[-1]
+            else:
+                logits = model(
+                    inputs,
+                    semantics=None,
+                    class_ids=candidate,
+                    runtime_targets=None,
+                )
         if isinstance(logits, (tuple, list)):
             logits = logits[0]
         if isinstance(logits, dict):
@@ -412,6 +466,38 @@ def _predict(
             raise RuntimeError("projected semantic prototypes changed between batches")
         if len(trace) != _model_num_layers(model):
             raise RuntimeError("Deep Prompt residual trace does not cover all layers")
+        if collect_prompt_slot_states:
+            if not isinstance(affinities, (Mapping, tuple, list)):
+                raise RuntimeError("Prompt slot affinity states are unavailable")
+            for layer_id in selected_layers:
+                layer = (
+                    affinities.get(int(layer_id))
+                    if isinstance(affinities, Mapping)
+                    else affinities[int(layer_id)]
+                )
+                if not isinstance(layer, Mapping):
+                    raise RuntimeError(
+                        "Prompt slot affinity layer {} is unavailable".format(
+                            layer_id
+                        )
+                    )
+                layer_bucket = prompt_state_batches.setdefault(int(layer_id), {})
+                for state_name, key in (
+                    ("raw_input", "_prompt_slot_raw_input"),
+                    ("layernorm_input", "_prompt_slot_ln_input"),
+                    ("key", "_prompt_slot_key"),
+                    ("value", "_prompt_slot_value"),
+                ):
+                    value = layer.get(key)
+                    if not torch.is_tensor(value):
+                        raise RuntimeError(
+                            "Prompt slot state {} is unavailable at layer {}".format(
+                                state_name, layer_id
+                            )
+                        )
+                    layer_bucket.setdefault(state_name, []).append(
+                        value.detach().cpu().float().numpy()
+                    )
         if effective_prompt_zero:
             current_parameter_names = tuple(
                 sorted(intervention_state.zeroed_parameter_names)
@@ -497,6 +583,39 @@ def _predict(
                     )
                 else:
                     applied_layers.add(layer_id)
+            if residual_subspace is not None:
+                applied = item.get("subspace_projection_applied")
+                if not torch.is_tensor(applied) or not bool(
+                    (applied.detach().float() > 0.5).all().item()
+                ):
+                    intervention_contract_pass = False
+                    intervention_failure_reasons.append(
+                        "layer {} subspace projection was not applied".format(
+                            layer_id
+                        )
+                    )
+                else:
+                    applied_layers.add(layer_id)
+                layer_stats = projection_stat_batches.setdefault(layer_id, {})
+                for key in (
+                    "subspace_projection_rank",
+                    "subspace_projection_basis_orthonormal_error",
+                    "subspace_projection_original_rms",
+                    "subspace_projection_natural_rms",
+                    "subspace_projection_output_rms",
+                    "subspace_projection_energy_ratio",
+                    "subspace_projection_reconstruction_error",
+                ):
+                    value = item.get(key)
+                    if not torch.is_tensor(value):
+                        intervention_contract_pass = False
+                        intervention_failure_reasons.append(
+                            "layer {} has no {} trace".format(layer_id, key)
+                        )
+                        continue
+                    layer_stats.setdefault(key, []).append(
+                        value.detach().cpu().float().reshape(-1).numpy()
+                    )
         if collect_geometry:
             current = residual_static_geometry(trace)
             if layer_ids is None:
@@ -525,7 +644,7 @@ def _predict(
         sample_ids.extend(identifiers)
         if hasattr(module, "clear_runtime_state"):
             module.clear_runtime_state()
-        del inputs, logits, classifier_state, distribution_state, trace
+        del inputs, logits, classifier_state, distribution_state, trace, affinities
     result = {
         "logits": np.concatenate(logits_batches, axis=0),
         "features": np.concatenate(feature_batches, axis=0),
@@ -581,6 +700,37 @@ def _predict(
             "namespace": prepass_cache_namespace,
             "batch_key_count": int(cache_key_count),
         },
+    }
+    result["residual_subspace_summary"] = {
+        "component": (
+            str(residual_subspace["component"])
+            if residual_subspace is not None
+            else None
+        ),
+        "norm_match": (
+            bool(residual_subspace.get("norm_match", False))
+            if residual_subspace is not None
+            else None
+        ),
+        "layers": {
+            str(layer_id): {
+                key: {
+                    "mean": float(np.concatenate(values).mean()),
+                    "min": float(np.concatenate(values).min()),
+                    "max": float(np.concatenate(values).max()),
+                    "count": int(np.concatenate(values).size),
+                }
+                for key, values in sorted(metrics.items())
+            }
+            for layer_id, metrics in sorted(projection_stat_batches.items())
+        },
+    }
+    result["prompt_slot_states"] = {
+        str(layer_id): {
+            state_name: np.concatenate(values, axis=0)
+            for state_name, values in sorted(states.items())
+        }
+        for layer_id, states in sorted(prompt_state_batches.items())
     }
     if collect_geometry:
         result["geometry"] = {

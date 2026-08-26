@@ -53,6 +53,7 @@ class MeanConditionedDeepPromptResidual(nn.Module):
         "common_only",
         "role_only",
         "role_permuted",
+        "subspace_projection",
     }
     _CONTENT_MODES = {"shared", "slot_scalar", "slot_low_rank"}
     _SAMPLE_GATE_MODES = {"none", "shared", "grouped", "layerwise"}
@@ -371,6 +372,100 @@ class MeanConditionedDeepPromptResidual(nn.Module):
             raise ValueError("layer_scales values must be finite")
         return reference.new_tensor(value)
 
+    def _apply_applied_delta_intervention(
+        self,
+        applied_delta: torch.Tensor,
+        layer_id: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Project the *applied* residual for checkpoint-only carrier diagnostics.
+
+        This deliberately runs after the normal amplitude/gate computation.  In
+        particular, bounded-ratio residuals normalize ``raw_delta`` internally;
+        projecting before that normalization would erase the natural energy
+        difference that P0-2 needs to measure.
+        """
+        intervention = self._runtime_intervention
+        if not isinstance(intervention, dict) or str(
+            intervention.get("mode", "")
+        ) != "subspace_projection":
+            return applied_delta, {}
+        component = str(intervention.get("component", "")).strip().lower()
+        if component not in {"span", "orthogonal"}:
+            raise ValueError(
+                "subspace_projection component must be span or orthogonal"
+            )
+        bases = intervention.get("basis_by_layer")
+        if not isinstance(bases, (tuple, list)) or len(bases) != self.num_layers:
+            raise ValueError(
+                "subspace_projection requires one orthonormal basis per layer"
+            )
+        basis = bases[int(layer_id)]
+        if not torch.is_tensor(basis) or basis.dim() != 2 or int(
+            basis.shape[1]
+        ) != self.dim:
+            raise ValueError(
+                "subspace_projection basis must have shape [rank, dim]"
+            )
+        basis = basis.to(device=applied_delta.device, dtype=applied_delta.dtype)
+        gram = basis.float() @ basis.float().t()
+        identity = torch.eye(int(basis.shape[0]), device=gram.device, dtype=gram.dtype)
+        orthonormal_error = (gram - identity).abs().max()
+        if float(orthonormal_error.detach().cpu()) > 1.0e-4:
+            raise ValueError("subspace_projection basis is not orthonormal")
+        span = torch.matmul(
+            torch.matmul(applied_delta, basis.t()),
+            basis,
+        )
+        orthogonal = applied_delta - span
+        natural = span if component == "span" else orthogonal
+        original_rms = applied_delta.float().square().mean(dim=(-2, -1)).sqrt()
+        natural_rms = natural.float().square().mean(dim=(-2, -1)).sqrt()
+        output = natural
+        norm_match = bool(intervention.get("norm_match", False))
+        if norm_match:
+            scale = original_rms / natural_rms.clamp_min(self.bounded_norm_eps)
+            scale = torch.where(
+                natural_rms > self.bounded_norm_eps,
+                scale,
+                torch.zeros_like(scale),
+            )
+            output = natural * scale[:, None, None].to(dtype=natural.dtype)
+        output_rms = output.float().square().mean(dim=(-2, -1)).sqrt()
+        reconstruction_error = (
+            span.float() + orthogonal.float() - applied_delta.float()
+        ).abs().flatten(1).max(dim=1).values
+        energy_ratio = natural.float().square().sum(dim=(-2, -1)) / applied_delta.float().square().sum(
+            dim=(-2, -1)
+        ).clamp_min(self.bounded_norm_eps ** 2)
+        return output, {
+            "subspace_projection_applied": applied_delta.new_ones(
+                int(applied_delta.shape[0])
+            ),
+            "subspace_projection_component": component,
+            "subspace_projection_norm_match": norm_match,
+            "subspace_projection_rank": applied_delta.new_full(
+                (int(applied_delta.shape[0]),), int(basis.shape[0])
+            ),
+            "subspace_projection_basis_orthonormal_error": orthonormal_error.expand(
+                int(applied_delta.shape[0])
+            ).to(dtype=applied_delta.dtype),
+            "subspace_projection_original_rms": original_rms.to(
+                dtype=applied_delta.dtype
+            ),
+            "subspace_projection_natural_rms": natural_rms.to(
+                dtype=applied_delta.dtype
+            ),
+            "subspace_projection_output_rms": output_rms.to(
+                dtype=applied_delta.dtype
+            ),
+            "subspace_projection_energy_ratio": energy_ratio.to(
+                dtype=applied_delta.dtype
+            ),
+            "subspace_projection_reconstruction_error": reconstruction_error.to(
+                dtype=applied_delta.dtype
+            ),
+        }
+
     def forward_layer(
         self,
         mean: torch.Tensor,
@@ -442,6 +537,13 @@ class MeanConditionedDeepPromptResidual(nn.Module):
             applied_ratio = applied_rms / base_rms.float().clamp_min(
                 self.bounded_norm_eps
             )
+        applied_delta, applied_intervention_stats = (
+            self._apply_applied_delta_intervention(applied_delta, layer_id)
+        )
+        applied_rms = applied_delta.float().square().mean(dim=(-2, -1)).sqrt()
+        applied_ratio = applied_rms / base_rms.float().clamp_min(
+            self.bounded_norm_eps
+        )
         stats = {
             "layer_id": layer_id,
             "source_mu": source,
@@ -470,6 +572,7 @@ class MeanConditionedDeepPromptResidual(nn.Module):
         stats.update(intervention_stats)
         stats.update(content_stats)
         stats.update(content_intervention_stats)
+        stats.update(applied_intervention_stats)
         return applied_delta, stats
 
 
