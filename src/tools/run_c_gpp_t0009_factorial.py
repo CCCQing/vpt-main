@@ -36,7 +36,17 @@ def _sha256_file(path):
     return digest.hexdigest().upper()
 
 
-def _run_command(python_bin, config, graph_path, run_root, group_name, seed, epochs, gpu_group):
+def _run_command(
+    python_bin,
+    config,
+    graph_path,
+    attr_name_embed_path,
+    run_root,
+    group_name,
+    seed,
+    epochs,
+    gpu_group,
+):
     group = GROUPS[group_name]
     nproc = len([item for item in gpu_group.split(",") if item.strip()])
     if nproc != 2:
@@ -65,6 +75,8 @@ def _run_command(python_bin, config, graph_path, run_root, group_name, seed, epo
         _bool_text(group["am"]),
         "MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_PATH",
         str(graph_path),
+        "MODEL.SEMANTIC_GRAPH.ATTR_NAME_EMBED_PATH",
+        str(attr_name_embed_path),
         "OUTPUT_DIR",
         str(run_root),
         "NUM_GPUS",
@@ -84,7 +96,16 @@ def _validate(run_root, group_name, seed, epochs):
     return result
 
 
-def _run_one(task, python_bin, config, graph_path, gpu_group, resume, dry_run):
+def _run_one(
+    task,
+    python_bin,
+    config,
+    graph_path,
+    attr_name_embed_path,
+    gpu_group,
+    resume,
+    dry_run,
+):
     group_name = task["group"]
     seed = int(task["seed"])
     epochs = int(task["epochs"])
@@ -100,7 +121,15 @@ def _run_one(task, python_bin, config, graph_path, gpu_group, resume, dry_run):
             pass
 
     command = _run_command(
-        python_bin, config, graph_path, run_root, group_name, seed, epochs, gpu_group
+        python_bin,
+        config,
+        graph_path,
+        attr_name_embed_path,
+        run_root,
+        group_name,
+        seed,
+        epochs,
+        gpu_group,
     )
     command_record = {
         "group": group_name,
@@ -192,6 +221,7 @@ def _run_task_batch(tasks, args, gpu_groups):
                             args.python,
                             args.config,
                             args.graph_path,
+                            args.attr_name_embed_path,
                             group,
                             args.resume,
                             args.dry_run,
@@ -232,6 +262,17 @@ def main():
         type=Path,
         default=ROOT / "cub_attribute_localization" / "05_hparam_searches" / "diff_only_graphs_v1" / "diff_only_method_matrices_v1.npz",
     )
+    parser.add_argument(
+        "--attr-name-embed-path",
+        type=Path,
+        default=ROOT
+        / "datasets"
+        / "xlsa17"
+        / "xlsa17"
+        / "data"
+        / "CUB"
+        / "cub_attributes_sbert_all_mpnet_base_v2.pt",
+    )
     parser.add_argument("--gpu-groups", default="0,1")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--groups", nargs="+", choices=list(GROUPS), default=list(GROUPS))
@@ -242,7 +283,9 @@ def main():
 
     args.config = args.config.resolve()
     args.graph_path = args.graph_path.resolve()
+    args.attr_name_embed_path = args.attr_name_embed_path.resolve()
     args.output_root = args.output_root.absolute()
+    attr_name_embed_sha256 = None
     if not args.dry_run:
         if not args.graph_path.is_file():
             raise FileNotFoundError(f"Missing historical graph file: {args.graph_path}")
@@ -251,6 +294,13 @@ def main():
             raise ValueError(
                 f"Historical graph SHA-256 mismatch: expected {EXPECTED_GRAPH_SHA256}, got {graph_sha256}"
             )
+        if not args.attr_name_embed_path.is_file():
+            raise FileNotFoundError(
+                f"Missing attribute-name embedding file: {args.attr_name_embed_path}"
+            )
+        attr_name_embed_sha256 = _sha256_file(args.attr_name_embed_path)
+    elif args.attr_name_embed_path.is_file():
+        attr_name_embed_sha256 = _sha256_file(args.attr_name_embed_path)
     gpu_groups = [item.strip() for item in args.gpu_groups.split(";") if item.strip()]
     if not gpu_groups:
         raise ValueError("--gpu-groups must contain at least one two-GPU group.")
@@ -294,6 +344,8 @@ def main():
         "output_root": str(args.output_root),
         "graph_path": str(args.graph_path),
         "graph_sha256": EXPECTED_GRAPH_SHA256,
+        "attr_name_embed_path": str(args.attr_name_embed_path),
+        "attr_name_embed_sha256": attr_name_embed_sha256,
         "gpu_groups": gpu_groups,
         "results": all_results,
         "all_valid": bool(all_results) and all(item.get("valid", args.dry_run) for item in all_results),
