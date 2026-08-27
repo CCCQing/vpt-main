@@ -1,0 +1,48 @@
+_BASE_: "A-04-A2-vpt-deep-ce.yaml"
+OUTPUT_DIR: "output/a2_cosine_baseline_search/default"
+
+MODEL:
+  R_SIMILARITY:
+    SCORE_MODE: "cosine"
+    LEARNABLE_SCALE: false
+    LOGIT_SCALE_INIT: 10.0
+    FIXED_LOGIT_SCALE: 1.0
+
+MONITOR:
+  ENABLE: true
+  OUTPUT_POLICY: "error_if_exists"
+  NUMERICAL_GUARD:
+    ENABLE: true
+  OPTIMIZER_SANITY:
+    ENABLE: true
+  PREDICTION_HEALTH:
+    ENABLE: false
+  CLASS_ERROR:
+    ENABLE: false
+  CALIBRATION:
+    ENABLE: true
+  TRAIN_EVAL:
+    ENABLE: false
+  LOSS_COMPONENT_TRAJECTORY:
+    ENABLE: true
+  PREDICTION_TRANSITION_TRAJECTORY:
+    ENABLE: false
+  MILESTONE_PROBE:
+    ENABLE: false
+  DIAGNOSTICS:
+    ENABLE: true
+  SEMANTIC_GRAPH_REFERENCE:
+    ENABLE: false
+  PROMPT_PARAMETER:
+    ENABLE: false
+  PROBE:
+    ENABLE: false
+    ROBUSTNESS_SELECTION_SEEDS: []
+  MODULE_EFFECT:
+    ENABLE: false
+  PROMPT:
+    ENABLE: false
+  ATTENTION_MEDIATION:
+    ENABLE: false
+  AFFINITY:
+    ENABLE: false
