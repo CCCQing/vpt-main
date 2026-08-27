@@ -54,10 +54,12 @@ def validate_run(run_root, expected_seed_mode, expected_seed=None, expected_epoc
     launcher_log = run_root / "legacy_launcher.log"
 
     texts = []
+    metric_text = ""
     if launcher_log.is_file():
         texts.append(launcher_log.read_text(encoding="utf-8", errors="replace"))
     if log_path is not None:
-        texts.append(log_path.read_text(encoding="utf-8", errors="replace"))
+        metric_text = log_path.read_text(encoding="utf-8", errors="replace")
+        texts.append(metric_text)
     else:
         errors.append("missing logs.txt")
     log_text = "\n".join(texts)
@@ -65,7 +67,7 @@ def validate_run(run_root, expected_seed_mode, expected_seed=None, expected_epoc
         errors.append("traceback found in logs")
 
     records = []
-    for match in GZSL_PATTERN.finditer(log_text):
+    for match in GZSL_PATTERN.finditer(metric_text):
         item = {
             "epoch": int(match.group("epoch")),
             "seen": float(match.group("seen")),
