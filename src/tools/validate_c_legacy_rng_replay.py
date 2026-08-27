@@ -110,6 +110,8 @@ def validate_run(run_root, expected_seed_mode, expected_seed=None, expected_epoc
             errors.append("historical graph SHA-256 mismatch")
         if not identity.get("local_path_config_sha256"):
             errors.append("missing local path config SHA-256")
+        if not identity.get("attr_name_embed_sha256"):
+            errors.append("missing attribute-name embedding SHA-256")
         if identity.get("seed_mode") != expected_seed_mode:
             errors.append("seed mode mismatch")
         if expected_seed_mode == "fixed":

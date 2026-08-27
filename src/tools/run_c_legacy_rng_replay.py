@@ -48,8 +48,31 @@ def _prepare_local_path_config(legacy_root, local_path_config):
     return target
 
 
-def _legacy_identity(legacy_root, graph_path, local_path_config):
+def _prepare_attr_name_embedding(legacy_root, attr_name_embed_path):
+    source = Path(attr_name_embed_path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError("Missing historical attribute-name embedding: {}".format(source))
+    target = (
+        Path(legacy_root)
+        / "datasets"
+        / "xlsa17"
+        / "xlsa17"
+        / "data"
+        / "CUB"
+        / "cub_attributes_sbert_all_mpnet_base_v2.pt"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(str(source), str(target))
+    return target
+
+
+def _legacy_identity(
+    legacy_root, graph_path, local_path_config, attr_name_embed_path
+):
     installed_local_path = _prepare_local_path_config(legacy_root, local_path_config)
+    installed_attr_name_embed = _prepare_attr_name_embedding(
+        legacy_root, attr_name_embed_path
+    )
     commit = _git_output(legacy_root, "rev-parse", "HEAD")
     dirty_text = _git_output(legacy_root, "status", "--porcelain")
     if commit != EXPECTED_COMMIT:
@@ -88,6 +111,8 @@ def _legacy_identity(legacy_root, graph_path, local_path_config):
         "training_entry_sha256": _sha256_file(entry),
         "local_path_config": str(installed_local_path.resolve()),
         "local_path_config_sha256": _sha256_file(installed_local_path),
+        "attr_name_embed_path": str(installed_attr_name_embed.resolve()),
+        "attr_name_embed_sha256": _sha256_file(installed_attr_name_embed),
         "graph_path": str(Path(graph_path).resolve()),
         "graph_sha256": graph_sha256,
     }
@@ -349,6 +374,7 @@ def main():
     )
     parser.add_argument("--graph-path", type=Path, required=True)
     parser.add_argument("--local-path-config", type=Path, required=True)
+    parser.add_argument("--attr-name-embed-path", type=Path, required=True)
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--stage", choices=["unseeded", "fixed", "all"], default="all")
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
@@ -361,10 +387,14 @@ def main():
     args.output_root = args.output_root.resolve()
     args.graph_path = args.graph_path.resolve()
     args.local_path_config = args.local_path_config.resolve()
+    args.attr_name_embed_path = args.attr_name_embed_path.resolve()
     if not args.graph_path.is_file():
         raise FileNotFoundError("Missing historical graph file: {}".format(args.graph_path))
     identity = _legacy_identity(
-        args.legacy_root, args.graph_path, args.local_path_config
+        args.legacy_root,
+        args.graph_path,
+        args.local_path_config,
+        args.attr_name_embed_path,
     )
     gpu_groups = [item.strip() for item in args.gpu_groups.split(";") if item.strip()]
     if not gpu_groups:
