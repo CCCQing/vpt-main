@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 
+import hashlib
+import json
 import os
+import platform
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
 import torch
 import warnings
 
@@ -14,9 +21,115 @@ from src.engine.evaluator import Evaluator
 from src.engine.trainer import Trainer
 from src.models.build_model import build_model
 from src.utils.file_io import PathManager
+from src.utils.distributed import get_rank, get_world_size
 
 from launch import default_argument_parser, logging_train_setup
 warnings.filterwarnings("ignore")
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_identity(repo_root):
+    def run_git(*args):
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    status = run_git("status", "--porcelain")
+    return {
+        "commit": run_git("rev-parse", "HEAD"),
+        "branch": run_git("branch", "--show-current"),
+        "dirty": bool(status),
+        "dirty_status": status.splitlines(),
+    }
+
+
+def _dataset_manifest(dataset):
+    digest = hashlib.sha256()
+    records = list(getattr(dataset, "_imdb", []) or [])
+    for record in records:
+        image_path = str(record.get("im_path", "")).replace("\\", "/")
+        class_id = int(record.get("class", -1))
+        digest.update(f"{image_path}\t{class_id}\n".encode("utf-8"))
+    seen = sorted(int(value) for value in list(getattr(dataset, "seen_classes", []) or []))
+    unseen = sorted(int(value) for value in list(getattr(dataset, "unseen_classes", []) or []))
+    return {
+        "name": str(getattr(dataset, "name", "")),
+        "sample_count": len(records),
+        "manifest_sha256": digest.hexdigest(),
+        "seen_classes": seen,
+        "unseen_classes": unseen,
+    }
+
+
+def _write_audit_artifacts(cfg, args, split_loaders):
+    if get_rank() != 0:
+        return
+
+    output_dir = Path(str(cfg.OUTPUT_DIR))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_text = cfg.dump() if hasattr(cfg, "dump") else str(cfg)
+    resolved_path = output_dir / "resolved_config.yaml"
+    resolved_path.write_text(resolved_text, encoding="utf-8")
+
+    repo_root = Path(__file__).resolve().parent
+    graph_raw = str(cfg.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_PATH or "")
+    graph_path = Path(graph_raw)
+    if graph_raw and not graph_path.is_absolute():
+        graph_path = repo_root / graph_path
+    graph_exists = bool(graph_raw) and graph_path.is_file()
+
+    split_manifests = {}
+    for split_name, data_loader in split_loaders.items():
+        if data_loader is not None:
+            split_manifests[split_name] = _dataset_manifest(data_loader.dataset)
+
+    identity = {
+        "schema_version": 1,
+        "experiment_family": "c_gpp_t0009_factorial",
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "git": _git_identity(repo_root),
+        "config_file": str(getattr(args, "config_file", "")),
+        "command_opts": list(getattr(args, "opts", []) or []),
+        "resolved_config_sha256": _sha256_file(resolved_path),
+        "seed": None if cfg.SEED is None else int(cfg.SEED),
+        "world_size": int(get_world_size()),
+        "num_gpus_config": int(cfg.NUM_GPUS),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "torch_version": str(torch.__version__),
+        "cuda_version": str(torch.version.cuda),
+        "graph": {
+            "path": str(graph_path),
+            "key": str(cfg.MODEL.SEMANTIC_GRAPH.EXTERNAL_GRAPH_KEY),
+            "exists": graph_exists,
+            "sha256": _sha256_file(graph_path) if graph_exists else "",
+        },
+        "switches": {
+            "graph_prob_prior_enable": bool(cfg.MODEL.GRAPH_PROB_PRIOR.ENABLE),
+            "graph_prob_prior_loss_weight": float(cfg.MODEL.GRAPH_PROB_PRIOR.LOSS_WEIGHT),
+            "attention_mediation_enable": bool(cfg.MODEL.ATTENTION_MEDIATION.ENABLE),
+        },
+        "splits": split_manifests,
+        "training_performed": True,
+        "optimizer_created": True,
+    }
+    (output_dir / "audit_identity.json").write_text(
+        json.dumps(identity, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _sync_xlsa_protocol(cfg):
@@ -122,9 +235,12 @@ def train(cfg, args):
     # main training / eval actions here
     # fix the seed for reproducibility
     if cfg.SEED is not None:
-        torch.manual_seed(cfg.SEED)
-        np.random.seed(cfg.SEED)
-        random.seed(0)
+        seed = int(cfg.SEED)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed)
+        random.seed(seed)
 
     # setup training env including loggers
     logging_train_setup(args, cfg)
@@ -181,6 +297,17 @@ def train(cfg, args):
 
     # ------------------------------------
     trainer = Trainer(cfg, model, evaluator, cur_device)
+
+    _write_audit_artifacts(
+        cfg,
+        args,
+        {
+            "train": train_loader,
+            "val": val_loader,
+            "test_seen": test_seen_loader,
+            "test_unseen": test_unseen_loader,
+        },
+    )
 
     # -----------------------------------
     if train_loader:

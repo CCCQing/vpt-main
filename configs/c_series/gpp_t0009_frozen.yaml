@@ -1,0 +1,159 @@
+RUN_N_TIMES: 1
+SEED: 0
+CUDNN_BENCHMARK: false
+NUM_GPUS: 2
+
+DATA:
+  NAME: "CUB"
+  NUMBER_CLASSES: 200
+  BATCH_SIZE: 64
+  NUM_WORKERS: 4
+  PIN_MEMORY: true
+  XLSA:
+    ENABLED: true
+    PROTOCOL_MODE: "final_gzsl"
+
+MODEL:
+  TYPE: "vit"
+  CLASSIFIER: "vspcn_baseline"
+
+  PROMPT:
+    ENABLE: true
+    BACKEND: "dynamic"
+    INIT_SOURCE: "distributor_mean"
+    DEEP: true
+    NUM_TOKENS: 32
+    DROPOUT: 0.0
+    DISTRIBUTOR:
+      ENABLE: true
+      SOURCE: "token_mlp"
+      STATS_HIDDEN_DIM: 64
+      INSTANCE_TOKENS: 16
+      DOMAIN_TOKENS: 16
+      OUTPUT_PARAM: "logvar"
+      LOGVAR_MIN: -10.0
+      LOGVAR_MAX: 5.0
+      EVAL_SAMPLE_MODE: "fixed_eps"
+      FIXED_EPS_SEED: 0
+      USE_SLOT_EMBED: true
+      FACTORIZED_ENABLE: false
+
+  SEMANTIC_TOKENS:
+    ENABLE: true
+    TOKENIZER: "linear"
+    NUM_TOKENS: 1
+    INPUT_DIM: 312
+    TRAIN_SOURCE: "class_mean"
+    EVAL_SOURCE: "class_mean"
+    RANDOM_SEED: 0
+    BLOCK_S_TO_CLS: false
+
+  AFFINITY:
+    ENABLE: true
+    DETACH: false
+    VIS: false
+
+  AFFINITY_EVOLUTION:
+    ENABLE: false
+
+  ATTENTION_MEDIATION:
+    ENABLE: true
+    SOURCE: "scores"
+    EXECUTION_MODE: "attention_parallel"
+    MLP_POLICY: "skip_mlp"
+    ROUTE_SCOPE: "visual_block"
+    PROMPT_ROUTE: "P_to_S_to_V"
+    SEMANTIC_ROUTE: "S_to_P_to_V"
+    MASS_MODE: "block_redistribute"
+    BETA_PROMPT_MASS: 0.0
+    BETA_SEMANTIC_MASS: 0.0
+    PROMPT_GAMMA_INIT: 0.0
+    SEMANTIC_GAMMA_INIT: 0.0
+
+  R_SIMILARITY:
+    ENABLE: true
+    USE_COSINE: true
+    LOGIT_SCALE_INIT: 10.0
+
+  CONSISTENCY:
+    ENABLE: false
+
+  SEMANTIC_GRAPH:
+    ENABLE: false
+    GRAPH_SOURCE: "external"
+    LOSS_TYPE: "none"
+    LOSS_WEIGHT: 0.0
+    TOPK: 16
+    TAU_ACC: 0.10
+    TARGET_MIX_ALPHA: 0.10
+    EXTERNAL_GRAPH_PATH: "cub_attribute_localization/05_hparam_searches/diff_only_graphs_v1/diff_only_method_matrices_v1.npz"
+    EXTERNAL_GRAPH_KEY: "method1_diff"
+    EXTERNAL_GRAPH_SYMMETRIZE: true
+    EXTERNAL_GRAPH_CLAMP: true
+    EXTERNAL_GRAPH_DIAG_VALUE: 1.0
+
+  GRAPH_PROB_PRIOR:
+    ENABLE: true
+    MODE: "class_aggregate_mmd"
+    LOSS_WEIGHT: 0.001
+    PRIOR_MEAN_MODE: "residual_anchor"
+    PRIOR_VAR_MODE: "unit"
+    PRIOR_LOGVAR_CONST: 0.0
+    RESIDUAL_SIGMA_MIN: 0.05
+    RESIDUAL_CLIP: 3.0
+    PRIOR_CONTEXT_TOPK: 16
+    PRIOR_MU_SCALE: 2.0
+    PRIOR_DELTA_SCALE: 0.10
+    TAU_GRAPH: 0.10
+    TAU_LATENT: 0.05
+    REL_WEIGHT: 0.0
+    TAU_PRIOR: 0.07
+    MMD_SAMPLES: 1
+    MMD_SIGMA: 32.0
+    FACTORIZED_VARIATION_WEIGHT: 0.0
+    FACTORIZED_DECOUPLE_WEIGHT: 0.0
+    GEOM_LOSS_ENABLE: false
+    GEOM_LOSS_TYPE: "soft_distribution_matching"
+    GEOM_LOSS_WEIGHT: 0.0001
+    GEOM_TOPK: 5
+    GEOM_SIGMA_PRIOR: 0.2
+    GEOM_TAU_UNI: 2.0
+    GEOM_TAU_GRAPH_TOP: 0.10
+    GEOM_TAU_CON: 0.10
+    GEOM_TAU_GRAPH_POS: 0.10
+    GEOM_TAU_GRAPH_DIST: 0.10
+    GEOM_TAU_DIST: 0.10
+    GEOM_BOUND_WEIGHT: 0.10
+    MONITOR_ENABLE: true
+    MONITOR_INACTIVE: false
+    MONITOR_TOPK: 5
+    MONITOR_EVERY_N: 37
+    DEBUG: false
+
+SOLVER:
+  MAIN_LOSS: "vspcn"
+  BASE_LR: 0.00125
+  WEIGHT_DECAY: 0.00001
+  WARMUP_EPOCH: 1
+  TOTAL_EPOCH: 10
+  OPTIMIZER: "adamw"
+  SCHEDULER: "cosine"
+  LOSS_VSPCN_AR_WEIGHT: 0.0005
+  LOSS_CM_WEIGHT: 0.05
+  LOSS_PROMPT_KL_WEIGHT: 0.0
+  LOSS_SEM_MED_WEIGHT: 0.0
+  LOSS_SPV_WEIGHT: 0.0
+  LOSS_ROUTE_TS_PROMPT_WEIGHT: 0.0
+  LOSS_ROUTE_TS_SEMANTIC_WEIGHT: 0.0
+  LOSS_ATTR_WEIGHT: 0.0
+  LOG_EVERY_N: 111
+  DEBUG_GRAD_NORM: false
+  DEBUG_TRACE_ONCE: false
+  DEBUG_SHAPES: false
+  VIS:
+    ENABLE: false
+    SAVE_RAW: false
+    SAVE_IMAGES: false
+    ROLLOUT: false
+
+OUTPUT_DIR: "output/c_gpp_t0009_factorial/manual"

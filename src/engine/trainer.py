@@ -169,7 +169,7 @@ class Trainer():
         self.checkpointer = Checkpointer(
             self.model,
             save_dir=cfg.OUTPUT_DIR,
-            save_to_disk=True,
+            save_to_disk=int(cfg.DIST_RANK) == 0,
             cls_criterion=self.cls_criterion,
         )
 
@@ -2324,6 +2324,20 @@ class Trainer():
 
             if str(self.evaluator.task_type).lower() == "gzsl":
                 self._update_gzsl_record_metrics(epoch, test_unseen_loader, seen_metrics, unseen_metrics)
+
+        if int(self.cfg.DIST_RANK) == 0:
+            checkpoint_path = self.checkpointer.save(
+                "model_final",
+                epoch=int(total_epoch),
+                seed=None if self.cfg.SEED is None else int(self.cfg.SEED),
+                protocol=str(self.cfg.DATA.XLSA.PROTOCOL_MODE),
+            )
+            logger.info(
+                "[audit-artifact] final_checkpoint=%s epoch=%d seed=%s",
+                str(checkpoint_path),
+                int(total_epoch),
+                str(self.cfg.SEED),
+            )
 
     def train_classifier(self, train_loader, val_loader, test_seen_loader, test_unseen_loader):
         if val_loader is not None:
