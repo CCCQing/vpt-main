@@ -436,7 +436,10 @@ def _effective_rank(x: torch.Tensor, center: bool = True) -> float:
     """
     if not torch.is_tensor(x) or x.dim() != 2:
         return 0.0
-    values = x.detach().float()
+    # Monitoring-only SVD must stay off CUDA on the historical PyTorch/MAGMA
+    # stack used by the 4090 server.  The tensor is already detached, so this
+    # CPU transfer cannot affect the training graph or optimizer state.
+    values = x.detach().float().cpu()
     if center:
         values = values - values.mean(dim=0, keepdim=True)
     try:
