@@ -221,7 +221,15 @@ def _run_one(task, args, identity, gpu_group):
         try:
             previous = json.loads(validation_path.read_text(encoding="utf-8"))
             if bool(previous.get("valid")):
-                return {"status": "skipped_valid", "gpu_group": gpu_group, **previous}
+                reconciled = {
+                    **previous,
+                    "status": "skipped_valid",
+                    "seed_mode": task["seed_mode"],
+                    "seed": task.get("seed"),
+                    "gpu_group": gpu_group,
+                }
+                _write_json(run_root / "run_status.json", reconciled)
+                return reconciled
         except Exception:
             pass
 
