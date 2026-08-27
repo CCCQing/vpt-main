@@ -25,6 +25,7 @@
 ```bash
 python src/tools/search_plans/a_series/run_a2_cosine_search.py \
   --gpu-groups '0;1;2;3' \
+  --workers-per-gpu 1 \
   --max-workers 4 \
   --out-root output/a2_cosine_baseline_search
 ```

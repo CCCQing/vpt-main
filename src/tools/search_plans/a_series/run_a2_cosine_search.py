@@ -548,6 +548,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--out-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--gpu-groups", default="0;1")
+    parser.add_argument(
+        "--workers-per-gpu",
+        type=int,
+        default=1,
+        help="Concurrent single-GPU jobs assigned to each listed card.",
+    )
     parser.add_argument("--max-workers", type=int, default=2)
     parser.add_argument("--token-grid", default="8,16,32")
     parser.add_argument("--lr-grid", default="3e-4,6e-4,1e-3")
@@ -568,7 +574,7 @@ def main() -> None:
         lr_grid = _parse_floats(args.lr_grid, "--lr-grid")
         epoch_grid = _parse_ints(args.epoch_grid, "--epoch-grid")
         anchor_seeds = _parse_ints(args.anchor_seeds, "--anchor-seeds", allow_zero=True)
-        gpu_groups = _parse_gpu_groups(args.gpu_groups)
+        physical_gpu_groups = _parse_gpu_groups(args.gpu_groups)
     except ValueError as exc:
         raise SystemExit(str(exc))
     if sorted(anchor_seeds) != [0, 1, 2]:
@@ -577,8 +583,17 @@ def main() -> None:
         raise SystemExit("--search-seed must remain 0 so shortlist supplementation is unambiguous.")
     if args.shortlist_size <= 0 or args.shortlist_size > 3:
         raise SystemExit("--shortlist-size must be between 1 and 3.")
+    if args.workers_per_gpu <= 0:
+        raise SystemExit("--workers-per-gpu must be positive.")
+    gpu_groups = [
+        gpu
+        for gpu in physical_gpu_groups
+        for _ in range(int(args.workers_per_gpu))
+    ]
     if args.max_workers <= 0 or args.max_workers > len(gpu_groups):
-        raise SystemExit("--max-workers must be positive and no larger than the GPU count.")
+        raise SystemExit(
+            "--max-workers must be positive and no larger than GPU count times workers-per-gpu."
+        )
     if args.ausuc_tolerance < 0.0 or args.progress_interval <= 0.0:
         raise SystemExit("Tolerance must be non-negative and progress interval must be positive.")
     if BASE_NUM_TOKENS not in token_grid or BASE_LR not in lr_grid or BASE_EPOCHS not in epoch_grid:
@@ -606,6 +621,9 @@ def main() -> None:
         "epoch_grid": epoch_grid,
         "shortlist_size": args.shortlist_size,
         "shortlist_training_seeds": [0, 1, 2],
+        "physical_gpu_groups": physical_gpu_groups,
+        "workers_per_gpu": args.workers_per_gpu,
+        "worker_gpu_slots": gpu_groups,
         "selection_order": "final_gzsl_h_desc_then_ausuc_desc_then_unseen_desc",
         "ausuc_guard": "candidate_ausuc >= fixed1_seed0_ausuc - tolerance",
         "ausuc_tolerance": args.ausuc_tolerance,
