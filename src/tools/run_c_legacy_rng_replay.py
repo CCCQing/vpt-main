@@ -67,7 +67,11 @@ def _prepare_attr_name_embedding(legacy_root, attr_name_embed_path):
 
 
 def _legacy_identity(
-    legacy_root, graph_path, local_path_config, attr_name_embed_path
+    legacy_root,
+    graph_path,
+    local_path_config,
+    attr_name_embed_path,
+    expected_commit,
 ):
     installed_local_path = _prepare_local_path_config(legacy_root, local_path_config)
     installed_attr_name_embed = _prepare_attr_name_embedding(
@@ -75,10 +79,10 @@ def _legacy_identity(
     )
     commit = _git_output(legacy_root, "rev-parse", "HEAD")
     dirty_text = _git_output(legacy_root, "status", "--porcelain")
-    if commit != EXPECTED_COMMIT:
+    if commit != expected_commit:
         raise ValueError(
             "Legacy worktree commit mismatch: expected {}, got {}".format(
-                EXPECTED_COMMIT, commit
+                expected_commit, commit
             )
         )
     if dirty_text:
@@ -104,6 +108,7 @@ def _legacy_identity(
     return {
         "legacy_root": str(Path(legacy_root).resolve()),
         "legacy_commit": commit,
+        "expected_commit": expected_commit,
         "legacy_dirty": False,
         "source_config": str(config.resolve()),
         "source_config_sha256": _sha256_file(config),
@@ -208,7 +213,16 @@ def _validate(run_root, seed_mode, seed):
     sys.path.insert(0, str(ROOT))
     from src.tools.validate_c_legacy_rng_replay import validate_run
 
-    result = validate_run(run_root, seed_mode, seed, 10)
+    identity = json.loads(
+        (Path(run_root) / "legacy_identity.json").read_text(encoding="utf-8")
+    )
+    result = validate_run(
+        run_root,
+        seed_mode,
+        seed,
+        10,
+        expected_commit=identity["expected_commit"],
+    )
     _write_json(Path(run_root) / "validation.json", result)
     return result
 
@@ -252,7 +266,7 @@ def _run_one(task, args, identity, gpu_group):
     run_identity.update(
         {
             "schema_version": 1,
-            "protocol": "exact_historical_cli",
+            "protocol": args.protocol_label,
             "seed_mode": seed_mode,
             "seed": seed,
             "gpu_group": gpu_group,
@@ -383,6 +397,8 @@ def main():
     parser.add_argument("--graph-path", type=Path, required=True)
     parser.add_argument("--local-path-config", type=Path, required=True)
     parser.add_argument("--attr-name-embed-path", type=Path, required=True)
+    parser.add_argument("--expected-commit", default=EXPECTED_COMMIT)
+    parser.add_argument("--protocol-label", default="exact_historical_cli")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--stage", choices=["unseeded", "fixed", "all"], default="all")
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
@@ -403,6 +419,7 @@ def main():
         args.graph_path,
         args.local_path_config,
         args.attr_name_embed_path,
+        args.expected_commit,
     )
     gpu_groups = [item.strip() for item in args.gpu_groups.split(";") if item.strip()]
     if not gpu_groups:
@@ -422,7 +439,7 @@ def main():
     unseeded_results = [item for item in results if item.get("seed_mode") == "unseeded"]
     summary = {
         "schema_version": 1,
-        "protocol": "exact_historical_cli_rng_replay",
+        "protocol": args.protocol_label,
         "stage": args.stage,
         "output_root": str(args.output_root),
         "legacy_identity": identity,

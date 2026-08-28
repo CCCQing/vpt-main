@@ -43,7 +43,13 @@ def _load_json(path, errors, label):
         return {}
 
 
-def validate_run(run_root, expected_seed_mode, expected_seed=None, expected_epochs=10):
+def validate_run(
+    run_root,
+    expected_seed_mode,
+    expected_seed=None,
+    expected_epochs=10,
+    expected_commit=EXPECTED_COMMIT,
+):
     run_root = Path(run_root).resolve()
     errors = []
     identity_path = run_root / "legacy_identity.json"
@@ -104,7 +110,7 @@ def validate_run(run_root, expected_seed_mode, expected_seed=None, expected_epoc
             )
 
     if identity:
-        if str(identity.get("legacy_commit")) != EXPECTED_COMMIT:
+        if str(identity.get("legacy_commit")) != str(expected_commit):
             errors.append("legacy commit mismatch")
         if bool(identity.get("legacy_dirty")):
             errors.append("legacy worktree is dirty")
@@ -154,7 +160,7 @@ def validate_run(run_root, expected_seed_mode, expected_seed=None, expected_epoc
             "seed_mode": expected_seed_mode,
             "seed": int(expected_seed) if expected_seed is not None else None,
             "epochs": int(expected_epochs),
-            "legacy_commit": EXPECTED_COMMIT,
+            "legacy_commit": str(expected_commit),
             "graph_sha256": EXPECTED_GRAPH_SHA256,
             "checkpoint_expected": False,
         },
@@ -180,10 +186,17 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--output-json", default="")
+    parser.add_argument("--expected-commit", default=EXPECTED_COMMIT)
     args = parser.parse_args()
     if args.seed_mode == "fixed" and args.seed is None:
         parser.error("--seed is required when --seed-mode=fixed")
-    result = validate_run(args.run_root, args.seed_mode, args.seed, args.epochs)
+    result = validate_run(
+        args.run_root,
+        args.seed_mode,
+        args.seed,
+        args.epochs,
+        expected_commit=args.expected_commit,
+    )
     output_path = Path(args.output_json) if args.output_json else Path(args.run_root) / "validation.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
