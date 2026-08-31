@@ -73,9 +73,7 @@ def static_checks(
     architecture_id = str(
         cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ARCHITECTURE_ID
     )
-    is_b3 = protocol_mode == "b3_pseudo_gzsl" or architecture_id.startswith(
-        "B3-"
-    )
+    is_b3 = architecture_id.startswith("B3-")
 
     expected = {
         "MODEL.CLASSIFIER": (str(cfg.MODEL.CLASSIFIER).lower(), "r_similarity"),
@@ -301,12 +299,8 @@ def static_checks(
     if is_b3:
         residual_cfg = cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL
         consistency_cfg = cfg.SOLVER.B3_CLASS_CONSISTENCY
-        if protocol_mode not in {"b3_pseudo_gzsl", "final_gzsl"}:
-            failures.append("B3 requires b3_pseudo_gzsl or locked final_gzsl")
-        if protocol_mode == "b3_pseudo_gzsl" and not allow_b3_template and not str(
-            cfg.DATA.XLSA.B3_PSEUDO_MANIFEST
-        ).strip():
-            failures.append("B3 pseudo-GZSL requires a non-empty manifest path")
+        if protocol_mode != "final_gzsl":
+            failures.append("B3 requires the locked official final_gzsl protocol")
         if stage == "B":
             if str(residual_cfg.AMPLITUDE_MODE).lower() != "bounded_ratio":
                 failures.append("B3 residual stages require AMPLITUDE_MODE=bounded_ratio")

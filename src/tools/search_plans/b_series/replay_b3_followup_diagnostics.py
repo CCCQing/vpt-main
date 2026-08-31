@@ -14,7 +14,6 @@ import argparse
 import copy
 import hashlib
 import json
-import os
 import random
 import sys
 import traceback
@@ -31,7 +30,6 @@ ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.configs.config import get_cfg
 from src.monitoring.eval_metrics import (
     representation_geometry_metrics,
     semantic_visual_graph_metrics,
@@ -40,7 +38,6 @@ from src.monitoring.eval_metrics import (
 from src.monitoring.logit_geometry import VIEWS, analyze_logit_geometry
 from src.monitoring.module_effect import (
     checkpoint_sha256,
-    deep_prompt_residual_replace_intervention,
     deep_prompt_residual_zero_intervention,
 )
 from src.monitoring.prompt_source_retention import (
@@ -51,6 +48,12 @@ from src.monitoring.prompt_source_retention import (
     geometry_deltas_from_summary,
     source_retention_metrics,
     summarize_geometry_controls,
+)
+from src.monitoring.representation_transport import (
+    head_representation_factorial_metrics,
+    prediction_transition_group_metrics,
+    representation_transport_metrics,
+    semantic_transport_metrics,
 )
 from src.tools.search_plans.a_series.replay_decision_gain_decomposition import (
     _load_model_and_loaders,
@@ -416,6 +419,52 @@ def _task_chain_summary(normal, residual_zero, cfg) -> Dict[str, Any]:
     }
 
 
+def _current_head_representation_task_summary(
+    normal_outputs: Mapping[str, Mapping[str, Any]], cfg
+) -> Dict[str, Any]:
+    prepass_outputs = {
+        split: {
+            **output,
+            "logits": output["prepass_current_head_logits"],
+            "features": output["source_input"],
+        }
+        for split, output in normal_outputs.items()
+    }
+    prepass = _condition_summary(
+        prepass_outputs, prepass_outputs, cfg, is_normal=True
+    )
+    final = _condition_summary(
+        normal_outputs, normal_outputs, cfg, is_normal=True
+    )
+    prepass.pop("logit_geometry", None)
+    final.pop("logit_geometry", None)
+    task_metrics = (
+        "seen_per_class_accuracy",
+        "unseen_per_class_accuracy",
+        "harmonic_mean",
+        "ausuc",
+        "raw_to_oracle_gain",
+        "oracle_peak_gamma",
+    )
+    delta = {
+        metric: float(final["gzsl"][metric]) - float(prepass["gzsl"][metric])
+        for metric in task_metrics
+    }
+    return {
+        "status": "partial_current_head_only",
+        "cells": {
+            "frozen_prepass_cls/current_head": prepass,
+            "normal_final_cls/current_head": final,
+            "frozen_prepass_cls/candidate_head": None,
+            "normal_final_cls/candidate_head": None,
+        },
+        "representation_gain_current_head_final_minus_prepass": delta,
+        "candidate_head_status": "not_available_not_trained",
+        "interaction": None,
+        "valid": bool(prepass["valid"] and final["valid"]),
+    }
+
+
 def _run_d2g(
     model,
     device,
@@ -430,15 +479,17 @@ def _run_d2g(
     if str(provider.source).lower() != "vit_cls_prepass":
         raise ValueError("D2G requires SOURCE=vit_cls_prepass")
     report: Dict[str, Any] = {
-        "format": "b3_d2g_source_to_decision_chain_v2",
+        "format": "b3_d2g_source_to_decision_chain_v3",
         "objects": [
             "frozen_prepass_cls",
             "trained_distributor_mu",
             "random_untrained_distributor_mu",
             "normal_final_cls",
+            "cls_delta",
             "residual_zero_final_cls",
             "projected_semantic_prototypes",
             "final_200d_logits",
+            "current_head_on_frozen_prepass_cls",
         ],
         "absolute_geometry_metrics": list(ABSOLUTE_GEOMETRY_METRICS),
         "logit_views": list(VIEWS),
@@ -457,6 +508,29 @@ def _run_d2g(
             "raw_scatter_cross_space_subtraction_allowed": False,
             "missing_metric_fill_value": None,
             "prepass_execution": "one cached extraction per batch reused by normal and Residual-zero",
+            "prepass_final_transport": "paired on identical samples; cls_delta is a deterministic transform, not an independent Bayesian object",
+            "prediction_group_boundary": "posthoc descriptive audit; never a training target or causal proof",
+        },
+        "atomic_evidence_group_schema": [
+            "representation_identity",
+            "prepass_final_transport",
+            "absolute_class_geometry",
+            "semantic_transport",
+            "head_representation_factorial",
+            "prediction_transition_groups",
+            "official_final_task",
+        ],
+        "p13a_extension_contract": {
+            "status": "candidate_head_not_available",
+            "current_replay_scope": "current_head_on_prepass_and_final_cls",
+            "required_future_cells": [
+                "frozen_prepass_cls/current_head",
+                "normal_final_cls/current_head",
+                "frozen_prepass_cls/candidate_head",
+                "normal_final_cls/candidate_head",
+            ],
+            "future_training_contract": "capacity-matched heads; all official Seen classes; predeclared fixed epochs; three independent training seeds; official final-GZSL evaluation",
+            "missing_cells_are_not_filled_with_zero": True,
         },
         "splits": {},
         "cross_method_comparability": {
@@ -486,6 +560,7 @@ def _run_d2g(
                 device,
                 loader,
                 collect_source_input=True,
+                collect_classifier_readout=True,
                 prepass_cache_mode="populate",
                 prepass_cache_namespace=cache_namespace,
             )
@@ -503,11 +578,101 @@ def _run_d2g(
         normal_outputs[split] = output
         residual_zero_outputs[split] = residual_zero
         labels = output["targets_global"]
-        prepass = absolute_class_geometry(output["source_input"], labels)
+        representation_transport = representation_transport_metrics(
+            output["source_input"],
+            output["features"],
+            labels,
+            pair_seed=int(pair_seed),
+            max_pairs=int(max_pairs),
+        )
+        prepass = representation_transport["absolute_geometry"][
+            "frozen_prepass_cls"
+        ]
         trained = absolute_class_geometry(output["source_mu"], labels)
-        normal_final_cls = absolute_class_geometry(output["features"], labels)
+        normal_final_cls = representation_transport["absolute_geometry"][
+            "normal_final_cls"
+        ]
         residual_zero_final_cls = absolute_class_geometry(
             residual_zero["features"], labels
+        )
+        source_dataset = _source_dataset(loader)
+        raw_attribute_value = source_dataset.class_attributes
+        raw_attributes = (
+            raw_attribute_value.detach().cpu().float().numpy()
+            if torch.is_tensor(raw_attribute_value)
+            else np.asarray(raw_attribute_value, dtype=np.float32)
+        )
+        candidate_indices = np.asarray(
+            output["candidate_class_ids"], dtype=np.int64
+        )
+        if (
+            raw_attributes.ndim != 2
+            or candidate_indices.size < 2
+            or int(candidate_indices.min()) < 0
+            or int(candidate_indices.max()) >= raw_attributes.shape[0]
+        ):
+            raise ValueError(
+                "raw class attributes do not cover the candidate class order"
+            )
+        raw_candidate_semantics = raw_attributes[candidate_indices]
+        prepass_logits = output["prepass_current_head_logits"]
+        reconstructed_final_logits = output[
+            "classifier_reconstructed_logits"
+        ]
+        classifier_reconstruction = {
+            "contract": output["classifier_contract"],
+            "max_abs_logit_error": float(
+                np.max(np.abs(reconstructed_final_logits - output["logits"]))
+            ),
+            "mean_abs_logit_error": float(
+                np.mean(np.abs(reconstructed_final_logits - output["logits"]))
+            ),
+            "prediction_equivalence": float(
+                np.mean(
+                    reconstructed_final_logits.argmax(axis=1)
+                    == output["logits"].argmax(axis=1)
+                )
+            ),
+            "exact_float32_equal": bool(
+                np.array_equal(reconstructed_final_logits, output["logits"])
+            ),
+        }
+        classifier_reconstruction["valid"] = bool(
+            classifier_reconstruction["prediction_equivalence"] == 1.0
+            and classifier_reconstruction["max_abs_logit_error"] <= 1.0e-5
+            and output["classifier_contract"][
+                "logit_scale_constant_across_batches"
+            ]
+        )
+        semantic_transport = semantic_transport_metrics(
+            output["source_input"],
+            output["features"],
+            output["semantic_prototypes"],
+            output["targets_local"],
+            prepass_logits=prepass_logits,
+            final_logits=output["logits"],
+            raw_semantic_prototypes=raw_candidate_semantics,
+        )
+        head_factorial = head_representation_factorial_metrics(
+            {
+                "frozen_prepass_cls": {"current_head": prepass_logits},
+                "normal_final_cls": {"current_head": output["logits"]},
+            },
+            output["targets_local"],
+            output["candidate_class_ids"],
+            output["seen_class_ids"],
+        )
+        transition_groups = prediction_transition_group_metrics(
+            output["source_input"],
+            output["features"],
+            prepass_logits,
+            output["logits"],
+            output["targets_local"],
+            output["candidate_class_ids"],
+            output["seen_class_ids"],
+            output["semantic_prototypes"],
+            reference_name="current_head_on_frozen_prepass_cls",
+            target_name="current_head_on_normal_final_cls",
         )
         normal_visual_semantic = _visual_semantic_condition(output)
         residual_zero_visual_semantic = _visual_semantic_condition(residual_zero)
@@ -609,6 +774,21 @@ def _run_d2g(
                 and output["prepass_cache_contract"]["batch_key_count"]
                 == residual_zero["prepass_cache_contract"]["batch_key_count"]
             ),
+            "prepass_final_transport_valid": bool(
+                representation_transport["validity"]["valid"]
+            ),
+            "prepass_final_semantic_transport_valid": bool(
+                semantic_transport["validity"]["valid"]
+            ),
+            "current_head_reconstruction_valid": bool(
+                classifier_reconstruction["valid"]
+            ),
+            "current_head_factorial_cells_valid": bool(
+                head_factorial["validity"]["current_available_cells_valid"]
+            ),
+            "prediction_transition_groups_valid": bool(
+                transition_groups["validity"]["valid"]
+            ),
             "finite_deltas": bool(
                 all(
                     np.isfinite(float(value))
@@ -662,7 +842,15 @@ def _run_d2g(
             "random_mu_geometry": random_geometry,
             "random_mu_geometry_summary": random_summary,
             "normal_final_cls_geometry": normal_final_cls,
+            "cls_delta_geometry": representation_transport[
+                "absolute_geometry"
+            ]["cls_delta"],
             "residual_zero_final_cls_geometry": residual_zero_final_cls,
+            "prepass_final_cls_transport": representation_transport,
+            "prepass_final_semantic_transport": semantic_transport,
+            "current_head_representation_factorial": head_factorial,
+            "prediction_transition_groups": transition_groups,
+            "classifier_reconstruction_contract": classifier_reconstruction,
             "visual_semantic_alignment": {
                 "normal": normal_visual_semantic,
                 "residual_zero": residual_zero_visual_semantic,
@@ -735,6 +923,9 @@ def _run_d2g(
     task_results = _task_chain_summary(
         normal_outputs, residual_zero_outputs, cfg
     )
+    head_representation_task = _current_head_representation_task_summary(
+        normal_outputs, cfg
+    )
     downstream_validity = {
         "semantic_reference_valid": bool(semantic_reference["validity"]["valid"]),
         "normal_logit_geometry_valid": bool(
@@ -744,6 +935,9 @@ def _run_d2g(
             residual_zero_logit_geometry["validity"]["valid"]
         ),
         "task_results_valid": bool(task_results["valid"]),
+        "current_head_representation_task_valid": bool(
+            head_representation_task["valid"]
+        ),
     }
     downstream_validity["valid"] = bool(all(downstream_validity.values()))
     if not downstream_validity["valid"]:
@@ -763,6 +957,16 @@ def _run_d2g(
         ),
     }
     report["task_results"] = task_results
+    report["head_representation_task_factorial"] = head_representation_task
+    report["atomic_evidence_status"] = {
+        "representation_identity": "available" if report["valid"] else "invalid",
+        "prepass_final_transport": "available" if report["valid"] else "invalid",
+        "absolute_class_geometry": "available" if report["valid"] else "invalid",
+        "semantic_transport": "available" if report["valid"] else "invalid",
+        "head_representation_factorial": "partial_current_head_only",
+        "prediction_transition_groups": "available" if report["valid"] else "invalid",
+        "official_final_task": "partial_candidate_head_not_trained",
+    }
     report["downstream_validity"] = downstream_validity
     report["scientific_status"] = (
         "implementation_valid_pending_formal_checkpoint_replay"
@@ -897,7 +1101,7 @@ def _run_d3_split(model, device, loader, selected_layers):
         normal_logits, normal_aff, normal_trace = _paired_affinity_forward(
             model, inputs, candidate, affinity_config, False
         )
-        zero_logits, zero_aff, zero_trace = _paired_affinity_forward(
+        zero_logits, zero_aff, _ = _paired_affinity_forward(
             model, inputs, candidate, affinity_config, True
         )
         add(
@@ -905,7 +1109,6 @@ def _run_d3_split(model, device, loader, selected_layers):
             (normal_logits - zero_logits).float().norm(dim=-1).numpy(),
         )
         normal_by_layer = {int(item["layer_id"]): item for item in normal_trace}
-        zero_by_layer = {int(item["layer_id"]): item for item in zero_trace}
         for layer_id in selected_layers:
             normal_layer = normal_aff[layer_id]
             zero_layer = zero_aff[layer_id]
@@ -1105,7 +1308,7 @@ def _run_d3_split(model, device, loader, selected_layers):
                     )
         if hasattr(_model_module(model), "clear_runtime_state"):
             _model_module(model).clear_runtime_state()
-        del inputs, normal_aff, zero_aff, normal_trace, zero_trace
+        del inputs, normal_aff, zero_aff, normal_trace
     return {name: _summary(values) for name, values in sorted(buckets.items())}
 
 

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import json
-import os
 import random
 import sys
 import time
@@ -45,6 +43,7 @@ from src.tools.search_plans.a_series.replay_decision_gain_decomposition import (
 from src.tools.search_plans.b_series.replay_b3_p0_diagnostics import (
     _a2_source_identity,
 )
+from src.tools.search_plans.common import atomic_write_json
 
 
 SPLITS = ("train_seen", "test_seen", "test_unseen")
@@ -77,14 +76,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(_json_safe(payload), ensure_ascii=False, indent=2, allow_nan=False)
-        + "\n",
-        encoding="utf-8",
-    )
-    os.replace(str(temporary), str(path))
+    atomic_write_json(path, _json_safe(payload), allow_nan=False)
 
 
 def _json_safe(value: Any) -> Any:
@@ -304,22 +296,6 @@ def _targets_local(labels: np.ndarray, candidate: Sequence[int]) -> np.ndarray:
     return np.asarray([mapping[int(value)] for value in labels], dtype=np.int64)
 
 
-def _heldout_classes(
-    seen_classes: Sequence[int],
-    split_seed: int,
-    fraction: float,
-) -> tuple[list[int], list[int]]:
-    values = np.asarray(sorted(int(value) for value in seen_classes), dtype=np.int64)
-    generator = np.random.default_rng(int(split_seed))
-    shuffled = generator.permutation(values)
-    holdout_count = max(2, int(round(values.size * float(fraction))))
-    heldout = sorted(int(value) for value in shuffled[:holdout_count])
-    train = sorted(int(value) for value in shuffled[holdout_count:])
-    if len(train) < 2:
-        raise ValueError("class-disjoint selection left fewer than two training classes")
-    return train, heldout
-
-
 def _model_for_variant(
     variant: str,
     visual_dim: int,
@@ -487,129 +463,6 @@ def _train_epochs(
     return history
 
 
-def _selection_phase(
-    variant: str,
-    cache: Mapping[str, Any],
-    semantics: np.ndarray,
-    train_classes: Sequence[int],
-    heldout_classes: Sequence[int],
-    device: torch.device,
-    training: Mapping[str, Any],
-    seed: int,
-) -> Dict[str, Any]:
-    output = cache["outputs"]["train_seen"]
-    features = np.asarray(output["features"], dtype=np.float32)
-    labels = np.asarray(output["targets_global"], dtype=np.int64)
-    train_mask = np.isin(labels, np.asarray(train_classes, dtype=np.int64))
-    constant = features[train_mask].mean(axis=0) if variant == "image_constant_raw312" else None
-    _seed_everything(seed)
-    model = _model_for_variant(variant, features.shape[1], semantics.shape[1], training).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(training["LR"]),
-        weight_decay=float(training["WEIGHT_DECAY"]),
-    )
-    train_positions = np.asarray(
-        [_global_to_local(cache["candidate_class_ids"])[int(value)] for value in train_classes],
-        dtype=np.int64,
-    )
-    heldout_positions = np.asarray(
-        [_global_to_local(cache["candidate_class_ids"])[int(value)] for value in heldout_classes],
-        dtype=np.int64,
-    )
-    train_semantic = torch.as_tensor(
-        semantics[train_positions], dtype=torch.float32, device=device
-    )
-    heldout_semantic = semantics[heldout_positions]
-    x_train = _variant_features(variant, features[train_mask], constant)
-    local_map = _global_to_local(train_classes)
-    y_train = np.asarray([local_map[int(value)] for value in labels[train_mask]], dtype=np.int64)
-    heldout_mask = np.isin(labels, np.asarray(heldout_classes, dtype=np.int64))
-    x_val = _variant_features(variant, features[heldout_mask], constant)
-    val_map = _global_to_local(heldout_classes)
-    y_val = np.asarray([val_map[int(value)] for value in labels[heldout_mask]], dtype=np.int64)
-    counts = np.bincount(y_train, minlength=len(train_classes)).astype(np.float64)
-    class_weights = counts.sum() / np.maximum(counts, 1.0)
-    class_weights = class_weights / class_weights.mean()
-    weight_tensor = torch.as_tensor(class_weights, dtype=torch.float32, device=device)
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(int(seed))
-    order_source = torch.arange(x_train.shape[0], dtype=torch.long)
-    best = None
-    best_state = None
-    history = []
-    stale = 0
-    for epoch in range(1, int(training["MAX_SELECTION_EPOCHS"]) + 1):
-        model.train()
-        permutation = order_source[torch.randperm(x_train.shape[0], generator=generator)]
-        loss_sum = 0.0
-        count = 0
-        for start in range(0, x_train.shape[0], int(training["BATCH_SIZE"])):
-            indices = permutation[start : start + int(training["BATCH_SIZE"])].numpy()
-            visual = torch.as_tensor(x_train[indices], dtype=torch.float32, device=device)
-            targets = torch.as_tensor(y_train[indices], dtype=torch.long, device=device)
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(
-                visual,
-                train_semantic,
-                candidate_chunk_size=int(training["CANDIDATE_CHUNK_SIZE"]),
-            )
-            loss = F.cross_entropy(logits, targets, weight=weight_tensor)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), float(training["GRAD_CLIP_NORM"]))
-            optimizer.step()
-            loss_sum += float(loss.detach().item()) * int(targets.numel())
-            count += int(targets.numel())
-        val_scores = _score(
-            model,
-            x_val,
-            heldout_semantic,
-            device,
-            batch_size=int(training["EVAL_BATCH_SIZE"]),
-            candidate_chunk_size=int(training["CANDIDATE_CHUNK_SIZE"]),
-        )
-        macro = _macro_accuracy(val_scores, y_val)
-        nll = float(classification_metrics(val_scores, y_val)["nll"])
-        row = {
-            "epoch": int(epoch),
-            "train_ce": float(loss_sum / max(1, count)),
-            "heldout_macro_accuracy": macro,
-            "heldout_nll": nll,
-        }
-        history.append(row)
-        key = (macro, -nll, -epoch)
-        if best is None or key > best:
-            best = key
-            best_state = copy.deepcopy(model.state_dict())
-            stale = 0
-        else:
-            stale += 1
-        if (
-            epoch >= int(training["MIN_SELECTION_EPOCHS"])
-            and stale >= int(training["PATIENCE"])
-        ):
-            break
-    best_row = max(
-        history,
-        key=lambda row: (
-            float(row["heldout_macro_accuracy"]),
-            -float(row["heldout_nll"]),
-            -int(row["epoch"]),
-        ),
-    )
-    model.load_state_dict(best_state)
-    return {
-        "selected_epoch": int(best_row["epoch"]),
-        "best_heldout_macro_accuracy": float(best_row["heldout_macro_accuracy"]),
-        "best_heldout_nll": float(best_row["heldout_nll"]),
-        "epochs_executed": int(len(history)),
-        "history": history,
-        "parameter_count": trainable_parameter_count(model),
-        "optimizer_created": True,
-        "optimizer_parameter_scope": "candidate_compatibility_head_only",
-    }
-
-
 def _nearest_semantic_negative(raw_semantics: np.ndarray) -> np.ndarray:
     values = raw_semantics / np.maximum(
         np.linalg.norm(raw_semantics, axis=1, keepdims=True), 1.0e-12
@@ -769,7 +622,7 @@ def _train_final_variant(
     variant: str,
     cache: Mapping[str, Any],
     semantics: np.ndarray,
-    selected_epoch: int,
+    train_epochs: int,
     device: torch.device,
     training: Mapping[str, Any],
     seed: int,
@@ -794,7 +647,7 @@ def _train_final_variant(
         device,
         training,
         seed=seed,
-        epochs=selected_epoch,
+        epochs=train_epochs,
         constant=constant,
         variant=variant,
     )
@@ -820,7 +673,7 @@ def _train_final_variant(
             "format": "p13a_head_only_v1",
             "variant": variant,
             "head_seed": int(seed),
-            "selected_epoch": int(selected_epoch),
+            "train_epochs": int(train_epochs),
             "model_state": {
                 key: value.detach().cpu() for key, value in model.state_dict().items()
             },
@@ -835,7 +688,7 @@ def _train_final_variant(
         "checkpoint_path": str(checkpoint_path.relative_to(output_dir)),
         "checkpoint_sha256": checkpoint_sha256(str(checkpoint_path)),
         "parameter_count": trainable_parameter_count(model),
-        "selected_epoch": int(selected_epoch),
+        "train_epochs": int(train_epochs),
         "final_training_history": history,
         "constant_feature_used": variant == "image_constant_raw312",
     }
@@ -888,21 +741,9 @@ def main() -> None:
         },
     )
     training = experiment["TRAINING"]
-    train_classes, heldout_classes = _heldout_classes(
-        cache["seen_class_ids"],
-        int(training["HELDOUT_CLASS_SPLIT_SEED"]),
-        float(training["HELDOUT_CLASS_FRACTION"]),
-    )
-    class_split = {
-        "format": "p13a_class_disjoint_selection_manifest_v1",
-        "split_seed": int(training["HELDOUT_CLASS_SPLIT_SEED"]),
-        "train_class_ids": train_classes,
-        "heldout_class_ids": heldout_classes,
-        "train_class_count": len(train_classes),
-        "heldout_class_count": len(heldout_classes),
-        "normal_unseen_class_ids_used_for_selection": False,
-    }
-    _atomic_json(output_dir / "class_disjoint_selection_manifest.json", class_split)
+    train_epochs = int(training["TRAIN_EPOCHS"])
+    if train_epochs <= 0:
+        raise ValueError("P1-3a TRAIN_EPOCHS must be positive")
     requested_device = str(args.device).lower()
     if requested_device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("P1-3a requested CUDA but CUDA is unavailable")
@@ -930,21 +771,11 @@ def main() -> None:
     for variant_index, variant in enumerate(TRAINED_VARIANTS):
         variant_seed = int(args.head_seed) * 100 + 51001 + variant_index
         semantics = _variant_semantics(variant, cache, semantic_permutation)
-        selection = _selection_phase(
-            variant,
-            cache,
-            semantics,
-            train_classes,
-            heldout_classes,
-            device,
-            training,
-            variant_seed,
-        )
         scores, final_metadata = _train_final_variant(
             variant,
             cache,
             semantics,
-            int(selection["selected_epoch"]),
+            train_epochs,
             device,
             training,
             variant_seed,
@@ -978,7 +809,6 @@ def main() -> None:
                     "image_constant_raw312",
                 },
             },
-            "selection": selection,
             "final_training": final_metadata,
             "task_metrics": _condition_task_metrics(
                 scores, cache, cfg.MONITOR.CALIBRATION.GAMMA_GRID
@@ -1008,12 +838,14 @@ def main() -> None:
             "a2_backbone_frozen": True,
             "a2_prompt_frozen": True,
             "a2_classifier_frozen_and_used_only_as_reference": True,
-            "normal_unseen_used_for_model_selection": False,
-            "class_disjoint_heldout_seen_used_for_selection": True,
+            "training_epoch_rule": "predeclared_fixed_epoch",
+            "train_epochs": train_epochs,
+            "all_official_seen_classes_used_for_training": True,
+            "evaluation_protocol": "official_final_gzsl",
+            "normal_test_environment_used_only_for_post_training_evaluation": True,
             "strict_training_seed_role": "independent_head_initialization_and_batch_order",
             "strict_probe_seed_role": "correlated_posthoc_sample_selection_robustness",
         },
-        "class_disjoint_selection": class_split,
         "feature_cache_manifest": cache_manifest,
         "conditions": conditions,
         "semantic_permutation": {

@@ -36,11 +36,10 @@ def _sync_xlsa_protocol(cfg):
         "dev": "zsl",
         "final_zsl": "zsl",
         "final_gzsl": "gzsl",
-        "b3_pseudo_gzsl": "gzsl",
     }
     if protocol_mode not in protocol_to_eval:
         raise ValueError(
-            "Unsupported DATA.XLSA.PROTOCOL_MODE='{}', expected one of ['dev', 'final_zsl', 'final_gzsl', 'b3_pseudo_gzsl'].".format(
+            "Unsupported DATA.XLSA.PROTOCOL_MODE='{}', expected one of ['dev', 'final_zsl', 'final_gzsl'].".format(
                 cfg.DATA.XLSA.PROTOCOL_MODE
             )
         )
@@ -112,7 +111,7 @@ def get_loaders(cfg, logger):
         train_loader = data_loader.construct_trainval_loader(cfg)
         logger.info("Loading final ZSL test data (test_unseen_loc)...")
         test_unseen_loader = data_loader.construct_test_unseen_loader(cfg)
-    elif protocol_mode in {"final_gzsl", "b3_pseudo_gzsl"}:
+    elif protocol_mode == "final_gzsl":
         logger.info("Loading GZSL train data for protocol %s...", protocol_mode)
         train_loader = data_loader.construct_trainval_loader(cfg)
         logger.info("Loading GZSL seen evaluation data for protocol %s...", protocol_mode)

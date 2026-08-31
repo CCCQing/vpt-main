@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import random
 import sys
 import traceback
@@ -56,6 +54,7 @@ from src.tools.search_plans.a_series.replay_decision_gain_decomposition import (
     _load_model_and_loaders,
     _source_identity,
 )
+from src.tools.search_plans.common import atomic_write_json
 
 
 SPLITS = ("train_seen", "test_seen", "test_unseen")
@@ -87,13 +86,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(str(temporary), str(path))
+    atomic_write_json(path, payload, allow_nan=False)
 
 
 def _json_safe(value: Any) -> Any:
@@ -118,21 +111,11 @@ def _load_cfg(run_dir: Path, batch_size: Optional[int], num_workers: int):
     cfg.NUM_GPUS = 1 if torch.cuda.is_available() else 0
     cfg.DATA.NUM_WORKERS = max(0, int(num_workers))
     cfg.DATA.PIN_MEMORY = bool(torch.cuda.is_available())
-    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "b3_pseudo_gzsl":
-        configured_manifest = Path(
-            str(cfg.DATA.XLSA.B3_PSEUDO_MANIFEST)
-        ).expanduser()
-        portable_manifest = run_dir / "b3_pseudo_manifest.json"
-        if not configured_manifest.is_file() and portable_manifest.is_file():
-            cfg.DATA.XLSA.B3_PSEUDO_MANIFEST = str(portable_manifest.resolve())
     if batch_size is not None:
         cfg.DATA.BATCH_SIZE = max(1, int(batch_size))
     cfg.freeze()
-    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() not in {
-        "final_gzsl",
-        "b3_pseudo_gzsl",
-    }:
-        raise ValueError("B-series replay requires a GZSL protocol")
+    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
+        raise ValueError("B-series replay requires the official final_gzsl protocol")
     if bool(cfg.MODEL.SEMANTIC_TOKENS.ENABLE):
         raise ValueError("B-series replay expects the semantic-token-free protocol")
     if not bool(cfg.MODEL.PROMPT.DISTRIBUTOR.DEEP_RESIDUAL.ENABLE):
@@ -275,6 +258,7 @@ def _predict(
     donor_mean_by_id: Optional[Mapping[str, np.ndarray]] = None,
     collect_geometry: bool = False,
     collect_source_input: bool = False,
+    collect_classifier_readout: bool = False,
     effective_prompt_zero: bool = False,
     residual_content_mode: Optional[str] = None,
     slot_permutation: Optional[Sequence[int]] = None,
@@ -286,6 +270,10 @@ def _predict(
 ) -> Dict[str, Any]:
     if prepass_cache_mode not in {None, "populate", "reuse"}:
         raise ValueError("prepass_cache_mode must be None, populate or reuse")
+    if collect_classifier_readout and not collect_source_input:
+        raise ValueError(
+            "collect_classifier_readout requires collect_source_input"
+        )
     if prepass_cache_mode is not None and not str(
         prepass_cache_namespace or ""
     ).strip():
@@ -316,6 +304,8 @@ def _predict(
     feature_batches = []
     mean_batches = []
     source_input_batches = []
+    classifier_reconstructed_logits_batches = []
+    prepass_current_head_logits_batches = []
     target_local_batches = []
     target_global_batches = []
     sample_ids = []
@@ -329,6 +319,8 @@ def _predict(
     prompt_zero_parameter_names = None
     prompt_zero_residual_module_count = None
     semantic_prototypes = None
+    classifier_score_mode = None
+    classifier_logit_scales = []
     prompt_state_batches: Dict[int, Dict[str, list[np.ndarray]]] = {}
     cache_key_count = 0
     requested_mode = (
@@ -464,6 +456,49 @@ def _predict(
             semantic_prototypes = current_semantic.copy()
         elif not np.array_equal(semantic_prototypes, current_semantic):
             raise RuntimeError("projected semantic prototypes changed between batches")
+        current_score_mode = str(
+            getattr(module.r_similarity_head, "score_mode", "")
+        ).lower()
+        current_scale = getattr(
+            module.r_similarity_head, "_loss_last_logit_scale", None
+        )
+        if current_score_mode not in {"dot", "cosine"} or not torch.is_tensor(
+            current_scale
+        ):
+            raise RuntimeError("classifier score-mode or logit-scale trace is unavailable")
+        if classifier_score_mode is None:
+            classifier_score_mode = current_score_mode
+        elif classifier_score_mode != current_score_mode:
+            raise RuntimeError("classifier score mode changed between batches")
+        classifier_logit_scales.append(float(current_scale.detach().cpu().item()))
+        if collect_source_input:
+            source_input = distribution_state.get("visual_input")
+            if not torch.is_tensor(source_input) or source_input.dim() != 2:
+                raise RuntimeError(
+                    "Prompt Distributor visual_input trace is unavailable"
+                )
+            source_input_batches.append(
+                source_input.detach().cpu().float().numpy()
+            )
+        if collect_classifier_readout:
+            reconstructed_logits = (
+                classifier_state["visual_repr"]
+                @ classifier_state["semantic_repr"].t()
+            ) * current_scale
+            classifier_reconstructed_logits_batches.append(
+                reconstructed_logits.detach().cpu().float().numpy()
+            )
+            prepass_repr = (
+                source_input
+                if current_score_mode == "dot"
+                else torch.nn.functional.normalize(source_input, dim=-1)
+            )
+            prepass_logits = (
+                prepass_repr @ classifier_state["semantic_repr"].t()
+            ) * current_scale
+            prepass_current_head_logits_batches.append(
+                prepass_logits.detach().cpu().float().numpy()
+            )
         if len(trace) != _model_num_layers(model):
             raise RuntimeError("Deep Prompt residual trace does not cover all layers")
         if collect_prompt_slot_states:
@@ -630,15 +665,6 @@ def _predict(
             classifier_state["visual_input"].detach().cpu().float().numpy()
         )
         mean_batches.append(distribution_state["mu"].detach().cpu().float().numpy())
-        if collect_source_input:
-            source_input = distribution_state.get("visual_input")
-            if not torch.is_tensor(source_input) or source_input.dim() != 2:
-                raise RuntimeError(
-                    "Prompt Distributor visual_input trace is unavailable"
-                )
-            source_input_batches.append(
-                source_input.detach().cpu().float().numpy()
-            )
         target_local_batches.append(local.numpy())
         target_global_batches.append(labels.numpy())
         sample_ids.extend(identifiers)
@@ -695,6 +721,22 @@ def _predict(
             ),
         },
         "semantic_prototypes": semantic_prototypes,
+        "classifier_contract": {
+            "score_mode": classifier_score_mode,
+            "logit_scale": float(classifier_logit_scales[0]),
+            "logit_scale_min": float(min(classifier_logit_scales)),
+            "logit_scale_max": float(max(classifier_logit_scales)),
+            "logit_scale_constant_across_batches": bool(
+                np.allclose(
+                    classifier_logit_scales,
+                    classifier_logit_scales[0],
+                    rtol=1.0e-7,
+                    atol=1.0e-7,
+                )
+            ),
+            "visual_object": "classifier_visual_input",
+            "semantic_object": "classifier_semantic_repr",
+        },
         "prepass_cache_contract": {
             "mode": prepass_cache_mode,
             "namespace": prepass_cache_namespace,
@@ -740,6 +782,13 @@ def _predict(
         result["geometry"]["layer_ids"] = layer_ids
     if collect_source_input:
         result["source_input"] = np.concatenate(source_input_batches, axis=0)
+        if collect_classifier_readout:
+            result["classifier_reconstructed_logits"] = np.concatenate(
+                classifier_reconstructed_logits_batches, axis=0
+            )
+            result["prepass_current_head_logits"] = np.concatenate(
+                prepass_current_head_logits_batches, axis=0
+            )
     return result
 
 
@@ -977,15 +1026,6 @@ def main() -> None:
     np.random.seed(int(cfg.SEED))
     random.seed(int(cfg.SEED))
     identity, checkpoint = _source_identity(source_run, cfg)
-    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "b3_pseudo_gzsl":
-        manifest_path = Path(str(cfg.DATA.XLSA.B3_PSEUDO_MANIFEST)).resolve()
-        recorded_manifest = checkpoint.get("b3_pseudo_manifest")
-        if not manifest_path.is_file() or not isinstance(recorded_manifest, dict):
-            raise ValueError("B3 replay source has no verifiable pseudo manifest")
-        if str(recorded_manifest.get("sha256", "")) != checkpoint_sha256(
-            str(manifest_path)
-        ):
-            raise ValueError("B3 replay manifest does not match the source checkpoint")
     model, device, full_test_loaders = _load_model_and_loaders(
         source_run, cfg, checkpoint
     )

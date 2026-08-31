@@ -19,17 +19,14 @@ vit_prompt 主干实现。
 """
 import math
 import os
-import numpy as np
 import torch
 import torch.nn as nn
-import torchvision as tv
 from typing import Optional, Dict, Any, Tuple, List
 
 from functools import reduce
 from operator import mul
 from torch.nn.modules.utils import _pair
-from torch.nn import Conv2d, Dropout, LayerNorm
-from scipy import ndimage
+from torch.nn import Dropout
 
 
 from ..vit_backbones.vit import (
@@ -38,7 +35,6 @@ from ..vit_backbones.vit import (
     VisionTransformer,
     _attach_prompt_continuity_to_layer,
     _offload_diagnostic_tree,
-    np2th,
 )
 from ...utils import logging
 from ...utils.reproducibility import make_torch_generator
@@ -47,13 +43,6 @@ from ..prompting.prompt_distribution import MeanConditionedDeepPromptResidual
 logger = logging.get_logger("visual_prompt")
 
 
-class _UnusedCrossAttention(nn.Module):
-    """最小跨注意力单元。
-
-    它只负责一件事：让 query 序列从 source 序列中读取上下文。
-    文件里语义、prompt、visual 三者的交互都复用它，因此它不绑定任何业务语义，
-    只关心输入输出的张量形状。
-    """
 class SemanticTokenProjector(nn.Module):
     """轻量语义交互分支。
 
@@ -109,22 +98,6 @@ class SemanticTokenProjector(nn.Module):
         if int(semantic_dim) != self.input_dim:
             raise ValueError(f"Semantic input dim mismatch: expected {self.input_dim}, got {int(semantic_dim)}")
 
-    def _gamma(self, layer_idx: int, num_layers: int) -> float:
-        """返回当前层的语义更新强度。
-
-        设计意图是：
-        - 早层尽量少动语义状态
-        - 到允许交互的层区间后，再逐步增大语义更新幅度
-        """
-        if layer_idx < self.start_layer:
-            return 0.0
-        end_layer = self.end_layer if self.end_layer >= 0 else (num_layers - 1)
-        if layer_idx > end_layer:
-            return 0.0
-        span = max(1, end_layer - self.start_layer)
-        t = float(layer_idx - self.start_layer) / float(span)
-        return self.gamma_min + (self.gamma_max - self.gamma_min) * t
-
     def init_state(self, semantics: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """初始化语义状态。
 
@@ -179,19 +152,6 @@ class SemanticTokenProjector(nn.Module):
             "semantic_token": semantic_token,
         }
         return semantic_token, state
-
-    def _disabled_step(self, sem_state: torch.Tensor, prompt_tokens: torch.Tensor, visual_tokens: torch.Tensor,
-        layer_idx: int, num_layers: int,) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Dict[str, float]]:
-        """执行单层语义交互更新：sem_state 作为 query，从 prompt+visual token 中读取上下文。"""
-        raise RuntimeError("Semantic tokens are updated only by ViT self-attention in the main token sequence.")
-
-    def export_token_state(self, sem_state: torch.Tensor) -> torch.Tensor:
-        """最简输出接口。
-
-        旧版会再过 readout head，把语义 token 汇聚成最终语义向量。
-        当前语义状态已经是单个 [B,D] 向量，所以直接返回即可。
-        """
-        return sem_state
 
     def finalize_state(self, encoded: torch.Tensor, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         # linear 旧路径只缓存输入/输出语义 token，便于和 orthogonal 路径统一读取。
@@ -521,7 +481,6 @@ class OrthogonalSemanticTokenizer(nn.Module):
             raise ValueError(f"Semantic input dim mismatch: expected {self.input_dim}, got {int(semantics.shape[-1])}")
 
         semantics = semantics.to(device=device, dtype=torch.float32)
-        batch_size = int(semantics.shape[0])
         tokens: List[torch.Tensor] = []
         # a_i @ W_i
         for group_id in range(self.num_tokens):
@@ -694,10 +653,6 @@ class PromptedTransformer(Transformer):
         self._last_prompt_path_info = {}
         self._last_prompt_distribution_stats = None
         self._last_injected_prompt_tokens = None
-        self._last_layer_prompt_trace = []
-        self._last_deep_prompt_residual_trace = []
-        self._current_deep_residual_mean = None
-        layer_zero_trace = None
         self._last_layer_prompt_trace = []
         self._last_deep_prompt_residual_trace = []
         self._current_deep_residual_mean = None
@@ -1322,7 +1277,6 @@ class PromptedTransformer(Transformer):
         hidden_states = embedding_output
         weights = None
         num_layers = self.vit_config.transformer["num_layers"]
-        sem_state, semantic_input = None, None
         semantic_length = self._active_semantic_length(semantics)
         if self.attention_mediation_enable and semantic_length <= 0:
             raise ValueError("Attention mediation requires semantic tensor input for every forward pass.")
@@ -1409,7 +1363,6 @@ class PromptedTransformer(Transformer):
         hidden_states = embedding_output
         weights = None
         num_layers = self.vit_config.transformer["num_layers"]
-        sem_state, semantic_input = None, None
         semantic_length = self._active_semantic_length(semantics)
         if self.attention_mediation_enable and semantic_length <= 0:
             raise ValueError("Attention mediation requires semantic tensor input for every forward pass.")

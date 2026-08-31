@@ -629,7 +629,7 @@ def _with_monitor_scores(row: MutableMapping[str, Any]) -> Dict[str, Any]:
     score += _lower_is_better(scored, "graph_prob_prior_monitor_false_high_prior_relation_still_gt_0_9_count", 20.0, 0.8)
     score += _lower_is_better(scored, "graph_prob_prior_monitor_prior_gzsl_unseen_to_seen_bias_risk_mean", 1.0, 0.5)
     score += _higher_is_better(scored, "graph_prob_prior_graph_gp_energy_margin_positive_ratio", 0.50, 1.0)
-    score += _higher_is_better(scored, "graph_prob_prior_graph_gp_energy_pseudo_unseen_acc", 0.20, 1.0)
+    score += _higher_is_better(scored, "graph_prob_prior_graph_gp_energy_acc", 0.20, 1.0)
     score += _upper_penalty(scored, "graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio", 0.10, 1.0)
 
     loss = _row_float(scored, "graph_prob_prior_match_loss")

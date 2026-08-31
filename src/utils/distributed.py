@@ -8,7 +8,6 @@ Distributed helpers.
 
 import torch
 import torch.distributed as dist
-_LOCAL_PROCESS_GROUP = None
 
 
 def get_world_size() -> int:
@@ -115,59 +114,3 @@ def scaled_all_reduce(cfg, tensors):
     for tensor in tensors:
         tensor.mul_(1.0 / world_size)
     return tensors
-
-
-def cat_all_gather(tensors):
-    """Performs the concatenated all_gather operation on the provided tensors.
-    """
-    tensors_gather = [
-        torch.ones_like(tensors)
-        for _ in range(torch.distributed.get_world_size())
-    ]
-    torch.distributed.all_gather(tensors_gather, tensors, async_op=False)
-
-    output = torch.cat(tensors_gather, dim=0)
-    return output
-
-
-def local_cat_all_gather(tensors):
-    """Performs the concatenated all_gather operation on the provided tensors.
-    """
-    tensors_gather = [
-        torch.ones_like(tensors)
-        for _ in range(get_local_size())
-    ]
-    torch.distributed.all_gather(
-        tensors_gather,
-        tensors,
-        async_op=False,
-        group=_LOCAL_PROCESS_GROUP,
-    )
-    output = torch.cat(tensors_gather, dim=0)
-    return output
-
-
-def get_local_size():
-    """
-    Returns:
-        The size of the per-machine process group,
-        i.e. the number of processes per machine.
-    """
-    if not dist.is_available():
-        return 1
-    if not dist.is_initialized():
-        return 1
-    return dist.get_world_size(group=_LOCAL_PROCESS_GROUP)
-
-
-def get_local_rank():
-    """
-    Returns:
-        The rank of the current process within the local (per-machine) process group.
-    """
-    if not dist.is_available():
-        return 0
-    if not dist.is_initialized():
-        return 0
-    assert _LOCAL_PROCESS_GROUP is not None
-    return dist.get_rank(group=_LOCAL_PROCESS_GROUP)

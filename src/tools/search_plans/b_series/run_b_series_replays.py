@@ -18,6 +18,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+from src.tools.search_plans.common import (
+    directory_has_contents as _has_contents,
+    parse_gpu_worker_slots as _gpu_groups,
+)
 
 
 RUN_SUFFIX = Path("CUB/sup_vitb16_224/lr0.0006_wd1e-05/run1")
@@ -56,13 +60,6 @@ def _selection_seeds(raw: str, scope: str) -> List[int]:
     return values
 
 
-def _gpu_groups(raw: str) -> List[str]:
-    values = [value.strip() for value in str(raw).split(";") if value.strip()]
-    if not values or any("," in value for value in values):
-        raise ValueError("GPU worker slots must be single cards separated by semicolons")
-    return values
-
-
 def _valid_output(path: Path) -> bool:
     summary = path / "b_series_replay_summary.json"
     if not summary.is_file():
@@ -72,10 +69,6 @@ def _valid_output(path: Path) -> bool:
     except (OSError, ValueError):
         return False
     return payload.get("status") == "completed" and payload.get("valid") is True
-
-
-def _has_contents(path: Path) -> bool:
-    return path.is_dir() and next(path.iterdir(), None) is not None
 
 
 def _build_jobs(args, seeds: List[int]) -> List[Job]:

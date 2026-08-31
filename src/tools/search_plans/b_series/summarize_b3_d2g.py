@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from functools import lru_cache
 from pathlib import Path
 from statistics import mean
 from typing import Any, Iterable
@@ -27,6 +28,7 @@ SPACES = (
     "trained_mu_geometry",
     "random_mu_geometry_mean",
     "normal_final_cls_geometry",
+    "cls_delta_geometry",
     "residual_zero_final_cls_geometry",
 )
 DELTA_NAMES = (
@@ -56,6 +58,23 @@ TASK_METRICS = (
     "harmonic_mean",
     "ausuc",
 )
+TRANSPORT_SAMPLE_METRICS = (
+    "prepass_final_cls_cosine",
+    "prepass_final_cls_l2_distance",
+    "delta_to_prepass_norm_ratio",
+)
+TRANSPORT_RELATION_METRICS = (
+    "sample_pair_distance_spearman",
+    "class_center_distance_spearman",
+    "linear_cka",
+)
+HEAD_GAIN_METRICS = ("top1", "top5", "per_class", "nll_improvement")
+TRANSITION_METRICS = (
+    "corrected_rate",
+    "regressed_rate",
+    "prediction_agreement_rate",
+    "net_correction_rate",
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -65,6 +84,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+@lru_cache(maxsize=None)
 def _load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -82,6 +102,13 @@ def _stats(values: Iterable[float]) -> dict[str, float | int]:
         "negative_count": sum(value < 0.0 for value in data),
         "zero_count": sum(value == 0.0 for value in data),
     }
+
+
+def _optional_stats(values: Iterable[float | None]) -> dict[str, Any]:
+    data = [float(value) for value in values if value is not None]
+    if not data:
+        return {"status": "not_observed", "count": 0}
+    return {"status": "observed", **_stats(data)}
 
 
 def _run_dir(
@@ -134,7 +161,7 @@ def _validate(root: Path) -> dict[str, Any]:
                         and summary.get("D2G", {}).get("valid")
                         and result.get("valid")
                         and result.get("format")
-                        == "b3_d2g_source_to_decision_chain_v2"
+                        == "b3_d2g_source_to_decision_chain_v3"
                         and result.get("decision_space_dim") == 200
                         and result.get("downstream_validity", {}).get("valid")
                         and result.get("semantic_reference", {})
@@ -238,6 +265,20 @@ def _full(root: Path) -> dict[str, Any]:
                 "spaces": {},
                 "deltas": {},
                 "relationships": {},
+                "prepass_final_transport": {
+                    "sample_transport": {},
+                    "relationship_metrics": {},
+                    "geometry_delta": {},
+                },
+                "prepass_final_semantic_transport": {
+                    "alignment_delta": {},
+                    "raw_projection_visual_relation": {},
+                },
+                "current_head_representation_gain": {},
+                "prediction_transition": {
+                    "overall": {},
+                    "groups": {},
+                },
                 "visual_semantic": {
                     "normal": {"alignment": {}, "semantic_graph": {}},
                     "residual_zero": {"alignment": {}, "semantic_graph": {}},
@@ -277,6 +318,126 @@ def _full(root: Path) -> dict[str, Any]:
                     document["splits"][split_name]["relationship_metrics"]["trained"][metric]
                     for document in documents
                 )
+            for metric in TRANSPORT_SAMPLE_METRICS:
+                split_result["prepass_final_transport"]["sample_transport"][
+                    metric
+                ] = _stats(
+                    document["splits"][split_name][
+                        "prepass_final_cls_transport"
+                    ]["sample_transport"][metric]["mean"]
+                    for document in documents
+                )
+            for metric in TRANSPORT_RELATION_METRICS:
+                split_result["prepass_final_transport"]["relationship_metrics"][
+                    metric
+                ] = _stats(
+                    document["splits"][split_name][
+                        "prepass_final_cls_transport"
+                    ]["relationship_metrics"][metric]
+                    for document in documents
+                )
+            for metric in METRICS:
+                split_result["prepass_final_transport"]["geometry_delta"][
+                    metric
+                ] = _stats(
+                    document["splits"][split_name][
+                        "prepass_final_cls_transport"
+                    ]["final_minus_prepass_geometry"][metric]
+                    for document in documents
+                )
+            for metric in ALIGNMENT_METRICS:
+                split_result["prepass_final_semantic_transport"][
+                    "alignment_delta"
+                ][metric] = _stats(
+                    document["splits"][split_name][
+                        "prepass_final_semantic_transport"
+                    ]["paired_deltas"]["final_minus_prepass"]["alignment"][metric]
+                    for document in documents
+                )
+            split_result["prepass_final_semantic_transport"][
+                "alignment_delta"
+            ]["true_prototype_rank_improvement"] = _stats(
+                document["splits"][split_name][
+                    "prepass_final_semantic_transport"
+                ]["paired_deltas"]["final_minus_prepass"][
+                    "true_prototype_rank_improvement"
+                ]
+                for document in documents
+            )
+            for object_name in ("frozen_prepass_cls", "normal_final_cls"):
+                split_result["prepass_final_semantic_transport"][
+                    "raw_projection_visual_relation"
+                ][object_name] = {}
+                for metric in (
+                    "semantic_visual_relation_spearman_312",
+                    "semantic_visual_relation_spearman_768",
+                    "semantic_visual_neighbor_overlap_at_5_312",
+                    "semantic_visual_neighbor_overlap_at_5_768",
+                    "false_high_semantic_edge_rate_312",
+                    "false_high_semantic_edge_rate_768",
+                ):
+                    split_result["prepass_final_semantic_transport"][
+                        "raw_projection_visual_relation"
+                    ][object_name][metric] = _stats(
+                        document["splits"][split_name][
+                            "prepass_final_semantic_transport"
+                        ]["raw_312d_vs_projected_768d_relation"][object_name][metric]
+                        for document in documents
+                    )
+            head_gain = split_result["current_head_representation_gain"]
+            for metric in HEAD_GAIN_METRICS:
+                head_gain[metric] = _stats(
+                    document["splits"][split_name][
+                        "current_head_representation_factorial"
+                    ]["representation_gain_by_head"]["current_head"][
+                        "classification_target_minus_reference"
+                    ][metric]
+                    for document in documents
+                )
+            for metric in TRANSITION_METRICS:
+                split_result["prediction_transition"]["overall"][metric] = _stats(
+                    document["splits"][split_name]["prediction_transition_groups"][
+                        "overall_transition"
+                    ][metric]
+                    for document in documents
+                )
+            for group_name in (
+                "stable_correct",
+                "corrected",
+                "regressed",
+                "stable_wrong",
+            ):
+                group_documents = [
+                    document["splits"][split_name]["prediction_transition_groups"][
+                        "groups"
+                    ][group_name]
+                    for document in documents
+                ]
+                split_result["prediction_transition"]["groups"][group_name] = {
+                    "sample_count": _stats(
+                        group["sample_count"] for group in group_documents
+                    ),
+                    "prediction_flip_rate": _optional_stats(
+                        group.get("prediction_flip_rate")
+                        for group in group_documents
+                    ),
+                }
+                for metric in (
+                    "prepass_final_cls_cosine",
+                    "semantic_margin_delta_final_minus_prepass",
+                    "true_prototype_rank_improvement",
+                    "true_logit_margin_delta_target_minus_reference",
+                ):
+                    split_result["prediction_transition"]["groups"][group_name][
+                        metric
+                    ] = _optional_stats(
+                        (
+                            group["metrics"][metric]["mean"]
+                            if group.get("metrics") is not None
+                            else None
+                        )
+                        for group in group_documents
+                    )
             for condition in ("normal", "residual_zero"):
                 for metric in ALIGNMENT_METRICS:
                     split_result["visual_semantic"][condition]["alignment"][
@@ -366,6 +527,36 @@ def _full(root: Path) -> dict[str, Any]:
             )
             for metric in TASK_METRICS
         }
+        method_result["head_representation_task_factorial"] = {
+            "frozen_prepass_cls_current_head": {
+                metric: _stats(
+                    document["head_representation_task_factorial"]["cells"][
+                        "frozen_prepass_cls/current_head"
+                    ]["gzsl"][metric]
+                    for document in documents
+                )
+                for metric in TASK_METRICS
+            },
+            "normal_final_cls_current_head": {
+                metric: _stats(
+                    document["head_representation_task_factorial"]["cells"][
+                        "normal_final_cls/current_head"
+                    ]["gzsl"][metric]
+                    for document in documents
+                )
+                for metric in TASK_METRICS
+            },
+            "representation_gain_final_minus_prepass": {
+                metric: _stats(
+                    document["head_representation_task_factorial"][
+                        "representation_gain_current_head_final_minus_prepass"
+                    ][metric]
+                    for document in documents
+                )
+                for metric in TASK_METRICS
+            },
+            "candidate_head_status": "not_available_not_trained",
+        }
         result[method] = method_result
     return result
 
@@ -392,12 +583,136 @@ def _probe(root: Path) -> dict[str, Any]:
         for split_name in SPLITS:
             split_result: dict[str, Any] = {
                 "absolute_geometry_deltas": {},
+                "prepass_final_transport": {
+                    "sample_transport": {},
+                    "relationship_metrics": {},
+                    "geometry_delta": {},
+                },
+                "prepass_final_semantic_transport": {},
+                "current_head_representation_gain": {},
+                "prediction_transition_overall": {},
                 "visual_semantic_deltas": {
                     "alignment": {},
                     "semantic_graph": {},
                 },
                 "logit_geometry_deltas": {},
             }
+            for metric in TRANSPORT_SAMPLE_METRICS:
+                values = {
+                    training_seed: [
+                        float(
+                            _document(root, method, training_seed, selection_seed)[
+                                "splits"
+                            ][split_name]["prepass_final_cls_transport"][
+                                "sample_transport"
+                            ][metric]["mean"]
+                        )
+                        for selection_seed in SELECTION_SEEDS
+                    ]
+                    for training_seed in TRAINING_SEEDS
+                }
+                split_result["prepass_final_transport"]["sample_transport"][
+                    metric
+                ] = _hierarchical_probe(values)
+            for metric in TRANSPORT_RELATION_METRICS:
+                values = {
+                    training_seed: [
+                        float(
+                            _document(root, method, training_seed, selection_seed)[
+                                "splits"
+                            ][split_name]["prepass_final_cls_transport"][
+                                "relationship_metrics"
+                            ][metric]
+                        )
+                        for selection_seed in SELECTION_SEEDS
+                    ]
+                    for training_seed in TRAINING_SEEDS
+                }
+                split_result["prepass_final_transport"]["relationship_metrics"][
+                    metric
+                ] = _hierarchical_probe(values)
+            for metric in METRICS:
+                values = {
+                    training_seed: [
+                        float(
+                            _document(root, method, training_seed, selection_seed)[
+                                "splits"
+                            ][split_name]["prepass_final_cls_transport"][
+                                "final_minus_prepass_geometry"
+                            ][metric]
+                        )
+                        for selection_seed in SELECTION_SEEDS
+                    ]
+                    for training_seed in TRAINING_SEEDS
+                }
+                split_result["prepass_final_transport"]["geometry_delta"][
+                    metric
+                ] = _hierarchical_probe(values)
+            for metric in (*ALIGNMENT_METRICS, "true_prototype_rank_improvement"):
+                values = {
+                    training_seed: [
+                        float(
+                            (
+                                _document(
+                                    root, method, training_seed, selection_seed
+                                )["splits"][split_name][
+                                    "prepass_final_semantic_transport"
+                                ]["paired_deltas"]["final_minus_prepass"][
+                                    "true_prototype_rank_improvement"
+                                ]
+                                if metric == "true_prototype_rank_improvement"
+                                else _document(
+                                    root, method, training_seed, selection_seed
+                                )["splits"][split_name][
+                                    "prepass_final_semantic_transport"
+                                ]["paired_deltas"]["final_minus_prepass"][
+                                    "alignment"
+                                ][metric]
+                            )
+                        )
+                        for selection_seed in SELECTION_SEEDS
+                    ]
+                    for training_seed in TRAINING_SEEDS
+                }
+                split_result["prepass_final_semantic_transport"][
+                    metric
+                ] = _hierarchical_probe(values)
+            for metric in HEAD_GAIN_METRICS:
+                values = {
+                    training_seed: [
+                        float(
+                            _document(root, method, training_seed, selection_seed)[
+                                "splits"
+                            ][split_name]["current_head_representation_factorial"][
+                                "representation_gain_by_head"
+                            ]["current_head"][
+                                "classification_target_minus_reference"
+                            ][metric]
+                        )
+                        for selection_seed in SELECTION_SEEDS
+                    ]
+                    for training_seed in TRAINING_SEEDS
+                }
+                split_result["current_head_representation_gain"][
+                    metric
+                ] = _hierarchical_probe(values)
+            for metric in TRANSITION_METRICS:
+                values = {
+                    training_seed: [
+                        float(
+                            _document(root, method, training_seed, selection_seed)[
+                                "splits"
+                            ][split_name]["prediction_transition_groups"][
+                                "overall_transition"
+                            ][metric]
+                        )
+                        for selection_seed in SELECTION_SEEDS
+                    ]
+                    for training_seed in TRAINING_SEEDS
+                }
+                split_result["prediction_transition_overall"][
+                    metric
+                ] = _hierarchical_probe(values)
             for delta_name in DELTA_NAMES:
                 split_result["absolute_geometry_deltas"][delta_name] = {}
                 for metric in METRICS:
@@ -485,6 +800,24 @@ def _probe(root: Path) -> dict[str, Any]:
                 for training_seed in TRAINING_SEEDS
             }
             method_result["task_result_deltas"][metric] = _hierarchical_probe(values)
+        method_result["head_representation_task_deltas"] = {}
+        for metric in TASK_METRICS:
+            values = {
+                training_seed: [
+                    float(
+                        _document(root, method, training_seed, selection_seed)[
+                            "head_representation_task_factorial"
+                        ]["representation_gain_current_head_final_minus_prepass"][
+                            metric
+                        ]
+                    )
+                    for selection_seed in SELECTION_SEEDS
+                ]
+                for training_seed in TRAINING_SEEDS
+            }
+            method_result["head_representation_task_deltas"][
+                metric
+            ] = _hierarchical_probe(values)
         result[method] = method_result
     return result
 
@@ -493,6 +826,16 @@ def _format(entry: dict[str, Any]) -> str:
     return "{:.4f} ({:.4f}~{:.4f})".format(
         entry["mean"], entry["min"], entry["max"]
     )
+
+
+def _format_optional(entry: dict[str, Any]) -> str:
+    if entry.get("status") == "not_observed":
+        return "not observed"
+    return _format(entry)
+
+
+def _probe_entry(payload: dict[str, Any]) -> dict[str, Any]:
+    return payload["across_training_seed_checkpoint_means"]
 
 
 def _render(summary: dict[str, Any]) -> str:
@@ -561,6 +904,153 @@ def _render(summary: dict[str, Any]) -> str:
                 )
     lines += [
         "",
+        "## Full prepass CLS to final CLS transport",
+        "",
+        "The current head is held fixed. Head gains below therefore isolate the representation change; candidate-head cells remain unavailable until P1-3a is trained.",
+        "",
+        "| method | split | CLS cosine | delta/prepass norm | dCLS Fisher | dSemantic margin | rank improvement | current-head dTop1 | corrected | regressed |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for method in METHODS:
+        for split_name in SPLITS:
+            split = summary["full"][method][split_name]
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                    method,
+                    split_name,
+                    _format(
+                        split["prepass_final_transport"]["sample_transport"][
+                            "prepass_final_cls_cosine"
+                        ]
+                    ),
+                    _format(
+                        split["prepass_final_transport"]["sample_transport"][
+                            "delta_to_prepass_norm_ratio"
+                        ]
+                    ),
+                    _format(
+                        split["prepass_final_transport"]["geometry_delta"][
+                            "fisher_trace_ratio"
+                        ]
+                    ),
+                    _format(
+                        split["prepass_final_semantic_transport"][
+                            "alignment_delta"
+                        ]["semantic_margin"]
+                    ),
+                    _format(
+                        split["prepass_final_semantic_transport"][
+                            "alignment_delta"
+                        ]["true_prototype_rank_improvement"]
+                    ),
+                    _format(split["current_head_representation_gain"]["top1"]),
+                    _format(
+                        split["prediction_transition"]["overall"][
+                            "corrected_rate"
+                        ]
+                    ),
+                    _format(
+                        split["prediction_transition"]["overall"][
+                            "regressed_rate"
+                        ]
+                    ),
+                )
+            )
+    lines += [
+        "",
+        "## Full prepass-to-final relation retention",
+        "",
+        "| method | split | CLS L2 | sample-pair distance Spearman | class-center distance Spearman | linear CKA |",
+        "|---|---|---:|---:|---:|---:|",
+    ]
+    for method in METHODS:
+        for split_name in SPLITS:
+            transport = summary["full"][method][split_name][
+                "prepass_final_transport"
+            ]
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} |".format(
+                    method,
+                    split_name,
+                    _format(
+                        transport["sample_transport"][
+                            "prepass_final_cls_l2_distance"
+                        ]
+                    ),
+                    _format(
+                        transport["relationship_metrics"][
+                            "sample_pair_distance_spearman"
+                        ]
+                    ),
+                    _format(
+                        transport["relationship_metrics"][
+                            "class_center_distance_spearman"
+                        ]
+                    ),
+                    _format(transport["relationship_metrics"]["linear_cka"]),
+                )
+            )
+    lines += [
+        "",
+        "## Full 312/768 semantic relation to visual centers",
+        "",
+        "Raw 312-D attributes and projected 768-D prototypes are compared with visual class centers through class-relation matrices, not direct cross-dimensional vector cosine.",
+        "",
+        "| method | split | visual object | relation Spearman 312 | relation Spearman 768 | neighbor overlap 312 | neighbor overlap 768 | false-high edge 312 | false-high edge 768 |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for method in METHODS:
+        for split_name in SPLITS:
+            objects = summary["full"][method][split_name][
+                "prepass_final_semantic_transport"
+            ]["raw_projection_visual_relation"]
+            for object_name, metrics in objects.items():
+                lines.append(
+                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                        method,
+                        split_name,
+                        object_name,
+                        _format(metrics["semantic_visual_relation_spearman_312"]),
+                        _format(metrics["semantic_visual_relation_spearman_768"]),
+                        _format(
+                            metrics["semantic_visual_neighbor_overlap_at_5_312"]
+                        ),
+                        _format(
+                            metrics["semantic_visual_neighbor_overlap_at_5_768"]
+                        ),
+                        _format(metrics["false_high_semantic_edge_rate_312"]),
+                        _format(metrics["false_high_semantic_edge_rate_768"]),
+                    )
+                )
+    lines += [
+        "",
+        "## Full test-unseen transition groups",
+        "",
+        "These four groups are post-hoc descriptions of the same current head before/after the representation transition; they are not training targets or causal proof.",
+        "",
+        "| method | group | samples | CLS cosine | dSemantic margin | rank improvement | dTrue-logit margin |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for method in METHODS:
+        groups = summary["full"][method]["test_unseen"][
+            "prediction_transition"
+        ]["groups"]
+        for group_name, group in groups.items():
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} | {} |".format(
+                    method,
+                    group_name,
+                    _format(group["sample_count"]),
+                    _format_optional(group["prepass_final_cls_cosine"]),
+                    _format_optional(group["semantic_margin_delta_final_minus_prepass"]),
+                    _format_optional(group["true_prototype_rank_improvement"]),
+                    _format_optional(
+                        group["true_logit_margin_delta_target_minus_reference"]
+                    ),
+                )
+            )
+    lines += [
+        "",
         "## Full source-to-decision paired chain",
         "",
         "All values are normal minus Residual-zero inside the same checkpoint and sample manifest.",
@@ -594,6 +1084,32 @@ def _render(summary: dict[str, Any]) -> str:
             )
     lines += [
         "",
+        "## Full fixed-current-head task readout",
+        "",
+        "The same current classifier head reads frozen prepass CLS and normal final CLS. Candidate-head cells and the interaction remain unavailable.",
+        "",
+        "| method | representation | Seen | Unseen | H | AUSUC |",
+        "|---|---|---:|---:|---:|---:|",
+    ]
+    for method in METHODS:
+        task = summary["full"][method]["head_representation_task_factorial"]
+        for cell_name in (
+            "frozen_prepass_cls_current_head",
+            "normal_final_cls_current_head",
+            "representation_gain_final_minus_prepass",
+        ):
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} |".format(
+                    method,
+                    cell_name,
+                    _format(task[cell_name]["seen_per_class_accuracy"]),
+                    _format(task[cell_name]["unseen_per_class_accuracy"]),
+                    _format(task[cell_name]["harmonic_mean"]),
+                    _format(task[cell_name]["ausuc"]),
+                )
+            )
+    lines += [
+        "",
         "## Full task endpoints",
         "",
         "| method | condition | Seen | Unseen | H | AUSUC |",
@@ -612,6 +1128,65 @@ def _render(summary: dict[str, Any]) -> str:
                     _format(task[condition]["ausuc"]),
                 )
             )
+    lines += [
+        "",
+        "## Strict three-Probe transport check (test-unseen)",
+        "",
+        "Each value first averages the three selection seeds inside one checkpoint, then summarizes the three independent training checkpoints.",
+        "",
+        "| method | CLS cosine | dCLS Fisher | dSemantic margin | current-head dTop1 | corrected | regressed | fixed-head dH |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for method in METHODS:
+        split = summary["probe_robustness"][method]["test_unseen"]
+        lines.append(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |".format(
+                method,
+                _format(
+                    _probe_entry(
+                        split["prepass_final_transport"]["sample_transport"][
+                            "prepass_final_cls_cosine"
+                        ]
+                    )
+                ),
+                _format(
+                    _probe_entry(
+                        split["prepass_final_transport"]["geometry_delta"][
+                            "fisher_trace_ratio"
+                        ]
+                    )
+                ),
+                _format(
+                    _probe_entry(
+                        split["prepass_final_semantic_transport"][
+                            "semantic_margin"
+                        ]
+                    )
+                ),
+                _format(
+                    _probe_entry(
+                        split["current_head_representation_gain"]["top1"]
+                    )
+                ),
+                _format(
+                    _probe_entry(
+                        split["prediction_transition_overall"]["corrected_rate"]
+                    )
+                ),
+                _format(
+                    _probe_entry(
+                        split["prediction_transition_overall"]["regressed_rate"]
+                    )
+                ),
+                _format(
+                    _probe_entry(
+                        summary["probe_robustness"][method][
+                            "head_representation_task_deltas"
+                        ]["harmonic_mean"]
+                    )
+                ),
+            )
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -623,7 +1198,7 @@ def main() -> int:
     if not completeness["complete"]:
         raise RuntimeError("D2-G evidence matrix is incomplete: {}".format(completeness))
     summary = {
-        "format": "b3_d2g_aggregate_v1",
+        "format": "b3_d2g_aggregate_v2",
         "statistical_identity": {
             "full": "three independent training seeds",
             "probe": "three selection seeds nested inside each checkpoint",

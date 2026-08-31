@@ -335,7 +335,7 @@ def main():
         "format": "cross_experiment_robustness_summary_v1",
         "analysis_role": "diagnostic_only",
         "checkpoint_selection_allowed": False,
-        "selection_protocol_required": "independent_dev_or_pseudo_unseen_validation",
+        "selection_protocol_required": "predeclared_fixed_training_and_official_final_gzsl_evaluation",
         "reference_experiment": reference_name,
         "comparison_row_count": len(rows),
         "rows": rows,

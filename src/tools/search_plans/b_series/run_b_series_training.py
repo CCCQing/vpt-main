@@ -19,6 +19,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+from src.tools.search_plans.common import (
+    directory_has_contents as _has_contents,
+    read_json as _read_json,
+)
 
 
 CONFIG_ROOT = ROOT / "configs" / "b_series_experiments"
@@ -91,10 +95,6 @@ def _gpu_groups(raw: str) -> List[str]:
     return values
 
 
-def _read_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _validate_e7_preconditions(path: Path, requested_groups: Sequence[str]) -> Dict[str, object]:
     e7_requested = any(group.startswith("E7-") for group in requested_groups)
     if not e7_requested:
@@ -109,7 +109,7 @@ def _validate_e7_preconditions(path: Path, requested_groups: Sequence[str]) -> D
     required = {
         "bidirectional_nontrivial_response",
         "predictable_without_test_leakage",
-        "pseudo_unseen_better_than_constant",
+        "normal_unseen_better_than_constant",
     }
     missing = sorted(required.difference(checks))
     passed = bool(block.get("eligible", False)) and not missing and all(
@@ -174,10 +174,6 @@ def _completed(output_root: Path) -> bool:
     if len(completed) > 1:
         raise RuntimeError("multiple completed runs found under {}".format(output_root))
     return bool(completed)
-
-
-def _has_contents(path: Path) -> bool:
-    return path.is_dir() and next(path.iterdir(), None) is not None
 
 
 def _build_jobs(

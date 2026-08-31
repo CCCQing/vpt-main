@@ -4,11 +4,34 @@ import hashlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from ..models.prompting.prompt_distribution import prompt_kl_loss
 from .graph_prob_prior_monitors import loss_scale_monitor
 from .semantic_graph_losses import GraphProbPriorLossComputer
+
+
+@dataclass(frozen=True)
+class LossTerm:
+    """One graph-retaining scalar loss component exposed for sparse audits."""
+
+    name: str
+    raw_tensor: torch.Tensor
+    weight: float
+    role: str
+    active: bool = True
+
+    @property
+    def weighted_tensor(self) -> torch.Tensor:
+        return self.raw_tensor * float(self.weight)
+
+
+def _capture_loss_terms(kwargs: Optional[Dict[str, Any]]) -> bool:
+    return bool(
+        isinstance(kwargs, Dict)
+        and kwargs.get("capture_loss_terms", False)
+    )
 
 
 def _extract_logits_and_aux(pred_logits: Any, kwargs: Optional[Dict[str, Any]]):
@@ -397,6 +420,7 @@ class SemanticMediatedAffinityAuxLoss(nn.Module):
         """读取 semantic-mediated affinity loss 的权重和配置。"""
         super().__init__()
         self.name = "sem_med_loss"
+        self.role = "transfer"
         self.requires_affinity_aux = True
         self.sem_med_weight = float(cfg.SOLVER.LOSS_SEM_MED_WEIGHT)
         self.cfg = cfg
@@ -421,6 +445,7 @@ class SemanticPromptVisualCycleAuxLoss(nn.Module):
         """读取 semantic prompt-visual cycle loss 的权重和配置。"""
         super().__init__()
         self.name = "spv_loss"
+        self.role = "transfer"
         self.requires_affinity_aux = True
         self.spv_weight = float(cfg.SOLVER.LOSS_SPV_WEIGHT)
         self.cfg = cfg
@@ -447,6 +472,7 @@ class AttributeReconstructionAuxLoss(nn.Module):
         """读取属性重建损失权重和度量方式。"""
         super().__init__()
         self.name = "attr_loss"
+        self.role = "transfer"
         self.requires_affinity_aux = False
         self.attr_weight = float(cfg.SOLVER.LOSS_ATTR_WEIGHT)
         self.cfg = cfg
@@ -502,6 +528,7 @@ class PromptKLAuxLoss(nn.Module):
     def __init__(self, cfg=None):
         super().__init__()
         self.name = "prompt_kl_loss"
+        self.role = "regularization"
         self.requires_affinity_aux = False
         self.prompt_kl_weight = float(cfg.SOLVER.LOSS_PROMPT_KL_WEIGHT)
 
@@ -517,11 +544,13 @@ class B3ClassConsistencyAuxLoss(nn.Module):
     def __init__(self, cfg=None):
         super().__init__()
         self.name = "b3_class_consistency_loss"
+        self.role = "transfer"
         self.requires_affinity_aux = False
         self.cfg = cfg.SOLVER.B3_CLASS_CONSISTENCY
         self.intra_weight = float(self.cfg.INTRA_WEIGHT)
         self.inter_weight = float(self.cfg.INTER_WEIGHT)
         self._last_loss_stats: Dict[str, float] = {}
+        self._last_loss_terms = ()
         if self.intra_weight < 0.0 or self.inter_weight < 0.0:
             raise ValueError("B3 class-consistency weights must be non-negative")
         if self.intra_weight + self.inter_weight <= 0.0:
@@ -607,6 +636,31 @@ class B3ClassConsistencyAuxLoss(nn.Module):
         intra = result["intra_loss"]
         inter = result["inter_loss"]
         total = self.intra_weight * intra + self.inter_weight * inter
+        if _capture_loss_terms(kwargs):
+            nested_terms = []
+            if self.intra_weight > 0.0:
+                nested_terms.append(
+                    LossTerm(
+                        name="b3_intra_loss",
+                        raw_tensor=intra,
+                        weight=self.intra_weight,
+                        role="transfer",
+                        active=True,
+                    )
+                )
+            if self.inter_weight > 0.0:
+                nested_terms.append(
+                    LossTerm(
+                        name="b3_inter_loss",
+                        raw_tensor=inter,
+                        weight=self.inter_weight,
+                        role="transfer",
+                        active=True,
+                    )
+                )
+            self._last_loss_terms = tuple(nested_terms)
+        else:
+            self._last_loss_terms = ()
         self._last_loss_stats = {
             "b3_intra_loss.raw": float(intra.detach().item()),
             "b3_intra_loss.weight": self.intra_weight,
@@ -636,9 +690,9 @@ class GraphProbPriorAuxLoss(nn.Module):
     """
     Graph-GP 辅助损失接入口。
 
-    posterior 来自 prompt distributor 的完整 mu/logvar；Graph-GP 根据 support-seen
+    posterior 来自 prompt distributor 的完整 mu/logvar；Graph-GP 根据全部官方 Seen
     视觉中心与 external graph 推断全类 Gaussian prototype，再用 energy classification
-    约束 posterior。评测阶段不更新 support buffer，因此明确跳过该训练期辅助损失。
+    约束 posterior。评测阶段不更新 Seen 统计 buffer，因此明确跳过该训练期辅助损失。
     """
 
     def __init__(self, cfg=None):
@@ -647,6 +701,7 @@ class GraphProbPriorAuxLoss(nn.Module):
         # CompositeLoss 会用 name 作为 stats 里的键：
         # stats["graph_prob_prior_loss"] = 当前 batch 未乘权重的 aux loss 标量。
         self.name = "graph_prob_prior_loss"
+        self.role = "graph"
 
         # GraphProbPrior 不需要 trainer 额外导出 attention affinity aux；
         # 它只依赖 prompt distributor runtime stats 和 trainer 传入的语义图资源。
@@ -759,6 +814,7 @@ class CompositeLoss(nn.Module):
             for aux in self.aux_losses
         )
         self._last_loss_stats: Dict[str, float] = {}
+        self._last_loss_terms = ()
 
     def is_single(self):
         """保持旧训练器接口兼容：当前 loss 返回单个标量。"""
@@ -770,9 +826,16 @@ class CompositeLoss(nn.Module):
 
         同时合并各子损失的 `_last_loss_stats`，供 trainer 打印日志。
         """
+        capture_terms = _capture_loss_terms(kwargs)
+        self._last_loss_terms = ()
         total = self.main_loss(pred_logits, targets, per_cls_weights, kwargs=kwargs)
         main_loss_value = float(total.detach().item())
         stats = dict(self.main_loss._last_loss_stats)
+        loss_terms = list(
+            getattr(self.main_loss, "_last_loss_terms", ())
+            if capture_terms
+            else ()
+        )
         component_names = [
             name
             for name in ("ce_loss", "ar_loss", "cm_loss")
@@ -790,8 +853,28 @@ class CompositeLoss(nn.Module):
             stats[f"{aux_loss.name}.weight"] = weight
             stats[f"{aux_loss.name}.weighted"] = weight * raw_value
             component_names.append(str(aux_loss.name))
+            if capture_terms:
+                nested_terms = tuple(getattr(aux_loss, "_last_loss_terms", ()))
+                if nested_terms:
+                    loss_terms.extend(nested_terms)
+                    component_names.extend(str(term.name) for term in nested_terms)
+                else:
+                    loss_terms.append(
+                        LossTerm(
+                            name=str(aux_loss.name),
+                            raw_tensor=aux_value,
+                            weight=weight,
+                            role=str(getattr(aux_loss, "role", "regularization")),
+                            active=True,
+                        )
+                    )
             if hasattr(aux_loss, "_last_loss_stats"):
                 stats.update(dict(aux_loss._last_loss_stats))
+                component_names.extend(
+                    key[:-len(".weighted")]
+                    for key in aux_loss._last_loss_stats
+                    if str(key).endswith(".weighted")
+                )
             if isinstance(aux_loss, GraphProbPriorAuxLoss):
                 stats.update(
                     loss_scale_monitor(
@@ -803,12 +886,32 @@ class CompositeLoss(nn.Module):
         total_value = float(total.detach().item())
         stats["total_loss"] = total_value
         denominator = max(abs(total_value), 1e-12)
-        for name in component_names:
+        for name in dict.fromkeys(component_names):
             weighted = stats.get(f"{name}.weighted")
             if weighted is not None:
                 stats[f"{name}.weighted_share"] = float(weighted) / denominator
         self._last_loss_stats = stats
+        if capture_terms:
+            names = [str(term.name) for term in loss_terms]
+            if len(names) != len(set(names)):
+                raise RuntimeError(
+                    "LossTerm names must be unique within one forward: {}".format(names)
+                )
+            self._last_loss_terms = tuple(loss_terms)
         return total
+
+    def get_last_loss_terms(self):
+        """Return current-step loss tensors; callers must clear them promptly."""
+        return tuple(self._last_loss_terms)
+
+    def clear_last_loss_terms(self):
+        """Release graph-retaining component references after sparse auditing."""
+        self._last_loss_terms = ()
+        if hasattr(self.main_loss, "_last_loss_terms"):
+            self.main_loss._last_loss_terms = ()
+        for aux_loss in self.aux_losses:
+            if hasattr(aux_loss, "_last_loss_terms"):
+                aux_loss._last_loss_terms = ()
 
 
 class RSimilarityLoss(nn.Module):
@@ -831,6 +934,7 @@ class RSimilarityLoss(nn.Module):
             raise ValueError("SOLVER.RSIM.ALIGN_WEIGHT must be non-negative.")
         self.diag_strict = cfg.SOLVER.DIAG.STRICT_CHECKS
         self._last_loss_stats: Dict[str, float] = {}
+        self._last_loss_terms = ()
 
     def is_single(self):
         """保持旧训练器接口兼容：该 loss 输出单个标量。"""
@@ -852,6 +956,16 @@ class RSimilarityLoss(nn.Module):
         weight = torch.tensor(per_cls_weights, device=logits.device)
         ce = F.cross_entropy(logits, targets, weight, reduction="mean")
         total = ce
+        capture_terms = _capture_loss_terms(kwargs)
+        self._last_loss_terms = (
+            LossTerm(
+                name="ce_loss",
+                raw_tensor=ce,
+                weight=1.0,
+                role="primary",
+                active=True,
+            ),
+        ) if capture_terms else ()
         ce_value = float(ce.detach().item())
         self._last_loss_stats = {
             "ce_loss": ce_value,
@@ -907,6 +1021,17 @@ class RSimilarityLoss(nn.Module):
 
         if align_term is not None:
             total = total + self.align_weight * align_term
+            if capture_terms:
+                align_name = "ar_loss" if align_mode == "ar" else "cm_loss"
+                self._last_loss_terms = self._last_loss_terms + (
+                    LossTerm(
+                        name=align_name,
+                        raw_tensor=align_term,
+                        weight=self.align_weight,
+                        role="transfer",
+                        active=True,
+                    ),
+                )
         return total
 
     def forward(self, pred_logits, targets, per_cls_weights, kwargs: Optional[Dict[str, Any]] = None):

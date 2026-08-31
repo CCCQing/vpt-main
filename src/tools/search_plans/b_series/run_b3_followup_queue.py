@@ -20,6 +20,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+from src.tools.search_plans.common import (
+    directory_has_contents as _has_contents,
+    parse_gpu_worker_slots as _gpu_groups,
+    read_json as _read_json,
+)
 
 
 RUN_SUFFIX = Path("CUB/sup_vitb16_224/lr0.0006_wd1e-05/run1")
@@ -66,17 +71,6 @@ def _integer_values(raw: str) -> List[int]:
     return values
 
 
-def _gpu_groups(raw: str) -> List[str]:
-    values = [item.strip() for item in str(raw).split(";") if item.strip()]
-    if not values or any("," in value for value in values):
-        raise ValueError("GPU worker slots must be single cards separated by semicolons")
-    return values
-
-
-def _read_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _completed(output_dir: Path, experiments: Sequence[str]) -> bool:
     summary = output_dir / "b3_followup_summary.json"
     if not summary.is_file():
@@ -90,10 +84,6 @@ def _completed(output_dir: Path, experiments: Sequence[str]) -> bool:
         and bool(payload.get("valid", False))
         and list(payload.get("experiments") or []) == list(experiments)
     )
-
-
-def _has_contents(path: Path) -> bool:
-    return path.is_dir() and next(path.iterdir(), None) is not None
 
 
 def _build_jobs(

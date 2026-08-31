@@ -1288,32 +1288,8 @@ class PreViTPromptDistributor(nn.Module):
         #   stats: 缓存在 transformer/model 上，供 trainer/loss 在本次 forward 后读取。
         return prompt_tokens, stats
 
-
-def generate_prompt_init(
-    distributor: PreViTPromptDistributor,
-    V_raw: torch.Tensor,
-    reduce: str = "mean",
-) -> torch.Tensor:
-    """
-    兼容旧 one-shot prompt 初始化接口。
-
-    新训练主线不再依赖旧 PromptGenerator 大解码器；这个 helper 只用于少量旧脚本
-    需要从 distributor 生成一个静态初始化 prompt 的情况。
-    """
-    with torch.no_grad():
-        prompts, _ = distributor(vit_image_tokens=V_raw)
-        if reduce == "first":
-            prompts = prompts[:1]
-        elif reduce == "mean":
-            prompts = prompts.mean(dim=0, keepdim=True)
-        else:
-            raise ValueError(f"Unsupported reduce mode: {reduce}")
-        return prompts.detach()
-
-
 __all__ = [
     "PreViTPromptDistributor",
     "MeanConditionedDeepPromptResidual",
     "prompt_kl_loss",
-    "generate_prompt_init",
 ]

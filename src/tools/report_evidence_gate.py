@@ -68,7 +68,7 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def _resolve_path(value: str, profile_path: Path, profile: Mapping[str, Any]) -> Path:
+def _expand_path(value: str, profile_path: Path, profile: Mapping[str, Any]) -> Path:
     variables = {
         "profile_dir": str(profile_path.parent),
         "repo_root": str(profile.get("repo_root", profile_path.parent)),
@@ -79,12 +79,19 @@ def _resolve_path(value: str, profile_path: Path, profile: Mapping[str, Any]) ->
     path = Path(expanded)
     if not path.is_absolute():
         path = profile_path.parent / path
-    return path.resolve()
+    return path
+
+
+def _resolve_path(value: str, profile_path: Path, profile: Mapping[str, Any]) -> Path:
+    return _expand_path(value, profile_path, profile).resolve()
 
 
 def _resolve_glob(value: str, profile_path: Path, profile: Mapping[str, Any]) -> List[Path]:
-    resolved = _resolve_path(value, profile_path, profile)
-    matches = [Path(item).resolve() for item in glob.glob(str(resolved), recursive=True)]
+    # Windows rejects Path.resolve() when the path still contains wildcard
+    # characters.  Expand profile variables first, run glob on that absolute
+    # pattern, and only resolve the concrete matches.
+    pattern = _expand_path(value, profile_path, profile)
+    matches = [Path(item).resolve() for item in glob.glob(str(pattern), recursive=True)]
     return sorted(path for path in matches if path.is_file())
 
 

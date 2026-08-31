@@ -13,7 +13,6 @@ from typing import Any, Dict, Optional, Tuple
 # 原有 Win 下 os.path.join 会产生反斜杠 "\"，会影响从权重字典中取键（键名一般用 "/"）
 # 因此改为从 posixpath 导入 join，确保键名分隔符始终为 "/"
 # from os.path import join as pjoin  # 原有Win下os.path.join会产生反斜杠 \
-from turtle import forward           # 原有代码就这两行
 from posixpath import join as pjoin  # 关键：确保键名里总是用 "/"
 # 8.21改动结束
 

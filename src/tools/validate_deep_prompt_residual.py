@@ -396,9 +396,16 @@ def validate_b3_class_consistency_state() -> None:
             "targets_global": groups,
             "sample_ids": ["sample{}".format(index) for index in range(8)],
             "is_train": True,
+            "capture_loss_terms": True,
         },
     )
+    assert [term.name for term in criterion.get_last_loss_terms()] == [
+        "ce_loss",
+        "b3_intra_loss",
+        "b3_inter_loss",
+    ]
     total.backward()
+    criterion.clear_last_loss_terms()
     assert second_mu.grad is not None
     assert "b3_intra_loss.weighted" in criterion._last_loss_stats
 
@@ -919,7 +926,7 @@ def validate_e7_precondition_evidence_gate() -> None:
                         "checks": {
                             "bidirectional_nontrivial_response": True,
                             "predictable_without_test_leakage": True,
-                            "pseudo_unseen_better_than_constant": True,
+                            "normal_unseen_better_than_constant": True,
                         },
                         "evidence_paths": [evidence.name],
                     }

@@ -23,10 +23,7 @@ def _always(_: Any) -> bool:
 
 
 def _gzsl_protocol_active(cfg: Any) -> bool:
-    return str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() in {
-        "final_gzsl",
-        "b3_pseudo_gzsl",
-    }
+    return str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "final_gzsl"
 
 
 def _prompt_distribution_source_active(cfg: Any) -> bool:
@@ -224,6 +221,16 @@ MONITOR_SPECS: Tuple[MonitorSpec, ...] = (
         description="sample-weighted raw, weighted, and share trajectories for active loss components",
         source_requirement="completed training epoch with finite loss component stats",
         is_requested=lambda cfg: bool(cfg.MONITOR.LOSS_COMPONENT_TRAJECTORY.ENABLE),
+        is_source_active=_always,
+    ),
+    MonitorSpec(
+        namespace="multi_loss_gradient_audit",
+        cadence="event",
+        artifact="multi_loss_gradient_audit_jsonl",
+        sampling="predeclared_epoch_first_batches",
+        description="sparse per-loss parameter-block gradients, conflicts, cancellation, and optimizer alignment",
+        source_requirement="training graph with one primary and at least one active auxiliary loss",
+        is_requested=lambda cfg: bool(cfg.MONITOR.MULTI_LOSS_GRADIENT_AUDIT.ENABLE),
         is_source_active=_always,
     ),
     MonitorSpec(

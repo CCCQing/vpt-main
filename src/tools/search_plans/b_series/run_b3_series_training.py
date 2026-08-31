@@ -19,6 +19,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+from src.tools.search_plans.common import (
+    directory_has_contents as _has_contents,
+    parse_gpu_worker_slots as _gpu_groups,
+    read_json as _read_json,
+)
 
 
 CONFIG_ROOT = ROOT / "configs" / "b_series_experiments"
@@ -87,10 +92,6 @@ class Job:
     inter_weight: Optional[float]
 
 
-def _read_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _comma_values(raw: str) -> List[str]:
     values = [value.strip().upper() for value in str(raw).split(",") if value.strip()]
     if not values or len(values) != len(set(values)):
@@ -122,13 +123,6 @@ def _pilot_weights(raw: str):
     if len(pairs) != len(set(pairs)):
         raise ValueError("pilot loss-weight pairs must be unique")
     return pairs
-
-
-def _gpu_groups(raw: str) -> List[str]:
-    values = [value.strip() for value in str(raw).split(";") if value.strip()]
-    if not values or any("," in value for value in values):
-        raise ValueError("GPU worker slots must be single cards separated by semicolons")
-    return values
 
 
 def _load_splits(protocol: str) -> List[SplitIdentity]:
@@ -235,10 +229,6 @@ def _completed(output_root: Path, allow_checkpoint_ready: bool = False) -> bool:
     if len(completed) > 1:
         raise RuntimeError("multiple completed runs found under {}".format(output_root))
     return bool(completed)
-
-
-def _has_contents(path: Path) -> bool:
-    return path.is_dir() and next(path.iterdir(), None) is not None
 
 
 def _build_jobs(

@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+from src.tools.search_plans.common import directory_has_contents as _has_contents
 
 
 DEFAULT_CONFIG = (
@@ -198,10 +199,6 @@ def _runtime_summary(output_root: Path) -> Optional[Path]:
     if len(completed) > 1:
         raise RuntimeError("Multiple completed runtime summaries found under {}.".format(output_root))
     return completed[0] if completed else None
-
-
-def _has_contents(path: Path) -> bool:
-    return path.is_dir() and next(path.iterdir(), None) is not None
 
 
 def _metric_rows(metrics_path: Path) -> List[Dict[str, str]]:

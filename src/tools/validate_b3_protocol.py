@@ -54,7 +54,6 @@ def validate_b3_final_dataset_and_runner_contract() -> None:
 
         cfg.defrost()
         cfg.DATA.XLSA.PROTOCOL_MODE = "final_gzsl"
-        cfg.DATA.XLSA.B3_PSEUDO_MANIFEST = ""
         cfg.OUTPUT_DIR = str(Path(temporary).resolve() / "manifest_output")
         cfg.freeze()
         train = CUB200Dataset(cfg, "trainval")
@@ -79,8 +78,7 @@ def validate_b3_final_dataset_and_runner_contract() -> None:
         assert len(jobs) == 3
         assert {job.seed for job in jobs} == {0, 1, 2}
         assert all(job.checkpoint is None for job in jobs)
-        command = _command(jobs[0], sys.executable, "final_gzsl")
-        assert "DATA.XLSA.B3_PSEUDO_MANIFEST" not in command
+        _command(jobs[0], sys.executable, "final_gzsl")
         assert _gpu_groups("5;5;6;6;7") == ["5", "5", "6", "6", "7"]
         pilot_jobs = _build_jobs(
             "R2",

@@ -2,7 +2,6 @@
 
 import argparse
 import hashlib
-import json
 import sys
 import traceback
 from pathlib import Path
@@ -22,6 +21,10 @@ from src.data import loader as data_loader
 from src.models.build_model import build_model
 from src.monitoring.decision_gain_decomposition import analyze_decision_gain
 from src.monitoring.module_effect import checkpoint_sha256
+from src.tools.search_plans.common import (
+    read_json as _read_json,
+    write_json as _write_json,
+)
 
 
 def parse_args():
@@ -36,16 +39,6 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=4)
     return parser.parse_args()
-
-
-def _read_json(path):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
-def _write_json(path, payload):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def _sha256_lines(values):

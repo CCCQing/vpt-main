@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import shlex
 import subprocess
@@ -18,7 +17,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import List, Sequence
 
 import torch
 import yaml
@@ -30,6 +29,10 @@ if str(ROOT) not in sys.path:
 
 from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
 from src.tools.search_plans.a_series.artifact_io import compact_to_gzip
+from src.tools.search_plans.common import (
+    atomic_write_json,
+    read_json as _read_json,
+)
 from src.tools.search_plans.b_series.run_b3_series_training import (
     RUN_SUFFIX,
     STAGE_ORDER,
@@ -69,18 +72,8 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _atomic_json(path: Path, payload) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name("{}.tmp.{}".format(path.name, os.getpid()))
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(str(temporary), str(path))
+    atomic_write_json(path, payload, sort_keys=True)
 
 
 def _actual_run(output_root: Path) -> Path:

@@ -13,6 +13,7 @@ GEOMETRY_SPACES = (
     "prepass_cls_geometry",
     "trained_mu_geometry",
     "normal_final_cls_geometry",
+    "cls_delta_geometry",
     "residual_zero_final_cls_geometry",
 )
 LOGIT_VIEWS = ("centered_logits", "direction_normalized_logits", "class_pattern")
@@ -34,13 +35,20 @@ def main() -> int:
     assert summary["valid"] is True
     assert summary["experiments"] == ["D2G"]
     assert summary["D2G"]["valid"] is True
-    assert result["format"] == "b3_d2g_source_to_decision_chain_v2"
+    assert result["format"] == "b3_d2g_source_to_decision_chain_v3"
     assert result["valid"] is True
     assert result["training_performed"] is False
     assert result["optimizer_created"] is False
     assert result["backward_performed"] is False
     assert summary["source_checkpoint_sha256"] == result["source_checkpoint_sha256"]
     assert result["random_mlp_seeds"] == RANDOM_MLP_SEEDS
+    assert result["atomic_evidence_status"]["prepass_final_transport"] == "available"
+    assert result["atomic_evidence_status"][
+        "head_representation_factorial"
+    ] == "partial_current_head_only"
+    assert result["atomic_evidence_status"][
+        "official_final_task"
+    ] == "partial_candidate_head_not_trained"
     assert result["downstream_validity"]["valid"] is True
     semantic = result["semantic_reference"]
     assert semantic["validity"]["valid"] is True
@@ -75,6 +83,43 @@ def main() -> int:
         assert item["visual_semantic_alignment"]["residual_zero"]["validity"][
             "valid"
         ]
+        transport = item["prepass_final_cls_transport"]
+        assert transport["entity_id"] == "frozen_prepass_cls_to_final_cls"
+        assert transport["validity"]["valid"] is True
+        assert set(transport["absolute_geometry"]) == {
+            "frozen_prepass_cls",
+            "normal_final_cls",
+            "cls_delta",
+        }
+        assert set(transport["final_minus_prepass_geometry"])
+        assert set(transport["sample_transport"]) == {
+            "prepass_final_cls_cosine",
+            "prepass_final_cls_l2_distance",
+            "delta_to_prepass_norm_ratio",
+        }
+        semantic_transport = item["prepass_final_semantic_transport"]
+        assert semantic_transport["validity"]["valid"] is True
+        assert semantic_transport["raw_312d_vs_projected_768d_relation"][
+            "status"
+        ] == "available"
+        assert "true_prototype_rank_improvement" in semantic_transport[
+            "paired_deltas"
+        ]["final_minus_prepass"]
+        reconstruction = item["classifier_reconstruction_contract"]
+        assert reconstruction["valid"] is True
+        assert reconstruction["prediction_equivalence"] == 1.0
+        assert reconstruction["max_abs_logit_error"] <= 1.0e-5
+        factorial = item["current_head_representation_factorial"]
+        assert factorial["status"] == "partial_current_head_only"
+        assert factorial["validity"]["current_available_cells_valid"] is True
+        assert factorial["validity"]["candidate_head_available"] is False
+        assert len(factorial["missing_cells"]) == 2
+        transitions = item["prediction_transition_groups"]
+        assert transitions["validity"]["valid"] is True
+        assert sum(
+            int(group["sample_count"])
+            for group in transitions["groups"].values()
+        ) == item["sample_manifest"]["sample_count"]
         assert item["prepass_cache_contract"]["normal"]["mode"] == "populate"
         assert item["prepass_cache_contract"]["residual_zero"]["mode"] == "reuse"
         assert item["prepass_cache_contract"][
@@ -150,6 +195,22 @@ def main() -> int:
         ):
             assert metric in tasks[condition]["gzsl"]
             assert metric in tasks["normal_minus_residual_zero"]
+    head_task = result["head_representation_task_factorial"]
+    assert head_task["status"] == "partial_current_head_only"
+    assert head_task["valid"] is True
+    assert head_task["candidate_head_status"] == "not_available_not_trained"
+    assert head_task["interaction"] is None
+    assert head_task["cells"]["frozen_prepass_cls/candidate_head"] is None
+    assert head_task["cells"]["normal_final_cls/candidate_head"] is None
+    for metric in (
+        "seen_per_class_accuracy",
+        "unseen_per_class_accuracy",
+        "harmonic_mean",
+        "ausuc",
+    ):
+        assert metric in head_task[
+            "representation_gain_current_head_final_minus_prepass"
+        ]
     compact["task_delta"] = tasks["normal_minus_residual_zero"]
     print(json.dumps({"valid": True, "splits": compact}, ensure_ascii=False, indent=2))
     return 0

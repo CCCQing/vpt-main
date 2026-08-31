@@ -15,7 +15,7 @@ import math
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, Mapping, Sequence
 
 import numpy as np
 

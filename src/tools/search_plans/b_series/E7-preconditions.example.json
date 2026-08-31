@@ -6,7 +6,7 @@
     "checks": {
       "bidirectional_nontrivial_response": false,
       "predictable_without_test_leakage": false,
-      "pseudo_unseen_better_than_constant": false
+      "normal_unseen_better_than_constant": false
     },
     "evidence_paths": []
   }

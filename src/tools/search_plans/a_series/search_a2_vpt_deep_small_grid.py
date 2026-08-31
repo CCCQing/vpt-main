@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+from src.tools.search_plans.common import directory_has_contents as _has_contents
 
 
 DEFAULT_CONFIG = ROOT / "configs" / "baseline_rebuild" / "A-04-A2-vpt-deep-ce.yaml"
@@ -120,10 +121,6 @@ def _completed_summary(output_root: Path) -> Optional[Path]:
     if len(completed) > 1:
         raise RuntimeError("Multiple completed runs found under {}.".format(output_root))
     return completed[0] if completed else None
-
-
-def _has_contents(path: Path) -> bool:
-    return path.is_dir() and next(path.iterdir(), None) is not None
 
 
 def _find_log(output_root: Path) -> Optional[Path]:

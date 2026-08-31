@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import json
 import random
 import sys
 import traceback
@@ -117,13 +116,6 @@ def _load_cfg(
     cfg.NUM_GPUS = 1 if torch.cuda.is_available() else 0
     cfg.DATA.NUM_WORKERS = 0
     cfg.DATA.PIN_MEMORY = False
-    if str(cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "b3_pseudo_gzsl":
-        configured_manifest = Path(
-            str(cfg.DATA.XLSA.B3_PSEUDO_MANIFEST)
-        ).expanduser()
-        portable_manifest = source_run / "b3_pseudo_manifest.json"
-        if not configured_manifest.is_file() and portable_manifest.is_file():
-            cfg.DATA.XLSA.B3_PSEUDO_MANIFEST = str(portable_manifest.resolve())
     cfg.MONITOR.OUTPUT_POLICY = "error_if_exists"
     cfg.MONITOR.PROBE.SELECTION_SEED = int(selection_seed)
     cfg.MONITOR.PROBE.ROBUSTNESS_SELECTION_SEEDS = []

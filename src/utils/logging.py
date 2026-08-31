@@ -5,14 +5,11 @@
 支持：
 - 仅主进程输出到控制台（多进程/分布式时屏蔽非主进程的 print/log）
 - 同时输出到文件并缓存文件句柄，避免重复打开
-- 彩色日志（依赖 termcolor），便于在终端快速分辨不同级别
-- 统一的 JSON 统计输出（训练/测试 epoch 级别指标）"""
+- 彩色日志（依赖 termcolor），便于在终端快速分辨不同级别"""
 
 import builtins
-import decimal
 import functools
 import logging
-import simplejson
 import sys
 import os
 from termcolor import colored
@@ -117,89 +114,9 @@ def setup_logging(
     return logger
 
 
-def setup_single_logging(name, output=""):
-    """Sets up the logging.非分布式/单进程的简化版日志初始化（始终在 stdout 打印）。
-    参数：
-        name: logger 名称
-        output: 可选的日志文件路径或目录
-    与 setup_logging 的区别：
-        - 不考虑主进程判断；总是配置 stdout 的输出
-        - 不处理彩色开关参数（这里默认使用彩色）"""
-    # Enable logging only for the master process
-    # Clear the root logger to prevent any existing logging config
-    # (e.g. set by another module) from messing with our setup
-    logging.root.handlers = []
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO, format=_FORMAT, stream=sys.stdout
-    )
-
-    if len(name) == 0:
-        name = __name__
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    plain_formatter = logging.Formatter(
-        "[%(asctime)s][%(levelname)s] %(name)s: %(lineno)4d: %(message)s",
-        datefmt="%m/%d %H:%M:%S",
-    )
-    formatter = _ColorfulFormatter(
-        colored("[%(asctime)s %(name)s]: ", "green") + "%(message)s",
-        datefmt="%m/%d %H:%M:%S",
-        root_name=name,
-        abbrev_name=str(name),
-    )
-
-    ch = logging.StreamHandler(stream=sys.stdout)
-    ch.setLevel(logging.DEBUG)
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
-
-    if len(output) > 0:
-        if output.endswith(".txt") or output.endswith(".log"):
-            filename = output
-        else:
-            filename = os.path.join(output, "logs.txt")
-
-        PathManager.mkdirs(os.path.dirname(filename))
-
-        fh = logging.StreamHandler(_cached_log_stream(filename))
-        fh.setLevel(logging.DEBUG)
-        fh.setFormatter(plain_formatter)
-        logger.addHandler(fh)
-
-    return logger
-
-
 def get_logger(name):
     """Retrieves the logger."""
     return logging.getLogger(name)
-
-
-def log_json_stats(stats, sort_keys=True):
-    """
-    Logs json stats.将统计信息（字典）以 JSON 格式写日志。
-    典型用法：训练/测试周期结束后，将指标（loss、acc 等）统一记录成一行 JSON，
-    方便后处理脚本（grep/jq/pandas）解析与可视化。
-    细节：
-    - Python 3.6+ 中 `json.encoder.FLOAT_REPR` 已无效；为保证定长小数位，
-      这里用 decimal + 字符串格式化，将浮点数转成固定 6 位小数的 Decimal。
-    - simplejson.dumps(sort_keys=True, use_decimal=True) 以保证键排序和 Decimal 正确序列化。
-    - 若 _type 是 "test_epoch"/"train_epoch"，额外加上 "json_stats:" 前缀，便于 grep。
-    """
-    # It seems that in Python >= 3.6 json.encoder.FLOAT_REPR has no effect
-    # Use decimal+string as a workaround for having fixed length values in logs
-    logger = get_logger(__name__)
-    stats = {
-        k: decimal.Decimal("{:.6f}".format(v)) if isinstance(v, float) else v
-        for k, v in stats.items()
-    }
-    json_stats = simplejson.dumps(stats, sort_keys=True, use_decimal=True)
-    if stats["_type"] == "test_epoch" or stats["_type"] == "train_epoch":
-        logger.info("json_stats: {:s}".format(json_stats))
-    else:
-        logger.info("{:s}".format(json_stats))
 
 
 class _ColorfulFormatter(logging.Formatter):

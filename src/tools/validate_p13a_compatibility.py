@@ -79,7 +79,15 @@ def _validate_result(path: Path) -> dict:
         "head_only": bool(contract.get("a2_backbone_frozen"))
         and bool(contract.get("a2_prompt_frozen"))
         and contract.get("optimizer_scope") == "candidate_compatibility_head_only",
-        "no_unseen_selection": contract.get("normal_unseen_used_for_model_selection") is False,
+        "fixed_training_epoch_rule": contract.get("training_epoch_rule")
+        == "predeclared_fixed_epoch"
+        and int(contract.get("train_epochs", 0)) > 0,
+        "official_seen_training": contract.get(
+            "all_official_seen_classes_used_for_training"
+        )
+        is True,
+        "official_final_evaluation": contract.get("evaluation_protocol")
+        == "official_final_gzsl",
         "single_feature_extraction": cache.get("feature_extraction_count_per_split") == 1,
         "feature_cache_valid": cache.get("valid") is True,
         "strict_three_probe": all(
@@ -103,7 +111,7 @@ def _validate_result(path: Path) -> dict:
                 item.get("identity", {}).get("kind") != "trained_head_only"
                 or not checkpoint.is_file()
                 or not str(final.get("checkpoint_sha256", ""))
-                or int(final.get("selected_epoch", 0)) <= 0
+                or int(final.get("train_epochs", 0)) <= 0
             ):
                 checks["trained_checkpoint_identity"] = False
     return {

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torchvision as tv
 
-from .eval_metrics import spearman_correlation
+from .eval_metrics import semantic_projection_health_metrics, spearman_correlation
 from .prompt_analysis import PromptContentSlotAccumulator
 
 
@@ -3583,6 +3583,7 @@ class StreamingFixedProbeAccumulator:
             self.class_count, track_covariance=track_geometry
         )
         self.semantic: Optional[np.ndarray] = None
+        self.raw_semantic: Optional[np.ndarray] = None
         self.sample_count = 0
         self.correct_count = 0
         self.top5_count = 0
@@ -3597,6 +3598,22 @@ class StreamingFixedProbeAccumulator:
         self.rank_sum = 0.0
         self.recall_count = 0
         self.ambiguity_count = 0
+
+    def set_raw_semantic_prototypes(self, raw_semantic_prototypes: Any) -> None:
+        raw = np.asarray(
+            torch.as_tensor(raw_semantic_prototypes).detach().cpu(),
+            dtype=np.float32,
+        )
+        if raw.ndim != 2 or raw.shape[0] != self.class_count or raw.shape[1] == 0:
+            raise ValueError(
+                "raw semantics must match the fixed-probe candidate class order"
+            )
+        if not np.isfinite(raw).all():
+            raise ValueError("raw fixed-probe semantics contain non-finite values")
+        if self.raw_semantic is None:
+            self.raw_semantic = raw.copy()
+        elif not np.allclose(self.raw_semantic, raw, rtol=0.0, atol=1e-6):
+            raise ValueError("raw semantic prototypes changed within a fixed probe")
 
     def update(self, logits: Any, targets: Any, visual_features: Any, semantic_prototypes: Any) -> None:
         score = torch.as_tensor(logits).detach().to(device="cpu", dtype=torch.float32)
@@ -3647,6 +3664,18 @@ class StreamingFixedProbeAccumulator:
     def merge_from(self, other: "StreamingFixedProbeAccumulator") -> None:
         if not np.array_equal(self.candidate, other.candidate):
             raise ValueError("cannot merge fixed-probe accumulators with different candidate orders")
+        if self.raw_semantic is None:
+            self.raw_semantic = (
+                other.raw_semantic.copy()
+                if other.raw_semantic is not None
+                else None
+            )
+        elif other.raw_semantic is not None and not np.allclose(
+            self.raw_semantic, other.raw_semantic, rtol=0.0, atol=1e-6
+        ):
+            raise ValueError(
+                "cannot merge fixed-probe accumulators with different raw semantics"
+            )
         if other.sample_count <= 0:
             return
         if self.semantic is None:
@@ -3694,12 +3723,14 @@ class StreamingFixedProbeAccumulator:
         left.class_sum += right.class_sum
         left.class_square_norm_sum += right.class_square_norm_sum
 
-    def _relation_metrics(self) -> tuple[Dict[str, float], Dict[str, float]]:
+    def _relation_metrics(
+        self,
+    ) -> tuple[Dict[str, float], Dict[str, float], Dict[str, float]]:
         if self.semantic is None:
-            return {}, {}
+            return {}, {}, {}
         observed, centers = self.representation.class_centers()
         if observed.size == 0:
-            return {}, {}
+            return {}, {}, {}
         semantic = self.semantic[observed]
         normalized_centers = _normalize_numpy_rows(centers)
         normalized_semantic = _normalize_numpy_rows(semantic)
@@ -3790,7 +3821,18 @@ class StreamingFixedProbeAccumulator:
                         covered += count
             graph["hard_negative_coverage"] = float(covered / wrong_count) if wrong_count else 1.0
             graph["confusion_edge_precision"] = graph["hard_negative_coverage"]
-        return alignment, graph
+        projection_health = (
+            semantic_projection_health_metrics(
+                self.raw_semantic,
+                self.semantic,
+                visual_class_centers=centers,
+                observed_class_ids=observed,
+                neighbor_k=self.recall_k,
+            )
+            if self.raw_semantic is not None
+            else {}
+        )
+        return alignment, graph, projection_health
 
     def class_aggregates(self) -> List[Dict[str, Any]]:
         rows = []
@@ -3814,6 +3856,7 @@ class StreamingFixedProbeAccumulator:
                 "representation_geometry": {},
                 "visual_semantic_alignment": {},
                 "semantic_graph_reference": {},
+                "semantic_projection_health": {},
             }
         per_class_values = [
             self.class_correct[index] / self.class_support[index]
@@ -3826,12 +3869,13 @@ class StreamingFixedProbeAccumulator:
             "nll": float(self.nll_sum / self.sample_count),
             "per_class": float(np.mean(per_class_values)) if per_class_values else 0.0,
         }
-        alignment, graph = self._relation_metrics()
+        alignment, graph, projection_health = self._relation_metrics()
         return {
             "classification": classification,
             "representation_geometry": self.representation.finalize(),
             "visual_semantic_alignment": alignment,
             "semantic_graph_reference": graph,
+            "semantic_projection_health": projection_health,
         }
 
 

@@ -44,6 +44,37 @@ def _scope_path(root: Path, experiment: str, method: str, seed: int, selection):
     return base / "full" if selection is None else base / "probe" / "selection_seed_{}".format(selection)
 
 
+def _p03_paired_metrics(result: Mapping[str, Any], condition: str):
+    p03 = result["P0-3"]
+    stored = p03.get("paired_312_vs_768", {}).get(condition)
+    if stored is not None:
+        return stored
+    raw = p03["spaces"]["attribute_312"]["conditions"][condition]["metrics"]
+    projected = p03["spaces"]["projected_768"]["conditions"][condition]["metrics"]
+    sources = {
+        "predicted_unseen_center_cosine": "predicted_to_true_center_cosine_mean",
+        "predicted_unseen_relation_spearman": "relation_spearman",
+        "predicted_unseen_neighbor_recovery_at_5": "visual_neighbor_recovery_at_k",
+        "unseen_center_top1": "unseen_only_top1",
+        "unseen_center_nll": "unseen_only_nll",
+    }
+    paired = {}
+    for public_name, source_name in sources.items():
+        raw_value = float(raw[source_name])
+        projected_value = float(projected[source_name])
+        paired[public_name + "_312"] = raw_value
+        paired[public_name + "_768"] = projected_value
+        if public_name == "unseen_center_nll":
+            paired["unseen_center_nll_improvement_768_over_312"] = float(
+                raw_value - projected_value
+            )
+        else:
+            paired[public_name + "_delta_768_minus_312"] = float(
+                projected_value - raw_value
+            )
+    return paired
+
+
 def _aggregate_p02(root: Path):
     report = {}
     for method in METHODS:
@@ -107,6 +138,17 @@ def _aggregate_p034(root: Path):
             )
             for metric in shuffled_names
         }
+    paired = {}
+    for condition in ("positive_cosine", "semantic_1nn", "global_seen_mean"):
+        metric_names = _p03_paired_metrics(full[0], condition)
+        paired[condition] = {
+            metric: _stats(
+                _p03_paired_metrics(item, condition)[metric]
+                for item in full
+            )
+            for metric in metric_names
+        }
+    p03["paired_312_vs_768"] = paired
     p04 = {}
     for condition in (
         "current_semantic_dot",
@@ -168,7 +210,8 @@ def _markdown(report: Mapping[str, Any]) -> str:
         "| semantic space | condition | mean | min | max |",
         "|---|---|---:|---:|---:|",
     ])
-    for space, payload in report["P0-34"]["P0-3"].items():
+    for space in ("attribute_312", "projected_768"):
+        payload = report["P0-34"]["P0-3"][space]
         for condition in ("positive_cosine", "semantic_1nn", "global_seen_mean"):
             row = payload[condition]["unseen_only_top1"]
             lines.append("| {} | {} | {:.6f} | {:.6f} | {:.6f} |".format(space, condition, row["mean"], row["min"], row["max"]))

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 import traceback
 from pathlib import Path
@@ -18,6 +17,7 @@ if str(ROOT) not in sys.path:
 
 from src.monitoring.logit_geometry import analyze_logit_geometry
 from src.tools.search_plans.a_series.replay_decision_gain_decomposition import _run_source
+from src.tools.search_plans.common import write_json
 
 
 def parse_args():
@@ -33,11 +33,7 @@ def parse_args():
 
 
 def _write_json(path: Path, payload) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
+    write_json(path, payload, allow_nan=False)
 
 
 def _require_output(output_dir: Path) -> None:

@@ -2608,7 +2608,6 @@ def main():
     seen_scores[np.arange(seen_targets.size), seen_targets] += 2.0
     unseen_scores[np.arange(unseen_targets.size), unseen_targets] += 1.5
     visual_seen = rng.normal(size=(seen_targets.size, 5))
-    visual_unseen = rng.normal(size=(unseen_targets.size, 5))
     semantic = SyntheticDataset.class_attributes.numpy()
 
     assert set(classification_metrics(seen_scores, seen_targets)) == {"top1", "top5", "nll", "per_class"}

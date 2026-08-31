@@ -1,0 +1,184 @@
+{
+  "files": [
+    {
+      "archive_group": "__init__.py",
+      "bytes": 1,
+      "path": "src/tools/historical_files/__init__.py",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 1,
+      "path": "src/tools/historical_files/cub_relation_graph/__init__.py",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 24392,
+      "path": "src/tools/historical_files/cub_relation_graph/build_cub_attribute_localization.py",
+      "sha256": "f1f0fd827c9c2f2918baaa4d7382a489caa733385a0217deb36cc3b307ec91bc"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 11666,
+      "path": "src/tools/historical_files/cub_relation_graph/build_cub_attribute_sbert_cache.py",
+      "sha256": "26ef045d4e59da96731098928ef3ac0b2e6bccd62a0608885b7a1f066de7afc8"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 18241,
+      "path": "src/tools/historical_files/cub_relation_graph/build_cub_llm_augmented_kgraph_v7_open.py",
+      "sha256": "9f067e6794a37775a2a28c114bc45f7fb6967e6dc5315d7e050095c1ecbd04b4"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 18875,
+      "path": "src/tools/historical_files/cub_relation_graph/build_cub_llm_structured_prototypes_v5.py",
+      "sha256": "e189c5e4ecdb262e62353e78931befadd476e9647163aa5e03f1ffdfafbba702"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 8707,
+      "path": "src/tools/historical_files/cub_relation_graph/build_cub_visual_reference.py",
+      "sha256": "fa4fb46c367fd34b848523db55f8f02b3d6d51465d243fbb841632e3946a6560"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 2639,
+      "path": "src/tools/historical_files/cub_relation_graph/cub_llm_slot_schema.py",
+      "sha256": "6e37b1829230585e2e77e02cf2ed6df2d47a47ec6d267087185cb25bf09183a4"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 41870,
+      "path": "src/tools/historical_files/cub_relation_graph/cub_semantic_relation_kernels.py",
+      "sha256": "e397d34155075bd6ce91e6c69ae0cb53385cfb6fbea31bb2acbf1f3b635d5771"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 33753,
+      "path": "src/tools/historical_files/cub_relation_graph/search_cub_llm_augmented_kgraph_v8.py",
+      "sha256": "e3e73ba59924a8999c5c366d292d2a9dd74246502ada0b8efeb43253d747ec91"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 64866,
+      "path": "src/tools/historical_files/cub_relation_graph/search_cub_semantic_relation_hparams.py",
+      "sha256": "d3e7299d550e5f9bff1f9a97d7bcaf82d9d656fe0d5edca75ed00eadbf4400ac"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 67443,
+      "path": "src/tools/historical_files/cub_relation_graph/search_cub_semantic_relation_v5.py",
+      "sha256": "22bfd8ed7c5fb55bc3ac812d4890da94af4d817a01fd9eef50f2919f349965b5"
+    },
+    {
+      "archive_group": "cub_relation_graph",
+      "bytes": 21738,
+      "path": "src/tools/historical_files/cub_relation_graph/validate_cub_relation_health.py",
+      "sha256": "313a1b61d50b64214592db1ae28253d72a73cb297244e956f2d178960ed92799"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 1,
+      "path": "src/tools/historical_files/graph_gp_factorial/__init__.py",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 41680,
+      "path": "src/tools/historical_files/graph_gp_factorial/build_stage2b_healthy_prompt_distributions.py",
+      "sha256": "e22068fa09573f5508c56039f69d90435a2423a97cad96c8afac0ac0fde5d5a7"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 21336,
+      "path": "src/tools/historical_files/graph_gp_factorial/build_stage2b_oracle_prompt_distributions.py",
+      "sha256": "5c0e72de80df8d93422859f307b64d4017d890c4aaa0dcffe909e96e3a945922"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 46096,
+      "path": "src/tools/historical_files/graph_gp_factorial/evaluate_graph_gp_center_transfer.py",
+      "sha256": "b4ca75d7dacfba0a92082cc2854abff6c1406ec6c2597888234c82b428089f70"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 34730,
+      "path": "src/tools/historical_files/graph_gp_factorial/evaluate_stage2b_healthy_intervention.py",
+      "sha256": "f791a0afb6851aedae965042b53c1524774add3372f0040f4eb1e30299a30bcb"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 26031,
+      "path": "src/tools/historical_files/graph_gp_factorial/evaluate_stage2b_prior_intervention.py",
+      "sha256": "32d15b62eb1b8939fe59ffd277818803180d0ef85a3562e1ecd22a0b4cbb2479"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 15894,
+      "path": "src/tools/historical_files/graph_gp_factorial/export_prompt_posterior_cache.py",
+      "sha256": "435dcc9ebd5102ee65d4960b05954c7dc4247ba3603d6e9bcd997efc53863702"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 37701,
+      "path": "src/tools/historical_files/graph_gp_factorial/run_arch_ablation_graph_gp_energy.py",
+      "sha256": "506bd18bd652c631a4e65eb13ada497b66618872fbc17843fa91330d7e60469b"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 30232,
+      "path": "src/tools/historical_files/graph_gp_factorial/run_graph_gp_full_factorial_pipeline.py",
+      "sha256": "1fc5815696f021903da259ce356c30a864f8e844b41fb82f831551a70053ca9e"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 13086,
+      "path": "src/tools/historical_files/graph_gp_factorial/summarize_graph_gp_factorial.py",
+      "sha256": "0f308659a1ae646b9432f9aef842b5e2e8703f9edae764e5719f9d20d76532bf"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 12668,
+      "path": "src/tools/historical_files/graph_gp_factorial/summarize_graph_gp_offline.py",
+      "sha256": "0edf6dd5b0f01c2e2b36fb01826d87092ba3c59a4f73887d521ce852df08d331"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 11779,
+      "path": "src/tools/historical_files/graph_gp_factorial/summarize_stage2b_healthy_intervention.py",
+      "sha256": "9ec817e0f1607f44d2d465eefd86235080f138c7ae83dc3b5bfcfb03c01367c1"
+    },
+    {
+      "archive_group": "graph_gp_factorial",
+      "bytes": 5552,
+      "path": "src/tools/historical_files/graph_gp_factorial/summarize_stage2b_prior_intervention.py",
+      "sha256": "920c73d503b6ed74f156faa187be2224421d8fc7f9b3911015269840fefb4eff"
+    },
+    {
+      "archive_group": "graph_prob_prior_diagnostics",
+      "bytes": 1,
+      "path": "src/tools/historical_files/graph_prob_prior_diagnostics/__init__.py",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "archive_group": "graph_prob_prior_diagnostics",
+      "bytes": 21802,
+      "path": "src/tools/historical_files/graph_prob_prior_diagnostics/diagnose_graph_prob_prior_temperatures.py",
+      "sha256": "71c2a60fbad1472b3cf70d2c1e9b03dfe40d96ac721017c23e77d632e640f233"
+    },
+    {
+      "archive_group": "graph_prob_prior_diagnostics",
+      "bytes": 17795,
+      "path": "src/tools/historical_files/graph_prob_prior_diagnostics/dump_graph_prob_prior_intermediates.py",
+      "sha256": "d0724c1941ecfca58d4f4cf39fb970395547775c606fbcbaae5126c941590926"
+    }
+  ],
+  "format": "historical_source_manifest_v1",
+  "manifest_sha256": "4b4a517efd78e54960dd751906fe4f7fc3c3e7cbd54179632cd3b2d09154ce3d",
+  "policy": "Preserve these sources until an independently stored archive with matching checksums is verified; cache files are not part of the archive.",
+  "source_count": 29,
+  "source_root": "src/tools/historical_files",
+  "total_bytes": 650576
+}

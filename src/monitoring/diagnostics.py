@@ -256,7 +256,7 @@ class DiagnosticManager:
                 candidate,
                 getattr(dataset, "seen_classes", []),
             )
-            path = self._write_json_artifact(
+            self._write_json_artifact(
                 "prediction_health",
                 f"prediction_health/epoch_{int(epoch):04d}/{split}.json",
                 {"split": str(split), "epoch": int(epoch), "metrics": prediction},

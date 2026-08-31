@@ -44,7 +44,6 @@ import json
 import re
 from typing import Dict
 from collections import defaultdict
-from contextlib import nullcontext
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -63,6 +62,7 @@ from ..utils.runtime_progress import TrainingProgressController
 from ..monitoring import (
     DiagnosticManager,
     MonitorManager,
+    MultiLossGradientAuditor,
     NumericalGuard,
     OptimizerSanity,
     PromptParameterTracker,
@@ -310,6 +310,13 @@ class Trainer():
         self._trace_rank = int(du.get_rank())
         is_monitor_writer = du.get_rank() == 0
         self.monitor_manager = MonitorManager(cfg, is_writer=is_monitor_writer)
+        self.multi_loss_gradient_auditor = MultiLossGradientAuditor(
+            cfg,
+            (("model", self._model_ref(self.model)), ("cls_criterion", self.cls_criterion)),
+            self.optimizer,
+            self.monitor_manager,
+            self.device,
+        )
         self.diagnostic_manager = DiagnosticManager(
             cfg,
             self.monitor_manager,
@@ -429,37 +436,6 @@ class Trainer():
         return outputs
 
     @staticmethod
-    def _replace_logits(outputs, logits):
-        """
-         在保持 outputs 原有结构的前提下，把其中的 logits 替换成新的 logits。
-
-         用途：
-         - seen-only CE 时，把 full logits 换成 seen-only logits
-         - 保持 tuple/list/dict 的其他辅助信息不丢失
-
-         支持：
-         1. tuple -> (new_logits, 其余保持不变)
-         2. list  -> list[0] = new_logits
-         3. dict  -> out["logits"] = new_logits
-         4. 其他  -> 直接返回 logits
-         """
-        if isinstance(outputs, tuple):
-            if len(outputs) == 0:
-                return logits
-            return (logits,) + tuple(outputs[1:])
-        if isinstance(outputs, list):
-            if len(outputs) == 0:
-                return logits
-            out = list(outputs)
-            out[0] = logits
-            return out
-        if isinstance(outputs, dict) and "logits" in outputs:
-            out = dict(outputs)
-            out["logits"] = logits
-            return out
-        return logits
-
-    @staticmethod
     def _dataset_space_meta(dataset, use_eval_space: bool):
         if dataset is None:
             raise ValueError("dataset is required for local-output remapping.")
@@ -497,24 +473,6 @@ class Trainer():
     @staticmethod
     def _model_ref(model):
         return model.module if hasattr(model, "module") else model
-
-    def _b3_pseudo_manifest_identity(self):
-        """Bind pseudo-GZSL checkpoints to the exact class/sample partition."""
-        if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "b3_pseudo_gzsl":
-            return None
-        manifest_path = os.path.abspath(
-            os.path.expanduser(str(self.cfg.DATA.XLSA.B3_PSEUDO_MANIFEST).strip())
-        )
-        if not os.path.isfile(manifest_path):
-            raise FileNotFoundError(
-                "b3_pseudo_gzsl requires DATA.XLSA.B3_PSEUDO_MANIFEST: {}".format(
-                    manifest_path
-                )
-            )
-        return {
-            "path": manifest_path,
-            "sha256": checkpoint_sha256(manifest_path),
-        }
 
     def _load_trainable_initialization_checkpoint(self):
         checkpoint_path = str(
@@ -565,19 +523,6 @@ class Trainer():
                     checkpoint_protocol, self.cfg.DATA.XLSA.PROTOCOL_MODE
                 )
             )
-        current_b3_manifest = self._b3_pseudo_manifest_identity()
-        checkpoint_b3_manifest = payload.get("b3_pseudo_manifest")
-        if current_b3_manifest is not None:
-            if not isinstance(checkpoint_b3_manifest, dict):
-                raise ValueError(
-                    "pseudo-GZSL initialization checkpoint does not record its B3 manifest"
-                )
-            if str(checkpoint_b3_manifest.get("sha256", "")) != str(
-                current_b3_manifest["sha256"]
-            ):
-                raise ValueError(
-                    "pseudo-GZSL initialization checkpoint uses a different B3 manifest"
-                )
         state = payload.get("model_state")
         if not isinstance(state, dict) or not state:
             raise ValueError(
@@ -626,7 +571,6 @@ class Trainer():
             "checkpoint_seed": checkpoint_seed,
             "run_seed": self.cfg.SEED,
             "protocol_mode": checkpoint_protocol,
-            "b3_pseudo_manifest": current_b3_manifest,
             "loaded_tensor_count": len(loaded_names),
             "new_trainable_parameter_names": new_trainable,
             "allowed_missing_prefixes": list(allowed_missing_prefixes),
@@ -752,17 +696,17 @@ class Trainer():
                 raise ValueError("val_unseen is only valid under dev protocol, got '{}'".format(protocol_mode))
             return "dev_unseen"
         if split == "test_seen":
-            if protocol_mode not in {"final_gzsl", "b3_pseudo_gzsl"}:
+            if protocol_mode != "final_gzsl":
                 raise ValueError("test_seen is only valid under a GZSL protocol, got '{}'".format(protocol_mode))
             return "gzsl_seen"
         if split == "test_unseen":
             if protocol_mode == "final_zsl":
                 return "zsl_unseen"
-            if protocol_mode in {"final_gzsl", "b3_pseudo_gzsl"}:
+            if protocol_mode == "final_gzsl":
                 return "gzsl_unseen"
             raise ValueError("test_unseen is only valid under final_zsl/GZSL, got '{}'".format(protocol_mode))
         if split == "train_eval_seen":
-            if protocol_mode not in {"final_gzsl", "b3_pseudo_gzsl"}:
+            if protocol_mode != "final_gzsl":
                 raise ValueError(
                     "train_eval_seen is only valid under a GZSL protocol, got '{}'".format(
                         protocol_mode
@@ -1678,31 +1622,6 @@ class Trainer():
             })
         return out
 
-    def _vis_save_layer_panel(self, path: str, image_u8: np.ndarray, layer_maps: list, title_prefix: str) -> None:
-        if (not self.vis_save_images) or len(layer_maps) == 0:
-            return
-        images = []
-        titles = []
-        h, w = image_u8.shape[:2]
-        for item in layer_maps:
-            heat_up = resize_map_torch(item["grid_map"], (h, w))
-            images.append(overlay_heatmap(image_u8, heat_up))
-            titles.append(f"{title_prefix} L{int(item['layer']):02d}")
-        save_panel(path, images, titles=titles, ncols=min(4, len(images)))
-
-    def _vis_save_layer_raw(self, path: str, layer_maps: list) -> None:
-        if (not self.vis_save_raw) or len(layer_maps) == 0:
-            return
-        ensure_dir(os.path.dirname(path))
-        arrays = {}
-        for item in layer_maps:
-            li = int(item["layer"])
-            arrays[f"layer_{li:02d}_grid"] = np.asarray(item["grid_map"], dtype=np.float32)
-            arrays[f"layer_{li:02d}_heads"] = np.asarray(item["head_raw"], dtype=np.float32)
-            if "head_vis" in item:
-                arrays[f"layer_{li:02d}_heads_vis"] = np.asarray(item["head_vis"], dtype=np.float32)
-        np.savez_compressed(as_long_path(path), **arrays)
-
     def _vis_save_prompt_matrix(self, path: str, prompt_maps: list, use_vis: bool) -> None:
         if (not self.vis_save_images) or len(prompt_maps) == 0:
             return
@@ -2460,6 +2379,12 @@ class Trainer():
                     else None
                 ),
             }
+            multi_loss_audit_due = self.multi_loss_gradient_auditor.should_audit(
+                epoch=int(self._trace_epoch + 1),
+                batch_index=int(self._trace_iter),
+                is_train=bool(is_train),
+            )
+            loss_kwargs["capture_loss_terms"] = bool(multi_loss_audit_due)
             # 常规分类损失（如 SoftmaxLoss），只需 outputs / targets / class_weights。
             loss = self.cls_criterion(
                 loss_outputs, loss_targets, loss_weights, kwargs=loss_kwargs)
@@ -2545,6 +2470,19 @@ class Trainer():
         # =======backward and optim step only if in training phase... =========
         # ========== 5. 训练阶段执行 backward + step ==========
         if is_train:
+            if multi_loss_audit_due:
+                try:
+                    self.multi_loss_gradient_auditor.prepare(
+                        self.cls_criterion.get_last_loss_terms(),
+                        targets=loss_targets,
+                        sample_ids=loss_kwargs.get("sample_ids"),
+                        epoch=int(self._trace_epoch + 1),
+                        global_step=int(self._trace_global_step),
+                    )
+                finally:
+                    self.multi_loss_gradient_auditor.clear_loss_terms(
+                        self.cls_criterion
+                    )
             self.optimizer.zero_grad()
             loss.backward()
             self._sync_cls_criterion_grads()
@@ -2597,6 +2535,7 @@ class Trainer():
                 raise FloatingPointError(
                     "numerical_guard rejected optimizer step: {}".format(numerical_failure["failures"][:8])
                 )
+            self.multi_loss_gradient_auditor.finalize_optimizer_step()
             if self.optimizer_sanity is not None and not self._optimizer_sanity_first_step_done:
                 self._optimizer_sanity_first_step_done = True
                 first_step_report = self.optimizer_sanity.first_step_report()
@@ -4623,7 +4562,7 @@ class Trainer():
                         scale=spec["scale"],
                         seed=spec["perturbation_seed"],
                         selected_layers=[target_layer],
-                    ) as intervention:
+                    ):
                         changed_source = static_prompt_vector(
                             model_ref, selected_layers
                         ).unsqueeze(0).expand(batch_size, -1)
@@ -4874,10 +4813,6 @@ class Trainer():
                 if distributor_active
                 else {}
             ),
-            "heldout_linear_probe": {
-                "status": "deferred_high_cost",
-                "reason": "requires_predeclared_fit_and_heldout_subsets_after_shortlist",
-            },
         }
         report = build_object_selection_report(registry, hierarchy_trace)
         return {
@@ -5128,6 +5063,10 @@ class Trainer():
                 raw_candidate_semantics = class_attributes.index_select(
                     0, candidate_index
                 )
+        if raw_candidate_semantics is not None:
+            normal_accumulator.set_raw_semantic_prototypes(
+                raw_candidate_semantics
+            )
         attribute_concept_reference = self._attribute_concept_reference(
             model_ref, raw_candidate_semantics
         )
@@ -7956,7 +7895,7 @@ class Trainer():
             }
         output_root_reference = "../" * (1 + len([item for item in artifact_prefix.split("/") if item]))
         combined_manifest = {
-            "format": "baseline_fixed_probe_collection_v11",
+            "format": "baseline_fixed_probe_collection_v12",
             "run_id": self.monitor_manager.run_id,
             "session_id": self.monitor_manager.session_id,
             "selection_seed": selection_seed,
@@ -8008,8 +7947,7 @@ class Trainer():
                 continue
             candidate_class_ids = (
                 list(dataset.seen_classes) + list(dataset.unseen_classes)
-                if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower()
-                in {"final_gzsl", "b3_pseudo_gzsl"}
+                if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower() == "final_gzsl"
                 else list(dataset.eval_local_classes)
             )
             manifest = build_probe_manifest(
@@ -8753,6 +8691,22 @@ class Trainer():
                         domain=domain,
                         entity_type=entity_type,
                         entity_id=entity_id,
+                        selection_seed=selection_seed,
+                        probe_manifest_sha256=manifest["manifest_sha256"],
+                    ))
+                projection_health = condition_metrics.get(
+                    "semantic_projection_health", {}
+                )
+                if projection_health:
+                    all_rows.extend(self._probe_metric_rows(
+                        projection_health,
+                        checkpoint_id=checkpoint_id,
+                        probe_id=manifest["probe_id"],
+                        split=split,
+                        condition=condition,
+                        domain="semantic_graph_reference",
+                        entity_type="projection",
+                        entity_id="raw_312_to_projected_768",
                         selection_seed=selection_seed,
                         probe_manifest_sha256=manifest["manifest_sha256"],
                     ))
@@ -10318,10 +10272,7 @@ class Trainer():
         cfg = self.cfg.MONITOR.MILESTONE_PROBE
         if not bool(cfg.ENABLE):
             return []
-        if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower() not in {
-            "final_gzsl",
-            "b3_pseudo_gzsl",
-        }:
+        if str(self.cfg.DATA.XLSA.PROTOCOL_MODE).lower() != "final_gzsl":
             raise ValueError("MONITOR.MILESTONE_PROBE requires a GZSL protocol")
         if int(self.cfg.NUM_GPUS) != 1 or int(self.cfg.NUM_SHARDS) != 1:
             raise ValueError(
@@ -10388,7 +10339,6 @@ class Trainer():
                 "seed": int(self.cfg.SEED) if self.cfg.SEED is not None else None,
                 "cell_id": str(self.cfg.SOLVER.STAGE2_CHECKPOINT_CELL_ID),
                 "protocol_mode": str(self.cfg.DATA.XLSA.PROTOCOL_MODE),
-                "b3_pseudo_manifest": self._b3_pseudo_manifest_identity(),
                 "total_epoch": int(total_epoch),
                 "config": str(self.cfg),
             },
@@ -10437,7 +10387,6 @@ class Trainer():
                 int(self.cfg.SEED) if self.cfg.SEED is not None else None
             ),
             "protocol_mode": str(self.cfg.DATA.XLSA.PROTOCOL_MODE),
-            "b3_pseudo_manifest": self._b3_pseudo_manifest_identity(),
             "checkpoint": {
                 "checkpoint_id": "final_epoch_{:04d}".format(int(total_epoch)),
                 "checkpoint_path": os.path.basename(checkpoint_path),
@@ -10505,7 +10454,6 @@ class Trainer():
                 "seed": int(self.cfg.SEED) if self.cfg.SEED is not None else None,
                 "cell_id": str(self.cfg.SOLVER.STAGE2_CHECKPOINT_CELL_ID),
                 "protocol_mode": str(self.cfg.DATA.XLSA.PROTOCOL_MODE),
-                "b3_pseudo_manifest": self._b3_pseudo_manifest_identity(),
                 "checkpoint_epoch": int(checkpoint_epoch),
                 "planned_total_epoch": int(total_epoch),
                 "checkpoint_selection_rule": "predeclared_training_milestone",
@@ -10611,6 +10559,9 @@ class Trainer():
             return result
         finally:
             self._finalize_progress_state("completed" if completed else "interrupted")
+            self.multi_loss_gradient_auditor.finalize(
+                status="completed" if completed else "interrupted"
+            )
             self.diagnostic_manager.finalize(
                 status="completed" if completed else "interrupted"
             )

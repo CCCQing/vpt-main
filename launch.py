@@ -99,7 +99,6 @@ def collect_env_info() -> str:
                 cuda_env = "(not set) -> CUDA not available (CPU mode)"
         data.append(("CUDA ID", cuda_env))
 
-        from collections import defaultdict
         # 统计每种 GPU 型号对应的设备索引列表，如 "GPU 0,1: NVIDIA GeForce RTX 3090"
         devices = defaultdict(list)
         for k in range(torch.cuda.device_count()):

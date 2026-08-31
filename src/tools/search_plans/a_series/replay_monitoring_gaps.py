@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import json
 import random
 import sys
 import traceback
@@ -27,6 +26,7 @@ from src.tools.search_plans.a_series.artifact_io import (
     read_json_artifact,
     resolve_text_artifact,
 )
+from src.tools.search_plans.common import write_json
 from src.utils.dataset_manifest import write_xlsa_dataset_manifest
 from src.utils.run_artifacts import write_resolved_config
 
@@ -79,12 +79,7 @@ def _read_json(path):
 
 
 def _write_json(path, payload):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    write_json(path, payload)
 
 
 def _require_new_output(source_run, output_run):
@@ -195,10 +190,8 @@ def _load_cfg(
 
 def _construct_loaders(cfg, logger):
     protocol_mode = str(cfg.DATA.XLSA.PROTOCOL_MODE).lower()
-    if protocol_mode not in {"final_gzsl", "b3_pseudo_gzsl"}:
-        raise ValueError(
-            "fixed-Probe replay requires final_gzsl or b3_pseudo_gzsl"
-        )
+    if protocol_mode != "final_gzsl":
+        raise ValueError("fixed-Probe replay requires the official final_gzsl protocol")
     logger.info(
         "Loading train/test datasets for fixed-probe replay protocol=%s",
         protocol_mode,

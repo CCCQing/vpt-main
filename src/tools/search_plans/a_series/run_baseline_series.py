@@ -17,6 +17,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+from src.tools.search_plans.common import (
+    build_single_gpu_train_command,
+    directory_has_contents as _has_contents,
+)
 
 
 MODEL_CONFIGS = {
@@ -95,27 +99,14 @@ def _completed_summary(output_root: Path) -> Optional[Path]:
     return completed[0] if completed else None
 
 
-def _has_contents(path: Path) -> bool:
-    return path.is_dir() and next(path.iterdir(), None) is not None
-
-
 def _command(python_bin: str, job: Job) -> List[str]:
-    return [
+    return build_single_gpu_train_command(
+        ROOT,
         python_bin,
-        str(ROOT / "train.py"),
-        "--config-file",
-        str(job.config_file),
-        "SEED",
-        str(job.seed),
-        "OUTPUT_DIR",
-        str(job.output_root),
-        "RUN_N_TIMES",
-        "1",
-        "NUM_GPUS",
-        "1",
-        "NUM_SHARDS",
-        "1",
-    ]
+        job.config_file,
+        job.seed,
+        job.output_root,
+    )
 
 
 def _format_command(command: Sequence[str]) -> str:

@@ -25,7 +25,6 @@ GRAPH_GP_SEARCH_SPACE:
   STAGES:
     stage0_conditioning:
       GRID:
-        MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_SUPPORT_RATIO: [0.7, 0.8, 0.9]
         MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_RIDGE: [1.0e-5, 1.0e-4, 1.0e-3]
     stage1_prior_variance:
       GRID:
@@ -33,4 +32,3 @@ GRAPH_GP_SEARCH_SPACE:
     stage2_energy:
       GRID:
         MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_ENERGY_TAU: [0.5, 1.0, 2.0]
-        MODEL.GRAPH_PROB_PRIOR.GRAPH_GP_PSEUDO_WEIGHT: [0.5, 1.0, 2.0]

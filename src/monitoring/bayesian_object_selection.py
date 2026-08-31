@@ -847,7 +847,6 @@ def build_object_selection_report(
                 {"status": "not_observed"},
             ),
             "effective_dimension": {"status": "not_observed_jacobian_deferred"},
-            "heldout_transfer": {"status": "not_observed"},
             "cross_seed_stability": {"status": "not_observed"},
             "coordinate_robustness": {"status": "not_observed"},
             "operational_cost": {

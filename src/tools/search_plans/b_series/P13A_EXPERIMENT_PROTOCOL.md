@@ -1,9 +1,10 @@
 # P1-3a head-only protocol
 
 P1-3a freezes each paired A2 checkpoint, extracts each split's final CLS once,
-and trains only a shared candidate-conditioned compatibility head. The locked
-class-disjoint Seen split selects the training duration; normal Unseen is not
-used for model selection.
+and trains only a shared candidate-conditioned compatibility head. Every
+trainable condition uses all official Seen classes for a predeclared fixed
+number of epochs. Post-training evaluation uses the official final-GZSL Seen and Unseen
+splits.
 
 The formal conditions are `candidate_raw312`, `candidate_projected768`,
 `semantic_permuted_raw312`, `image_constant_raw312`,

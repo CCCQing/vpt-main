@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
-import json
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -103,11 +102,6 @@ def save_panel(path: str, images: List[np.ndarray], titles: Optional[List[str]] 
     plt.close()
 
 
-def entropy_lastdim(p: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    p = p.float().clamp_min(eps)
-    return -(p * p.log()).sum(dim=-1)
-
-
 def attention_rollout(attn_weights: List[torch.Tensor], add_identity: bool = True) -> Optional[torch.Tensor]:
     """
     attn_weights: list of [B,H,L,L]. Returns rollout [B,L,L].
@@ -125,23 +119,3 @@ def attention_rollout(attn_weights: List[torch.Tensor], add_identity: bool = Tru
         a_mean = a_mean / a_mean.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         roll = a_mean if roll is None else torch.bmm(a_mean, roll)
     return roll
-
-
-def append_csv_row(path: str, row: Dict[str, object], field_order: Optional[List[str]] = None) -> None:
-    import csv
-
-    ensure_dir(os.path.dirname(path))
-    if field_order is None:
-        field_order = list(row.keys())
-    write_header = not os.path.exists(as_long_path(path))
-    with open(as_long_path(path), "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=field_order)
-        if write_header:
-            w.writeheader()
-        w.writerow(row)
-
-
-def save_json(path: str, obj: Dict[str, object]) -> None:
-    ensure_dir(os.path.dirname(path))
-    with open(as_long_path(path), "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)

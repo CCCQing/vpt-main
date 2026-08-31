@@ -20,6 +20,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.tools.search_plans.a_series.progress_dashboard import run_parallel_trials
+from src.tools.search_plans.common import (
+    directory_has_contents as _has_contents,
+    read_json as _read_json,
+)
 
 
 RUN_SUFFIX = Path("CUB/sup_vitb16_224/lr0.0006_wd1e-05/run1")
@@ -62,10 +66,6 @@ def _gpus(raw: str) -> List[str]:
     return values
 
 
-def _read_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def _completed(job: Job) -> bool:
     path = job.output_dir / "p0_summary.json"
     if not path.is_file():
@@ -79,10 +79,6 @@ def _completed(job: Job) -> bool:
         and payload.get("valid") is True
         and payload.get("experiment") == job.experiment
     )
-
-
-def _has_contents(path: Path) -> bool:
-    return path.is_dir() and next(path.iterdir(), None) is not None
 
 
 def _source_run(root: Path, method: str, seed: int) -> Path:

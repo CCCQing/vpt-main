@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -532,6 +532,180 @@ def semantic_graph_reference_metrics(
         "seen_unseen_edge_mass": cross_mass,
         "unseen_nearest_seen_ratio": float(np.mean(unseen_ratios)) if unseen_ratios else 0.0,
     }
+
+
+def _relation_neighbor_overlap(
+    left_relation: np.ndarray,
+    right_relation: np.ndarray,
+    neighbor_k: int,
+) -> float:
+    count = int(left_relation.shape[0])
+    if count < 2:
+        return 0.0
+    use_k = min(max(1, int(neighbor_k)), count - 1)
+    overlaps = []
+    for row in range(count):
+        left_order = [
+            int(item)
+            for item in np.argsort(-left_relation[row], kind="mergesort")
+            if int(item) != row
+        ][:use_k]
+        right_order = [
+            int(item)
+            for item in np.argsort(-right_relation[row], kind="mergesort")
+            if int(item) != row
+        ][:use_k]
+        overlaps.append(
+            len(set(left_order).intersection(right_order)) / float(use_k)
+        )
+    return float(np.mean(overlaps))
+
+
+def _normalized_relation_effective_rank(relation: np.ndarray) -> float:
+    count = int(relation.shape[0])
+    if count < 2:
+        return 0.0
+    centering = np.eye(count, dtype=np.float32) - np.full(
+        (count, count), 1.0 / float(count), dtype=np.float32
+    )
+    centered_relation = centering @ relation @ centering
+    effective_rank, _ = _effective_rank(centered_relation)
+    return float(effective_rank / max(1, count - 1))
+
+
+def semantic_projection_health_metrics(
+    raw_semantic_prototypes: Any,
+    projected_semantic_prototypes: Any,
+    *,
+    visual_class_centers: Optional[Any] = None,
+    observed_class_ids: Optional[Sequence[int]] = None,
+    neighbor_k: int = 5,
+    high_semantic_threshold: float = 0.8,
+    low_reference_threshold: float = 0.2,
+) -> Dict[str, float]:
+    """Compare raw/projected semantic relations, optionally against visual centers.
+
+    Raw and projected prototypes may have different feature dimensions.  All
+    cross-space comparisons therefore use class-by-class cosine relation
+    matrices; only the existing projected-space alignment monitor performs
+    direct 768-D visual/prototype comparisons.
+    """
+    raw = np.asarray(raw_semantic_prototypes, dtype=np.float32)
+    projected = np.asarray(projected_semantic_prototypes, dtype=np.float32)
+    if raw.ndim != 2 or projected.ndim != 2 or raw.shape[0] != projected.shape[0]:
+        raise ValueError(
+            "raw and projected semantics must be [same_classes, feature_dim] matrices"
+        )
+    if raw.shape[0] < 2 or raw.shape[1] == 0 or projected.shape[1] == 0:
+        return {}
+    if not np.isfinite(raw).all() or not np.isfinite(projected).all():
+        raise ValueError("semantic projection inputs contain non-finite values")
+    if np.any(np.linalg.norm(raw, axis=1) <= 1e-12):
+        raise ValueError("raw semantic prototypes contain zero-direction classes")
+    if np.any(np.linalg.norm(projected, axis=1) <= 1e-12):
+        raise ValueError("projected semantic prototypes contain zero-direction classes")
+
+    raw_relation = _normalize_rows(raw) @ _normalize_rows(raw).T
+    projected_relation = _normalize_rows(projected) @ _normalize_rows(projected).T
+    upper = np.triu_indices(raw.shape[0], k=1)
+    raw_edges = raw_relation[upper]
+    projected_edges = projected_relation[upper]
+    projected_high = projected_edges >= float(high_semantic_threshold)
+    raw_high = raw_edges >= float(high_semantic_threshold)
+    new_false_high = projected_high & (raw_edges <= float(low_reference_threshold))
+    dropped_high = raw_high & (projected_edges <= float(low_reference_threshold))
+    raw_rank = _normalized_relation_effective_rank(raw_relation)
+    projected_rank = _normalized_relation_effective_rank(projected_relation)
+    result = {
+        "projection_relation_spearman": spearman_correlation(
+            raw_edges, projected_edges
+        ),
+        "projection_neighbor_preservation_at_1": _relation_neighbor_overlap(
+            raw_relation, projected_relation, 1
+        ),
+        "projection_neighbor_preservation_at_5": _relation_neighbor_overlap(
+            raw_relation, projected_relation, neighbor_k
+        ),
+        "projection_new_false_high_edge_rate": float(
+            new_false_high.sum() / max(1, projected_high.sum())
+        ),
+        "projection_dropped_high_edge_rate": float(
+            dropped_high.sum() / max(1, raw_high.sum())
+        ),
+        "semantic_relation_normalized_effective_rank_312": raw_rank,
+        "semantic_relation_normalized_effective_rank_768": projected_rank,
+        "semantic_relation_normalized_effective_rank_delta_768_minus_312": float(
+            projected_rank - raw_rank
+        ),
+    }
+    if visual_class_centers is None:
+        return result
+
+    centers = np.asarray(visual_class_centers, dtype=np.float32)
+    if centers.ndim != 2 or centers.shape[0] < 2 or centers.shape[1] == 0:
+        return result
+    if not np.isfinite(centers).all():
+        raise ValueError("visual class centers contain non-finite values")
+    if np.any(np.linalg.norm(centers, axis=1) <= 1e-12):
+        raise ValueError("visual class centers contain zero-direction classes")
+    if observed_class_ids is None:
+        observed = np.arange(centers.shape[0], dtype=np.int64)
+    else:
+        observed = np.asarray(observed_class_ids, dtype=np.int64).reshape(-1)
+    if observed.size != centers.shape[0]:
+        raise ValueError("observed_class_ids length does not match visual centers")
+    if observed.size and (
+        int(observed.min()) < 0 or int(observed.max()) >= raw.shape[0]
+    ):
+        raise ValueError("observed class ids fall outside the semantic class order")
+
+    raw_observed = raw_relation[np.ix_(observed, observed)]
+    projected_observed = projected_relation[np.ix_(observed, observed)]
+    visual_relation = _normalize_rows(centers) @ _normalize_rows(centers).T
+    visual_upper = np.triu_indices(observed.size, k=1)
+    visual_edges = visual_relation[visual_upper]
+    raw_observed_edges = raw_observed[visual_upper]
+    projected_observed_edges = projected_observed[visual_upper]
+    raw_spearman = spearman_correlation(raw_observed_edges, visual_edges)
+    projected_spearman = spearman_correlation(
+        projected_observed_edges, visual_edges
+    )
+    raw_overlap = _relation_neighbor_overlap(
+        raw_observed, visual_relation, neighbor_k
+    )
+    projected_overlap = _relation_neighbor_overlap(
+        projected_observed, visual_relation, neighbor_k
+    )
+    raw_high = raw_observed_edges >= float(high_semantic_threshold)
+    projected_high = projected_observed_edges >= float(high_semantic_threshold)
+    raw_false_high = raw_high & (
+        visual_edges <= float(low_reference_threshold)
+    )
+    projected_false_high = projected_high & (
+        visual_edges <= float(low_reference_threshold)
+    )
+    raw_false_rate = float(raw_false_high.sum() / max(1, raw_high.sum()))
+    projected_false_rate = float(
+        projected_false_high.sum() / max(1, projected_high.sum())
+    )
+    result.update({
+        "semantic_visual_relation_spearman_312": raw_spearman,
+        "semantic_visual_relation_spearman_768": projected_spearman,
+        "semantic_visual_relation_spearman_delta_768_minus_312": float(
+            projected_spearman - raw_spearman
+        ),
+        "semantic_visual_neighbor_overlap_at_5_312": raw_overlap,
+        "semantic_visual_neighbor_overlap_at_5_768": projected_overlap,
+        "semantic_visual_neighbor_overlap_at_5_delta_768_minus_312": float(
+            projected_overlap - raw_overlap
+        ),
+        "false_high_semantic_edge_rate_312": raw_false_rate,
+        "false_high_semantic_edge_rate_768": projected_false_rate,
+        "false_high_semantic_edge_rate_delta_768_minus_312": float(
+            projected_false_rate - raw_false_rate
+        ),
+    })
+    return result
 
 
 def semantic_visual_graph_metrics(

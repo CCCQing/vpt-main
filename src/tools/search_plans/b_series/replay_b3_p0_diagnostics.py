@@ -6,11 +6,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -20,7 +19,6 @@ ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.data import loader as data_loader
 from src.monitoring.eval_metrics import (
     calibration_profile_metrics,
     classification_metrics,
@@ -52,7 +50,6 @@ from src.tools.search_plans.b_series.replay_b_series_experiments import (
     _json_safe,
     _load_cfg as _load_b_cfg,
     _model_num_layers,
-    _predict,
     _run_condition,
     _source_dataset,
 )
@@ -710,10 +707,41 @@ def _run_p03(outputs, raw_attributes, projected_semantic, shuffle_seeds) -> Dict
             "class_shuffled_controls": shuffled,
             "class_shuffled_summary": shuffled_summary,
         }
+    paired = {}
+    paired_fields = {
+        "predicted_unseen_center_cosine": "predicted_to_true_center_cosine_mean",
+        "predicted_unseen_relation_spearman": "relation_spearman",
+        "predicted_unseen_neighbor_recovery_at_5": "visual_neighbor_recovery_at_k",
+        "unseen_center_top1": "unseen_only_top1",
+        "unseen_center_nll": "unseen_only_nll",
+    }
+    for condition_name in (
+        "positive_cosine", "semantic_1nn", "global_seen_mean"
+    ):
+        raw_metrics = reports["attribute_312"]["conditions"][condition_name][
+            "metrics"
+        ]
+        projected_metrics = reports["projected_768"]["conditions"][
+            condition_name
+        ]["metrics"]
+        condition_pair = {}
+        for public_name, source_name in paired_fields.items():
+            raw_value = float(raw_metrics[source_name])
+            projected_value = float(projected_metrics[source_name])
+            condition_pair[public_name + "_312"] = raw_value
+            condition_pair[public_name + "_768"] = projected_value
+            if public_name == "unseen_center_nll":
+                condition_pair[
+                    "unseen_center_nll_improvement_768_over_312"
+                ] = float(raw_value - projected_value)
+            else:
+                condition_pair[
+                    public_name + "_delta_768_minus_312"
+                ] = float(projected_value - raw_value)
+        paired[condition_name] = condition_pair
     return {
-        "format": "b3_p0_3_seen_to_unseen_semantic_prediction_v1",
+        "format": "b3_p0_3_seen_to_unseen_semantic_prediction_v2",
         "official_seen_to_unseen": True,
-        "pseudo_unseen_used": False,
         "graph_prob_prior_used": False,
         "unseen_used_for_fitting_or_tuning": False,
         "oracle_evaluation_uses_true_unseen_centers": True,
@@ -722,6 +750,7 @@ def _run_p03(outputs, raw_attributes, projected_semantic, shuffle_seeds) -> Dict
         "seen_center_support": seen_support.tolist(),
         "unseen_center_support": unseen_support.tolist(),
         "spaces": reports,
+        "paired_312_vs_768": paired,
         "valid": bool(
             all(
                 item["relation_validity"]["valid"]

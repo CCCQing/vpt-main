@@ -68,7 +68,6 @@ def _validate_p034(result):
     p04 = result["P0-4"]
     assert p03["valid"] is True
     assert p03["official_seen_to_unseen"] is True
-    assert p03["pseudo_unseen_used"] is False
     assert p03["graph_prob_prior_used"] is False
     assert p03["unseen_used_for_fitting_or_tuning"] is False
     assert set(p03["spaces"]) == {"attribute_312", "projected_768"}

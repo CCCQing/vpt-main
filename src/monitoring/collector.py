@@ -22,6 +22,10 @@ class MonitorManager:
         "metrics_events.jsonl",
         "monitor_runtime_summary.json",
         "optimizer_sanity.json",
+        "multi_loss_gradient_audit.jsonl",
+        "multi_loss_gradient_audit_summary.json",
+        "multi_loss_parameter_group_manifest.json",
+        "multi_loss_gradient_audit_validation.json",
     )
 
     def __init__(self, cfg: Any, *, is_writer: bool = True) -> None:
@@ -180,6 +184,18 @@ class MonitorManager:
         write_json(path, {**self._base(), **dict(payload)})
         return path
 
+    def append_evidence_jsonl(
+        self, filename: str, payload: Mapping[str, Any]
+    ) -> Optional[Path]:
+        """Append a named high-cost evidence record outside shared step logs."""
+        if not self.enabled:
+            return None
+        name = str(filename).strip()
+        if not name or Path(name).name != name or not name.endswith(".jsonl"):
+            raise ValueError("monitor evidence filename must be a plain .jsonl file name")
+        self._append_jsonl(name, {**self._base(), **dict(payload)})
+        return self.output_dir / name
+
     def set_context(
         self,
         *,
@@ -200,6 +216,21 @@ class MonitorManager:
                 None if graph_prob_prior_forward is None else int(graph_prob_prior_forward)
             ),
         )
+
+    def update_runtime_source_state(
+        self, namespace: str, *, source_active: bool
+    ) -> None:
+        """Refine a config-only source decision using a constructed runtime object."""
+        spec = get_monitor_spec(namespace)
+        state = self.monitor_groups[spec.namespace]
+        state["source_active"] = bool(source_active)
+        state["effective"] = bool(
+            self.enabled
+            and state["requested"]
+            and state["source_active"]
+        )
+        if self.enabled:
+            self._write_runtime_summary("running")
 
     def _is_recordable(self, namespace: str, cadence: str) -> bool:
         spec = get_monitor_spec(namespace)

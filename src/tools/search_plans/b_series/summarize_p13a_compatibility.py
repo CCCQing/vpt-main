@@ -22,7 +22,7 @@ def _read(path: Path) -> Mapping[str, Any]:
 def _range(values):
     rows = [float(value) for value in values]
     return {
-        "mean": float(statistics.fmean(rows)),
+        "mean": float(statistics.mean(rows)),
         "min": float(min(rows)),
         "max": float(max(rows)),
         "values": rows,
@@ -68,17 +68,9 @@ def summarize(root: Path) -> Dict[str, Any]:
                     for row in rows
                 ),
             },
-            "selection": (
-                {
-                    "heldout_macro_accuracy": _range(
-                        row["selection"]["best_heldout_macro_accuracy"]
-                        for row in rows
-                    ),
-                    "selected_epoch": _range(
-                        row["selection"]["selected_epoch"] for row in rows
-                    ),
-                }
-                if all("selection" in row for row in rows)
+            "train_epochs": (
+                _range(row["final_training"]["train_epochs"] for row in rows)
+                if all("final_training" in row for row in rows)
                 else None
             ),
         }
@@ -108,8 +100,14 @@ def summarize(root: Path) -> Dict[str, Any]:
         len(conditions) == 8
         and all(item.get("valid") is True for item in results)
         and all(
-            item["execution_contract"]["normal_unseen_used_for_model_selection"]
-            is False
+            item["execution_contract"]["training_epoch_rule"]
+            == "predeclared_fixed_epoch"
+            and item["execution_contract"][
+                "all_official_seen_classes_used_for_training"
+            ]
+            is True
+            and item["execution_contract"]["evaluation_protocol"]
+            == "official_final_gzsl"
             for item in results
         )
     )

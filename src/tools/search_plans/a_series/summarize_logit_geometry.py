@@ -9,7 +9,7 @@ import math
 import statistics
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, Mapping, Sequence
 
 
 def parse_args():

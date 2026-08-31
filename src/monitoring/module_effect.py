@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 import numpy as np
 import torch

@@ -8,7 +8,7 @@ It does not participate in loss computation or alter gradients.
 from __future__ import annotations
 
 import math
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Optional
 
 import torch
 import torch.nn.functional as F
@@ -16,13 +16,6 @@ import torch.nn.functional as F
 def _as_float(value: torch.Tensor) -> float:
     """把 0 维 tensor 安全转成 Python float，便于写入 json/csv/log。"""
     return float(value.detach().float().cpu().item())
-
-def _finite_flatten(x: torch.Tensor) -> torch.Tensor:
-    """取出 tensor 中所有有限值并展平成一维；当前保留给后续扩展使用。"""
-    if not torch.is_tensor(x):
-        return torch.empty(0)
-    values = x.detach().float().reshape(-1)
-    return values[torch.isfinite(values)]
 
 def tensor_stats(prefix: str, x: torch.Tensor) -> Dict[str, float]:
     """统计任意实值张量的有限比例、范围和分位数。"""
@@ -133,8 +126,8 @@ def _membership_mask(values: torch.Tensor, members: torch.Tensor) -> torch.Tenso
     """
     判断 values 中每个类别 id 是否属于 members。
 
-    这里不用 torch.isin，是为了兼容旧版 PyTorch。Graph-GP 的 support/pseudo
-    监测需要按类别集合切分当前 batch，所以用广播比较构造布尔 mask。
+    这里不用 torch.isin，是为了兼容旧版 PyTorch。监测需要按类别集合筛选
+    当前 batch，所以用广播比较构造布尔 mask。
     """
     if not torch.is_tensor(values) or not torch.is_tensor(members) or members.numel() == 0:
         return torch.zeros_like(values, dtype=torch.bool)
@@ -323,17 +316,16 @@ def _index_tensor(ids, device: torch.device) -> torch.Tensor:
 def graph_gp_prototype_monitor(
     prior_mu: torch.Tensor,
     prior_logvar: Optional[torch.Tensor],
-    support_ids: torch.Tensor,
-    pseudo_unseen_ids: torch.Tensor,
-    observed_support_ids: torch.Tensor,
-    support_count: torch.Tensor,
+    seen_ids: torch.Tensor,
+    observed_seen_ids: torch.Tensor,
+    seen_count: torch.Tensor,
     center_var: torch.Tensor,
     obs_noise: torch.Tensor,
     solve_residual: torch.Tensor,
     uncertainty_diag: torch.Tensor,
     system_diag_ratio: torch.Tensor,
-    support_post_var: Optional[torch.Tensor] = None,
-    support_visual_var: Optional[torch.Tensor] = None,
+    seen_post_var: Optional[torch.Tensor] = None,
+    seen_visual_var: Optional[torch.Tensor] = None,
     visual_within_var: Optional[torch.Tensor] = None,
     proto_var_term: Optional[torch.Tensor] = None,
     visual_var_term: Optional[torch.Tensor] = None,
@@ -357,35 +349,29 @@ def graph_gp_prototype_monitor(
     Graph-GP prototype 推断专属监测量。
 
     这些统计不参与 loss，只回答四个问题：
-    1. support-seen 中有多少类已经被 posterior_mu 观测到；
-    2. V_support 的类内方差和观测噪声 R_s 是否异常；
+    1. 官方 Seen 类中有多少类已经被 posterior_mu 观测到；
+    2. Seen 类中心的类内方差和观测噪声 R_s 是否异常；
     3. 线性方程求解是否稳定，Graph-GP predictive uncertainty 是否过大；
-    4. 推断出的 M_star 是否仍然同向扎堆，以及 pseudo-unseen 样本能否在 energy CE 中找到真类 prototype。
+    4. 推断出的 M_star 是否仍然同向扎堆，以及 Seen 样本能否在 energy CE 中找到真类 prototype。
     """
     stats: Dict[str, float] = {}
     if not torch.is_tensor(prior_mu):
         return stats
 
     device = prior_mu.device
-    support_ids = support_ids.to(device=device, dtype=torch.long) if torch.is_tensor(support_ids) else torch.empty(0, device=device, dtype=torch.long)
-    pseudo_unseen_ids = (
-        pseudo_unseen_ids.to(device=device, dtype=torch.long)
-        if torch.is_tensor(pseudo_unseen_ids)
-        else torch.empty(0, device=device, dtype=torch.long)
-    )
-    observed_support_ids = (
-        observed_support_ids.to(device=device, dtype=torch.long)
-        if torch.is_tensor(observed_support_ids)
+    seen_ids = seen_ids.to(device=device, dtype=torch.long) if torch.is_tensor(seen_ids) else torch.empty(0, device=device, dtype=torch.long)
+    observed_seen_ids = (
+        observed_seen_ids.to(device=device, dtype=torch.long)
+        if torch.is_tensor(observed_seen_ids)
         else torch.empty(0, device=device, dtype=torch.long)
     )
 
-    stats[f"{prefix}_support_class_count"] = float(support_ids.numel())
-    stats[f"{prefix}_pseudo_unseen_class_count"] = float(pseudo_unseen_ids.numel())
-    stats[f"{prefix}_support_observed_class_count"] = float(observed_support_ids.numel())
-    stats[f"{prefix}_support_observed_ratio"] = float(observed_support_ids.numel()) / float(max(int(support_ids.numel()), 1))
-    if support_ids.numel() > 0 and torch.is_tensor(support_count):
-        selected_count = support_count.detach().float().to(device=device).index_select(0, support_ids)
-        stats.update(tensor_stats(f"{prefix}_support_count", selected_count))
+    stats[f"{prefix}_seen_class_count"] = float(seen_ids.numel())
+    stats[f"{prefix}_seen_observed_class_count"] = float(observed_seen_ids.numel())
+    stats[f"{prefix}_seen_observed_ratio"] = float(observed_seen_ids.numel()) / float(max(int(seen_ids.numel()), 1))
+    if seen_ids.numel() > 0 and torch.is_tensor(seen_count):
+        selected_count = seen_count.detach().float().to(device=device).index_select(0, seen_ids)
+        stats.update(tensor_stats(f"{prefix}_seen_count", selected_count))
 
     if torch.is_tensor(center_var) and center_var.numel() > 0:
         stats.update(tensor_stats(f"{prefix}_seen_center_var", center_var))
@@ -400,10 +386,10 @@ def graph_gp_prototype_monitor(
         stats[f"{prefix}_kernel_diag_ratio"] = _as_float(system_diag_ratio)
     if torch.is_tensor(uncertainty_diag) and uncertainty_diag.numel() > 0:
         stats.update(tensor_stats(f"{prefix}_uncertainty_diag", uncertainty_diag))
-    if torch.is_tensor(support_post_var) and support_post_var.numel() > 0:
-        stats.update(tensor_stats(f"{prefix}_support_post_var", support_post_var))
-    if torch.is_tensor(support_visual_var) and support_visual_var.numel() > 0:
-        stats.update(tensor_stats(f"{prefix}_support_visual_var", support_visual_var))
+    if torch.is_tensor(seen_post_var) and seen_post_var.numel() > 0:
+        stats.update(tensor_stats(f"{prefix}_seen_post_var", seen_post_var))
+    if torch.is_tensor(seen_visual_var) and seen_visual_var.numel() > 0:
+        stats.update(tensor_stats(f"{prefix}_seen_visual_var", seen_visual_var))
     if torch.is_tensor(visual_within_var) and visual_within_var.numel() > 0:
         visual_var = visual_within_var.detach().float()
         stats.update(tensor_stats(f"{prefix}_visual_within_var", visual_var))
@@ -441,11 +427,8 @@ def graph_gp_prototype_monitor(
         stats[f"{prefix}_system_condition"] = _matrix_condition_number(system)
 
     if torch.is_tensor(k_all_s) and k_all_s.dim() == 2 and k_all_s.numel() > 0:
-        support_prob = _row_probability_from_nonnegative(k_all_s.to(device=device))
-        stats.update(probability_stats(f"{prefix}_k_all_s_support", support_prob, topk=topk))
-        if pseudo_unseen_ids.numel() > 0 and int(k_all_s.shape[0]) > int(pseudo_unseen_ids.max().item()):
-            pseudo_support_prob = support_prob.index_select(0, pseudo_unseen_ids)
-            stats.update(probability_stats(f"{prefix}_k_us_support", pseudo_support_prob, topk=topk))
+        seen_prob = _row_probability_from_nonnegative(k_all_s.to(device=device))
+        stats.update(probability_stats(f"{prefix}_k_all_seen", seen_prob, topk=topk))
 
     if torch.is_tensor(smoothing_coeff) and smoothing_coeff.dim() == 2 and smoothing_coeff.numel() > 0:
         coeff_prob = _abs_row_probability(smoothing_coeff.to(device=device))
@@ -501,55 +484,25 @@ def graph_gp_prototype_monitor(
             best_neg = neg_distance.min(dim=-1).values
             margin = best_neg - true_dist
 
-            pseudo_mask = _membership_mask(targets, pseudo_unseen_ids)
-            support_mask = _membership_mask(targets, support_ids)
-            if bool(pseudo_mask.any().item()):
-                stats[f"{prefix}_pseudo_unseen_rank1"] = _as_float(hit[pseudo_mask].mean())
-                stats[f"{prefix}_pseudo_unseen_acc"] = stats[f"{prefix}_pseudo_unseen_rank1"]
-                stats[f"{prefix}_pseudo_unseen_true_kl_mean"] = _as_float(true_dist[pseudo_mask].mean())
-                stats.update(tensor_stats(f"{prefix}_pseudo_unseen_margin", margin[pseudo_mask]))
+            seen_mask = _membership_mask(targets, seen_ids)
+            if bool(seen_mask.any().item()):
+                stats[f"{prefix}_seen_rank1"] = _as_float(hit[seen_mask].mean())
+                stats[f"{prefix}_seen_acc"] = stats[f"{prefix}_seen_rank1"]
+                stats[f"{prefix}_seen_true_kl_mean"] = _as_float(true_dist[seen_mask].mean())
+                stats.update(tensor_stats(f"{prefix}_seen_margin", margin[seen_mask]))
                 if torch.is_tensor(sample_energy_loss) and sample_energy_loss.numel() == targets.numel():
-                    stats[f"{prefix}_pseudo_unseen_energy_loss"] = _as_float(
-                        sample_energy_loss.detach().float().to(device=targets.device)[pseudo_mask].mean()
-                    )
-            if bool(support_mask.any().item()):
-                stats[f"{prefix}_support_seen_rank1"] = _as_float(hit[support_mask].mean())
-                stats[f"{prefix}_support_seen_acc"] = stats[f"{prefix}_support_seen_rank1"]
-                stats[f"{prefix}_support_seen_true_kl_mean"] = _as_float(true_dist[support_mask].mean())
-                stats.update(tensor_stats(f"{prefix}_support_seen_margin", margin[support_mask]))
-                if torch.is_tensor(sample_energy_loss) and sample_energy_loss.numel() == targets.numel():
-                    stats[f"{prefix}_support_seen_energy_loss"] = _as_float(
-                        sample_energy_loss.detach().float().to(device=targets.device)[support_mask].mean()
-                    )
-            if bool(pseudo_mask.any().item()) and bool(support_mask.any().item()):
-                stats[f"{prefix}_support_pseudo_rank1_gap"] = (
-                    stats[f"{prefix}_support_seen_rank1"] - stats[f"{prefix}_pseudo_unseen_rank1"]
-                )
-                stats[f"{prefix}_support_pseudo_acc_gap"] = (
-                    stats[f"{prefix}_support_seen_acc"] - stats[f"{prefix}_pseudo_unseen_acc"]
-                )
-                if f"{prefix}_support_seen_energy_loss" in stats and f"{prefix}_pseudo_unseen_energy_loss" in stats:
-                    stats[f"{prefix}_support_pseudo_energy_loss_gap"] = (
-                        stats[f"{prefix}_pseudo_unseen_energy_loss"] - stats[f"{prefix}_support_seen_energy_loss"]
+                    stats[f"{prefix}_seen_energy_loss"] = _as_float(
+                        sample_energy_loss.detach().float().to(device=targets.device)[seen_mask].mean()
                     )
 
             if torch.is_tensor(posterior_mu) and posterior_mu.dim() == 2 and posterior_mu.shape[0] == targets.numel():
                 stats.update(
                     _batch_class_center_stats(
-                        f"{prefix}_pseudo_unseen",
+                        f"{prefix}_seen",
                         posterior_mu,
                         prior_mu,
                         targets,
-                        pseudo_mask,
-                    )
-                )
-                stats.update(
-                    _batch_class_center_stats(
-                        f"{prefix}_support_seen",
-                        posterior_mu,
-                        prior_mu,
-                        targets,
-                        support_mask,
+                        seen_mask,
                     )
                 )
 
@@ -867,33 +820,3 @@ def loss_scale_monitor(
         if main_loss is not None:
             stats["graph_prob_prior_monitor_loss_weighted_gpp_to_main_loss_ratio"] = weighted / max(abs(float(main_loss)), eps)
     return stats
-
-def aggregate_monitor_rows(rows: Iterable[Dict[str, float]]) -> Dict[str, float]:
-    """
-    聚合短跑诊断脚本收集到的逐 batch 监测量。
-
-    输入 rows 是若干个 batch 的 stats dict。
-    输出对同名字段做简单平均，并跳过缺失值和非有限值。
-
-    注意：
-    - 这是为了快速得到一个“本次短跑的总体印象”；
-    - 如果要看训练过程漂移，应直接看 CSV 中逐 batch 的曲线，而不是只看 summary。
-    """
-    buckets: Dict[str, List[float]] = {}
-    for row in rows:
-        for key, value in row.items():
-            if isinstance(value, (int, float)) and math.isfinite(float(value)):
-                buckets.setdefault(key, []).append(float(value))
-    summary: Dict[str, float] = {}
-    for key, values in sorted(buckets.items()):
-        if not values:
-            continue
-        mean_value = float(sum(values) / len(values))
-        summary[key] = mean_value
-        summary[f"{key}_first"] = float(values[0])
-        summary[f"{key}_last"] = float(values[-1])
-        if len(values) > 1:
-            summary[f"{key}_slope"] = float((values[-1] - values[0]) / float(len(values) - 1))
-        else:
-            summary[f"{key}_slope"] = 0.0
-    return summary

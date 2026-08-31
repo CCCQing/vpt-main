@@ -12,7 +12,23 @@ import torch.nn as nn
 from scipy import ndimage
 
 from torch.nn import Linear, LayerNorm
-from ..vit_backbones.vit import *
+from ..vit_backbones.vit import (
+    ACT2FN,
+    ATTENTION_K,
+    ATTENTION_NORM,
+    ATTENTION_OUT,
+    ATTENTION_Q,
+    ATTENTION_V,
+    CONFIGS,
+    FC_0,
+    FC_1,
+    MLP_NORM,
+    Attention,
+    Embeddings,
+    Mlp,
+    np2th,
+    pjoin,
+)
 from ...utils import logging
 logger = logging.get_logger("visual_prompt")
 

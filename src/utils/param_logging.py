@@ -9,7 +9,7 @@ distributed across these groups.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import torch.nn as nn
 
@@ -165,18 +165,3 @@ def log_trainable_parameters(
             "[visual_prompt]: WARNING: affinity_branch has "
             f"{stats['affinity_branch']['train_numel']} trainable params, but affinity is intended to be a loss-only alignment path."
         )
-
-
-def debug_list_trainable_params(model: nn.Module, logger, substring: Optional[str] = None) -> None:
-    """
-    If substring is None, list all trainable parameters (name, shape).
-    If substring is given, only list parameters whose names contain that substring.
-    """
-
-    logger.info("[visual_prompt]: Trainable parameter list (debug):")
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if substring and substring.lower() not in name.lower():
-            continue
-        logger.info(f"[visual_prompt]:   {name}: shape={list(param.shape)}")
